@@ -77,25 +77,54 @@ fn retirement_mark(dir: &Path) -> RetirementMark {
 /// environment wearing a retired-looking name. The previous release would have restored and
 /// reopened it; this one cannot, so it must not be waved through on the strength of what it
 /// is called.
-fn legacy_directories(root_dir: &Path) -> Vec<PathBuf> {
+fn legacy_directories(root_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut found = Vec::new();
+
+    // `symlink_metadata`, not `try_exists`. The latter follows links, so a looping or
+    // dangling one at the live name reads as nothing being there. And an error is not an
+    // absence: a root that can be traversed but not queried would hide the environment
+    // this function exists to find, and the caller would start.
     let live = root_dir.join(LEGACY_ENV_DIR);
-    if live.try_exists().unwrap_or(false) {
-        found.push(live);
-    }
-    let prefix = format!("{LEGACY_ENV_DIR}{RETIRED_SUFFIX}");
-    if let Ok(entries) = std::fs::read_dir(root_dir) {
-        for entry in entries.flatten() {
-            if entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.starts_with(&prefix))
-            {
-                found.push(entry.path());
-            }
+    match std::fs::symlink_metadata(&live) {
+        Ok(_) => found.push(live),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(Error::Storage(format!(
+                "Cannot tell whether {} is there ({e}), so this node cannot tell whether it \
+                 has chunks in a store this build cannot read. Refusing to start rather \
+                 than assume it does not.",
+                live.display()
+            )))
         }
     }
-    found
+
+    // The same for the tombstones. A directory that cannot be listed hides every one of
+    // them, and a single unreadable entry inside it hides that one.
+    let prefix = format!("{LEGACY_ENV_DIR}{RETIRED_SUFFIX}");
+    let entries = std::fs::read_dir(root_dir).map_err(|e| {
+        Error::Storage(format!(
+            "Cannot list {} ({e}), so this node cannot tell what the storage migration left \
+             behind. Refusing to start rather than assume it left nothing.",
+            root_dir.display()
+        ))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            Error::Storage(format!(
+                "Cannot read an entry in {} ({e}), so this node cannot tell what the storage \
+                 migration left behind. Refusing to start rather than skip it.",
+                root_dir.display()
+            ))
+        })?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(&prefix))
+        {
+            found.push(entry.path());
+        }
+    }
+    Ok(found)
 }
 
 /// Refuse to start if this node still has chunks in a store this build cannot read.
@@ -106,9 +135,10 @@ fn legacy_directories(root_dir: &Path) -> Vec<PathBuf> {
 /// # Errors
 ///
 /// Returns [`Error::Storage`] naming the directory when one is present without a
-/// retirement mark, or when whether it carries one cannot be determined.
+/// retirement mark, when whether it carries one cannot be determined, or when the node
+/// root cannot be read well enough to say whether one is there at all.
 pub fn refuse_if_unmigrated(root_dir: &Path) -> Result<()> {
-    for dir in legacy_directories(root_dir) {
+    for dir in legacy_directories(root_dir)? {
         match retirement_mark(&dir) {
             // Retired before this build ever ran. Its chunks are in the file store and the
             // deletion simply did not finish. Left exactly where it is: this build has no
@@ -220,6 +250,53 @@ mod tests {
         assert!(
             refuse_if_unmigrated(dir.path()).is_err(),
             "a directory that only looks retired is not retired"
+        );
+    }
+
+    /// A node root that cannot be listed stops the node.
+    ///
+    /// Finding the leftovers is as load-bearing as classifying them, and an error looking
+    /// for one is not the same as there being none. A root that can be traversed but not
+    /// listed would hide every tombstone, and the node would start believing it had
+    /// nothing left over. This is the same fail-open the classifier itself was written
+    /// three-state to avoid, one step earlier in the same function.
+    ///
+    /// Unix only: the state is staged by taking the permission to list away.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_that_cannot_be_listed_stops_the_node() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("node");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        let refused = refuse_if_unmigrated(&root);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let Err(e) = refused else {
+            println!("skipped: this user can list a 000 directory");
+            return;
+        };
+        assert!(format!("{e}").contains("Cannot"), "{e}");
+    }
+
+    /// A link where the environment should be is not an absence either.
+    ///
+    /// `try_exists` follows links, so a loop or a dangling target reads as nothing being
+    /// there. Whatever that is, it is not proof this node has no chunks in a store this
+    /// build cannot read.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_wearing_the_environment_name_is_not_treated_as_absence() {
+        let dir = TempDir::new().expect("temp dir");
+        let live = dir.path().join(LEGACY_ENV_DIR);
+        std::os::unix::fs::symlink(&live, &live).expect("a link to itself");
+
+        assert!(
+            refuse_if_unmigrated(dir.path()).is_err(),
+            "a link at the environment name must not read as nothing being there"
         );
     }
 

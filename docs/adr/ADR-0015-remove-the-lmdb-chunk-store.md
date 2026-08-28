@@ -129,6 +129,18 @@ symbolic link pointing at itself, so looking for the mark returns a loop while e
 else about the directory keeps working, which is a state any user can reach and root cannot
 skip. Restoring the penalty is pinned by a test that fails if the constant is flipped back.
 
+**Deleted, and what replaced it.** ADR-0014's validation section describes four harnesses.
+Three of them existed to prove the bridge worked: that the disk came back when the old store
+was deleted, that a node killed mid-copy lost nothing, and that several nodes on one disk
+took turns. There is no bridge left for them to test, so they go with it. The fourth, which
+measures what one file per chunk costs at scale, stays.
+
+That leaves the loopback filesystem job with nothing to run, and deleting it would quietly
+drop ext4, XFS and btrfs coverage of the store itself. It now runs the storage unit tests
+against each mounted filesystem instead, which is what still has something to say there:
+publishing through a temporary and a rename, flushing, deleting, and rebuilding an index
+from the names.
+
 **Not proved here, and inherited from ADR-0014.** Forced power loss on the five filesystems.
 Scale at one and ten million keys. How many short-of-disk nodes can clear the possession
 gate, which this decision makes sharper: under ADR-0014 such a node kept serving from both

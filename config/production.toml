@@ -46,59 +46,6 @@ enabled = true
 # Verify content hash on read
 verify_on_read = true
 
-# Maximum size in GiB of the legacy LMDB store, while one still exists
-# (0 = derive it from available disk). Retired along with LMDB itself.
-db_size_gb = 0
-
-# --- Moving off the legacy LMDB chunk store ---
-#
-# Chunks are now one file each, under {root_dir}/chunks/. A node that still has a
-# chunks.mdb copies it into files in the background, then deletes it whole, which is the
-# only moment LMDB's disk comes back.
-#
-# The two release-level switches (whether to delete the old store, and whether audits
-# still penalise) belong to the build, not to this file, so they are deliberately absent.
-[storage.migration]
-# Run the copier. Turning this off leaves both stores in place forever and never
-# returns the old store's disk.
-enabled = true
-
-# Also write new chunks to the legacy store while it exists, so a fleet rollback to an
-# older build cannot lose a chunk uploaded during the migration.
-dual_write_legacy = true
-
-# Allow a node that cannot fit its chunks to give up the ones it is furthest from.
-#
-# Whatever this is set to, a chunk is only ever given up when the node is near the back of
-# its group for it, its close group has received the node's reduced commitment, AND all but
-# one of that group has cryptographically proven it holds a copy. A node that cannot show
-# all three keeps both stores and asks for more disk. Turn this off if you would rather add
-# disk than have the node give anything up at all.
-allow_shed = true
-
-# Hours after this build first starts before a node may give anything up, so peers on
-# older builds have upgraded and stopped penalising it for doing so.
-shed_hold_hours = 72
-
-# Hours between one migration wave opening and the next.
-#
-# A close group is split into waves so only two of its members give chunks up at a time.
-# If all seven went together none could prove to the others that a copy survived, and the
-# group would deadlock waiting on each other. A node with room to copy everything does not
-# wait for a wave: it is never unable to serve, so it is not part of that problem.
-wave_hours = 24
-
-# Hours between a node committing to what it will keep and deleting the old store.
-# Never shorter than 4: that is what the answerability window needs.
-retire_delay_hours = 4
-
-# Free space, in MiB, the copier leaves untouched on top of disk_reserve_mb.
-copier_slack_mb = 2048
-
-# Copy rate ceiling, in MiB/s. Keep it modest: an unthrottled copier competing with the
-# audit responder for disk turns a storage migration into an audit incident.
-copier_throttle_mib_per_sec = 32
-
 # --- Upgrade ---
 [upgrade]
 enabled = false
