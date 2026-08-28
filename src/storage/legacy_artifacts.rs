@@ -134,6 +134,21 @@ fn legacy_directories(root_dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(found)
 }
 
+/// Is this directory empty?
+///
+/// An error is not an emptiness. A directory that cannot be listed might hold anything, and
+/// the caller uses this to decide whether it is safe to ignore.
+fn is_empty(dir: &Path) -> Result<bool> {
+    let mut entries = std::fs::read_dir(dir).map_err(|e| {
+        Error::Storage(format!(
+            "Cannot list {} ({e}), so this node cannot tell whether it still has chunks in \
+             it. Refusing to start rather than assume it is empty.",
+            dir.display()
+        ))
+    })?;
+    Ok(entries.next().is_none())
+}
+
 /// Refuse to start if this node still has chunks in a store this build cannot read.
 ///
 /// Called before the file store is opened, so a node that is going to refuse does not
@@ -155,6 +170,17 @@ pub fn refuse_if_unmigrated(root_dir: &Path) -> Result<()> {
                 "{} is a leftover of the storage migration. It was already retired, so \
                  its chunks are in the file store and nothing is missing. It is costing \
                  disk until it is removed by hand.",
+                dir.display()
+            ),
+            // A directory with nothing in it holds no chunks, so it cannot be hiding any.
+            // The previous release's reaper emptied a tombstone, removed its mark and then
+            // removed the directory, so a crash between the last two steps leaves exactly
+            // this: empty, unmarked, and fully migrated. That release recognised the state
+            // and cleaned it up. Refusing to start over it would hold a node offline for a
+            // directory that has nothing in it.
+            RetirementMark::Absent if is_empty(&dir)? => warn!(
+                "{} is an empty leftover of the storage migration, which is what an \
+                 interrupted cleanup leaves. Nothing is in it. It can be removed.",
                 dir.display()
             ),
             RetirementMark::Absent => {
@@ -234,6 +260,30 @@ mod tests {
                 .join(format!("{LEGACY_ENV_DIR}{RETIRED_SUFFIX}.3")),
         );
         assert!(refuse_if_unmigrated(dir.path()).is_ok());
+    }
+
+    /// An empty leftover is not a reason to stay down.
+    ///
+    /// The previous release's cleanup emptied the directory, removed its mark, and then
+    /// removed the directory. A crash between the last two steps leaves an empty, unmarked
+    /// one behind: fully migrated, nothing in it, and indistinguishable by name from a
+    /// store that was never copied. That release recognised the state and tidied it up.
+    /// Holding a node offline for a directory with nothing in it would be an outage for
+    /// bookkeeping.
+    #[test]
+    fn an_empty_leftover_is_not_a_reason_to_refuse() {
+        for name in [
+            LEGACY_ENV_DIR.to_string(),
+            format!("{LEGACY_ENV_DIR}{RETIRED_SUFFIX}"),
+            format!("{LEGACY_ENV_DIR}{RETIRED_SUFFIX}.2"),
+        ] {
+            let dir = TempDir::new().expect("temp dir");
+            std::fs::create_dir_all(dir.path().join(&name)).expect("mkdir");
+            assert!(
+                refuse_if_unmigrated(dir.path()).is_ok(),
+                "{name} has nothing in it and must not stop the node"
+            );
+        }
     }
 
     /// An environment nobody retired stops the node.
