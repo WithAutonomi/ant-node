@@ -42,7 +42,7 @@ mimalloc = "0.1"
 # Branch pin while the settlement-version wire types are in review
 # (WithAutonomi/ant-protocol#25). Swap back to a published `ant-protocol`
 # version pin once that PR merges and the release train publishes it.
-ant-protocol = { git = "https://github.com/grumbach/ant-protocol", branch = "settlement-version-quote-gate" }
+ant-protocol = { git = "https://github.com/grumbach/ant-protocol", branch = "reapply/pr-23-settlement-version" }
 
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
 saorsa-core = "0.27.1"
