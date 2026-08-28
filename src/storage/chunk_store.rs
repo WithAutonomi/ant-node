@@ -705,6 +705,10 @@ pub struct ChunkStore {
     ///
     /// Tests hold the write half to park an in-flight write on the blocking pool, which
     /// is the shape a `select!` losing to a shutdown token leaves behind.
+    ///
+    /// Compiled under `test-utils` too, unlike the gate below, because the browser devnet
+    /// harness parks a real write through it. What that costs a write in a `test-utils`
+    /// build is an uncontended read taken on the blocking thread, not an await.
     #[cfg(any(test, feature = "test-utils"))]
     test_put_gate: Arc<parking_lot::RwLock<()>>,
 
@@ -720,8 +724,16 @@ pub struct ChunkStore {
     /// exists for: a put that a delete's wait cannot see yet, because there is nothing to
     /// see. Without a hook here, a test cannot tell a delete blocked by the lane from a
     /// delete blocked by the wait, and so cannot show the lane is doing anything.
-    #[cfg(any(test, feature = "test-utils"))]
+    #[cfg(test)]
     test_pre_registration_gate: Arc<tokio::sync::RwLock<()>>,
+
+    /// Test-only: how many puts have reached that gate.
+    ///
+    /// So a test can wait for the put to be parked rather than sleeping and hoping. A sleep
+    /// makes the staging a guess, and a guess in a test that is meant to be deterministic
+    /// is a flake waiting for a loaded machine.
+    #[cfg(test)]
+    test_reached_pre_registration: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ChunkStore {
@@ -831,8 +843,10 @@ impl ChunkStore {
             corrupt_reported: Notify::new(),
             #[cfg(any(test, feature = "test-utils"))]
             test_put_gate: Arc::new(parking_lot::RwLock::new(())),
-            #[cfg(any(test, feature = "test-utils"))]
+            #[cfg(test)]
             test_pre_registration_gate: Arc::new(tokio::sync::RwLock::new(())),
+            #[cfg(test)]
+            test_reached_pre_registration: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -914,8 +928,12 @@ impl ChunkStore {
         // Registered before the work is spawned and cleared by the work itself, so a
         // caller that goes away cannot leave a delete free to race this publish.
         // Test-only: the window between taking the lane and being visible to a delete.
-        #[cfg(any(test, feature = "test-utils"))]
-        drop(self.test_pre_registration_gate.read().await);
+        #[cfg(test)]
+        {
+            self.test_reached_pre_registration
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            drop(self.test_pre_registration_gate.read().await);
+        }
         let in_flight = self.begin_write(address);
         // And the lease, for the same reason the scan holds it: this thread writes into a
         // directory whose exclusivity the lock is what establishes, and it can outlive
@@ -1896,10 +1914,16 @@ impl ChunkStore {
     }
 
     /// Test-only handle to the gate that parks a put before it registers itself.
-    #[cfg(any(test, feature = "test-utils"))]
-    #[must_use]
-    pub fn test_pre_registration_gate(&self) -> Arc<tokio::sync::RwLock<()>> {
+    #[cfg(test)]
+    fn test_pre_registration_gate(&self) -> Arc<tokio::sync::RwLock<()>> {
         Arc::clone(&self.test_pre_registration_gate)
+    }
+
+    /// Test-only: how many puts have reached the pre-registration gate.
+    #[cfg(test)]
+    fn test_reached_pre_registration(&self) -> u64 {
+        self.test_reached_pre_registration
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Test-only handle to the write lanes, and the index of the one `address` is
@@ -3582,7 +3606,16 @@ mod tests {
             let content = content.clone();
             tokio::spawn(async move { store.put(&addr, &content).await })
         };
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Waited for, not slept at. A sleep makes the staging a guess, and on a loaded
+        // machine the guess is wrong and the test fails for the wrong reason.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while store.test_reached_pre_registration() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the put never reached the gate"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
 
         // The delete must not get past the lane while that put holds it. Without the lane
         // on `put` this finishes immediately, which is the regression.
