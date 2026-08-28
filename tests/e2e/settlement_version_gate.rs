@@ -2,9 +2,10 @@
 //!
 //! Every other test of this gate calls the handler in-process. This one puts
 //! the four cases on a real QUIC connection between two nodes built from this
-//! branch, which is the one thing ADR-0013 records as never having been done:
-//! "the gate itself has never run over a real connection, because the devnet
-//! speaks the pre-versioned dialect".
+//! branch, closing the gap ADR-0013 recorded before this test existed: the
+//! gate had never run over a real connection, because the devnet speaks the
+//! pre-versioned dialect. ADR-0013 now records this run under "The gate
+//! itself, over a real connection".
 //!
 //! Four cases per quote path, all against the same node so routing state and
 //! quote pricing are shared:
