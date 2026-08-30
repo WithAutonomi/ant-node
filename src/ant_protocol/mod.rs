@@ -17,9 +17,11 @@
 pub use ::ant_protocol::chunk;
 
 pub use ::ant_protocol::chunk::{
-    ChunkGetRequest, ChunkGetResponse, ChunkMessage, ChunkMessageBody, ChunkPutRequest,
-    ChunkPutResponse, ChunkQuoteRequest, ChunkQuoteResponse, MerkleCandidateQuoteRequest,
-    MerkleCandidateQuoteResponse, ProtocolError, XorName, CHUNK_PROTOCOL_ID, CLOSE_GROUP_MAJORITY,
-    CLOSE_GROUP_SIZE, DATA_TYPE_CHUNK, MAX_CHUNK_SIZE, MAX_WIRE_MESSAGE_SIZE, PROOF_TAG_MERKLE,
+    settlement_compatibility, ChunkGetRequest, ChunkGetResponse, ChunkMessage, ChunkMessageBody,
+    ChunkPutRequest, ChunkPutResponse, ChunkQuoteRequest, ChunkQuoteRequestV2, ChunkQuoteResponse,
+    MerkleCandidateQuoteRequest, MerkleCandidateQuoteRequestV2, MerkleCandidateQuoteResponse,
+    ProtocolError, SettlementCompatibility, XorName, CHUNK_PROTOCOL_ID, CLOSE_GROUP_MAJORITY,
+    CLOSE_GROUP_SIZE, CURRENT_SETTLEMENT_VERSION, DATA_TYPE_CHUNK, MAX_CHUNK_SIZE,
+    MAX_WIRE_MESSAGE_SIZE, MIN_SUPPORTED_SETTLEMENT_VERSION, PROOF_TAG_MERKLE,
     PROOF_TAG_SINGLE_NODE, PROTOCOL_VERSION, XORNAME_LEN,
 };
