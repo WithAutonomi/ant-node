@@ -862,8 +862,8 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "2.3.2"
-source = "git+https://github.com/grumbach/ant-protocol?branch=reapply/pr-23-settlement-version#f2bf6e42547ef06bf6ab46acbc4941a5d3a1014d"
+version = "2.3.3"
+source = "git+https://github.com/grumbach/ant-protocol?branch=reapply/pr-23-settlement-version#a22897d7a3048c41f8c419975274151c9ac9a843"
 dependencies = [
  "blake3",
  "bytes",
