@@ -18,7 +18,7 @@ use evmlib::common::{Amount, TxHash};
 use evmlib::{EncodedPeerId, PaymentQuote, ProofOfPayment, RewardsAddress};
 use parking_lot::RwLock;
 use saorsa_core::identity::NodeIdentity;
-use saorsa_core::{DHTNode, MultiAddr, P2PNode, PeerId};
+use saorsa_core::{DHTNode, KnownReachability, MultiAddr, P2PNode, PeerId};
 use saorsa_transport::webrtc_direct::{
     WebRtcCertificate, WebRtcDataChannel, WebRtcDirectConnection, WebRtcDirectListener,
     MAX_DATA_CHANNEL_MESSAGE_SIZE,
@@ -40,7 +40,8 @@ const PROTOCOL_NAME: &str = "autonomi.web.poc.v3";
 const DATA_CHANNEL_LABEL: &str = "autonomi.web.v3";
 const MAX_FIND_NODE_RESULTS: usize = 20;
 const MAX_RESPONSE_HEADER_BYTES: usize = 64 * 1024;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const REQUEST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const WEBRTC_WRITE_CHUNK_BYTES: usize = MAX_DATA_CHANNEL_MESSAGE_SIZE;
 const AUTOMATIC_PORT_MIN: u32 = 32_768;
 const AUTOMATIC_PORT_COUNT: u32 = 65_536 - AUTOMATIC_PORT_MIN;
@@ -369,7 +370,17 @@ async fn handle_webrtc_channel(
         let (request, content) =
             match read_webrtc_request(&channel, state.config.max_request_bytes).await {
                 Ok(request) => request,
-                Err(error) if error == "DataChannel closed" => return Ok(()),
+                Err(error)
+                    if matches!(
+                        error.as_str(),
+                        "DataChannel closed" | "request idle timeout" | "request frame timed out"
+                    ) =>
+                {
+                    if let Err(close_error) = channel.close().await {
+                        debug!("Failed to close idle WebRTC DataChannel: {close_error}");
+                    }
+                    return Ok(());
+                }
                 Err(error) => {
                     let response = Response::error(0, "invalid_request", error);
                     write_webrtc_response(&channel, &response, &[]).await?;
@@ -412,15 +423,27 @@ async fn read_webrtc_request(
     channel: &WebRtcDataChannel,
     max_header_bytes: usize,
 ) -> ServerResult<(Request, Vec<u8>)> {
+    let first_message = tokio::time::timeout(REQUEST_IDLE_TIMEOUT, channel.receive())
+        .await
+        .map_err(|_| "request idle timeout".to_string())?
+        .map_err(|error| format!("request message read failed: {error}"))?;
+    if first_message.is_empty() {
+        return Err("DataChannel closed".to_string());
+    }
     let read = async {
         let mut frame = Vec::new();
         let mut expected_length = None;
+        let mut next_message = Some(first_message);
         let max_frame_bytes = 4 + max_header_bytes + MAX_CHUNK_SIZE;
         loop {
-            let message = channel
-                .receive()
-                .await
-                .map_err(|error| format!("request message read failed: {error}"))?;
+            let message = if let Some(message) = next_message.take() {
+                message
+            } else {
+                channel
+                    .receive()
+                    .await
+                    .map_err(|error| format!("request message read failed: {error}"))?
+            };
             if message.is_empty() {
                 return Err("DataChannel closed".to_string());
             }
@@ -473,9 +496,9 @@ async fn read_webrtc_request(
             }
         }
     };
-    tokio::time::timeout(REQUEST_TIMEOUT, read)
+    tokio::time::timeout(REQUEST_FRAME_TIMEOUT, read)
         .await
-        .map_err(|_| "request timed out".to_string())?
+        .map_err(|_| "request frame timed out".to_string())?
 }
 
 async fn write_webrtc_response(
@@ -612,7 +635,9 @@ async fn process_find_node(
         .await;
     let mut nodes = Vec::with_capacity(dht_nodes.len());
     for node in dht_nodes {
-        let supplemental = dht.supplemental_addresses_for_peer(&node.peer_id).await;
+        let supplemental = dht
+            .supplemental_address_records_for_peer(&node.peer_id)
+            .await;
         nodes.push(browser_node_from_dht(
             &node,
             &supplemental,
@@ -627,17 +652,20 @@ async fn process_find_node(
 
 fn browser_node_from_dht(
     node: &DHTNode,
-    supplemental: &[MultiAddr],
+    supplemental: &[(MultiAddr, KnownReachability)],
     endpoint_catalog: &BrowserEndpointCatalog,
 ) -> BrowserNode {
     let addresses = node.addresses_by_priority();
     let discovered_endpoint = supplemental
         .iter()
-        .find(|address| {
-            address.is_webrtc_direct()
+        .find(|(address, reachability)| {
+            matches!(
+                reachability,
+                KnownReachability::Direct | KnownReachability::Lan
+            ) && address.is_webrtc_direct()
                 && address.peer_id().is_some_and(|peer| peer == &node.peer_id)
         })
-        .cloned()
+        .map(|(address, _)| address.clone())
         .map(|multiaddr| BrowserEndpoint { multiaddr });
     BrowserNode {
         webrtc_direct: discovered_endpoint.or_else(|| endpoint_catalog.get(&node.peer_id)),
@@ -1372,9 +1400,10 @@ mod tests {
             reliability: 0.75,
         };
 
+        let supplemental = (endpoint.multiaddr.clone(), KnownReachability::Direct);
         let browser_node = browser_node_from_dht(
             &node,
-            std::slice::from_ref(&endpoint.multiaddr),
+            std::slice::from_ref(&supplemental),
             &BrowserEndpointCatalog::default(),
         );
 
@@ -1383,5 +1412,32 @@ mod tests {
             browser_node.native_addresses,
             vec!["/ip4/203.0.113.9/udp/10000/quic"]
         );
+    }
+
+    #[test]
+    fn find_node_hides_relay_only_webrtc_endpoint() {
+        let peer_id = PeerId::from_bytes([0x32; 32]);
+        let endpoint = BrowserEndpoint::new(
+            "203.0.113.10:42768".parse().expect("socket address"),
+            &peer_id,
+            [0x53; 32],
+        )
+        .expect("browser endpoint");
+        let node = DHTNode {
+            peer_id,
+            addresses: Vec::new(),
+            address_types: Vec::new(),
+            distance: None,
+            reliability: 0.75,
+        };
+        let supplemental = (endpoint.multiaddr, KnownReachability::Relay);
+
+        let browser_node = browser_node_from_dht(
+            &node,
+            std::slice::from_ref(&supplemental),
+            &BrowserEndpointCatalog::default(),
+        );
+
+        assert!(browser_node.webrtc_direct.is_none());
     }
 }
