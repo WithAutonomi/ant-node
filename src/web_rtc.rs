@@ -14,6 +14,7 @@ use crate::error::{Error, Result};
 use crate::logging::{debug, info, warn};
 use crate::payment::{serialize_single_node_proof, PaymentProof};
 use crate::storage::AntProtocol;
+use ant_protocol::web_rtc::transfer_timeout;
 use evmlib::common::{Amount, TxHash};
 use evmlib::{EncodedPeerId, PaymentQuote, ProofOfPayment, RewardsAddress};
 use parking_lot::RwLock;
@@ -41,7 +42,6 @@ const DATA_CHANNEL_LABEL: &str = "autonomi.web.v3";
 const MAX_FIND_NODE_RESULTS: usize = 20;
 const MAX_RESPONSE_HEADER_BYTES: usize = 64 * 1024;
 const REQUEST_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-const REQUEST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const WEBRTC_WRITE_CHUNK_BYTES: usize = MAX_DATA_CHANNEL_MESSAGE_SIZE;
 const AUTOMATIC_PORT_MIN: u32 = 32_768;
 const AUTOMATIC_PORT_COUNT: u32 = 65_536 - AUTOMATIC_PORT_MIN;
@@ -430,75 +430,74 @@ async fn read_webrtc_request(
     if first_message.is_empty() {
         return Err("DataChannel closed".to_string());
     }
-    let read = async {
-        let mut frame = Vec::new();
-        let mut expected_length = None;
-        let mut next_message = Some(first_message);
-        let max_frame_bytes = 4 + max_header_bytes + MAX_CHUNK_SIZE;
-        loop {
-            let message = if let Some(message) = next_message.take() {
-                message
-            } else {
-                channel
-                    .receive()
-                    .await
-                    .map_err(|error| format!("request message read failed: {error}"))?
-            };
-            if message.is_empty() {
-                return Err("DataChannel closed".to_string());
-            }
-            if frame.len() + message.len() > max_frame_bytes {
+    let frame_started = tokio::time::Instant::now();
+    let mut frame_deadline = frame_started + transfer_timeout(0);
+    let mut frame = Vec::new();
+    let mut expected_length = None;
+    let mut next_message = Some(first_message);
+    let max_frame_bytes = 4 + max_header_bytes + MAX_CHUNK_SIZE;
+    loop {
+        let message = if let Some(message) = next_message.take() {
+            message
+        } else {
+            tokio::time::timeout_at(frame_deadline, channel.receive())
+                .await
+                .map_err(|_| "request frame timed out".to_string())?
+                .map_err(|error| format!("request message read failed: {error}"))?
+        };
+        if message.is_empty() {
+            return Err("DataChannel closed".to_string());
+        }
+        if frame.len() + message.len() > max_frame_bytes {
+            return Err(format!(
+                "request exceeds the {max_frame_bytes}-byte frame limit"
+            ));
+        }
+        frame.extend_from_slice(&message);
+
+        if expected_length.is_none() && frame.len() >= 4 {
+            let header_len = u32::from_be_bytes(
+                frame[..4]
+                    .try_into()
+                    .map_err(|_| "request prefix is incomplete".to_string())?,
+            ) as usize;
+            if header_len == 0 || header_len > max_header_bytes {
                 return Err(format!(
-                    "request exceeds the {max_frame_bytes}-byte frame limit"
+                    "request header length {header_len} is outside 1..={max_header_bytes}"
                 ));
             }
-            frame.extend_from_slice(&message);
+            if frame.len() >= 4 + header_len {
+                let request: Request = serde_json::from_slice(&frame[4..4 + header_len])
+                    .map_err(|error| format!("request JSON is invalid: {error}"))?;
+                if request.content_length > MAX_CHUNK_SIZE {
+                    return Err(format!(
+                        "request content length {} exceeds {MAX_CHUNK_SIZE}",
+                        request.content_length
+                    ));
+                }
+                let frame_length = 4 + header_len + request.content_length;
+                frame_deadline = frame_started + transfer_timeout(frame_length);
+                expected_length = Some((frame_length, request));
+            }
+        }
 
-            if expected_length.is_none() && frame.len() >= 4 {
+        if let Some((length, _)) = expected_length.as_ref() {
+            if frame.len() > *length {
+                return Err("request contains bytes after its declared frame".to_string());
+            }
+            if frame.len() == *length {
+                let (_, request) = expected_length
+                    .take()
+                    .ok_or_else(|| "request length state was lost".to_string())?;
                 let header_len = u32::from_be_bytes(
                     frame[..4]
                         .try_into()
                         .map_err(|_| "request prefix is incomplete".to_string())?,
                 ) as usize;
-                if header_len == 0 || header_len > max_header_bytes {
-                    return Err(format!(
-                        "request header length {header_len} is outside 1..={max_header_bytes}"
-                    ));
-                }
-                if frame.len() >= 4 + header_len {
-                    let request: Request = serde_json::from_slice(&frame[4..4 + header_len])
-                        .map_err(|error| format!("request JSON is invalid: {error}"))?;
-                    if request.content_length > MAX_CHUNK_SIZE {
-                        return Err(format!(
-                            "request content length {} exceeds {MAX_CHUNK_SIZE}",
-                            request.content_length
-                        ));
-                    }
-                    expected_length = Some((4 + header_len + request.content_length, request));
-                }
-            }
-
-            if let Some((length, _)) = expected_length.as_ref() {
-                if frame.len() > *length {
-                    return Err("request contains bytes after its declared frame".to_string());
-                }
-                if frame.len() == *length {
-                    let (_, request) = expected_length
-                        .take()
-                        .ok_or_else(|| "request length state was lost".to_string())?;
-                    let header_len = u32::from_be_bytes(
-                        frame[..4]
-                            .try_into()
-                            .map_err(|_| "request prefix is incomplete".to_string())?,
-                    ) as usize;
-                    return Ok((request, frame.split_off(4 + header_len)));
-                }
+                return Ok((request, frame.split_off(4 + header_len)));
             }
         }
-    };
-    tokio::time::timeout(REQUEST_FRAME_TIMEOUT, read)
-        .await
-        .map_err(|_| "request frame timed out".to_string())?
+    }
 }
 
 async fn write_webrtc_response(
