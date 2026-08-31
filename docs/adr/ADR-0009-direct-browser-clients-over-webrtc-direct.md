@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-08-03
-- **Last amended:** 2026-08-25
+- **Last amended:** 2026-08-28
 - **Decision owners:** <pending>
 - **Reviewers:** <pending>
 - **Supersedes:** none
@@ -436,7 +436,34 @@ compatibility requirement: the Safari PoC observed later DataChannels timing
 out after rapid connection churn even though each earlier caller invoked
 `close()`. The pool avoids relying on prompt browser resource reclamation,
 serializes concurrent RPCs per node, limits live associations, evicts only idle
-entries, and closes every entry when the complete file operation finishes.
+entries, and closes every entry when the application closes the client.
+
+The pool belongs to the long-lived browser client and is closed explicitly by
+the application. It is not discarded between records or between complete file
+operations. The same client also retains learned routing entries and a bounded
+negative endpoint cache, so a second chunk lookup does not restart from the
+bootstrap list or repeatedly wait on an endpoint that just failed.
+
+### Client API compatibility
+
+`ant-core` keeps its existing native `data::Client` and `ClientConfig` public
+API. Existing native Rust applications, including `ant-cli`, continue to
+construct and call that client without source changes. Native QUIC, Tokio task
+management, wallet integrations, and filesystem behavior remain behind that
+facade.
+
+Reusable client algorithms live behind a private runtime-neutral Rust engine.
+This includes bounded unordered work scheduling, endpoint failure state, and
+the transport-independent iterative lookup driver. The native facade supplies
+Tokio/QUIC adapters; the WASM facade supplies browser timers and WebRTC Direct
+sessions. Both therefore use the same Rust policies without forcing existing
+native callers onto a new trait or configuration type.
+
+Browser applications instantiate the Rust/WASM `BrowserNetworkClient`. That
+facade owns bootstrap, routing, quote preparation, paid storage, downloads,
+and random-access reads. JavaScript remains only at browser boundaries that
+Rust cannot own directly: DOM events, wallet-provider calls, service-worker
+message plumbing, and the browser's WebRTC API bindings.
 
 The sender observes `bufferedAmount`, pauses above the configured high-water
 mark, and resumes only after `bufferedamountlow`. Both sides cap total buffered
@@ -452,12 +479,26 @@ browser signs locally, and only the resulting public proof crosses WebRTC.
 
 ### Lookup behavior
 
-The browser owns the iterative lookup state machine. It starts from the
-constant WebRTC Direct bootstrap list, queries up to `ALPHA = 3` unqueried
-closest endpoints in parallel, merges verified endpoint records, and stops at
-convergence or the iteration limit. The initial implementation targets the
-current native `K = 20` behavior. Lookup and chunk retry policies should
-eventually share language-independent test vectors with the native client.
+The browser owns the iterative lookup state machine. The first lookup starts
+from the constant WebRTC Direct bootstrap list. Later lookups start from the
+closest entries in the Rust client's retained routing view. It queries up to
+`ALPHA = 3` unqueried closest endpoints in parallel, merges verified endpoint
+records, and stops at convergence or the iteration limit. The implementation
+uses the current native `K = 20` behavior.
+
+Native QUIC and browser WebRTC adapters share the same Rust rule for each
+parallel query batch: await the first result, accept additional results during
+a bounded grace period, and cancel remaining stragglers. A failed endpoint is
+suppressed for a cooldown unless the peer publishes a different address; a
+successful request clears the failure. This prevents unreachable NAT-side
+listeners from adding their full WebRTC opening timeout to every record.
+
+V2 address records carry reachability independently from transport type. A
+WebRTC Direct endpoint inherits its owner's canonical reachability evidence.
+One-hop browser `FIND_NODE` responses expose Direct endpoints (and LAN
+endpoints in local testnets), but do not describe a relay-only endpoint as
+directly dialable. A future relayed WebRTC endpoint remains a separate address
+record rather than overloading the direct address.
 
 Every storage node, or a sufficient storage-aware replica set, must expose a
 browser endpoint. Filtering native closest results to a sparse browser-only
@@ -576,9 +617,11 @@ that one address, traversed routing views from dozens of independent peer
 processes, obtained four quotes from four non-bootstrap closest nodes, paid
 once, and stored all four encrypted records. This verifies that the input
 address is a bootstrap seed rather than a storage proxy. Nodes behind the
-testnet's deliberate inbound-NAT rules still require relayed WebRTC; failed
-direct attempts are tolerated but currently add the full DataChannel opening
-timeout to lookup latency.
+testnet's deliberate inbound-NAT rules still require relayed WebRTC. Their
+relay-only direct listeners are no longer returned as usable browser
+endpoints, and failed endpoints learned before that classification are
+cancelled after the shared lookup grace period and suppressed by the browser
+client's negative cache.
 
 After replacing that prototype with the compatibility-safe V2 address plane,
 a five-node headless-Chromium test again started with exactly one WebRTC seed.
@@ -607,7 +650,9 @@ round-trip tests.
 - The stable DTLS fingerprint is separately bound to the persistent PQ node
   identity rather than being treated as the ANT identity.
 - Rust producers and consumers share the network's native `MultiAddr` codec;
-  browser JavaScript implements the same canonical wire syntax.
+  browser WASM parses and validates the same canonical wire syntax.
+- Existing native `ant-core` client applications retain their public API while
+  native and browser facades share runtime-neutral Rust client policies.
 - Existing PQ node networking and compatibility remain isolated.
 
 ### Negative / Trade-offs
@@ -669,7 +714,8 @@ The decision advances beyond PoC only after all of the following are covered:
   a new ICE credential must override a stale address mapping, while binding
   responses and non-STUN traffic continue to use the selected address mapping.
 - Browser-side iterative lookup parity tests cover XOR ordering, `K`, `ALPHA`,
-  convergence, retries, expired discovered records, and unavailable endpoints.
+  convergence, retained routing entries, grace cancellation, failure cooldown,
+  changed endpoints, expired discovered records, and unavailable endpoints.
 - Reliable downloads and uploads work at 0 bytes, typical sizes, and 4 MiB,
   with BLAKE3 verification, bounded memory, fragmentation, cancellation, and
   backpressure measurements.
