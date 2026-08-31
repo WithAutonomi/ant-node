@@ -5817,7 +5817,10 @@ async fn dispatch_fresh_offer(
                 responder_class = "fresh_offer",
                 source = %source,
                 key = %hex::encode(key),
-                "Fresh offer refused at admission — this node will be penalised                  for the resulting absence: {failure}"
+                penalty_suspended = config::close_group_storage_penalty_suspended(),
+                "Fresh offer refused at admission; the resulting absence is recorded \
+                 against this node, and penalised unless the release withholds it: \
+                 {failure}"
             );
             // Release the key explicitly rather than on drop, so the next offer
             // opens a fresh entry rather than queueing behind a handler that was
@@ -6971,6 +6974,86 @@ fn request_is_stale(received_at: Instant, timeout: Duration) -> bool {
     received_at.elapsed() >= timeout
 }
 
+/// How a fetch responder's answer is charged against its reputation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetchFault {
+    /// The peer does not hold a chunk it was expected to hold.
+    ///
+    /// This is the lane the release withholds, because a node part-way through moving
+    /// off the legacy store answers exactly this way about chunks it has legitimately
+    /// given up.
+    UnheldChunk,
+    /// The peer's own storage failed, or served bytes that no longer hash to their
+    /// address.
+    ///
+    /// Never withheld. `FetchResponse::Error` has one producer, and it is the responder's
+    /// storage read returning an error: an I/O fault, an exhausted descriptor table, or a
+    /// failed integrity check. A peer that merely does not hold the chunk answers
+    /// `NotFound` instead, so nothing about the migration produces this.
+    ResponderFault,
+}
+
+/// Classify a fetch response that did not carry the chunk.
+///
+/// `Success` yields `None`. Every other answer is a fault of one kind or the other, and
+/// which kind decides whether this release charges for it.
+fn fetch_fault_for(response: &protocol::FetchResponse) -> Option<FetchFault> {
+    match response {
+        protocol::FetchResponse::Success { .. } => None,
+        protocol::FetchResponse::NotFound { .. } => Some(FetchFault::UnheldChunk),
+        protocol::FetchResponse::Error { .. } => Some(FetchFault::ResponderFault),
+    }
+}
+
+/// Charge a fetch fault to the responder.
+///
+/// The only place the two kinds are treated differently. An unheld chunk goes through the
+/// release switch, which is currently withholding it; a responder fault is charged
+/// directly and is not affected by the switch at all.
+async fn charge_fetch_fault(
+    p2p_node: &Arc<P2PNode>,
+    source: &PeerId,
+    fault: FetchFault,
+    lane: &'static str,
+) {
+    match fault {
+        FetchFault::UnheldChunk => {
+            config::penalise_unheld_close_group_chunk(
+                p2p_node,
+                source,
+                lane,
+                REPLICATION_TRUST_WEIGHT,
+            )
+            .await;
+        }
+        FetchFault::ResponderFault => {
+            p2p_node
+                .report_trust_event(
+                    source,
+                    TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
+                )
+                .await;
+        }
+    }
+}
+
+/// Turn the responder's storage read into the answer it sends back.
+///
+/// The whole distinction the fetch lanes rest on is made here. A key this node does not
+/// hold reads as `Ok(None)` and is answered `NotFound`. A read that fails, from an I/O
+/// fault, an exhausted descriptor table, or a failed integrity check, is answered `Error`.
+/// Nothing about a node giving chunks up produces the second.
+fn fetch_response_for(key: XorName, read: Result<Option<Vec<u8>>>) -> protocol::FetchResponse {
+    match read {
+        Ok(Some(data)) => protocol::FetchResponse::Success { key, data },
+        Ok(None) => protocol::FetchResponse::NotFound { key },
+        Err(e) => protocol::FetchResponse::Error {
+            key,
+            reason: format!("{e}"),
+        },
+    }
+}
+
 async fn handle_fetch_request(
     source: &PeerId,
     request: &protocol::FetchRequest,
@@ -6979,17 +7062,7 @@ async fn handle_fetch_request(
     request_id: u64,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
-    let response = match storage.get(&request.key).await {
-        Ok(Some(data)) => protocol::FetchResponse::Success {
-            key: request.key,
-            data,
-        },
-        Ok(None) => protocol::FetchResponse::NotFound { key: request.key },
-        Err(e) => protocol::FetchResponse::Error {
-            key: request.key,
-            reason: format!("{e}"),
-        },
-    };
+    let response = fetch_response_for(request.key, storage.get(&request.key).await);
 
     send_replication_response(
         source,
@@ -8184,7 +8257,7 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
         }
 
         // Step 5: Update queues with the evaluated outcomes.
-        let mut bad_singleton_hints: HashMap<PeerId, usize> = HashMap::new();
+        let mut bad_singleton_hints: HashMap<(PeerId, SingletonHintFault), usize> = HashMap::new();
         let mut q = queues.write().await;
         for (key, outcome) in evaluated {
             let replica_hint_sources = q
@@ -8256,20 +8329,38 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
         }
         drop(q);
 
-        for (peer, bad_hint_count) in bad_singleton_hints {
+        for ((peer, fault), bad_hint_count) in bad_singleton_hints {
             let reports = bad_hint_count.min(MAX_BAD_HINT_TRUST_REPORTS_PER_PEER_PER_CYCLE);
             warn!(
                 "Peer {peer} submitted {bad_hint_count} rejected or self-contradicting \
-                 sole-source replica hints; \
+                 sole-source replica hints ({fault:?}); \
                  reporting {reports} bounded trust failure(s)"
             );
             for _ in 0..reports {
-                p2p_node
-                    .report_trust_event(
-                        &peer,
-                        TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
-                    )
-                    .await;
+                match fault {
+                    // A claim about a key that does not exist. Punishable whatever the
+                    // sender's disk is doing.
+                    SingletonHintFault::RejectedByCloseGroup => {
+                        p2p_node
+                            .report_trust_event(
+                                &peer,
+                                TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
+                            )
+                            .await;
+                    }
+                    // "I advertised it and no longer have it." That is the one statement a
+                    // node short of disk cannot avoid making while it moves its chunks, so
+                    // it goes through the release switch.
+                    SingletonHintFault::DeniedPossession => {
+                        config::penalise_unheld_close_group_chunk(
+                            p2p_node,
+                            &peer,
+                            "replica_hint_denied_possession",
+                            REPLICATION_TRUST_WEIGHT,
+                        )
+                        .await;
+                    }
+                }
             }
         }
     }
@@ -8361,25 +8452,43 @@ fn add_replica_hint_sources(sources: &mut Vec<PeerId>, replica_hint_sources: &Ha
     }
 }
 
+/// Why a sole-source replica hint is punishable.
+///
+/// The two cases look alike and are not. A hint the close group rejects outright is a
+/// claim about a key that does not exist, which is a bad hint however the sender's disk is
+/// doing. A sender that advertised a key and then answers `Absent` for it is making a
+/// statement about its own storage, and that is the one thing a node short of disk cannot
+/// avoid saying while it moves its chunks out of a store that will not give the space back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SingletonHintFault {
+    /// The close group says the key does not exist.
+    RejectedByCloseGroup,
+    /// The sender advertised the key and then denied holding it.
+    DeniedPossession,
+}
+
 /// Return the sole replica advertiser when either the close group definitively
-/// rejects the key or the advertiser explicitly denies possessing it.
+/// rejects the key or the advertiser explicitly denies possessing it, and say which.
 /// Paid-only advertisements, corroborated replica hints, and inconclusive
 /// rounds without that direct contradiction are deliberately non-penalizing.
 fn punishable_singleton_replica_hint_source(
     replica_hint_sources: &HashSet<PeerId>,
     outcome: &KeyVerificationOutcome,
     evidence: &crate::replication::types::KeyVerificationEvidence,
-) -> Option<PeerId> {
+) -> Option<(PeerId, SingletonHintFault)> {
     // A paid-only advertiser leaves this set empty, so the sole-source lane is
     // reserved for peers that actually claimed possession.
     if replica_hint_sources.len() != 1 {
         return None;
     }
     let source = *replica_hint_sources.iter().next()?;
-    let rejected_by_close_group = matches!(outcome, KeyVerificationOutcome::QuorumFailed);
-    let denied_possession = evidence.presence.get(&source) == Some(&PresenceEvidence::Absent);
-
-    (rejected_by_close_group || denied_possession).then_some(source)
+    if matches!(outcome, KeyVerificationOutcome::QuorumFailed) {
+        return Some((source, SingletonHintFault::RejectedByCloseGroup));
+    }
+    if evidence.presence.get(&source) == Some(&PresenceEvidence::Absent) {
+        return Some((source, SingletonHintFault::DeniedPossession));
+    }
+    None
 }
 
 /// Post-verification bootstrap bookkeeping: remove terminal keys from the
@@ -8845,43 +8954,33 @@ async fn execute_single_fetch(
                         result: FetchResult::Stored,
                     }
                 }
-                ReplicationMessageBody::FetchResponse(protocol::FetchResponse::NotFound {
-                    ..
-                }) => {
-                    // This peer was selected as a fetch source because it
-                    // recently answered `Present` during verification. A
-                    // subsequent NotFound is evidence of a stale/false claim
-                    // or chunk wiping, so penalize lightly and try another
-                    // verified source.
-                    warn!(
-                        "Fetch: verified source {source} returned NotFound for {}",
-                        hex::encode(key)
-                    );
-                    p2p_node
-                        .report_trust_event(
-                            &source,
-                            TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
-                        )
-                        .await;
-                    FetchOutcome {
-                        key,
-                        result: FetchResult::SourceFailed,
+                ReplicationMessageBody::FetchResponse(
+                    ref response @ (protocol::FetchResponse::NotFound { .. }
+                    | protocol::FetchResponse::Error { .. }),
+                ) => {
+                    // This peer was selected as a fetch source because it recently
+                    // answered `Present` during verification, so either answer is
+                    // evidence of something. Which one decides what it is charged: a peer
+                    // that does not hold the chunk is the lane this release withholds, a
+                    // peer whose own read failed is not.
+                    if let protocol::FetchResponse::Error { reason, .. } = response {
+                        warn!(
+                            "Fetch: peer {source} returned error for {}: {reason}",
+                            hex::encode(key)
+                        );
+                    } else {
+                        warn!(
+                            "Fetch: verified source {source} returned NotFound for {}",
+                            hex::encode(key)
+                        );
                     }
-                }
-                ReplicationMessageBody::FetchResponse(protocol::FetchResponse::Error {
-                    reason,
-                    ..
-                }) => {
-                    warn!(
-                        "Fetch: peer {source} returned error for {}: {reason}",
-                        hex::encode(key)
-                    );
-                    p2p_node
-                        .report_trust_event(
-                            &source,
-                            TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
-                        )
-                        .await;
+                    if let Some(fault) = fetch_fault_for(response) {
+                        let lane = match fault {
+                            FetchFault::UnheldChunk => "fetch_not_found",
+                            FetchFault::ResponderFault => "fetch_error",
+                        };
+                        charge_fetch_fault(&p2p_node, &source, fault, lane).await;
+                    }
                     FetchOutcome {
                         key,
                         result: FetchResult::SourceFailed,
@@ -8969,6 +9068,10 @@ async fn handle_subtree_failed_audit(
         let mut provers_guard = recent_provers.write().await;
         apply_audit_failure_credit_revocation(&mut provers_guard, challenged_peer, reason);
     }
+    // Deliberately NOT routed through the release switch. This is the commitment-bound
+    // subtree audit: the peer published a signed claim to hold these keys and could not
+    // answer for them. That contract is enforced in every release, including the one that
+    // withholds the penalty for merely not holding a close-group chunk.
     p2p_node
         .report_trust_event(
             challenged_peer,
@@ -9161,12 +9264,13 @@ async fn handle_audit_result(
                 } else {
                     debug!("Audit timeout for {challenged_peer}; retaining active bootstrap claim");
                 }
-                p2p_node
-                    .report_trust_event(
-                        challenged_peer,
-                        TrustEvent::ApplicationFailure(config::AUDIT_FAILURE_TRUST_WEIGHT),
-                    )
-                    .await;
+                config::penalise_unheld_close_group_chunk(
+                    p2p_node,
+                    challenged_peer,
+                    crate::replication::audit_metrics::AuditType::ResponsibleChunk.as_str(),
+                    config::AUDIT_FAILURE_TRUST_WEIGHT,
+                )
+                .await;
             }
         }
         AuditTickResult::BootstrapClaim { peer } => {
@@ -9967,6 +10071,78 @@ async fn rebuild_and_rotate_commitment(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+
+    /// The two fetch failures mean different things and must be charged differently.
+    ///
+    /// `NotFound` is a peer saying it does not hold the chunk, which is what a node
+    /// part-way through the migration says about chunks it has legitimately given up, so
+    /// it is the lane this release withholds. `Error` has a single producer, the
+    /// responder's own storage read failing, and that is never about the migration.
+    #[test]
+    fn a_missing_chunk_and_a_failed_read_are_different_faults() {
+        let key = [7u8; 32];
+        assert_eq!(
+            fetch_fault_for(&protocol::FetchResponse::NotFound { key }),
+            Some(FetchFault::UnheldChunk)
+        );
+        assert_eq!(
+            fetch_fault_for(&protocol::FetchResponse::Error {
+                key,
+                reason: "read failed".to_string(),
+            }),
+            Some(FetchFault::ResponderFault)
+        );
+        assert_eq!(
+            fetch_fault_for(&protocol::FetchResponse::Success {
+                key,
+                data: vec![1, 2, 3],
+            }),
+            None
+        );
+    }
+
+    /// The responder's answer says which fault it is, so the mapping from a storage read
+    /// to a response is what the classification above rests on.
+    ///
+    /// A key the peer does not hold reads as `Ok(None)`. A read that fails, whether from
+    /// an I/O fault or a failed integrity check, reads as `Err`. Nothing in the migration
+    /// turns the first into the second.
+    #[tokio::test]
+    async fn a_missing_key_reads_as_a_plain_miss_and_a_failed_read_as_a_fault() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let storage = LmdbStorage::new(crate::storage::LmdbStorageConfig {
+            root_dir: dir.path().to_path_buf(),
+            verify_on_read: true,
+            max_map_size: 0,
+            disk_reserve: 0,
+        })
+        .await
+        .expect("open store");
+
+        let absent = [9u8; 32];
+        assert!(
+            matches!(storage.get(&absent).await, Ok(None)),
+            "a chunk this node does not hold must read as a plain miss, not a fault"
+        );
+
+        // And the answer each read produces. A miss is `NotFound`, which is the withheld
+        // lane; a failed read is `Error`, which is not.
+        assert!(matches!(
+            fetch_response_for(absent, Ok(None)),
+            protocol::FetchResponse::NotFound { .. }
+        ));
+        assert!(matches!(
+            fetch_response_for(absent, Ok(Some(vec![1, 2, 3]))),
+            protocol::FetchResponse::Success { .. }
+        ));
+        assert!(matches!(
+            fetch_response_for(
+                absent,
+                Err(crate::error::Error::Storage("read failed".into()))
+            ),
+            protocol::FetchResponse::Error { .. }
+        ));
+    }
     use super::*;
     use super::{
         apply_audit_failure_credit_revocation, audit_failure_clears_bootstrap_claim,
@@ -10428,7 +10604,9 @@ mod tests {
 
         assert_eq!(
             punishable_singleton_replica_hint_source(&HashSet::from([source]), &failed, &evidence),
-            Some(source)
+            Some((source, SingletonHintFault::RejectedByCloseGroup)),
+            "a close-group rejection outranks the denial: the key does not exist, which is \
+             a bad hint however the sender's own disk is doing"
         );
         assert_eq!(
             punishable_singleton_replica_hint_source(
@@ -10451,7 +10629,7 @@ mod tests {
             .insert(source, PresenceEvidence::Unresolved);
         assert_eq!(
             punishable_singleton_replica_hint_source(&HashSet::from([source]), &failed, &evidence),
-            Some(source),
+            Some((source, SingletonHintFault::RejectedByCloseGroup)),
             "definitive close-group rejection is punishable without direct contradiction"
         );
         assert_eq!(
@@ -10473,8 +10651,10 @@ mod tests {
                 },
                 &evidence,
             ),
-            Some(source),
-            "an explicit denial is punishable regardless of the overall outcome"
+            Some((source, SingletonHintFault::DeniedPossession)),
+            "an explicit denial is punishable regardless of the overall outcome, and is \
+             classified separately because it is a statement about the sender's own \
+             storage rather than about the key"
         );
     }
 

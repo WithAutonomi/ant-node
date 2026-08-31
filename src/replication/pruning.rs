@@ -1980,12 +1980,13 @@ async fn report_prune_audit_failure_once(
         "Prune audit failure: peer={peer}, audit_failure_class={audit_failure_class}, key={}",
         hex::encode(key)
     );
-    p2p_node
-        .report_trust_event(
-            peer,
-            saorsa_core::TrustEvent::ApplicationFailure(AUDIT_FAILURE_TRUST_WEIGHT),
-        )
-        .await;
+    crate::replication::config::penalise_unheld_close_group_chunk(
+        p2p_node,
+        peer,
+        AuditType::Prune.as_str(),
+        AUDIT_FAILURE_TRUST_WEIGHT,
+    )
+    .await;
     true
 }
 

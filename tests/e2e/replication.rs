@@ -266,7 +266,7 @@ async fn test_fresh_replication_propagates_to_close_group() {
 /// eviction acts on), via `P2PNode::peer_trust`.
 #[tokio::test]
 #[serial]
-async fn possession_check_penalises_absent_peer_only() {
+async fn possession_check_penalises_absent_peer_only_and_obeys_the_release_switch() {
     let harness = TestHarness::setup_small().await.expect("setup");
     harness.warmup_dht().await.expect("warmup");
 
@@ -324,6 +324,10 @@ async fn possession_check_penalises_absent_peer_only() {
         "precondition: C must hold the chunk"
     );
 
+    // Switched on explicitly, so this half keeps testing the possession mechanism rather
+    // than whichever release it happens to be compiled against.
+    ant_node::replication::config::set_close_group_storage_penalty_suspended(false);
+
     let trust_b_before = p2p_a.peer_trust(&peer_b);
     let trust_c_before = p2p_a.peer_trust(&peer_c);
 
@@ -343,6 +347,25 @@ async fn possession_check_penalises_absent_peer_only() {
     assert!(
         trust_c_after >= trust_c_before - f64::EPSILON,
         "present peer C must not be penalised: {trust_c_before} -> {trust_c_after}"
+    );
+
+    // And the other half of the contract, on the same harness. The release that moves
+    // nodes off the legacy chunk store withholds exactly this penalty: a node short of
+    // disk cannot avoid answering "absent" while it moves its chunks out of a store that
+    // never returns space, and it cannot stop its peers penalising it for that, because
+    // the penalty is the auditor's decision. So the auditors stop one release ahead.
+    ant_node::replication::config::set_close_group_storage_penalty_suspended(true);
+    let trust_b_suspended_before = p2p_a.peer_trust(&peer_b);
+    engine_a
+        .run_possession_check_now(address, vec![peer_b, peer_c])
+        .await;
+    let trust_b_suspended_after = p2p_a.peer_trust(&peer_b);
+    ant_node::replication::config::set_close_group_storage_penalty_suspended(false);
+
+    assert!(
+        trust_b_suspended_after >= trust_b_suspended_before - f64::EPSILON,
+        "an absent peer must not be penalised while the release withholds that penalty: \
+         {trust_b_suspended_before} -> {trust_b_suspended_after}"
     );
 
     harness.teardown().await.expect("teardown");
