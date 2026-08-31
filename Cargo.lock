@@ -5202,6 +5202,10 @@ dependencies = [
 [[package]]
 name = "saorsa-dht-lookup"
 version = "0.1.0"
+dependencies = [
+ "futures-core",
+ "futures-util",
+]
 
 [[package]]
 name = "saorsa-pqc"
