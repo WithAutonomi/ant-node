@@ -885,7 +885,10 @@ checksum = "dd13dd1f51e3e9b3e871673b7d52a65054c9431b0656f4fa9589098126c3dafd"
 dependencies = [
  "blake3",
  "bytes",
+ "chacha20poly1305",
  "evmlib",
+ "fips203",
+ "getrandom 0.2.17",
  "hex",
  "postcard",
  "rmp-serde",

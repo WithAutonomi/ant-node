@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-08-03
-- **Last amended:** 2026-08-28
+- **Last amended:** 2026-09-01
 - **Decision owners:** <pending>
 - **Reviewers:** <pending>
 - **Supersedes:** none
@@ -83,8 +83,9 @@ to be reconsidered.
   plaintext to a signaling or relay peer.
 - A 4 MiB chunk is transferred reliably with explicit fragmentation,
   backpressure, cancellation, and bounded buffering.
-- Endpoint ownership remains bound to the node's persistent ML-DSA identity
-  even though browser DTLS currently uses classical cryptography.
+- Endpoint ownership remains bound to the node's persistent ML-DSA identity,
+  and all browser RPC payloads use fresh ML-KEM-derived application keys even
+  though WebRTC's DTLS connection establishment remains classical.
 
 ## Considered Options
 
@@ -163,9 +164,11 @@ chunks with the same quote and payment checks as native clients.
 The initial transport targets browser-to-public-server WebRTC Direct. It uses
 ICE-lite on the node, browser-managed ICE on the client, DTLS for transport
 confidentiality and integrity, reliable ordered SCTP DataChannels, and a
-mandatory application-layer ML-DSA identity handshake. It does not require a
-DNS name, public-CA certificate, TURN server, or out-of-band SDP signaling for
-a directly reachable node.
+mandatory application-layer post-quantum session. That session uses ephemeral
+ML-KEM-768 key establishment authenticated by the node's persistent ML-DSA-65
+identity, then protects every browser RPC request and response with
+ChaCha20-Poly1305. It does not require a DNS name, public-CA certificate, TURN
+server, or out-of-band SDP signaling for a directly reachable node.
 
 The transport is implemented and versioned by Saorsa. It does not use libp2p
 libraries or wire layers: there is no libp2p peer ID, Noise handshake,
@@ -173,8 +176,12 @@ multistream selection, connection gater, protobuf stream envelope, or libp2p
 DataChannel close protocol. `saorsa-transport` owns ICE-lite/DTLS/SCTP setup,
 the shared UDP association mux, persisted certificates, native diagnostic
 dialing, and reliable ordered DataChannels. `saorsa-core` owns only the
-validated endpoint/address integration. `ant-node` owns the bounded browser
-RPC protocol, and browser clients use `RTCPeerConnection` directly.
+validated endpoint/address integration. `ant-protocol` owns the shared
+post-quantum handshake, encrypted-record layer, outer framing, and transfer
+limits. `ant-core` owns the runtime-neutral client algorithms and the browser
+WASM facade; `ant-node` owns the bounded browser RPC adapter. The two sides use
+the same Rust protocol implementation, while the browser transport adapter
+calls `RTCPeerConnection` directly through Web APIs.
 
 The native ML-KEM/ML-DSA transport remains the node-to-node transport and is
 not downgraded or replaced. The WebRTC listener has independent connection,
@@ -209,12 +216,36 @@ fingerprints across restarts have also been implemented as
 [libp2p prior art](https://github.com/libp2p/go-libp2p/pull/3512).
 
 The DTLS transport key is not the ANT identity credential. Compromise of that
-key alone must not authorize browser RPCs. Before accepting application
-requests, the node proves possession of its ML-DSA identity key in a
-domain-separated handshake covering at least the network ID, protocol version,
-fresh browser challenge, expected peer ID, and advertised DTLS fingerprint. The
-browser verifies the public-key-to-peer-ID binding and the signature. A
-mismatched `/p2p` identity aborts the connection.
+key alone must neither authorize browser RPCs nor disclose their plaintext.
+The `/certhash` fingerprint and WebRTC SDP authenticate the DTLS connection;
+the application session separately authenticates the ANT identity named by the
+multiaddress's `/p2p` suffix. These are independent bindings to the same
+endpoint rather than a claim that the DTLS transcript is ML-DSA-signed.
+
+Before accepting an application request, the browser sends a versioned,
+ephemeral ML-KEM-768 encapsulation public key. The node returns an ML-KEM
+ciphertext, its 32-byte peer ID, its complete ML-DSA-65 public key, and an
+ML-DSA-65 signature over a domain-separated transcript containing the client
+hello, KEM ciphertext, and peer ID. The browser verifies that the response peer
+ID matches the multiaddress, that BLAKE3 of the ML-DSA public key equals that
+peer ID, and that the transcript signature is valid. Any mismatch aborts and
+closes the connection.
+
+Both sides mix the fresh ML-KEM shared secret with the handshake transcript
+hash and derive independent client-to-server and server-to-client 256-bit
+keys. Every later application frame, including `HELLO`, is authenticated and
+encrypted with ChaCha20-Poly1305. Per-direction monotonically increasing
+64-bit sequence numbers produce unique nonces and are authenticated as
+additional data. Replayed, skipped, reordered, modified, or unauthenticated
+records fail closed. Session keys and sequence state are zeroized when the
+session is dropped.
+
+This layer gives application payloads post-quantum confidentiality and node
+authentication without replacing WebRTC. ICE, DTLS, SCTP, certificate
+fingerprints, packet sizes, message timing, connection metadata, and denial of
+service exposure remain properties of the classical WebRTC layer. The
+additional encryption therefore does not make all transport metadata or
+WebRTC connection establishment post-quantum secure.
 
 Routine time-based DTLS certificate rotation is not performed. Rotation is an
 exceptional operation associated with transport-key compromise or node
@@ -296,9 +327,11 @@ join that network, and V1 decoding may be removed in a later cleanup release.
 
 The browser accepts a discovered endpoint only when its `/p2p` suffix matches
 the returned peer, then proves that binding again through certificate-pinned
-DTLS and ML-DSA HELLO. A malicious DHT responder can omit an endpoint or make a
-client spend a bounded failed dial, but cannot authenticate an endpoint as
-another peer.
+DTLS and the authenticated ML-KEM application session. The encrypted `HELLO`
+checks the endpoint and protocol metadata after cryptographic session
+establishment. A malicious DHT responder can omit an endpoint or make a client
+spend a bounded failed dial, but cannot authenticate an endpoint as another
+peer.
 
 A later hardening phase may add a separately versioned, independently
 cacheable record without changing the existing Postcard `DHTNode` shape:
@@ -385,17 +418,22 @@ depend on libp2p adopting or shipping it.
 Production is therefore conditional on a new, explicitly versioned Saorsa
 connection-establishment profile that works without forbidden SDP mutation.
 We should adopt compatible standards-level techniques and cross-browser test
-vectors from v2 work where they fit. The ANT ML-DSA handshake remains the only
-node-identity protocol. Unknown connection-establishment versions are rejected,
-and v1 is not a silent fallback once browsers no longer support it.
+vectors from v2 work where they fit. The ANT ML-KEM/ML-DSA application session
+remains the only ANT node-identity and application-encryption protocol on the
+WebRTC connection; the pinned DTLS fingerprint remains the transport
+authentication mechanism. Unknown connection-establishment versions are
+rejected, and v1 is not a silent fallback once browsers no longer support it.
 
 ### Browser protocol and DataChannel framing
 
 The public protocol is not the private Saorsa `WireMessage` or native Postcard
-DHT protocol. The initial methods are:
+DHT protocol. The application protocol name is `autonomi.web.poc.v4`, its
+DataChannel label is `autonomi.web.v4`, and the embedded post-quantum session
+has its own independently checked wire version 1. The initial methods are:
 
-- `HELLO`: negotiate version/network/capabilities and complete node identity
-  authentication.
+- `HELLO`: return and validate protocol, peer, endpoint, capability, chunk-size,
+  and payment metadata after the post-quantum session has authenticated the
+  node. `HELLO` is no longer a separate cryptographic challenge/response.
 - `FIND_NODE`: return up to the local DHT K value, ordered by XOR distance.
   It never initiates a network lookup on the server.
 - `GET_CHUNK`: return a locally stored chunk, `not_found`, or a bounded error.
@@ -414,18 +452,32 @@ DHT protocol. The initial methods are:
 
 WebRTC DataChannels are messages, not byte streams. One persistent reliable
 ordered DataChannel carries a sequence of RPC request/response frames for one
-association. The application framing is a four-byte JSON-header length, a
-bounded versioned JSON header, and the declared raw binary body; chunk bytes
-are never JSON/base64. Application frames are fragmented into DataChannel
-messages of at most 16 KiB and reassembled directly by the receiver. No
-libp2p stream envelope or half-close control frame exists.
+association. Protocol v4 has two framing layers:
 
-Application frames are self-delimiting: receivers validate the JSON header and
-its declared body length rather than trusting DataChannel boundaries. A client
-serializes requests on its persistent channel, waits for the complete declared
-response, and can then send the next request without closing the channel.
-Trailing bytes, channel closure before completion, and mismatched lengths are
-protocol errors. This design directly removes the cross-version `FIN_ACK` and
+1. The plaintext inner frame is a four-byte JSON-header length, a bounded
+   versioned JSON header, and the declared raw binary body. Chunk bytes are
+   never JSON/base64.
+2. The shared post-quantum session seals the complete inner frame as one record.
+   The record contains a type tag, a 64-bit sequence number, and
+   ChaCha20-Poly1305 ciphertext and authentication tag. A four-byte encrypted
+   payload length delimits that record for DataChannel reassembly.
+
+Only the outer encrypted-record length, DataChannel message count, and timing
+are visible outside the application session; JSON fields and chunk bytes are
+encrypted. The handshake messages use the same bounded outer length prefix but
+are not AEAD records because they establish the session keys. Outer frames are
+fragmented into DataChannel messages of at most 16 KiB and reassembled before
+handshake processing or AEAD opening. No libp2p stream envelope or half-close
+control frame exists.
+
+Frames are self-delimiting at both layers. Receivers validate the bounded outer
+length before allocation, authenticate and decrypt the exact record, then
+validate the inner JSON header and its declared body length. A client serializes
+requests on its persistent channel, waits for the complete declared response,
+and can then send the next request without closing the channel. Trailing bytes,
+channel closure before completion, mismatched lengths, unexpected sequences,
+or failed record authentication are protocol errors. Cryptographic errors close
+the association. This design directly removes the cross-version `FIN_ACK` and
 RESET lifecycle failure observed with the libp2p PoC.
 
 High-level browser operations share a bounded pool of authenticated node
@@ -458,6 +510,13 @@ the transport-independent iterative lookup driver. The native facade supplies
 Tokio/QUIC adapters; the WASM facade supplies browser timers and WebRTC Direct
 sessions. Both therefore use the same Rust policies without forcing existing
 native callers onto a new trait or configuration type.
+
+The browser and node adapters also consume the same `ant-protocol`
+post-quantum session and framing module. Cryptographic transcript construction,
+key derivation, sequence handling, record authentication, and frame bounds are
+not reimplemented in JavaScript or separately in `ant-node`. Existing native
+applications such as `ant-cli` continue through the unchanged native client
+path and do not opt into the browser WebRTC wire protocol.
 
 Browser applications instantiate the Rust/WASM `BrowserNetworkClient`. That
 facade owns bootstrap, routing, quote preparation, paid storage, downloads,
@@ -517,9 +576,10 @@ candidate when required.
 Signaling peers coordinate connection establishment only. They do not perform
 DHT lookup on the browser's behalf and do not carry application requests or
 chunk bytes. A TURN-like or Saorsa relay forwards encrypted DTLS packets; DTLS
-and application identity authentication terminate at the storage node, not
-the relay. Relay allocations are published in signed, expiring endpoint
-records rather than the constant bootstrap list.
+and the inner post-quantum application session terminate at the browser and
+storage node, not the relay. The relay sees neither RPC nor chunk plaintext.
+Relay allocations are published in signed, expiring endpoint records rather
+than the constant bootstrap list.
 
 ### Implemented proof-of-concept slice
 
@@ -535,9 +595,11 @@ The earlier feature-gated WebTransport PoC has been replaced by the
 - native `saorsa-transport` and `saorsa-core::MultiAddr` support for canonical,
   literal-IP `/webrtc-direct/certhash/.../p2p/...` addresses with exactly one
   fingerprint and no DNS form;
-- a per-connection ML-DSA `HELLO` challenge before other RPCs. The signed
-  transcript binds the challenge, ANT peer ID, and full advertised endpoint;
-  the browser verifies both the signature and the public-key-to-peer-ID hash;
+- a protocol v4 browser session backed by the shared `ant-protocol`
+  post-quantum session v1, which performs ephemeral ML-KEM-768 key
+  establishment, authenticates the transcript and ANT peer ID with ML-DSA-65,
+  derives direction-separated keys, and protects every later application frame
+  with ordered ChaCha20-Poly1305 records;
 - a persistent reliable ordered application DataChannel, bounded 16-KiB
   messages, declared-length reassembly, and browser `bufferedAmount`
   backpressure;
@@ -567,10 +629,11 @@ The local manifest remains test scaffolding for ephemeral loopback ports. The
 production client is designed to accept the same endpoint values from a
 compiled constant list, without fetching a manifest or resolving DNS.
 
-This implementation currently uses the Saorsa v1 connection-establishment
-profile described above. It is a PoC, not evidence that the production
-no-mutation gate has been met. Promotion remains blocked on the cross-browser
-validation listed below.
+This implementation currently uses the Saorsa v1 WebRTC
+connection-establishment profile and the v4 encrypted application protocol
+described above. It is a PoC, not evidence that the production no-mutation gate
+has been met. Promotion remains blocked on the cross-browser validation listed
+below.
 
 ### Local testnet implementation slice
 
@@ -595,12 +658,32 @@ pre-populates the devnet payment cache for those addresses, while
 content-address verification, DHT responsibility, payment-cache admission,
 LMDB storage, and verified reads remain active.
 
-### Public Internet smoke result
+### Protocol v4 local validation
+
+On 2026-09-01 the ignored five-node WebRTC Direct devnet integration test used
+the actual native client adapter and shared `ant-protocol` implementation to
+complete the ML-KEM/ML-DSA handshake, encrypted `HELLO`, iterative lookup,
+download, quote/payment-proof handling, paid upload, and read-back. Shared
+protocol unit tests additionally reject tampered and replayed records, wrong
+peer IDs, tampered node signatures, and invalid outer-frame lengths. The
+`ant-core` browser target builds and lints as WASM, and the browser SDK's
+generated bindings, type checks, and unit tests pass with protocol v4.
+
+This is strong local integration evidence but not the required browser
+interoperability result. A real Chrome, Firefox, and Safari run against a
+matching deployed v4 node fleet remains an acceptance criterion.
+
+### Historical public Internet v3 smoke result
+
+The following results predate the v4 post-quantum record layer. They validate
+WebRTC Direct connectivity, decentralized lookup, paid storage, and browser
+client behavior, but they do not validate the v4 handshake or encrypted-record
+implementation and must be repeated with matching v4 clients and nodes.
 
 On 2026-08-27 a headless Chromium client loaded the local web application and
 dialed a literal public-IPv4 WebRTC Direct address on a DigitalOcean-hosted
 node. With no browser manifest available, it completed ICE, DTLS, SCTP, the
-DataChannel handshake, and authenticated ML-DSA `HELLO`; the UI then installed
+DataChannel handshake, and the former ML-DSA `HELLO`; the UI then installed
 that single address as the Rust network bootstrap seed and completed a
 `FIND_NODE` query without page errors. Restarting the remote node left the
 complete multiaddress byte-identical and the same browser client reconnected
@@ -647,8 +730,13 @@ round-trip tests.
   reconstructing the complete file.
 - WebRTC supplies a standardized browser API and an established path toward
   direct ICE and end-to-end relayed connectivity for NATed nodes.
-- The stable DTLS fingerprint is separately bound to the persistent PQ node
-  identity rather than being treated as the ANT identity.
+- The stable DTLS fingerprint authenticates transport setup while the shared
+  ML-KEM/ML-DSA session independently authenticates the persistent ANT identity
+  and protects every application payload.
+- A future attacker that records the classical DTLS traffic cannot recover RPC
+  or chunk plaintext by later breaking only the DTLS key exchange; application
+  confidentiality additionally depends on ML-KEM-768 and 256-bit symmetric
+  keys.
 - Rust producers and consumers share the network's native `MultiAddr` codec;
   browser WASM parses and validates the same canonical wire syntax.
 - Existing native `ant-core` client applications retain their public API while
@@ -662,12 +750,16 @@ round-trip tests.
 - DataChannels require application fragmentation, reassembly, flow control,
   and cancellation. They are less natural than WebTransport streams for 4 MiB
   chunks.
+- The application session adds an ML-KEM-768/ML-DSA-65 handshake, large
+  post-quantum handshake messages, per-record ChaCha20-Poly1305 work, another
+  framing layer, and extra copies on top of WebRTC's existing encryption.
 - Native media playback needs a small same-origin service-worker bridge because
   a page-owned WebRTC client cannot itself expose an HTTP range URL. The page
   must remain open while playback uses its authenticated associations.
-- A stable DTLS transport key has a larger compromise window. ML-DSA
-  application authentication limits its authority, but emergency replacement
-  of a bootstrap fingerprint still requires overlap and client-list updates.
+- A stable DTLS transport key has a larger compromise window. Its compromise
+  alone cannot authenticate the ANT node or decrypt application records, but
+  emergency replacement of a bootstrap fingerprint still requires overlap and
+  client-list updates.
 - Constant bootstrap peers require stable public IP addresses and ports even
   though ordinary nodes do not.
 - Signaling-free WebRTC Direct depends on browser behaviors beyond the basic
@@ -676,7 +768,9 @@ round-trip tests.
 - Direct operation still requires broad browser-endpoint coverage among
   storage nodes. NATed nodes may consume relay bandwidth even though relays
   cannot read their traffic.
-- Current browser DTLS is not post-quantum.
+- WebRTC connection establishment and certificate authentication are still
+  classical. The additional layer protects application contents, not ICE/DTLS/
+  SCTP metadata, lengths, timing, availability, or the browser's WebRTC stack.
 
 ### Neutral / Operational
 
@@ -687,8 +781,14 @@ round-trip tests.
   requirements than ordinary storage nodes.
 - Origin is policy input, not client authentication. Public deployments still
   need per-IP/session request, channel, and byte quotas.
+- The post-quantum handshake authenticates the node to the browser, not the
+  browser user to the node. Client authority remains method-specific; for paid
+  storage it comes from the normal wallet signature and payment proof.
 - Bootstrap peers do not perform lookup or proxy uploads/downloads; they
   answer the same bounded one-hop RPCs as other browser-capable nodes.
+- Application protocol v4 requires matching browser and node deployments;
+  plaintext v3 and encrypted v4 peers deliberately fail closed. Native QUIC
+  nodes and existing `ant-core`/`ant-cli` callers are unaffected.
 
 ## Validation
 
@@ -704,9 +804,14 @@ The decision advances beyond PoC only after all of the following are covered:
 - WebRTC Direct connection establishment works on current Chrome, Firefox,
   and Safari from a real secure context without forbidden SDP mutation. Tests
   explicitly cover the Chrome ICE-credential restriction that breaks v1.
-- The browser rejects wrong fingerprints, wrong peer IDs, wrong networks,
-  replayed handshakes, invalid ML-DSA signatures, and signatures not bound to
-  the DTLS transcript.
+- The browser rejects wrong DTLS fingerprints, wrong peer IDs and public-key
+  bindings, malformed or version-mismatched PQ handshakes, invalid ML-DSA
+  transcript signatures, modified KEM transcripts, replayed or out-of-order
+  records, modified ciphertext, and sequence exhaustion. A v3 plaintext frame
+  sent to a v4 endpoint fails closed rather than downgrading.
+- Cryptographic tests cover both traffic directions, direction-separated key
+  derivation, nonce/sequence uniqueness, transcript domain separation,
+  handshake and frame bounds, tampering, replay, reordering, and key cleanup.
 - Automated tests cover malformed STUN/SDP/SCTP input, oversized messages,
   excessive channels, slow readers, connection floods, request amplification,
   and global/per-client byte quotas.
@@ -734,6 +839,9 @@ The decision advances beyond PoC only after all of the following are covered:
   relay path where DTLS terminates at the NATed node, not the relay.
 - Regression tests prove the existing native PQ port and native client
   behavior are unchanged when browser support is disabled.
+- Mixed-deployment tests cover v3/v4 incompatibility and confirm that upgrades
+  cannot produce a silent plaintext downgrade; deployment documentation treats
+  protocol v4 as a coordinated browser-client and node rollout.
 - WebRTC and the recorded WebTransport baseline are benchmarked for setup
   latency, CPU and memory, sustained 4 MiB throughput, cancellation, loss
   recovery, and concurrent request behavior before production promotion.

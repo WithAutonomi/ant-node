@@ -1,8 +1,9 @@
 //! ADR-0009 WebRTC Direct browser transport.
 //!
 //! The listener uses Saorsa's signaling-free WebRTC Direct transport for ICE,
-//! DTLS, SCTP, and reliable ordered `DataChannels`. ANT's ML-DSA HELLO binds the
-//! pinned WebRTC endpoint to the node identity without a libp2p or Noise layer.
+//! DTLS, SCTP, and reliable ordered `DataChannels`. A shared application layer
+//! in `ant-protocol` uses ML-KEM-768, ML-DSA-65, and ChaCha20-Poly1305 to bind
+//! the node identity and protect every browser RPC without libp2p or Noise.
 
 use crate::ant_protocol::{
     ChunkMessage, ChunkMessageBody, ChunkPutRequest, ChunkPutResponse, ChunkQuoteRequest,
@@ -14,7 +15,10 @@ use crate::error::{Error, Result};
 use crate::logging::{debug, info, warn};
 use crate::payment::{serialize_single_node_proof, PaymentProof};
 use crate::storage::AntProtocol;
-use ant_protocol::web_rtc::transfer_timeout;
+use ant_protocol::web_rtc::{
+    accept_pq_session, decode_pq_frame, encode_pq_frame, pq_frame_length, transfer_timeout,
+    PqSession, PQ_CLIENT_HELLO_BYTES, PQ_ENCRYPTED_OVERHEAD_BYTES, PQ_FRAME_PREFIX_BYTES,
+};
 use evmlib::common::{Amount, TxHash};
 use evmlib::{EncodedPeerId, PaymentQuote, ProofOfPayment, RewardsAddress};
 use parking_lot::RwLock;
@@ -29,16 +33,15 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-const PROTOCOL_VERSION: u16 = 3;
-const PROTOCOL_NAME: &str = "autonomi.web.poc.v3";
-const DATA_CHANNEL_LABEL: &str = "autonomi.web.v3";
+const PROTOCOL_VERSION: u16 = 4;
+const PROTOCOL_NAME: &str = "autonomi.web.poc.v4";
+const DATA_CHANNEL_LABEL: &str = "autonomi.web.v4";
 const MAX_FIND_NODE_RESULTS: usize = 20;
 const MAX_RESPONSE_HEADER_BYTES: usize = 64 * 1024;
 const REQUEST_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -333,7 +336,6 @@ async fn handle_connection(
     state: Arc<ServerState>,
     shutdown: CancellationToken,
 ) -> ServerResult<()> {
-    let authenticated = Arc::new(AtomicBool::new(false));
     loop {
         let channel = tokio::select! {
             () = shutdown.cancelled() => return Ok(()),
@@ -342,9 +344,8 @@ async fn handle_connection(
             }
         };
         let state = Arc::clone(&state);
-        let authenticated = Arc::clone(&authenticated);
         tokio::spawn(async move {
-            if let Err(error) = handle_webrtc_channel(channel, state, authenticated).await {
+            if let Err(error) = handle_webrtc_channel(channel, state).await {
                 debug!("WebRTC Direct DataChannel ended: {error}");
             }
         });
@@ -354,7 +355,6 @@ async fn handle_connection(
 async fn handle_webrtc_channel(
     channel: WebRtcDataChannel,
     state: Arc<ServerState>,
-    authenticated: Arc<AtomicBool>,
 ) -> ServerResult<()> {
     if channel.label() != DATA_CHANNEL_LABEL {
         if let Err(error) = channel.close().await {
@@ -366,15 +366,19 @@ async fn handle_webrtc_channel(
         ));
     }
 
+    let mut pq_session = establish_pq_session(&channel, &state).await?;
+    let mut hello_completed = false;
     loop {
         let (request, content) =
-            match read_webrtc_request(&channel, state.config.max_request_bytes).await {
+            match read_webrtc_request(&channel, state.config.max_request_bytes, &mut pq_session)
+                .await
+            {
                 Ok(request) => request,
                 Err(error)
                     if matches!(
                         error.as_str(),
                         "DataChannel closed" | "request idle timeout" | "request frame timed out"
-                    ) =>
+                    ) || error.starts_with("PQ session:") =>
                 {
                     if let Err(close_error) = channel.close().await {
                         debug!("Failed to close idle WebRTC DataChannel: {close_error}");
@@ -383,7 +387,7 @@ async fn handle_webrtc_channel(
                 }
                 Err(error) => {
                     let response = Response::error(0, "invalid_request", error);
-                    write_webrtc_response(&channel, &response, &[]).await?;
+                    write_webrtc_response(&channel, &mut pq_session, &response, &[]).await?;
                     return Ok(());
                 }
             };
@@ -396,54 +400,148 @@ async fn handle_webrtc_channel(
                     request.version
                 ),
             );
-            write_webrtc_response(&channel, &response, &[]).await?;
+            write_webrtc_response(&channel, &mut pq_session, &response, &[]).await?;
             continue;
         }
 
-        let is_hello = matches!(&request.body, RequestBody::Hello { .. });
-        if !is_hello && !authenticated.load(Ordering::Acquire) {
+        let is_hello = matches!(&request.body, RequestBody::Hello);
+        if !is_hello && !hello_completed {
             let response = Response::error(
                 request.id,
                 "authentication_required",
-                "HELLO must authenticate this WebRTC connection first".to_string(),
+                "HELLO must initialize this encrypted WebRTC session first".to_string(),
             );
-            write_webrtc_response(&channel, &response, &[]).await?;
+            write_webrtc_response(&channel, &mut pq_session, &response, &[]).await?;
             continue;
         }
 
         let (response, content) = process_request(request, content, &state).await;
         if is_hello && matches!(&response.status, ResponseStatus::Ok) {
-            authenticated.store(true, Ordering::Release);
+            hello_completed = true;
         }
-        write_webrtc_response(&channel, &response, content.as_deref().unwrap_or_default()).await?;
+        write_webrtc_response(
+            &channel,
+            &mut pq_session,
+            &response,
+            content.as_deref().unwrap_or_default(),
+        )
+        .await?;
     }
+}
+
+async fn establish_pq_session(
+    channel: &WebRtcDataChannel,
+    state: &ServerState,
+) -> ServerResult<PqSession> {
+    let client_hello = read_pq_payload(
+        channel,
+        PQ_CLIENT_HELLO_BYTES,
+        "PQ client hello idle timeout",
+        "PQ client hello timed out",
+    )
+    .await?;
+    let peer_id = *state.p2p.peer_id().to_bytes();
+    let public_key = state.identity.public_key().as_bytes();
+    let (server_accept, session) =
+        accept_pq_session(&client_hello, &peer_id, public_key, |transcript| {
+            state
+                .identity
+                .sign(transcript)
+                .map(|signature| signature.as_bytes().to_vec())
+        })
+        .map_err(|error| format!("PQ session: {error}"))?;
+    write_pq_payload(channel, &server_accept).await?;
+    Ok(session)
 }
 
 async fn read_webrtc_request(
     channel: &WebRtcDataChannel,
     max_header_bytes: usize,
+    pq_session: &mut PqSession,
 ) -> ServerResult<(Request, Vec<u8>)> {
+    let max_plaintext_bytes = 4 + max_header_bytes + MAX_CHUNK_SIZE;
+    let encrypted = read_pq_payload(
+        channel,
+        max_plaintext_bytes + PQ_ENCRYPTED_OVERHEAD_BYTES,
+        "request idle timeout",
+        "request frame timed out",
+    )
+    .await?;
+    let frame = pq_session
+        .open(&encrypted)
+        .map_err(|error| format!("PQ session: {error}"))?;
+    parse_webrtc_request(&frame, max_header_bytes)
+}
+
+fn parse_webrtc_request(frame: &[u8], max_header_bytes: usize) -> ServerResult<(Request, Vec<u8>)> {
+    if frame.len() < 4 {
+        return Err("request prefix is incomplete".to_string());
+    }
+    let header_len = u32::from_be_bytes(
+        frame[..4]
+            .try_into()
+            .map_err(|_| "request prefix is incomplete".to_string())?,
+    ) as usize;
+    if header_len == 0 || header_len > max_header_bytes {
+        return Err(format!(
+            "request header length {header_len} is outside 1..={max_header_bytes}"
+        ));
+    }
+    let content_offset = 4usize
+        .checked_add(header_len)
+        .ok_or_else(|| "request header length overflow".to_string())?;
+    if frame.len() < content_offset {
+        return Err("request JSON is truncated".to_string());
+    }
+    let request: Request = serde_json::from_slice(&frame[4..content_offset])
+        .map_err(|error| format!("request JSON is invalid: {error}"))?;
+    if request.content_length > MAX_CHUNK_SIZE {
+        return Err(format!(
+            "request content length {} exceeds {MAX_CHUNK_SIZE}",
+            request.content_length
+        ));
+    }
+    let expected_length = content_offset
+        .checked_add(request.content_length)
+        .ok_or_else(|| "request frame length overflow".to_string())?;
+    if frame.len() != expected_length {
+        return Err(format!(
+            "request contains {} bytes; declared {expected_length}",
+            frame.len()
+        ));
+    }
+    Ok((request, frame[content_offset..].to_vec()))
+}
+
+async fn read_pq_payload(
+    channel: &WebRtcDataChannel,
+    max_payload_bytes: usize,
+    idle_timeout_message: &str,
+    frame_timeout_message: &str,
+) -> ServerResult<Vec<u8>> {
     let first_message = tokio::time::timeout(REQUEST_IDLE_TIMEOUT, channel.receive())
         .await
-        .map_err(|_| "request idle timeout".to_string())?
-        .map_err(|error| format!("request message read failed: {error}"))?;
+        .map_err(|_| idle_timeout_message.to_string())?
+        .map_err(|error| format!("DataChannel message read failed: {error}"))?;
     if first_message.is_empty() {
         return Err("DataChannel closed".to_string());
     }
     let frame_started = tokio::time::Instant::now();
-    let mut frame_deadline = frame_started + transfer_timeout(0);
+    let mut frame_deadline = frame_started + transfer_timeout(PQ_FRAME_PREFIX_BYTES);
     let mut frame = Vec::new();
     let mut expected_length = None;
     let mut next_message = Some(first_message);
-    let max_frame_bytes = 4 + max_header_bytes + MAX_CHUNK_SIZE;
+    let max_frame_bytes = 4usize
+        .checked_add(max_payload_bytes)
+        .ok_or_else(|| "PQ frame limit overflow".to_string())?;
     loop {
         let message = if let Some(message) = next_message.take() {
             message
         } else {
             tokio::time::timeout_at(frame_deadline, channel.receive())
                 .await
-                .map_err(|_| "request frame timed out".to_string())?
-                .map_err(|error| format!("request message read failed: {error}"))?
+                .map_err(|_| frame_timeout_message.to_string())?
+                .map_err(|error| format!("DataChannel message read failed: {error}"))?
         };
         if message.is_empty() {
             return Err("DataChannel closed".to_string());
@@ -455,46 +553,21 @@ async fn read_webrtc_request(
         }
         frame.extend_from_slice(&message);
 
-        if expected_length.is_none() && frame.len() >= 4 {
-            let header_len = u32::from_be_bytes(
-                frame[..4]
-                    .try_into()
-                    .map_err(|_| "request prefix is incomplete".to_string())?,
-            ) as usize;
-            if header_len == 0 || header_len > max_header_bytes {
-                return Err(format!(
-                    "request header length {header_len} is outside 1..={max_header_bytes}"
-                ));
-            }
-            if frame.len() >= 4 + header_len {
-                let request: Request = serde_json::from_slice(&frame[4..4 + header_len])
-                    .map_err(|error| format!("request JSON is invalid: {error}"))?;
-                if request.content_length > MAX_CHUNK_SIZE {
-                    return Err(format!(
-                        "request content length {} exceeds {MAX_CHUNK_SIZE}",
-                        request.content_length
-                    ));
-                }
-                let frame_length = 4 + header_len + request.content_length;
-                frame_deadline = frame_started + transfer_timeout(frame_length);
-                expected_length = Some((frame_length, request));
+        if expected_length.is_none() {
+            expected_length = pq_frame_length(&frame, max_payload_bytes)
+                .map_err(|error| format!("PQ session: {error}"))?;
+            if let Some(length) = expected_length {
+                frame_deadline = frame_started + transfer_timeout(length);
             }
         }
 
-        if let Some((length, _)) = expected_length.as_ref() {
-            if frame.len() > *length {
-                return Err("request contains bytes after its declared frame".to_string());
+        if let Some(length) = expected_length {
+            if frame.len() > length {
+                return Err("PQ frame contains bytes after its declared payload".to_string());
             }
-            if frame.len() == *length {
-                let (_, request) = expected_length
-                    .take()
-                    .ok_or_else(|| "request length state was lost".to_string())?;
-                let header_len = u32::from_be_bytes(
-                    frame[..4]
-                        .try_into()
-                        .map_err(|_| "request prefix is incomplete".to_string())?,
-                ) as usize;
-                return Ok((request, frame.split_off(4 + header_len)));
+            if frame.len() == length {
+                return decode_pq_frame(&frame, max_payload_bytes)
+                    .map_err(|error| format!("PQ session: {error}"));
             }
         }
     }
@@ -502,6 +575,7 @@ async fn read_webrtc_request(
 
 async fn write_webrtc_response(
     channel: &WebRtcDataChannel,
+    pq_session: &mut PqSession,
     response: &Response,
     content: &[u8],
 ) -> ServerResult<()> {
@@ -512,10 +586,18 @@ async fn write_webrtc_response(
     }
     let header_len = u32::try_from(header.len())
         .map_err(|_| "response header length does not fit u32".to_string())?;
-    let mut frame = Vec::with_capacity(4 + header.len() + content.len());
-    frame.extend_from_slice(&header_len.to_be_bytes());
-    frame.extend_from_slice(&header);
-    frame.extend_from_slice(content);
+    let mut plaintext = Vec::with_capacity(4 + header.len() + content.len());
+    plaintext.extend_from_slice(&header_len.to_be_bytes());
+    plaintext.extend_from_slice(&header);
+    plaintext.extend_from_slice(content);
+    let frame = pq_session
+        .seal(&plaintext)
+        .map_err(|error| format!("PQ session: {error}"))?;
+    write_pq_payload(channel, &frame).await
+}
+
+async fn write_pq_payload(channel: &WebRtcDataChannel, payload: &[u8]) -> ServerResult<()> {
+    let frame = encode_pq_frame(payload).map_err(|error| format!("PQ session: {error}"))?;
     for chunk in frame.chunks(WEBRTC_WRITE_CHUNK_BYTES) {
         channel
             .send(chunk)
@@ -541,40 +623,14 @@ async fn process_request(
         );
     }
     match request.body {
-        RequestBody::Hello { challenge } => {
-            let challenge_bytes = match decode_32_byte_hex(&challenge) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    return (
-                        Response::error(request.id, "invalid_challenge", error),
-                        None,
-                    )
-                }
-            };
+        RequestBody::Hello => {
             let peer_id = state.p2p.peer_id().to_hex();
-            let transcript = hello_transcript(&challenge_bytes, &peer_id, &state.endpoint);
-            let signature = match state.identity.sign(&transcript) {
-                Ok(signature) => signature,
-                Err(error) => {
-                    return (
-                        Response::error(
-                            request.id,
-                            "identity_signing_failed",
-                            format!("could not sign HELLO: {error}"),
-                        ),
-                        None,
-                    )
-                }
-            };
             (
                 Response::ok(
                     request.id,
                     ResponseBody::Hello {
                         protocol: PROTOCOL_NAME.to_string(),
                         peer_id,
-                        challenge,
-                        public_key: hex::encode(state.identity.public_key().as_bytes()),
-                        signature: hex::encode(signature.as_bytes()),
                         max_chunk_size: MAX_CHUNK_SIZE,
                         endpoint: state.endpoint.clone(),
                         payment: state.payment.clone(),
@@ -959,14 +1015,6 @@ fn decode_32_byte_hex(value: &str) -> ServerResult<[u8; 32]> {
         .map_err(|bytes: Vec<u8>| format!("expected 32 bytes, received {}", bytes.len()))
 }
 
-fn hello_transcript(challenge: &[u8; 32], peer_id: &str, endpoint: &BrowserEndpoint) -> Vec<u8> {
-    let mut transcript = b"autonomi-webrtc-direct-hello-v1\0".to_vec();
-    transcript.extend_from_slice(challenge);
-    transcript.extend_from_slice(peer_id.as_bytes());
-    transcript.extend_from_slice(endpoint.multiaddr.to_string().as_bytes());
-    transcript
-}
-
 type ServerResult<T> = std::result::Result<T, String>;
 
 #[derive(Debug, Deserialize)]
@@ -982,9 +1030,7 @@ struct Request {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum RequestBody {
-    Hello {
-        challenge: String,
-    },
+    Hello,
     FindNode {
         target: String,
         #[serde(default)]
@@ -1063,9 +1109,6 @@ enum ResponseBody {
     Hello {
         protocol: String,
         peer_id: String,
-        challenge: String,
-        public_key: String,
-        signature: String,
         max_chunk_size: usize,
         endpoint: BrowserEndpoint,
         payment: BrowserPaymentNetwork,
@@ -1284,7 +1327,7 @@ mod tests {
     #[test]
     fn parses_versioned_requests() {
         let request: Request = serde_json::from_str(
-            r#"{"version":3,"request_id":7,"content_length":0,"type":"find_node","target":"0000000000000000000000000000000000000000000000000000000000000000","count":20}"#,
+            r#"{"version":4,"request_id":7,"content_length":0,"type":"find_node","target":"0000000000000000000000000000000000000000000000000000000000000000","count":20}"#,
         )
         .expect("valid request");
 
@@ -1324,7 +1367,7 @@ mod tests {
             3,
         );
         let value = serde_json::to_value(response).expect("serialize response");
-        assert_eq!(value["version"], 3);
+        assert_eq!(value["version"], 4);
         assert_eq!(value["request_id"], 42);
         assert_eq!(value["status"], "ok");
         assert_eq!(value["content_length"], 3);
