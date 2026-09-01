@@ -115,7 +115,7 @@ bao = "0.13.1"
 
 # ADR-0009 browser transport. The dependency remains optional so minimal
 # native-only builds can opt out with `--no-default-features`.
-saorsa-transport = { version = "0.35.3", features = ["webrtc-direct"], optional = true }
+saorsa-transport = { version = "0.36.3", features = ["webrtc-direct"], optional = true }
 self_encryption = { version = "0.36", optional = true }
 
 [target.'cfg(unix)'.dependencies]
@@ -202,8 +202,8 @@ webrtc-direct = [
 ]
 
 [patch.crates-io]
-saorsa-core = { path = "../saorsa-core-web-support" }
-saorsa-transport = { path = "../saorsa-transport-web-support" }
+saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core.git", rev = "915f3f1050006d96569c0efb6402828a01176e27" }
+saorsa-transport = { git = "https://github.com/WithAutonomi/saorsa-transport.git", rev = "44b3292b3ffa49e6048f2816f9ea5c38c6804815" }
 
 [profile.release]
 lto = true
