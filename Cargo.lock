@@ -879,11 +879,14 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "2.3.1"
-source = "git+https://github.com/WithAutonomi/ant-protocol.git?rev=41433e6d44a4602ce1918f62782415478f92bcdd#41433e6d44a4602ce1918f62782415478f92bcdd"
+source = "git+https://github.com/WithAutonomi/ant-protocol.git?rev=4dad14b6947b6264e0b5982c976a385f9fdac9e0#4dad14b6947b6264e0b5982c976a385f9fdac9e0"
 dependencies = [
  "blake3",
  "bytes",
+ "chacha20poly1305",
  "evmlib",
+ "fips203",
+ "getrandom 0.2.17",
  "hex",
  "postcard",
  "rmp-serde",
@@ -893,6 +896,7 @@ dependencies = [
  "tiny-keccak",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
