@@ -879,6 +879,7 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "2.3.1"
+source = "git+https://github.com/WithAutonomi/ant-protocol.git?rev=41433e6d44a4602ce1918f62782415478f92bcdd#41433e6d44a4602ce1918f62782415478f92bcdd"
 dependencies = [
  "blake3",
  "bytes",
@@ -5206,6 +5207,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.26.4"
+source = "git+https://github.com/WithAutonomi/saorsa-core.git?rev=710ea023a72c0de90a950c617cf286906a9fecd1#710ea023a72c0de90a950c617cf286906a9fecd1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5237,6 +5239,7 @@ dependencies = [
 [[package]]
 name = "saorsa-dht-lookup"
 version = "0.1.0"
+source = "git+https://github.com/WithAutonomi/saorsa-core.git?rev=710ea023a72c0de90a950c617cf286906a9fecd1#710ea023a72c0de90a950c617cf286906a9fecd1"
 dependencies = [
  "futures-core",
  "futures-util",
@@ -5328,6 +5331,7 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.35.3"
+source = "git+https://github.com/WithAutonomi/saorsa-transport.git?rev=c6d893bb1ce46cc7e7635b8f1dbc5e5257b67f38#c6d893bb1ce46cc7e7635b8f1dbc5e5257b67f38"
 dependencies = [
  "anyhow",
  "async-trait",

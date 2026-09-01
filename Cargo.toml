@@ -194,9 +194,9 @@ webrtc-direct = [
 ]
 
 [patch.crates-io]
-ant-protocol = { path = "../ant-protocol-web-support" }
-saorsa-core = { path = "../saorsa-core-web-support" }
-saorsa-transport = { path = "../saorsa-transport-web-support" }
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol.git", rev = "41433e6d44a4602ce1918f62782415478f92bcdd" }
+saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core.git", rev = "710ea023a72c0de90a950c617cf286906a9fecd1" }
+saorsa-transport = { git = "https://github.com/WithAutonomi/saorsa-transport.git", rev = "c6d893bb1ce46cc7e7635b8f1dbc5e5257b67f38" }
 
 [profile.release]
 lto = true
