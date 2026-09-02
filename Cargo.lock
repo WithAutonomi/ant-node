@@ -5211,7 +5211,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.26.4"
-source = "git+https://github.com/WithAutonomi/saorsa-core.git?rev=710ea023a72c0de90a950c617cf286906a9fecd1#710ea023a72c0de90a950c617cf286906a9fecd1"
+source = "git+https://github.com/WithAutonomi/saorsa-core.git?rev=2ed691c7cb49690c86beb445ee422f22a230ef9a#2ed691c7cb49690c86beb445ee422f22a230ef9a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5243,7 +5243,7 @@ dependencies = [
 [[package]]
 name = "saorsa-dht-lookup"
 version = "0.1.0"
-source = "git+https://github.com/WithAutonomi/saorsa-core.git?rev=710ea023a72c0de90a950c617cf286906a9fecd1#710ea023a72c0de90a950c617cf286906a9fecd1"
+source = "git+https://github.com/WithAutonomi/saorsa-core.git?rev=2ed691c7cb49690c86beb445ee422f22a230ef9a#2ed691c7cb49690c86beb445ee422f22a230ef9a"
 dependencies = [
  "futures-core",
  "futures-util",
@@ -5335,7 +5335,7 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.35.3"
-source = "git+https://github.com/WithAutonomi/saorsa-transport.git?rev=c6d893bb1ce46cc7e7635b8f1dbc5e5257b67f38#c6d893bb1ce46cc7e7635b8f1dbc5e5257b67f38"
+source = "git+https://github.com/WithAutonomi/saorsa-transport.git?rev=2c6e23cd6cd4db79f475676e25af9334a044a343#2c6e23cd6cd4db79f475676e25af9334a044a343"
 dependencies = [
  "anyhow",
  "async-trait",
