@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-08-03
-- **Last amended:** 2026-09-01
+- **Last amended:** 2026-09-02
 - **Decision owners:** <pending>
 - **Reviewers:** <pending>
 - **Supersedes:** none
@@ -406,23 +406,31 @@ address and per-association ICE credential. Saorsa uses that standards-based
 mechanism as design input, not the libp2p transport, identity, Noise, mux, or
 stream wire protocols.
 
-The current Saorsa profile is identified by the ICE credential prefix
-`saorsa+webrtc+v1/`. Like the prior v1 mechanism, it replaces the ICE ufrag and
+The original Saorsa profile was identified by the ICE credential prefix
+`saorsa+webrtc+v1/`. Like the prior v1 mechanism, it replaced the ICE ufrag and
 password in the browser-generated local SDP. Browser vendors are restricting
 that unsupported SDP-munging behavior, creating a documented [Chrome
-compatibility risk](https://github.com/libp2p/go-libp2p/issues/3499). Ongoing
-[WebRTC Direct v2 work](https://github.com/libp2p/specs/pull/715) is useful
-interoperability research because it avoids that mutation, but Saorsa does not
-depend on libp2p adopting or shipping it.
+compatibility risk](https://github.com/libp2p/go-libp2p/issues/3499).
 
-Production is therefore conditional on a new, explicitly versioned Saorsa
-connection-establishment profile that works without forbidden SDP mutation.
-We should adopt compatible standards-level techniques and cross-browser test
-vectors from v2 work where they fit. The ANT ML-KEM/ML-DSA application session
+The implemented v2 profile is identified by `saorsa+webrtc+v2/` and follows the
+standards-level technique developed by [WebRTC Direct v2
+work](https://github.com/libp2p/specs/pull/715). The browser sets its generated
+offer unchanged, reads its effective local ICE password back from
+`RTCPeerConnection.localDescription`, and embeds that password after the v2
+prefix in the synthetic server answer's ufrag. The first STUN request therefore
+carries `saorsa+webrtc+v2/<client-pwd>:<client-ufrag>`. The listener validates
+both fragments, recovers the client password, and constructs the matching
+association without modifying browser-owned local credentials or using a
+signaling service. New browser and native diagnostic dials use v2 with no v1
+fallback; the listener accepts v1 during migration.
+
+Production promotion remains conditional on current Chrome, Firefox, and
+Safari interoperability tests for this v2 flow. Saorsa does not depend on
+libp2p adopting or shipping it. The ANT ML-KEM/ML-DSA application session
 remains the only ANT node-identity and application-encryption protocol on the
 WebRTC connection; the pinned DTLS fingerprint remains the transport
 authentication mechanism. Unknown connection-establishment versions are
-rejected, and v1 is not a silent fallback once browsers no longer support it.
+rejected.
 
 ### Browser protocol and DataChannel framing
 
@@ -763,8 +771,8 @@ round-trip tests.
 - Constant bootstrap peers require stable public IP addresses and ports even
   though ordinary nodes do not.
 - Signaling-free WebRTC Direct depends on browser behaviors beyond the basic
-  WebRTC API. The v2 profile and Chrome, Firefox, and Safari interoperability
-  must be proven before production.
+  WebRTC API. The implemented v2 profile's Chrome, Firefox, and Safari
+  interoperability must be proven before production.
 - Direct operation still requires broad browser-endpoint coverage among
   storage nodes. NATed nodes may consume relay bandwidth even though relays
   cannot read their traffic.
