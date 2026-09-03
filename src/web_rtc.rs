@@ -23,7 +23,7 @@ use evmlib::common::{Amount, TxHash};
 use evmlib::{EncodedPeerId, PaymentQuote, ProofOfPayment, RewardsAddress};
 use parking_lot::{Mutex, RwLock};
 use saorsa_core::identity::NodeIdentity;
-use saorsa_core::{DHTNode, KnownReachability, MultiAddr, P2PNode, PeerId};
+use saorsa_core::{DHTNode, MultiAddr, P2PNode, PeerId};
 use saorsa_transport::webrtc_direct::{
     WebRtcCertificate, WebRtcDataChannel, WebRtcDirectConnection, WebRtcDirectListener,
     MAX_DATA_CHANNEL_MESSAGE_SIZE,
@@ -135,10 +135,9 @@ fn routed_local_ip(ipv4: bool) -> Option<IpAddr> {
 
 /// Browser endpoints known to one or more listeners in the same process.
 ///
-/// The in-process devnet shares this catalog so its listeners can expose one
-/// another immediately. Independently deployed nodes discover endpoints from
-/// the authenticated DHT address sets; this remains a local fast-path and
-/// fallback while those records converge.
+/// Only the in-process devnet supplies this catalog. Independently deployed
+/// nodes discover endpoints exclusively from authenticated DHT address
+/// records.
 #[derive(Default)]
 pub struct BrowserEndpointCatalog {
     endpoints: RwLock<HashMap<PeerId, BrowserEndpoint>>,
@@ -491,7 +490,7 @@ pub async fn spawn(
     ant_protocol: Option<Arc<AntProtocol>>,
     evm_network: &evmlib::Network,
     shutdown: CancellationToken,
-    endpoint_catalog: Arc<BrowserEndpointCatalog>,
+    endpoint_catalog: Option<Arc<BrowserEndpointCatalog>>,
 ) -> Result<WebRtcDirectServer> {
     validate_webrtc_config(config)?;
     let certificate_path = certificate_path(config, root_dir);
@@ -511,13 +510,13 @@ pub async fn spawn(
     let browser_endpoint = BrowserEndpoint::new(advertised_addr, &peer_id, certificate_sha256)
         .map_err(Error::Config)?;
     persist_browser_endpoint(root_dir, &browser_endpoint).await?;
-    endpoint_catalog.insert(peer_id, browser_endpoint.clone());
-    let dht = Arc::clone(p2p.dht_manager());
-
+    if let Some(catalog) = endpoint_catalog.as_ref() {
+        catalog.insert(peer_id, browser_endpoint.clone());
+    }
     let state = Arc::new(ServerState {
         config: config.clone(),
         identity,
-        p2p,
+        p2p: Arc::clone(&p2p),
         ant_protocol,
         payment: BrowserPaymentNetwork::from_evm_network(evm_network),
         endpoint: browser_endpoint.clone(),
@@ -532,10 +531,9 @@ pub async fn spawn(
         "ADR-0009 WebRTC Direct listening"
     );
 
-    let task = tokio::spawn(async move {
-        serve_webrtc(listener, state, resources, shutdown).await;
-    });
-    dht.set_supplemental_self_addresses(vec![browser_endpoint.multiaddr.clone()])
+    let task = tokio::spawn(serve_webrtc(listener, state, resources, shutdown));
+    p2p.dht_manager()
+        .set_supplemental_self_addresses(vec![browser_endpoint.multiaddr.clone()])
         .await;
     Ok(WebRtcDirectServer {
         endpoint: browser_endpoint,
@@ -1311,13 +1309,11 @@ async fn process_find_node(
         .await;
     let mut nodes = Vec::with_capacity(dht_nodes.len());
     for node in dht_nodes {
-        let supplemental = dht
-            .supplemental_address_records_for_peer(&node.peer_id)
-            .await;
+        let supplemental = dht.supplemental_addresses_for_peer(&node.peer_id).await;
         nodes.push(browser_node_from_dht(
             &node,
             &supplemental,
-            &state.endpoint_catalog,
+            state.endpoint_catalog.as_deref(),
         ));
     }
     (
@@ -1328,23 +1324,21 @@ async fn process_find_node(
 
 fn browser_node_from_dht(
     node: &DHTNode,
-    supplemental: &[(MultiAddr, KnownReachability)],
-    endpoint_catalog: &BrowserEndpointCatalog,
+    supplemental: &[MultiAddr],
+    endpoint_catalog: Option<&BrowserEndpointCatalog>,
 ) -> BrowserNode {
     let addresses = node.addresses_by_priority();
     let discovered_endpoint = supplemental
         .iter()
-        .find(|(address, reachability)| {
-            matches!(
-                reachability,
-                KnownReachability::Direct | KnownReachability::Lan
-            ) && address.is_webrtc_direct()
+        .find(|address| {
+            address.is_webrtc_direct()
                 && address.peer_id().is_some_and(|peer| peer == &node.peer_id)
         })
-        .map(|(address, _)| address.clone())
+        .cloned()
         .map(|multiaddr| BrowserEndpoint { multiaddr });
     BrowserNode {
-        webrtc_direct: discovered_endpoint.or_else(|| endpoint_catalog.get(&node.peer_id)),
+        webrtc_direct: discovered_endpoint
+            .or_else(|| endpoint_catalog.and_then(|catalog| catalog.get(&node.peer_id))),
         peer_id: node.peer_id.to_hex(),
         native_addresses: addresses
             .into_iter()
@@ -1907,7 +1901,7 @@ struct ServerState {
     ant_protocol: Option<Arc<AntProtocol>>,
     payment: BrowserPaymentNetwork,
     endpoint: BrowserEndpoint,
-    endpoint_catalog: Arc<BrowserEndpointCatalog>,
+    endpoint_catalog: Option<Arc<BrowserEndpointCatalog>>,
 }
 
 #[cfg(test)]
@@ -2311,12 +2305,8 @@ mod tests {
             reliability: 0.75,
         };
 
-        let supplemental = (endpoint.multiaddr.clone(), KnownReachability::Direct);
-        let browser_node = browser_node_from_dht(
-            &node,
-            std::slice::from_ref(&supplemental),
-            &BrowserEndpointCatalog::default(),
-        );
+        let supplemental = endpoint.multiaddr.clone();
+        let browser_node = browser_node_from_dht(&node, std::slice::from_ref(&supplemental), None);
 
         assert_eq!(browser_node.webrtc_direct, Some(endpoint));
         assert_eq!(
@@ -2326,7 +2316,7 @@ mod tests {
     }
 
     #[test]
-    fn find_node_hides_relay_only_webrtc_endpoint() {
+    fn production_find_node_does_not_use_dev_endpoint_catalog() {
         let peer_id = PeerId::from_bytes([0x32; 32]);
         let endpoint = BrowserEndpoint::new(
             "203.0.113.10:42768".parse().expect("socket address"),
@@ -2341,14 +2331,14 @@ mod tests {
             distance: None,
             reliability: 0.75,
         };
-        let supplemental = (endpoint.multiaddr, KnownReachability::Relay);
+        let catalog = BrowserEndpointCatalog::default();
+        catalog.insert(peer_id, endpoint.clone());
 
-        let browser_node = browser_node_from_dht(
-            &node,
-            std::slice::from_ref(&supplemental),
-            &BrowserEndpointCatalog::default(),
-        );
+        let browser_node = browser_node_from_dht(&node, &[], None);
 
         assert!(browser_node.webrtc_direct.is_none());
+
+        let devnet_node = browser_node_from_dht(&node, &[], Some(&catalog));
+        assert_eq!(devnet_node.webrtc_direct, Some(endpoint));
     }
 }

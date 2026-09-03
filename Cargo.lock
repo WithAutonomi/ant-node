@@ -5211,7 +5211,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.26.4"
-source = "git+https://github.com/WithAutonomi/saorsa-core.git?rev=2ed691c7cb49690c86beb445ee422f22a230ef9a#2ed691c7cb49690c86beb445ee422f22a230ef9a"
+source = "git+https://github.com/WithAutonomi/saorsa-core.git?rev=1432fa9751d46887dc86767928bd3320a24c6367#1432fa9751d46887dc86767928bd3320a24c6367"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5243,7 +5243,7 @@ dependencies = [
 [[package]]
 name = "saorsa-dht-lookup"
 version = "0.1.0"
-source = "git+https://github.com/WithAutonomi/saorsa-core.git?rev=2ed691c7cb49690c86beb445ee422f22a230ef9a#2ed691c7cb49690c86beb445ee422f22a230ef9a"
+source = "git+https://github.com/WithAutonomi/saorsa-core.git?rev=1432fa9751d46887dc86767928bd3320a24c6367#1432fa9751d46887dc86767928bd3320a24c6367"
 dependencies = [
  "futures-core",
  "futures-util",

@@ -371,9 +371,12 @@ TransportAddressRecord {
 
 Known transport identifiers are `Quic = 1` and `WebRtcDirect = 2`. Transport
 and reachability are deliberately orthogonal: the known reachability IDs are
-Relay, Direct, Unverified, and Lan, and a WebRTC Direct listener is initially
-published as `WebRtcDirect + Unverified`. Relay acquisition selects
-`Quic + Direct`; native dialing never consumes WebRTC records.
+Relay, Direct, Unverified, and Lan. WebRTC Direct currently has no relayed
+address form, so every WebRTC endpoint is published as `Unverified`; its
+reachability is determined by attempting the certificate-pinned browser
+connection. Relay acquisition selects `Quic + Direct`; native dialing never
+consumes WebRTC records and native QUIC reachability is never reused as WebRTC
+evidence.
 
 The identifiers are numeric fields rather than serialized Rust enums and are
 never reused. `address` is a bounded, length-delimited payload that is decoded
@@ -639,12 +642,14 @@ suppressed for a cooldown unless the peer publishes a different address; a
 successful request clears the failure. This prevents unreachable NAT-side
 listeners from adding their full WebRTC opening timeout to every record.
 
-V2 address records carry reachability independently from transport type. A
-WebRTC Direct endpoint inherits its owner's canonical reachability evidence.
-One-hop browser `FIND_NODE` responses expose Direct endpoints (and LAN
-endpoints in local testnets), but do not describe a relay-only endpoint as
-directly dialable. A future relayed WebRTC endpoint remains a separate address
-record rather than overloading the direct address.
+V2 address records carry a reachability field independently from transport
+type, but WebRTC Direct currently has no relay transport. Its records are
+therefore normalized to `Unverified` rather than borrowing the classification
+of a native QUIC socket on another UDP port. One-hop browser `FIND_NODE`
+responses expose these authenticated, self-contained endpoints and the browser
+handles failed dials through its bounded negative-endpoint cache. If relayed
+WebRTC is added later, it requires a distinct address form and selection policy
+rather than overloading the direct address.
 
 Every storage node, or a sufficient storage-aware replica set, must expose a
 browser endpoint. Filtering native closest results to a sparse browser-only
@@ -655,18 +660,11 @@ storage nodes.
 
 WebRTC Direct removes the signaling server only for publicly reachable
 listeners. It does not make a NATed server directly dialable from a static
-address. After initial bootstrap, the browser can use authenticated network
-peers to exchange short-lived SDP/ICE information with a NATed node. ICE tries
-host and server-reflexive candidates first and uses an end-to-end relay
-candidate when required.
-
-Signaling peers coordinate connection establishment only. They do not perform
-DHT lookup on the browser's behalf and do not carry application requests or
-chunk bytes. A TURN-like or Saorsa relay forwards encrypted DTLS packets; DTLS
-and the inner post-quantum application session terminate at the browser and
-storage node, not the relay. The relay sees neither RPC nor chunk plaintext.
-Relay allocations are published in signed, expiring endpoint records rather
-than the constant bootstrap list.
+address, and this implementation has no WebRTC relay transport. An endpoint
+that cannot be reached is simply a failed browser dial and is suppressed by
+the negative-endpoint cache. Supporting NATed WebRTC nodes would require a
+separate signaling and relay design; it is not represented by the current
+reachability field.
 
 ### Implemented proof-of-concept slice
 
@@ -675,6 +673,9 @@ The earlier feature-gated WebTransport PoC has been replaced by the
 
 - a separate Saorsa-owned WebRTC Direct UDP listener in `saorsa-transport` and
   a browser dialer built directly on `RTCPeerConnection`/`RTCDataChannel`;
+- WebRTC endpoint publication as `Unverified`, independent of native QUIC
+  reachability, with actual availability determined by a certificate-pinned
+  browser dial;
 - credential-first STUN routing in the shared UDP mux, so a new association is
   not sent to a stale ICE agent when a browser reuses a source UDP port;
 - a generated and persisted DTLS certificate whose fingerprint remains stable
@@ -730,9 +731,9 @@ below.
 The in-process `ant-devnet` launcher can enable a listener on every node. The
 listeners share an in-memory endpoint catalog, allowing each local
 `FIND_NODE` answer to attach the self-contained WebRTC Direct multiaddress of
-every browser-enabled peer in its routing view. This catalog is explicitly a
-local replacement for future signed DHT endpoint records, not a production
-discovery mechanism.
+every browser-enabled peer in its routing view before DHT publication has
+converged. This catalog is development-only; production lookup uses only the
+authenticated V2 DHT endpoint records.
 
 Local testnets may publish a runtime manifest because their loopback addresses
 and ephemeral ports are created for each test run. Production bootstrap must
@@ -798,11 +799,10 @@ that one address, traversed routing views from dozens of independent peer
 processes, obtained four quotes from four non-bootstrap closest nodes, paid
 once, and stored all four encrypted records. This verifies that the input
 address is a bootstrap seed rather than a storage proxy. Nodes behind the
-testnet's deliberate inbound-NAT rules still require relayed WebRTC. Their
-relay-only direct listeners are no longer returned as usable browser
-endpoints, and failed endpoints learned before that classification are
-cancelled after the shared lookup grace period and suppressed by the browser
-client's negative cache.
+testnet's deliberate inbound-NAT rules are not reachable through the current
+WebRTC Direct transport. Failed direct endpoints are cancelled after the
+shared lookup grace period and suppressed by the browser client's negative
+cache.
 
 After replacing that prototype with the compatibility-safe V2 address plane,
 a five-node headless-Chromium test again started with exactly one WebRTC seed.

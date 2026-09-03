@@ -554,7 +554,6 @@ impl RunningNode {
                 actual_port,
                 observed_ip,
             );
-            let endpoint_catalog = Arc::new(crate::web_rtc::BrowserEndpointCatalog::default());
             let evm_network = self.config.payment.evm_network.clone().into_evm_network();
             match crate::web_rtc::spawn(
                 &webrtc_direct_config,
@@ -563,7 +562,7 @@ impl RunningNode {
                 self.ant_protocol.clone(),
                 &evm_network,
                 self.shutdown.clone(),
-                endpoint_catalog,
+                None,
             )
             .await
             {
