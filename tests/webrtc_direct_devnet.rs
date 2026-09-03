@@ -4,7 +4,8 @@ use ant_node::devnet::{Devnet, DevnetConfig};
 use ant_node::BrowserEndpoint;
 use ant_protocol::web_rtc::{
     decode_pq_frame, encode_pq_frame, pq_frame_length, PqClientHandshake, PqSession,
-    PQ_ENCRYPTED_OVERHEAD_BYTES, PQ_SERVER_ACCEPT_BYTES,
+    BROWSER_PROTOCOL_NAME, BROWSER_PROTOCOL_VERSION, PQ_ENCRYPTED_OVERHEAD_BYTES,
+    PQ_SERVER_ACCEPT_BYTES, WEBRTC_DIRECT_DATA_CHANNEL, WEBRTC_WRITE_CHUNK_BYTES,
 };
 use ant_protocol::MAX_CHUNK_SIZE;
 use bytes::Bytes;
@@ -12,17 +13,12 @@ use evmlib::common::{Amount, QuoteHash};
 use evmlib::wallet::Wallet;
 use evmlib::RewardsAddress;
 use saorsa_transport::transport::{WebRtcCertificateHash, WebRtcDirectAddr};
-use saorsa_transport::webrtc_direct::{
-    WebRtcDataChannel, WebRtcDirectClient, MAX_DATA_CHANNEL_MESSAGE_SIZE,
-};
+use saorsa_transport::webrtc_direct::{WebRtcDataChannel, WebRtcDirectClient};
 use self_encryption::{DataMap, EncryptedChunk};
 use serde_json::{json, Value};
 use std::error::Error;
 use std::io;
 use std::str::FromStr;
-
-const DATA_CHANNEL_LABEL: &str = "autonomi.web.v4";
-const WEBRTC_WRITE_CHUNK_BYTES: usize = MAX_DATA_CHANNEL_MESSAGE_SIZE;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "starts a five-node local network"]
@@ -64,70 +60,104 @@ async fn seeded_public_file_downloads_and_paid_uploads_over_direct_node_endpoint
         .first()
         .ok_or_else(|| io::Error::other("browser-enabled devnet returned no direct endpoints"))?;
     let parsed_endpoint = endpoint.endpoint.parse().map_err(io::Error::other)?;
-    let (hello, hello_content) = rpc(
-        &endpoint.endpoint,
-        json!({
-            "version": 4,
-            "request_id": 5,
-            "type": "hello",
-        }),
-        &[],
-    )
-    .await?;
+    let mut seed_client = BrowserRpcClient::connect(&endpoint.endpoint).await?;
+    let (hello, hello_content) = seed_client
+        .rpc(
+            json!({
+                "version": BROWSER_PROTOCOL_VERSION,
+                "request_id": 5,
+                "type": "hello",
+            }),
+            &[],
+        )
+        .await?;
     assert_eq!(hello["status"], "ok");
-    assert_eq!(hello["protocol"], "autonomi.web.poc.v4");
+    assert_eq!(hello["protocol"], BROWSER_PROTOCOL_NAME);
     assert_eq!(
         hello["payment"]["rpc_url"].as_str(),
         Some(evm_testnet.to_network().rpc_url().as_str())
     );
-    assert_eq!(hello["peer_id"], parsed_endpoint.peer_id.to_hex());
+    assert_eq!(hello["peer_id"], parsed_endpoint.peer_id);
     assert_eq!(
         hello["endpoint"]["multiaddr"],
         endpoint.endpoint.multiaddr.to_string()
     );
     assert!(hello_content.is_empty());
 
-    let (closest, closest_content) = rpc(
-        &endpoint.endpoint,
-        json!({
-            "version": 4,
-            "request_id": 6,
-            "type": "find_node",
-            "target": public_file.address,
-            "count": 20,
-        }),
-        &[],
-    )
-    .await?;
+    let (closest, closest_content) = seed_client
+        .rpc(
+            json!({
+                "version": BROWSER_PROTOCOL_VERSION,
+                "request_id": 6,
+                "type": "find_node",
+                "target": public_file.address,
+                "count": 20,
+            }),
+            &[],
+        )
+        .await?;
     assert_eq!(closest["status"], "ok");
     assert_eq!(closest["type"], "nodes");
     assert_eq!(closest["target"], public_file.address);
     assert!(closest_content.is_empty());
-    let discovered_peer = closest["nodes"]
+    let discovered = closest["nodes"]
         .as_array()
-        .and_then(|nodes| nodes.iter().find(|node| node["webrtc_direct"].is_object()))
-        .and_then(|node| node["peer_id"].as_str())
-        .ok_or_else(|| io::Error::other("FIND_NODE returned no browser endpoint"))?;
-    let download_endpoint = endpoints
-        .iter()
-        .find(|candidate| {
-            candidate
-                .endpoint
-                .parse()
-                .is_ok_and(|parsed| parsed.peer_id.to_hex() == discovered_peer)
+        .and_then(|nodes| {
+            nodes.iter().find(|node| {
+                node["webrtc_direct"]["multiaddr"]
+                    .as_str()
+                    .is_some_and(|addr| addr != endpoint.endpoint.multiaddr)
+            })
         })
-        .ok_or_else(|| io::Error::other("discovered endpoint was not in the devnet catalog"))?;
-    let (header, data_map_bytes) = rpc(
-        &download_endpoint.endpoint,
-        json!({
-            "version": 4,
-            "request_id": 7,
-            "type": "get_chunk",
-            "address": public_file.address,
-        }),
-        &[],
-    )
-    .await?;
+        .ok_or_else(|| io::Error::other("FIND_NODE returned no browser endpoint"))?;
+    let discovered_peer = discovered["peer_id"]
+        .as_str()
+        .ok_or_else(|| io::Error::other("FIND_NODE node omitted its peer ID"))?;
+    let download_endpoint: BrowserEndpoint =
+        serde_json::from_value(discovered["webrtc_direct"].clone())?;
+    let parsed_download = download_endpoint.parse().map_err(io::Error::other)?;
+    assert_eq!(parsed_download.peer_id, discovered_peer);
+    let mut download_client = BrowserRpcClient::connect(&download_endpoint).await?;
+    let (download_hello, _) = download_client
+        .rpc(
+            json!({
+                "version": BROWSER_PROTOCOL_VERSION,
+                "request_id": 7,
+                "type": "hello",
+            }),
+            &[],
+        )
+        .await?;
+    assert_eq!(download_hello["peer_id"], discovered_peer);
+    let (next_hop, next_hop_content) = download_client
+        .rpc(
+            json!({
+                "version": BROWSER_PROTOCOL_VERSION,
+                "request_id": 8,
+                "type": "find_node",
+                "target": public_file.address,
+                "count": 20,
+            }),
+            &[],
+        )
+        .await?;
+    assert_eq!(next_hop["status"], "ok");
+    assert_eq!(next_hop["type"], "nodes");
+    assert!(next_hop["nodes"]
+        .as_array()
+        .is_some_and(|nodes| !nodes.is_empty()));
+    assert!(next_hop_content.is_empty());
+    let (header, data_map_bytes) = download_client
+        .rpc(
+            json!({
+                "version": BROWSER_PROTOCOL_VERSION,
+                "request_id": 9,
+                "type": "get_chunk",
+                "address": public_file.address,
+            }),
+            &[],
+        )
+        .await?;
 
     assert_eq!(header["status"], "ok");
     assert_eq!(header["type"], "chunk");
@@ -139,17 +169,17 @@ async fn seeded_public_file_downloads_and_paid_uploads_over_direct_node_endpoint
     let mut encrypted_chunks = Vec::new();
     for (index, chunk) in public_file.chunks.iter().enumerate() {
         let request_id = u64::try_from(index)?.saturating_add(10);
-        let (chunk_header, chunk_bytes) = rpc(
-            &download_endpoint.endpoint,
-            json!({
-                "version": 4,
-                "request_id": request_id,
-                "type": "get_chunk",
-                "address": chunk.dst_hash,
-            }),
-            &[],
-        )
-        .await?;
+        let (chunk_header, chunk_bytes) = download_client
+            .rpc(
+                json!({
+                    "version": BROWSER_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "type": "get_chunk",
+                    "address": chunk.dst_hash,
+                }),
+                &[],
+            )
+            .await?;
         assert_eq!(chunk_header["status"], "ok");
         assert_eq!(chunk_header["type"], "chunk");
         encrypted_chunks.push(EncryptedChunk {
@@ -161,18 +191,18 @@ async fn seeded_public_file_downloads_and_paid_uploads_over_direct_node_endpoint
 
     let upload_content = b"paid browser WebRtcDirect upload";
     let upload_address = hex::encode(blake3::hash(upload_content).as_bytes());
-    let (quote_header, quote_content) = rpc(
-        &download_endpoint.endpoint,
-        json!({
-            "version": 4,
-            "request_id": 50,
-            "type": "quote_chunk",
-            "address": upload_address,
-            "size": upload_content.len(),
-        }),
-        &[],
-    )
-    .await?;
+    let (quote_header, quote_content) = download_client
+        .rpc(
+            json!({
+                "version": BROWSER_PROTOCOL_VERSION,
+                "request_id": 50,
+                "type": "quote_chunk",
+                "address": upload_address,
+                "size": upload_content.len(),
+            }),
+            &[],
+        )
+        .await?;
     assert_eq!(quote_header["status"], "ok");
     assert_eq!(quote_header["type"], "storage_quote");
     assert_eq!(quote_header["already_stored"], false);
@@ -189,37 +219,42 @@ async fn seeded_public_file_downloads_and_paid_uploads_over_direct_node_endpoint
         .get(&quote_hash)
         .ok_or_else(|| io::Error::other("payment returned no transaction hash for quote"))?;
 
-    let (put_header, put_content) = rpc(
-        &download_endpoint.endpoint,
-        json!({
-            "version": 4,
-            "request_id": 51,
-            "type": "put_chunk",
-            "address": upload_address,
-            "quote": quote,
-            "transaction_hash": format!("{transaction_hash:?}"),
-        }),
-        upload_content,
-    )
-    .await?;
+    let (put_header, put_content) = download_client
+        .rpc(
+            json!({
+                "version": BROWSER_PROTOCOL_VERSION,
+                "request_id": 51,
+                "type": "put_chunk",
+                "address": upload_address,
+                "quote": quote,
+                "transaction_hash": format!("{transaction_hash:?}"),
+            }),
+            upload_content,
+        )
+        .await?;
     assert_eq!(put_header["status"], "ok");
     assert_eq!(put_header["type"], "chunk_stored");
     assert_eq!(put_header["address"], upload_address);
     assert!(put_content.is_empty());
 
-    let (uploaded_header, uploaded_content) = rpc(
-        &download_endpoint.endpoint,
-        json!({
-            "version": 4,
-            "request_id": 52,
-            "type": "get_chunk",
-            "address": upload_address,
-        }),
-        &[],
-    )
-    .await?;
+    let (uploaded_header, uploaded_content) = download_client
+        .rpc(
+            json!({
+                "version": BROWSER_PROTOCOL_VERSION,
+                "request_id": 52,
+                "type": "get_chunk",
+                "address": upload_address,
+            }),
+            &[],
+        )
+        .await?;
     assert_eq!(uploaded_header["status"], "ok");
     assert_eq!(uploaded_content, upload_content);
+    assert!(seed_client.requests_sent() >= 2);
+    assert!(download_client.requests_sent() >= 6);
+
+    download_client.close().await?;
+    seed_client.close().await?;
 
     devnet.shutdown().await?;
     Ok(())
@@ -231,43 +266,59 @@ fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, io::Err
         .ok_or_else(|| io::Error::other(format!("quote omitted {field}")))
 }
 
-async fn rpc(
-    endpoint: &BrowserEndpoint,
-    request: Value,
-    content: &[u8],
-) -> Result<(Value, Vec<u8>), Box<dyn Error>> {
-    let request_type = request["type"].as_str().unwrap_or("unknown").to_string();
-    let parsed = endpoint.parse().map_err(io::Error::other)?;
-    let direct_addr = WebRtcDirectAddr::new(
-        parsed.socket_addr,
-        WebRtcCertificateHash::new(parsed.certificate_hash),
-    )?;
-    let client = WebRtcDirectClient::dial(&direct_addr, DATA_CHANNEL_LABEL)
-        .await
-        .map_err(|error| io::Error::other(format!("WebRTC Direct dial failed: {error}")))?;
-    let expected_peer_id = *parsed.peer_id.to_bytes();
-    let mut pq_session = establish_pq_session(client.data_channel(), &expected_peer_id).await?;
-    if request["type"] != "hello" {
-        let _ = rpc_stream(
-            client.data_channel(),
-            &mut pq_session,
-            json!({
-                "version": 4,
-                "request_id": 1,
-                "type": "hello",
-            }),
-            &[],
-        )
-        .await
-        .map_err(|error| io::Error::other(format!("WebRTC Direct HELLO failed: {error}")))?;
+struct BrowserRpcClient {
+    client: WebRtcDirectClient,
+    pq_session: PqSession,
+    requests_sent: usize,
+}
+
+impl BrowserRpcClient {
+    async fn connect(endpoint: &BrowserEndpoint) -> Result<Self, Box<dyn Error>> {
+        let parsed = endpoint.parse().map_err(io::Error::other)?;
+        let direct_addr = WebRtcDirectAddr::new(
+            parsed.socket_addr().map_err(io::Error::other)?,
+            WebRtcCertificateHash::new(parsed.certificate_hash),
+        )?;
+        let client = WebRtcDirectClient::dial(&direct_addr, WEBRTC_DIRECT_DATA_CHANNEL)
+            .await
+            .map_err(|error| io::Error::other(format!("WebRTC Direct dial failed: {error}")))?;
+        let expected_peer_id = parsed.peer_id_bytes().map_err(io::Error::other)?;
+        let pq_session = establish_pq_session(client.data_channel(), &expected_peer_id).await?;
+        Ok(Self {
+            client,
+            pq_session,
+            requests_sent: 0,
+        })
     }
-    let result = rpc_stream(client.data_channel(), &mut pq_session, request, content)
+
+    async fn rpc(
+        &mut self,
+        request: Value,
+        content: &[u8],
+    ) -> Result<(Value, Vec<u8>), Box<dyn Error>> {
+        let request_type = request["type"].as_str().unwrap_or("unknown").to_string();
+        let result = rpc_stream(
+            self.client.data_channel(),
+            &mut self.pq_session,
+            request,
+            content,
+        )
         .await
         .map_err(|error| {
             io::Error::other(format!("WebRTC Direct {request_type} RPC failed: {error}"))
-        });
-    client.close().await?;
-    Ok(result?)
+        })?;
+        self.requests_sent += 1;
+        Ok(result)
+    }
+
+    const fn requests_sent(&self) -> usize {
+        self.requests_sent
+    }
+
+    async fn close(self) -> Result<(), Box<dyn Error>> {
+        self.client.close().await?;
+        Ok(())
+    }
 }
 
 async fn rpc_stream(
