@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-08-03
-- **Last amended:** 2026-09-02
+- **Last amended:** 2026-09-03
 - **Decision owners:** <pending>
 - **Reviewers:** <pending>
 - **Supersedes:** none
@@ -188,6 +188,85 @@ not downgraded or replaced. The WebRTC listener has independent connection,
 channel, request, timeout, message, and byte limits. Its write surface accepts
 only content-addressed chunks accompanied by a verifiable native payment
 proof.
+
+### Public-listener resource isolation
+
+The public WebRTC listener has a resource envelope independent from native
+QUIC. Browser traffic does not consume the native transport's limits, and
+native limits are not relied upon to protect the browser listener. The initial
+server defaults are:
+
+| Setting | Default | Scope |
+|---|---:|---|
+| `max_connections` | 32 | listener |
+| `max_connections_per_ip` | 4 | source IP |
+| `max_channels_per_connection` | 2 | association |
+| `max_channels` | 32 | listener and channel-handler tasks |
+| `max_concurrent_requests` | 16 | listener work slots |
+| `max_requests_per_second` | 256 | listener work token bucket |
+| `max_requests_per_second_per_ip` | 32 | source-IP work token bucket |
+| `max_requests_per_second_per_connection` | 16 | association work token bucket |
+| `max_in_flight_bytes` | 64 MiB | listener frame memory |
+| `max_in_flight_bytes_per_ip` | 16 MiB | source-IP frame memory |
+| `max_request_bytes` | 64 KiB | JSON request header |
+
+These are independent controls, not alternative ways to express one shared
+ceiling. Configuration fails startup unless every value is nonzero and a
+single source retains strict headroom for other sources in each global pool:
+
+- `max_connections_per_ip < max_connections`;
+- `max_connections_per_ip * max_channels_per_connection` is lower than both
+  `max_channels` and `max_concurrent_requests`;
+- the per-IP request rate is lower than the global request rate, and the
+  per-connection rate does not exceed the per-IP rate; and
+- the per-IP in-flight byte ceiling is lower than the global byte ceiling.
+
+The source key is the observed remote IP; an IPv4-mapped IPv6 address maps to
+the same key as its IPv4 form. Per-IP rate and byte state is shared by every
+association from that source. Normal reconnects reuse retained rate state, so
+reconnecting alone does not refill a depleted bucket. The source table itself
+has a hard bound and evicts only the oldest inactive entry, preventing the
+limiter from becoming a source-churn memory attack.
+
+Admission is non-queueing above the application bounds. The server stops
+starting new transport accepts while all global association slots are in use.
+After accept, an association must obtain both its global and per-IP share. A
+connection may own at most `max_channels_per_connection` active DataChannels,
+and every admitted channel must also own one of the global `max_channels`
+permits. Excess channels are closed and terminate the offending association.
+The v4 protocol expects persistent channels, so an association is closed when
+its last application channel ends rather than retaining a stale connection
+slot for a hypothetical channel reopen.
+
+Connection and channel handlers are children of bounded `JoinSet`s rather
+than detached tasks. Their semaphore permits and source counters are RAII
+guards. Normal shutdown drains connection tasks for five seconds, then aborts
+and joins any remainder; closing a connection also aborts and joins its
+remaining channel tasks. A channel waiting for its next frame has a 60-second
+idle deadline. Partial-frame reads and all response writes have total,
+size-scaled transfer deadlines, so slow senders and readers cannot retain work
+or byte reservations indefinitely.
+
+A request obtains a global work permit only after its first message arrives,
+so an idle persistent channel does not consume a request slot. The permit is
+held through frame assembly, processing, and response transmission. The
+ML-KEM/ML-DSA session handshake consumes the same global, per-IP, and
+per-connection rate tokens and the same work permits as an RPC; otherwise
+channel churn would provide an unmetered public-key-cryptography path. All
+three rate controls are constant-space token buckets with a one-second burst.
+Capacity or rate rejection closes the channel or association without sending
+an error response that would amplify attacker traffic.
+
+Frame memory is reserved atomically against both the source and listener byte
+budgets. Once an outer prefix declares a valid length, the complete frame is
+reserved before the listener accepts a slow body. Reservations include
+ciphertext/plaintext overlap during authenticated decryption, parsed request
+content retained during processing, response serialization and encryption,
+and bytes held through response writes. `GET_CHUNK` reserves the maximum chunk
+size before asking storage to allocate the result, then shrinks to the actual
+size. Outbound frames send the four-byte prefix and bounded payload fragments
+without allocating another full-frame copy. Every reservation is released on
+success, rejection, cancellation, task abort, or protocol error.
 
 ### Stable addresses and transport certificates
 
@@ -611,6 +690,9 @@ The earlier feature-gated WebTransport PoC has been replaced by the
 - a persistent reliable ordered application DataChannel, bounded 16-KiB
   messages, declared-length reassembly, and browser `bufferedAmount`
   backpressure;
+- an independent node-side resource envelope with strict global, per-IP, and
+  per-association connection/channel/request/rate/byte bounds, owned handler
+  tasks, and deadline-bounded frame reads and response writes;
 - a bounded browser connection pool that reuses authenticated DataChannels
   across every lookup, quote, and record in one complete upload or download;
 - a Rust/WASM random-access reader that resolves the public root DataMap,
@@ -668,7 +750,7 @@ LMDB storage, and verified reads remain active.
 
 ### Protocol v4 local validation
 
-On 2026-09-01 the ignored five-node WebRTC Direct devnet integration test used
+On 2026-09-03 the ignored five-node WebRTC Direct devnet integration test used
 the actual native client adapter and shared `ant-protocol` implementation to
 complete the ML-KEM/ML-DSA handshake, encrypted `HELLO`, iterative lookup,
 download, quote/payment-proof handling, paid upload, and read-back. Shared
@@ -676,6 +758,14 @@ protocol unit tests additionally reject tampered and replayed records, wrong
 peer IDs, tampered node signatures, and invalid outer-frame lengths. The
 `ant-core` browser target builds and lints as WASM, and the browser SDK's
 generated bindings, type checks, and unit tests pass with protocol v4.
+
+Node-side resource tests additionally cover fail-fast headroom invariants,
+per-IP association isolation, IPv4-mapped IPv6 normalization, token-bucket
+refill, preservation of source rate state across reconnects, bounded inactive
+source state, global/per-source byte ceilings, rollback after failed global
+reservation, and RAII release. The devnet workflow exercises the same limits
+while transferring real encrypted chunks. The adversarial browser and fleet
+tests listed under Validation remain promotion requirements.
 
 This is strong local integration evidence but not the required browser
 interoperability result. A real Chrome, Firefox, and Safari run against a
@@ -787,8 +877,9 @@ round-trip tests.
   dependency after the application has been installed.
 - Designated bootstrap nodes have stronger uptime and stable-address
   requirements than ordinary storage nodes.
-- Origin is policy input, not client authentication. Public deployments still
-  need per-IP/session request, channel, and byte quotas.
+- Origin is policy input, not client authentication. Public listeners enforce
+  independent per-IP/session request, channel, rate, and byte quotas; origin
+  does not bypass or replace those controls.
 - The post-quantum handshake authenticates the node to the browser, not the
   browser user to the node. Client authority remains method-specific; for paid
   storage it comes from the normal wallet signature and payment proof.
@@ -822,7 +913,9 @@ The decision advances beyond PoC only after all of the following are covered:
   handshake and frame bounds, tampering, replay, reordering, and key cleanup.
 - Automated tests cover malformed STUN/SDP/SCTP input, oversized messages,
   excessive channels, slow readers, connection floods, request amplification,
-  and global/per-client byte quotas.
+  reconnect churn, task cleanup, and global/per-client byte quotas. Tests must
+  also show that one source at each configured ceiling leaves another source
+  admissible.
 - UDP-mux regression tests cover source-port reuse: a binding request carrying
   a new ICE credential must override a stale address mapping, while binding
   responses and non-STUN traffic continue to use the selected address mapping.

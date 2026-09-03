@@ -16,12 +16,12 @@ use crate::logging::{debug, info, warn};
 use crate::payment::{serialize_single_node_proof, PaymentProof};
 use crate::storage::AntProtocol;
 use ant_protocol::web_rtc::{
-    accept_pq_session, decode_pq_frame, encode_pq_frame, pq_frame_length, transfer_timeout,
-    PqSession, PQ_CLIENT_HELLO_BYTES, PQ_ENCRYPTED_OVERHEAD_BYTES, PQ_FRAME_PREFIX_BYTES,
+    accept_pq_session, decode_pq_frame, pq_frame_length, transfer_timeout, PqSession,
+    PQ_CLIENT_HELLO_BYTES, PQ_ENCRYPTED_OVERHEAD_BYTES, PQ_FRAME_PREFIX_BYTES,
 };
 use evmlib::common::{Amount, TxHash};
 use evmlib::{EncodedPeerId, PaymentQuote, ProofOfPayment, RewardsAddress};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use saorsa_core::identity::NodeIdentity;
 use saorsa_core::{DHTNode, KnownReachability, MultiAddr, P2PNode, PeerId};
 use saorsa_transport::webrtc_direct::{
@@ -33,10 +33,11 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
-use tokio::sync::Semaphore;
-use tokio::task::JoinHandle;
+use std::time::{Duration, Instant, SystemTime};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 const PROTOCOL_VERSION: u16 = 4;
@@ -45,9 +46,19 @@ const DATA_CHANNEL_LABEL: &str = "autonomi.web.v4";
 const MAX_FIND_NODE_RESULTS: usize = 20;
 const MAX_RESPONSE_HEADER_BYTES: usize = 64 * 1024;
 const REQUEST_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const WEBRTC_WRITE_CHUNK_BYTES: usize = MAX_DATA_CHANNEL_MESSAGE_SIZE;
 const AUTOMATIC_PORT_MIN: u32 = 32_768;
 const AUTOMATIC_PORT_COUNT: u32 = 65_536 - AUTOMATIC_PORT_MIN;
+const TRACKED_SOURCE_MULTIPLIER: usize = 4;
+const MIN_TRACKED_SOURCES: usize = 64;
+const CONNECTION_CAPACITY_ERROR: &str = "global connection capacity exhausted";
+const SOURCE_CONNECTION_CAPACITY_ERROR: &str = "source connection capacity exhausted";
+const CHANNEL_CAPACITY_ERROR: &str = "global DataChannel capacity exhausted";
+const REQUEST_CAPACITY_ERROR: &str = "global request capacity exhausted";
+const REQUEST_RATE_ERROR: &str = "request rate limit exceeded";
+const GLOBAL_BYTE_CAPACITY_ERROR: &str = "global in-flight byte capacity exhausted";
+const SOURCE_BYTE_CAPACITY_ERROR: &str = "source in-flight byte capacity exhausted";
 
 /// Filename containing the node's canonical browser bootstrap address.
 ///
@@ -143,6 +154,327 @@ impl BrowserEndpointCatalog {
     }
 }
 
+/// Fixed-capacity token bucket with a one-second burst allowance.
+///
+/// The bucket is deliberately constant-space: source churn must not turn the
+/// request limiter itself into a memory-exhaustion surface.
+struct RequestRateBucket {
+    rate_per_second: u128,
+    token_units: u128,
+    last_refill: Instant,
+}
+
+impl RequestRateBucket {
+    fn new(rate_per_second: usize) -> Self {
+        let rate_per_second = rate_per_second as u128;
+        Self {
+            rate_per_second,
+            token_units: rate_per_second.saturating_mul(1_000_000_000),
+            last_refill: Instant::now(),
+        }
+    }
+
+    fn allow(&mut self, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.last_refill);
+        self.last_refill = now;
+        let capacity = self.rate_per_second.saturating_mul(1_000_000_000);
+        let refill = elapsed.as_nanos().saturating_mul(self.rate_per_second);
+        self.token_units = self.token_units.saturating_add(refill).min(capacity);
+        if self.token_units < 1_000_000_000 {
+            return false;
+        }
+        self.token_units -= 1_000_000_000;
+        true
+    }
+}
+
+/// Atomic byte budget and an RAII reservation within it.
+///
+/// A custom counter is used instead of a semaphore because WebRTC frames grow
+/// incrementally and the accounting must resize without queueing an unbounded
+/// number of waiters.
+struct ByteBudget {
+    limit: usize,
+    in_use: AtomicUsize,
+}
+
+impl ByteBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            in_use: AtomicUsize::new(0),
+        }
+    }
+
+    fn try_acquire(
+        self: &Arc<Self>,
+        amount: usize,
+        error: &'static str,
+    ) -> ServerResult<ByteReservation> {
+        self.in_use
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current
+                    .checked_add(amount)
+                    .filter(|next| *next <= self.limit)
+            })
+            .map_err(|_| error.to_string())?;
+        Ok(ByteReservation {
+            budget: Arc::clone(self),
+            amount,
+            error,
+        })
+    }
+
+    #[cfg(test)]
+    fn in_use(&self) -> usize {
+        self.in_use.load(Ordering::Acquire)
+    }
+}
+
+struct ByteReservation {
+    budget: Arc<ByteBudget>,
+    amount: usize,
+    error: &'static str,
+}
+
+impl ByteReservation {
+    fn try_grow(&mut self, amount: usize) -> ServerResult<()> {
+        self.budget
+            .in_use
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current
+                    .checked_add(amount)
+                    .filter(|next| *next <= self.budget.limit)
+            })
+            .map_err(|_| self.error.to_string())?;
+        self.amount += amount;
+        Ok(())
+    }
+
+    fn shrink(&mut self, amount: usize) {
+        let released = amount.min(self.amount);
+        self.amount -= released;
+        self.budget.in_use.fetch_sub(released, Ordering::AcqRel);
+    }
+}
+
+impl Drop for ByteReservation {
+    fn drop(&mut self) {
+        self.budget.in_use.fetch_sub(self.amount, Ordering::AcqRel);
+    }
+}
+
+struct InFlightByteReservation {
+    source: ByteReservation,
+    global: ByteReservation,
+}
+
+impl InFlightByteReservation {
+    fn try_grow(&mut self, amount: usize) -> ServerResult<()> {
+        self.source.try_grow(amount)?;
+        if let Err(error) = self.global.try_grow(amount) {
+            self.source.shrink(amount);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn resize(&mut self, amount: usize) -> ServerResult<()> {
+        if amount > self.source.amount {
+            self.try_grow(amount - self.source.amount)
+        } else {
+            let released = self.source.amount - amount;
+            self.source.shrink(released);
+            self.global.shrink(released);
+            Ok(())
+        }
+    }
+}
+
+struct TrackedBytes {
+    bytes: Vec<u8>,
+    reservation: InFlightByteReservation,
+}
+
+impl TrackedBytes {
+    fn reserve_length(&mut self, length: usize) -> ServerResult<()> {
+        self.reservation.resize(length)?;
+        if self.bytes.capacity() < length {
+            self.bytes.reserve_exact(length - self.bytes.len());
+        }
+        Ok(())
+    }
+}
+
+struct SourceQuota {
+    request_rate: Mutex<RequestRateBucket>,
+    bytes: Arc<ByteBudget>,
+}
+
+struct SourceEntry {
+    active_connections: usize,
+    last_seen: Instant,
+    quota: Arc<SourceQuota>,
+}
+
+#[derive(Default)]
+struct SourceAdmissionState {
+    sources: HashMap<IpAddr, SourceEntry>,
+}
+
+/// Admission and accounting shared by every association on one listener.
+struct ListenerResources {
+    connection_limit: Arc<Semaphore>,
+    channel_limit: Arc<Semaphore>,
+    request_limit: Arc<Semaphore>,
+    global_request_rate: Mutex<RequestRateBucket>,
+    global_bytes: Arc<ByteBudget>,
+    source_state: Mutex<SourceAdmissionState>,
+    max_connections_per_ip: usize,
+    max_requests_per_second_per_ip: usize,
+    max_requests_per_second_per_connection: usize,
+    max_in_flight_bytes_per_ip: usize,
+    max_tracked_sources: usize,
+}
+
+impl ListenerResources {
+    fn new(config: &WebRtcDirectConfig) -> Arc<Self> {
+        Arc::new(Self {
+            connection_limit: Arc::new(Semaphore::new(config.max_connections)),
+            channel_limit: Arc::new(Semaphore::new(config.max_channels)),
+            request_limit: Arc::new(Semaphore::new(config.max_concurrent_requests)),
+            global_request_rate: Mutex::new(RequestRateBucket::new(config.max_requests_per_second)),
+            global_bytes: Arc::new(ByteBudget::new(config.max_in_flight_bytes)),
+            source_state: Mutex::new(SourceAdmissionState::default()),
+            max_connections_per_ip: config.max_connections_per_ip,
+            max_requests_per_second_per_ip: config.max_requests_per_second_per_ip,
+            max_requests_per_second_per_connection: config.max_requests_per_second_per_connection,
+            max_in_flight_bytes_per_ip: config.max_in_flight_bytes_per_ip,
+            max_tracked_sources: config
+                .max_connections
+                .saturating_mul(TRACKED_SOURCE_MULTIPLIER)
+                .max(MIN_TRACKED_SOURCES),
+        })
+    }
+
+    fn try_admit_connection(
+        self: &Arc<Self>,
+        remote_addr: SocketAddr,
+    ) -> ServerResult<ConnectionAdmission> {
+        let global = Arc::clone(&self.connection_limit)
+            .try_acquire_owned()
+            .map_err(|_| CONNECTION_CAPACITY_ERROR.to_string())?;
+        let ip = canonical_source_ip(remote_addr.ip());
+        let source = {
+            let mut state = self.source_state.lock();
+            if !state.sources.contains_key(&ip) && state.sources.len() >= self.max_tracked_sources {
+                let eviction = state
+                    .sources
+                    .iter()
+                    .filter(|(_, entry)| entry.active_connections == 0)
+                    .min_by_key(|(_, entry)| entry.last_seen)
+                    .map(|(ip, _)| *ip);
+                let Some(eviction) = eviction else {
+                    return Err(CONNECTION_CAPACITY_ERROR.to_string());
+                };
+                state.sources.remove(&eviction);
+            }
+
+            let entry = state.sources.entry(ip).or_insert_with(|| SourceEntry {
+                active_connections: 0,
+                last_seen: Instant::now(),
+                quota: Arc::new(SourceQuota {
+                    request_rate: Mutex::new(RequestRateBucket::new(
+                        self.max_requests_per_second_per_ip,
+                    )),
+                    bytes: Arc::new(ByteBudget::new(self.max_in_flight_bytes_per_ip)),
+                }),
+            });
+            if entry.active_connections >= self.max_connections_per_ip {
+                return Err(SOURCE_CONNECTION_CAPACITY_ERROR.to_string());
+            }
+            entry.active_connections += 1;
+            entry.last_seen = Instant::now();
+            Arc::clone(&entry.quota)
+        };
+        let context = Arc::new(ConnectionResources {
+            listener: Arc::clone(self),
+            source,
+            request_rate: Mutex::new(RequestRateBucket::new(
+                self.max_requests_per_second_per_connection,
+            )),
+        });
+        Ok(ConnectionAdmission {
+            listener: Arc::clone(self),
+            ip,
+            context,
+            _global: global,
+        })
+    }
+
+    fn release_connection(&self, ip: IpAddr) {
+        let mut state = self.source_state.lock();
+        if let Some(entry) = state.sources.get_mut(&ip) {
+            entry.active_connections = entry.active_connections.saturating_sub(1);
+            entry.last_seen = Instant::now();
+        }
+    }
+}
+
+struct ConnectionResources {
+    listener: Arc<ListenerResources>,
+    source: Arc<SourceQuota>,
+    request_rate: Mutex<RequestRateBucket>,
+}
+
+impl ConnectionResources {
+    fn try_admit_request(&self) -> ServerResult<OwnedSemaphorePermit> {
+        let permit = Arc::clone(&self.listener.request_limit)
+            .try_acquire_owned()
+            .map_err(|_| REQUEST_CAPACITY_ERROR.to_string())?;
+        let now = Instant::now();
+        if !self.source.request_rate.lock().allow(now)
+            || !self.request_rate.lock().allow(now)
+            || !self.listener.global_request_rate.lock().allow(now)
+        {
+            return Err(REQUEST_RATE_ERROR.to_string());
+        }
+        Ok(permit)
+    }
+
+    fn try_reserve_bytes(&self, amount: usize) -> ServerResult<InFlightByteReservation> {
+        let source = self
+            .source
+            .bytes
+            .try_acquire(amount, SOURCE_BYTE_CAPACITY_ERROR)?;
+        let global = self
+            .listener
+            .global_bytes
+            .try_acquire(amount, GLOBAL_BYTE_CAPACITY_ERROR)?;
+        Ok(InFlightByteReservation { source, global })
+    }
+}
+
+struct ConnectionAdmission {
+    listener: Arc<ListenerResources>,
+    ip: IpAddr,
+    context: Arc<ConnectionResources>,
+    _global: OwnedSemaphorePermit,
+}
+
+impl Drop for ConnectionAdmission {
+    fn drop(&mut self) {
+        self.listener.release_connection(self.ip);
+    }
+}
+
+fn canonical_source_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or(IpAddr::V6(ip), IpAddr::V4),
+        IpAddr::V4(ip) => IpAddr::V4(ip),
+    }
+}
+
 /// A running browser listener and the endpoint clients use to reach it.
 pub struct WebRtcDirectServer {
     /// Direct endpoint with its certificate pin embedded in the multiaddress.
@@ -191,7 +523,7 @@ pub async fn spawn(
         endpoint: browser_endpoint.clone(),
         endpoint_catalog,
     });
-    let connection_limit = Arc::new(Semaphore::new(config.max_connections));
+    let resources = ListenerResources::new(config);
 
     info!(
         bind = %local_addr,
@@ -201,7 +533,7 @@ pub async fn spawn(
     );
 
     let task = tokio::spawn(async move {
-        serve_webrtc(listener, state, connection_limit, shutdown).await;
+        serve_webrtc(listener, state, resources, shutdown).await;
     });
     dht.set_supplemental_self_addresses(vec![browser_endpoint.multiaddr.clone()])
         .await;
@@ -223,9 +555,84 @@ async fn persist_browser_endpoint(root_dir: &Path, endpoint: &BrowserEndpoint) -
 }
 
 fn validate_webrtc_config(config: &WebRtcDirectConfig) -> Result<()> {
-    if config.max_connections == 0 {
+    for (name, value) in [
+        ("max_connections", config.max_connections),
+        ("max_connections_per_ip", config.max_connections_per_ip),
+        (
+            "max_channels_per_connection",
+            config.max_channels_per_connection,
+        ),
+        ("max_channels", config.max_channels),
+        ("max_concurrent_requests", config.max_concurrent_requests),
+    ] {
+        if value == 0 || value > Semaphore::MAX_PERMITS {
+            return Err(Error::Config(format!(
+                "webrtc_direct.{name} must be between 1 and {}",
+                Semaphore::MAX_PERMITS
+            )));
+        }
+    }
+    for (name, value) in [
+        ("max_requests_per_second", config.max_requests_per_second),
+        (
+            "max_requests_per_second_per_ip",
+            config.max_requests_per_second_per_ip,
+        ),
+        (
+            "max_requests_per_second_per_connection",
+            config.max_requests_per_second_per_connection,
+        ),
+        ("max_in_flight_bytes", config.max_in_flight_bytes),
+        (
+            "max_in_flight_bytes_per_ip",
+            config.max_in_flight_bytes_per_ip,
+        ),
+    ] {
+        if value == 0 {
+            return Err(Error::Config(format!(
+                "webrtc_direct.{name} must be greater than zero"
+            )));
+        }
+    }
+    if config.max_connections_per_ip >= config.max_connections {
         return Err(Error::Config(
-            "webrtc_direct.max_connections must be greater than zero".to_string(),
+            "webrtc_direct.max_connections_per_ip must be lower than max_connections".to_string(),
+        ));
+    }
+    let source_channel_ceiling = config
+        .max_connections_per_ip
+        .checked_mul(config.max_channels_per_connection)
+        .ok_or_else(|| {
+            Error::Config("webrtc_direct per-IP DataChannel ceiling overflows usize".to_string())
+        })?;
+    if source_channel_ceiling >= config.max_channels {
+        return Err(Error::Config(
+            "webrtc_direct max_connections_per_ip * max_channels_per_connection must be lower than max_channels"
+                .to_string(),
+        ));
+    }
+    if source_channel_ceiling >= config.max_concurrent_requests {
+        return Err(Error::Config(
+            "webrtc_direct max_connections_per_ip * max_channels_per_connection must be lower than max_concurrent_requests"
+                .to_string(),
+        ));
+    }
+    if config.max_requests_per_second_per_connection > config.max_requests_per_second_per_ip {
+        return Err(Error::Config(
+            "webrtc_direct.max_requests_per_second_per_connection must not exceed max_requests_per_second_per_ip"
+                .to_string(),
+        ));
+    }
+    if config.max_requests_per_second_per_ip >= config.max_requests_per_second {
+        return Err(Error::Config(
+            "webrtc_direct.max_requests_per_second_per_ip must be lower than max_requests_per_second"
+                .to_string(),
+        ));
+    }
+    if config.max_in_flight_bytes_per_ip >= config.max_in_flight_bytes {
+        return Err(Error::Config(
+            "webrtc_direct.max_in_flight_bytes_per_ip must be lower than max_in_flight_bytes"
+                .to_string(),
         ));
     }
     if config.max_request_bytes == 0 || config.max_request_bytes > MAX_RESPONSE_HEADER_BYTES {
@@ -288,33 +695,55 @@ fn advertised_addr(config: &WebRtcDirectConfig, local_addr: SocketAddr) -> Resul
     Ok(local_addr)
 }
 
+#[allow(clippy::significant_drop_tightening)]
 async fn serve_webrtc(
     mut listener: WebRtcDirectListener,
     state: Arc<ServerState>,
-    connection_limit: Arc<Semaphore>,
+    resources: Arc<ListenerResources>,
     shutdown: CancellationToken,
 ) {
+    let mut connection_tasks = JoinSet::new();
     loop {
         let connection = tokio::select! {
+            biased;
             () = shutdown.cancelled() => break,
-            connection = listener.accept() => connection,
+            completed = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    warn!(%error, "WebRTC Direct connection task failed");
+                }
+                continue;
+            }
+            // Do not perform another ICE/DTLS/SCTP accept while every
+            // application connection slot is occupied. The transport's
+            // pending-association queue remains bounded, and completed
+            // sessions release a permit before this branch becomes eligible.
+            connection = listener.accept(), if resources.connection_limit.available_permits() > 0 => connection,
         };
         match connection {
             Ok(connection) => {
                 let remote_addr = connection.remote_addr();
-                let Ok(permit) = Arc::clone(&connection_limit).try_acquire_owned() else {
-                    debug!(remote = %remote_addr, "Rejected WebRTC Direct connection: busy");
-                    if let Err(error) = connection.close().await {
-                        debug!(remote = %remote_addr, %error, "Failed to close busy connection");
+                let admission = match resources.try_admit_connection(remote_addr) {
+                    Ok(admission) => admission,
+                    Err(error) => {
+                        debug!(remote = %remote_addr, %error, "Rejected WebRTC Direct connection");
+                        if let Err(close_error) = connection.close().await {
+                            debug!(remote = %remote_addr, %close_error, "Failed to close rejected connection");
+                        }
+                        continue;
                     }
-                    continue;
                 };
+                let connection_resources = Arc::clone(&admission.context);
                 let connection_state = Arc::clone(&state);
                 let connection_shutdown = shutdown.clone();
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    if let Err(error) =
-                        handle_connection(connection, connection_state, connection_shutdown).await
+                connection_tasks.spawn(async move {
+                    let _admission = admission;
+                    if let Err(error) = handle_connection(
+                        connection,
+                        connection_state,
+                        connection_resources,
+                        connection_shutdown,
+                    )
+                    .await
                     {
                         debug!(remote = %remote_addr, "WebRTC Direct connection ended: {error}");
                     }
@@ -328,69 +757,128 @@ async fn serve_webrtc(
     if let Err(error) = listener.close().await {
         debug!("WebRTC Direct listener close failed: {error}");
     }
+    let drained = tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, async {
+        while let Some(result) = connection_tasks.join_next().await {
+            if let Err(error) = result {
+                debug!(%error, "WebRTC Direct connection task failed during shutdown");
+            }
+        }
+    })
+    .await;
+    if drained.is_err() {
+        warn!("WebRTC Direct connection tasks did not drain before shutdown deadline");
+        connection_tasks.abort_all();
+        while connection_tasks.join_next().await.is_some() {}
+    }
     info!("ADR-0009 WebRTC Direct stopped");
 }
 
 async fn handle_connection(
     mut connection: WebRtcDirectConnection,
     state: Arc<ServerState>,
+    resources: Arc<ConnectionResources>,
     shutdown: CancellationToken,
 ) -> ServerResult<()> {
-    loop {
-        let channel = tokio::select! {
-            () = shutdown.cancelled() => return Ok(()),
-            result = connection.accept_data_channel() => {
-                result.map_err(|error| format!("DataChannel accept failed: {error}"))?
+    let remote_addr = connection.remote_addr();
+    let mut channel_tasks = JoinSet::new();
+    let outcome = loop {
+        let accepted = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => break Ok(()),
+            completed = channel_tasks.join_next(), if !channel_tasks.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    debug!(remote = %remote_addr, %error, "WebRTC Direct DataChannel task failed");
+                }
+                // The v4 protocol uses persistent channels; it has no channel
+                // reopen/continuation handshake. Once the last channel ends,
+                // close the association promptly instead of retaining a stale
+                // per-IP connection slot while waiting for another channel.
+                if channel_tasks.is_empty() {
+                    break Ok(());
+                }
+                continue;
             }
+            result = connection.accept_data_channel() => result,
         };
-        let state = Arc::clone(&state);
-        tokio::spawn(async move {
-            if let Err(error) = handle_webrtc_channel(channel, state).await {
-                debug!("WebRTC Direct DataChannel ended: {error}");
+        let channel = match accepted {
+            Ok(channel) => channel,
+            Err(error) => break Err(format!("DataChannel accept failed: {error}")),
+        };
+        if channel_tasks.len() >= state.config.max_channels_per_connection {
+            if let Err(error) = channel.close().await {
+                debug!(remote = %remote_addr, %error, "Failed to close excess DataChannel");
+            }
+            break Err("per-connection DataChannel capacity exhausted".to_string());
+        }
+        let Ok(channel_permit) = Arc::clone(&resources.listener.channel_limit).try_acquire_owned()
+        else {
+            if let Err(error) = channel.close().await {
+                debug!(remote = %remote_addr, %error, "Failed to close excess DataChannel");
+            }
+            break Err(CHANNEL_CAPACITY_ERROR.to_string());
+        };
+        let channel_state = Arc::clone(&state);
+        let channel_resources = Arc::clone(&resources);
+        channel_tasks.spawn(async move {
+            let _channel_permit = channel_permit;
+            if let Err(error) =
+                handle_webrtc_channel(&channel, channel_state, channel_resources).await
+            {
+                debug!(remote = %remote_addr, channel = channel.id(), "WebRTC Direct DataChannel ended: {error}");
+            }
+            if let Err(error) = channel.close().await {
+                debug!(remote = %remote_addr, channel = channel.id(), %error, "Failed to close WebRTC Direct DataChannel");
             }
         });
+    };
+
+    if let Err(error) = connection.close().await {
+        debug!(remote = %remote_addr, %error, "Failed to close WebRTC Direct connection");
     }
+    channel_tasks.abort_all();
+    while channel_tasks.join_next().await.is_some() {}
+    outcome
 }
 
+#[allow(clippy::significant_drop_tightening)]
 async fn handle_webrtc_channel(
-    channel: WebRtcDataChannel,
+    channel: &WebRtcDataChannel,
     state: Arc<ServerState>,
+    resources: Arc<ConnectionResources>,
 ) -> ServerResult<()> {
     if channel.label() != DATA_CHANNEL_LABEL {
-        if let Err(error) = channel.close().await {
-            debug!("Failed to close unsupported DataChannel: {error}");
-        }
         return Err(format!(
             "unsupported DataChannel label {:?}",
             channel.label()
         ));
     }
 
-    let mut pq_session = establish_pq_session(&channel, &state).await?;
+    let mut pq_session = establish_pq_session(channel, &state, &resources).await?;
     let mut hello_completed = false;
     loop {
-        let (request, content) =
-            match read_webrtc_request(&channel, state.config.max_request_bytes, &mut pq_session)
-                .await
-            {
-                Ok(request) => request,
-                Err(error)
-                    if matches!(
-                        error.as_str(),
-                        "DataChannel closed" | "request idle timeout" | "request frame timed out"
-                    ) || error.starts_with("PQ session:") =>
-                {
-                    if let Err(close_error) = channel.close().await {
-                        debug!("Failed to close idle WebRTC DataChannel: {close_error}");
-                    }
-                    return Ok(());
-                }
-                Err(error) => {
-                    let response = Response::error(0, "invalid_request", error);
-                    write_webrtc_response(&channel, &mut pq_session, &response, &[]).await?;
-                    return Ok(());
-                }
-            };
+        let admitted = match read_webrtc_request(
+            channel,
+            state.config.max_request_bytes,
+            &mut pq_session,
+            &resources,
+        )
+        .await
+        {
+            Ok(request) => request,
+            Err(error) if is_quiet_channel_close(&error) => return Ok(()),
+            Err(error) => {
+                let response = Response::error(0, "invalid_request", error);
+                write_webrtc_response(channel, &mut pq_session, &response, None, &resources)
+                    .await?;
+                return Ok(());
+            }
+        };
+        let AdmittedRequest {
+            request,
+            content,
+            _request_permit,
+            _in_flight_bytes,
+        } = admitted;
         if request.version != PROTOCOL_VERSION {
             let response = Response::error(
                 request.id,
@@ -400,7 +888,7 @@ async fn handle_webrtc_channel(
                     request.version
                 ),
             );
-            write_webrtc_response(&channel, &mut pq_session, &response, &[]).await?;
+            write_webrtc_response(channel, &mut pq_session, &response, None, &resources).await?;
             continue;
         }
 
@@ -411,69 +899,129 @@ async fn handle_webrtc_channel(
                 "authentication_required",
                 "HELLO must initialize this encrypted WebRTC session first".to_string(),
             );
-            write_webrtc_response(&channel, &mut pq_session, &response, &[]).await?;
+            write_webrtc_response(channel, &mut pq_session, &response, None, &resources).await?;
             continue;
         }
 
-        let (response, content) = process_request(request, content, &state).await;
+        let (response, content) = process_request(request, content, &state, &resources).await?;
         if is_hello && matches!(&response.status, ResponseStatus::Ok) {
             hello_completed = true;
         }
         write_webrtc_response(
-            &channel,
+            channel,
             &mut pq_session,
             &response,
-            content.as_deref().unwrap_or_default(),
+            content.as_ref(),
+            &resources,
         )
         .await?;
     }
 }
 
+fn is_quiet_channel_close(error: &str) -> bool {
+    matches!(
+        error,
+        "DataChannel closed"
+            | "request idle timeout"
+            | "request frame timed out"
+            | REQUEST_CAPACITY_ERROR
+            | REQUEST_RATE_ERROR
+            | GLOBAL_BYTE_CAPACITY_ERROR
+            | SOURCE_BYTE_CAPACITY_ERROR
+    ) || error.starts_with("PQ session:")
+}
+
 async fn establish_pq_session(
     channel: &WebRtcDataChannel,
     state: &ServerState,
+    resources: &ConnectionResources,
 ) -> ServerResult<PqSession> {
-    let client_hello = read_pq_payload(
+    let first_message = receive_first_message(channel, "PQ client hello idle timeout").await?;
+    // The post-quantum handshake is deliberately charged to the same work and
+    // rate envelopes as an RPC. Otherwise a source could churn channels and
+    // force unmetered ML-KEM/ML-DSA work without ever sending a request.
+    let _handshake_permit = resources.try_admit_request()?;
+    let client_hello = read_pq_payload_after_first(
+        first_message,
         channel,
         PQ_CLIENT_HELLO_BYTES,
-        "PQ client hello idle timeout",
         "PQ client hello timed out",
+        resources,
     )
     .await?;
     let peer_id = *state.p2p.peer_id().to_bytes();
     let public_key = state.identity.public_key().as_bytes();
     let (server_accept, session) =
-        accept_pq_session(&client_hello, &peer_id, public_key, |transcript| {
+        accept_pq_session(&client_hello.bytes, &peer_id, public_key, |transcript| {
             state
                 .identity
                 .sign(transcript)
                 .map(|signature| signature.as_bytes().to_vec())
         })
         .map_err(|error| format!("PQ session: {error}"))?;
-    write_pq_payload(channel, &server_accept).await?;
+    write_pq_payload(channel, &server_accept, resources).await?;
     Ok(session)
+}
+
+struct AdmittedRequest {
+    request: Request,
+    content: Vec<u8>,
+    _request_permit: OwnedSemaphorePermit,
+    _in_flight_bytes: InFlightByteReservation,
 }
 
 async fn read_webrtc_request(
     channel: &WebRtcDataChannel,
     max_header_bytes: usize,
     pq_session: &mut PqSession,
-) -> ServerResult<(Request, Vec<u8>)> {
+    resources: &ConnectionResources,
+) -> ServerResult<AdmittedRequest> {
+    let first_message = receive_first_message(channel, "request idle timeout").await?;
+    // Admission happens as soon as a client starts a frame. Idle persistent
+    // channels consume neither request-rate tokens nor request worker slots.
+    let request_permit = resources.try_admit_request()?;
     let max_plaintext_bytes = 4 + max_header_bytes + MAX_CHUNK_SIZE;
-    let encrypted = read_pq_payload(
+    let mut encrypted = read_pq_payload_after_first(
+        first_message,
         channel,
         max_plaintext_bytes + PQ_ENCRYPTED_OVERHEAD_BYTES,
-        "request idle timeout",
         "request frame timed out",
+        resources,
     )
     .await?;
+    let encrypted_len = encrypted.bytes.len();
+    // AEAD opening briefly holds ciphertext and plaintext at once. Reserve the
+    // second buffer before asking the cryptographic layer to allocate it.
+    encrypted.reservation.try_grow(encrypted_len)?;
     let frame = pq_session
-        .open(&encrypted)
+        .open(&encrypted.bytes)
         .map_err(|error| format!("PQ session: {error}"))?;
-    parse_webrtc_request(&frame, max_header_bytes)
+    let TrackedBytes {
+        bytes: encrypted_bytes,
+        mut reservation,
+    } = encrypted;
+    drop(encrypted_bytes);
+    reservation.resize(frame.len())?;
+
+    let (request, content_offset) = parse_webrtc_request(&frame, max_header_bytes)?;
+    let content_len = frame.len() - content_offset;
+    let accounted_request_bytes = frame.len();
+    // serde owns the parsed header and the body copy below owns the content.
+    // Account the copy while the complete plaintext frame is still live, then
+    // retain one frame-sized reservation for the parsed request's lifetime.
+    reservation.try_grow(content_len)?;
+    let content = frame[content_offset..].to_vec();
+    drop(frame);
+    reservation.resize(accounted_request_bytes)?;
+    Ok(AdmittedRequest {
+        request,
+        content,
+        _request_permit: request_permit,
+        _in_flight_bytes: reservation,
+    })
 }
 
-fn parse_webrtc_request(frame: &[u8], max_header_bytes: usize) -> ServerResult<(Request, Vec<u8>)> {
+fn parse_webrtc_request(frame: &[u8], max_header_bytes: usize) -> ServerResult<(Request, usize)> {
     if frame.len() < 4 {
         return Err("request prefix is incomplete".to_string());
     }
@@ -510,66 +1058,102 @@ fn parse_webrtc_request(frame: &[u8], max_header_bytes: usize) -> ServerResult<(
             frame.len()
         ));
     }
-    Ok((request, frame[content_offset..].to_vec()))
+    Ok((request, content_offset))
 }
 
-async fn read_pq_payload(
+async fn receive_first_message(
     channel: &WebRtcDataChannel,
-    max_payload_bytes: usize,
     idle_timeout_message: &str,
-    frame_timeout_message: &str,
 ) -> ServerResult<Vec<u8>> {
-    let first_message = tokio::time::timeout(REQUEST_IDLE_TIMEOUT, channel.receive())
+    let message = tokio::time::timeout(REQUEST_IDLE_TIMEOUT, channel.receive())
         .await
         .map_err(|_| idle_timeout_message.to_string())?
         .map_err(|error| format!("DataChannel message read failed: {error}"))?;
-    if first_message.is_empty() {
+    if message.is_empty() {
         return Err("DataChannel closed".to_string());
     }
+    Ok(message)
+}
+
+async fn read_pq_payload_after_first(
+    first_message: Vec<u8>,
+    channel: &WebRtcDataChannel,
+    max_payload_bytes: usize,
+    frame_timeout_message: &str,
+    resources: &ConnectionResources,
+) -> ServerResult<TrackedBytes> {
     let frame_started = tokio::time::Instant::now();
     let mut frame_deadline = frame_started + transfer_timeout(PQ_FRAME_PREFIX_BYTES);
-    let mut frame = Vec::new();
+    let mut frame = TrackedBytes {
+        reservation: resources.try_reserve_bytes(first_message.len())?,
+        bytes: first_message,
+    };
     let mut expected_length = None;
-    let mut next_message = Some(first_message);
     let max_frame_bytes = 4usize
         .checked_add(max_payload_bytes)
         .ok_or_else(|| "PQ frame limit overflow".to_string())?;
     loop {
-        let message = if let Some(message) = next_message.take() {
-            message
-        } else {
-            tokio::time::timeout_at(frame_deadline, channel.receive())
-                .await
-                .map_err(|_| frame_timeout_message.to_string())?
-                .map_err(|error| format!("DataChannel message read failed: {error}"))?
-        };
-        if message.is_empty() {
-            return Err("DataChannel closed".to_string());
-        }
-        if frame.len() + message.len() > max_frame_bytes {
+        if frame.bytes.len() > max_frame_bytes {
             return Err(format!(
                 "request exceeds the {max_frame_bytes}-byte frame limit"
             ));
         }
-        frame.extend_from_slice(&message);
 
         if expected_length.is_none() {
-            expected_length = pq_frame_length(&frame, max_payload_bytes)
+            expected_length = pq_frame_length(&frame.bytes, max_payload_bytes)
                 .map_err(|error| format!("PQ session: {error}"))?;
             if let Some(length) = expected_length {
+                if frame.bytes.len() > length {
+                    return Err("PQ frame contains bytes after its declared payload".to_string());
+                }
+                // Reserve the complete declared frame before accepting a slow
+                // body. A sender cannot make many partial 4 MiB frames consume
+                // unaccounted memory during their transfer windows.
+                frame.reserve_length(length)?;
                 frame_deadline = frame_started + transfer_timeout(length);
             }
         }
 
         if let Some(length) = expected_length {
-            if frame.len() > length {
-                return Err("PQ frame contains bytes after its declared payload".to_string());
-            }
-            if frame.len() == length {
-                return decode_pq_frame(&frame, max_payload_bytes)
-                    .map_err(|error| format!("PQ session: {error}"));
+            if frame.bytes.len() == length {
+                let payload_len = length - PQ_FRAME_PREFIX_BYTES;
+                frame.reservation.try_grow(payload_len)?;
+                let payload = decode_pq_frame(&frame.bytes, max_payload_bytes)
+                    .map_err(|error| format!("PQ session: {error}"))?;
+                let TrackedBytes {
+                    bytes: encoded_frame,
+                    mut reservation,
+                } = frame;
+                drop(encoded_frame);
+                reservation.resize(payload.len())?;
+                return Ok(TrackedBytes {
+                    bytes: payload,
+                    reservation,
+                });
             }
         }
+
+        let message = tokio::time::timeout_at(frame_deadline, channel.receive())
+            .await
+            .map_err(|_| frame_timeout_message.to_string())?
+            .map_err(|error| format!("DataChannel message read failed: {error}"))?;
+        if message.is_empty() {
+            return Err("DataChannel closed".to_string());
+        }
+        let next_length = frame
+            .bytes
+            .len()
+            .checked_add(message.len())
+            .ok_or_else(|| "PQ frame length overflow".to_string())?;
+        if next_length > max_frame_bytes
+            || expected_length.is_some_and(|length| next_length > length)
+        {
+            return Err("PQ frame contains bytes after its declared payload".to_string());
+        }
+        if expected_length.is_none() {
+            frame.reserve_length(next_length)?;
+        }
+        frame.bytes.extend_from_slice(&message);
     }
 }
 
@@ -577,31 +1161,67 @@ async fn write_webrtc_response(
     channel: &WebRtcDataChannel,
     pq_session: &mut PqSession,
     response: &Response,
-    content: &[u8],
+    content: Option<&TrackedBytes>,
+    resources: &ConnectionResources,
 ) -> ServerResult<()> {
+    // GET content carries its own reservation from before the storage read.
+    // This reservation accounts only the new header, plaintext, and ciphertext
+    // allocations made while encoding the response.
+    let content = content.map_or(&[][..], |tracked| tracked.bytes.as_slice());
+    let mut reservation = resources.try_reserve_bytes(0)?;
     let header = serde_json::to_vec(response)
         .map_err(|error| format!("response JSON serialization failed: {error}"))?;
     if header.len() > MAX_RESPONSE_HEADER_BYTES {
         return Err("response header exceeds protocol limit".to_string());
     }
+    reservation.try_grow(header.len())?;
     let header_len = u32::try_from(header.len())
         .map_err(|_| "response header length does not fit u32".to_string())?;
-    let mut plaintext = Vec::with_capacity(4 + header.len() + content.len());
+    let plaintext_len = 4usize
+        .checked_add(header.len())
+        .and_then(|length| length.checked_add(content.len()))
+        .ok_or_else(|| "response frame length overflow".to_string())?;
+    reservation.try_grow(plaintext_len)?;
+    let mut plaintext = Vec::with_capacity(plaintext_len);
     plaintext.extend_from_slice(&header_len.to_be_bytes());
     plaintext.extend_from_slice(&header);
     plaintext.extend_from_slice(content);
-    let frame = pq_session
+    let encrypted_len = plaintext_len
+        .checked_add(PQ_ENCRYPTED_OVERHEAD_BYTES)
+        .ok_or_else(|| "encrypted response length overflow".to_string())?;
+    reservation.try_grow(encrypted_len)?;
+    let encrypted = pq_session
         .seal(&plaintext)
         .map_err(|error| format!("PQ session: {error}"))?;
-    write_pq_payload(channel, &frame).await
+    drop(plaintext);
+    reservation.resize(content.len() + header.len() + encrypted.len())?;
+    write_framed_pq_payload(channel, &encrypted).await
 }
 
-async fn write_pq_payload(channel: &WebRtcDataChannel, payload: &[u8]) -> ServerResult<()> {
-    let frame = encode_pq_frame(payload).map_err(|error| format!("PQ session: {error}"))?;
-    for chunk in frame.chunks(WEBRTC_WRITE_CHUNK_BYTES) {
-        channel
-            .send(chunk)
+async fn write_pq_payload(
+    channel: &WebRtcDataChannel,
+    payload: &[u8],
+    resources: &ConnectionResources,
+) -> ServerResult<()> {
+    let _reservation = resources.try_reserve_bytes(payload.len())?;
+    write_framed_pq_payload(channel, payload).await
+}
+
+async fn write_framed_pq_payload(channel: &WebRtcDataChannel, payload: &[u8]) -> ServerResult<()> {
+    let payload_len = u32::try_from(payload.len())
+        .map_err(|_| "PQ session: payload length does not fit u32".to_string())?;
+    let framed_len = PQ_FRAME_PREFIX_BYTES
+        .checked_add(payload.len())
+        .ok_or_else(|| "PQ response frame length overflow".to_string())?;
+    let deadline = tokio::time::Instant::now() + transfer_timeout(framed_len);
+    tokio::time::timeout_at(deadline, channel.send(&payload_len.to_be_bytes()))
+        .await
+        .map_err(|_| "response frame timed out".to_string())?
+        .map_err(|error| format!("response message write failed: {error}"))?;
+    for chunk in payload.chunks(WEBRTC_WRITE_CHUNK_BYTES) {
+        tokio::time::timeout_at(deadline, channel.send(chunk))
             .await
+            .map_err(|_| "response frame timed out".to_string())?
             .map_err(|error| format!("response message write failed: {error}"))?;
     }
     Ok(())
@@ -611,21 +1231,22 @@ async fn process_request(
     request: Request,
     content: Vec<u8>,
     state: &ServerState,
-) -> (Response, Option<Vec<u8>>) {
+    resources: &ConnectionResources,
+) -> ServerResult<(Response, Option<TrackedBytes>)> {
     if !matches!(&request.body, RequestBody::PutChunk { .. }) && !content.is_empty() {
-        return (
+        return Ok((
             Response::error(
                 request.id,
                 "unexpected_content",
                 "only put_chunk accepts binary request content".to_string(),
             ),
             None,
-        );
+        ));
     }
     match request.body {
         RequestBody::Hello => {
             let peer_id = state.p2p.peer_id().to_hex();
-            (
+            Ok((
                 Response::ok(
                     request.id,
                     ResponseBody::Hello {
@@ -644,30 +1265,30 @@ async fn process_request(
                     0,
                 ),
                 None,
-            )
+            ))
         }
         RequestBody::FindNode { target, count } => {
-            process_find_node(request.id, target, count, state).await
+            Ok(process_find_node(request.id, target, count, state).await)
         }
-        RequestBody::GetChunk { address } => process_get_chunk(request.id, address, state).await,
+        RequestBody::GetChunk { address } => {
+            process_get_chunk(request.id, address, state, resources).await
+        }
         RequestBody::QuoteChunk { address, size } => {
-            process_quote_chunk(request.id, address, size, state).await
+            Ok(process_quote_chunk(request.id, address, size, state).await)
         }
         RequestBody::PutChunk {
             address,
             quote,
             transaction_hash,
-        } => {
-            process_put_chunk(
-                request.id,
-                address,
-                *quote,
-                transaction_hash,
-                content,
-                state,
-            )
-            .await
-        }
+        } => Ok(process_put_chunk(
+            request.id,
+            address,
+            *quote,
+            transaction_hash,
+            content,
+            state,
+        )
+        .await),
     }
 }
 
@@ -676,7 +1297,7 @@ async fn process_find_node(
     target: String,
     count: Option<usize>,
     state: &ServerState,
-) -> (Response, Option<Vec<u8>>) {
+) -> (Response, Option<TrackedBytes>) {
     let target_bytes = match decode_32_byte_hex(&target) {
         Ok(bytes) => bytes,
         Err(error) => return (Response::error(request_id, "invalid_target", error), None),
@@ -738,26 +1359,34 @@ async fn process_get_chunk(
     request_id: u64,
     address: String,
     state: &ServerState,
-) -> (Response, Option<Vec<u8>>) {
+    resources: &ConnectionResources,
+) -> ServerResult<(Response, Option<TrackedBytes>)> {
     let address_bytes = match decode_32_byte_hex(&address) {
         Ok(bytes) => bytes,
-        Err(error) => return (Response::error(request_id, "invalid_address", error), None),
+        Err(error) => {
+            return Ok((Response::error(request_id, "invalid_address", error), None));
+        }
     };
     let Some(ant_protocol) = state.ant_protocol.as_ref() else {
-        return (
+        return Ok((
             Response::error(
                 request_id,
                 "storage_disabled",
                 "chunk storage is disabled on this node".to_string(),
             ),
             None,
-        );
+        ));
     };
 
-    match ant_protocol.storage().get(&address_bytes).await {
+    // The storage API allocates its returned Vec internally, so reserve the
+    // largest permitted chunk before awaiting it. This closes the interval in
+    // which many concurrent GETs could materialize unaccounted full chunks.
+    let mut content_reservation = resources.try_reserve_bytes(MAX_CHUNK_SIZE)?;
+    let response = match ant_protocol.storage().get(&address_bytes).await {
         Ok(Some(content)) if content.len() <= MAX_CHUNK_SIZE => {
             let content_length = content.len();
-            (
+            content_reservation.resize(content_length)?;
+            Ok((
                 Response::ok(
                     request_id,
                     ResponseBody::Chunk {
@@ -766,10 +1395,13 @@ async fn process_get_chunk(
                     },
                     content_length,
                 ),
-                Some(content),
-            )
+                Some(TrackedBytes {
+                    bytes: content,
+                    reservation: content_reservation,
+                }),
+            ))
         }
-        Ok(Some(content)) => (
+        Ok(Some(content)) => Ok((
             Response::error(
                 request_id,
                 "oversize_chunk",
@@ -779,17 +1411,18 @@ async fn process_get_chunk(
                 ),
             ),
             None,
-        ),
-        Ok(None) => (Response::not_found(request_id, address), None),
-        Err(error) => (
+        )),
+        Ok(None) => Ok((Response::not_found(request_id, address), None)),
+        Err(error) => Ok((
             Response::error(
                 request_id,
                 "storage_error",
                 format!("chunk read failed: {error}"),
             ),
             None,
-        ),
-    }
+        )),
+    };
+    response
 }
 
 async fn process_quote_chunk(
@@ -797,7 +1430,7 @@ async fn process_quote_chunk(
     address: String,
     size: u64,
     state: &ServerState,
-) -> (Response, Option<Vec<u8>>) {
+) -> (Response, Option<TrackedBytes>) {
     let address_bytes = match decode_32_byte_hex(&address) {
         Ok(bytes) => bytes,
         Err(error) => return (Response::error(request_id, "invalid_address", error), None),
@@ -893,7 +1526,7 @@ async fn process_put_chunk(
     transaction_hash: String,
     content: Vec<u8>,
     state: &ServerState,
-) -> (Response, Option<Vec<u8>>) {
+) -> (Response, Option<TrackedBytes>) {
     let address_bytes = match decode_32_byte_hex(&address) {
         Ok(bytes) => bytes,
         Err(error) => return (Response::error(request_id, "invalid_address", error), None),
@@ -1278,9 +1911,245 @@ struct ServerState {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::significant_drop_tightening
+)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_resource_limits_preserve_headroom_for_other_sources() {
+        let config = WebRtcDirectConfig::default();
+        validate_webrtc_config(&config).expect("default resource limits");
+
+        let source_channel_ceiling =
+            config.max_connections_per_ip * config.max_channels_per_connection;
+        assert!(config.max_connections_per_ip < config.max_connections);
+        assert!(source_channel_ceiling < config.max_channels);
+        assert!(source_channel_ceiling < config.max_concurrent_requests);
+        assert!(config.max_requests_per_second_per_ip < config.max_requests_per_second);
+        assert!(config.max_in_flight_bytes_per_ip < config.max_in_flight_bytes);
+    }
+
+    #[test]
+    fn rejects_resource_limits_that_let_one_ip_exhaust_a_global_pool() {
+        let mut config = WebRtcDirectConfig::default();
+        config.max_connections_per_ip = config.max_connections;
+        assert!(validate_webrtc_config(&config).is_err());
+
+        let mut config = WebRtcDirectConfig::default();
+        config.max_channels = config.max_connections_per_ip * config.max_channels_per_connection;
+        assert!(validate_webrtc_config(&config).is_err());
+
+        let mut config = WebRtcDirectConfig::default();
+        config.max_in_flight_bytes_per_ip = config.max_in_flight_bytes;
+        assert!(validate_webrtc_config(&config).is_err());
+    }
+
+    #[test]
+    fn per_ip_connection_limit_cannot_starve_another_source() {
+        let config = WebRtcDirectConfig::default();
+        let resources = ListenerResources::new(&config);
+        let attacker: SocketAddr = "198.51.100.1:1000".parse().expect("attacker address");
+        let honest: SocketAddr = "203.0.113.2:2000".parse().expect("honest address");
+        let mut attacker_admissions = Vec::new();
+
+        for port in 0..config.max_connections_per_ip {
+            let mut address = attacker;
+            address.set_port(u16::try_from(port + 1).expect("test port"));
+            attacker_admissions.push(
+                resources
+                    .try_admit_connection(address)
+                    .expect("source share remains"),
+            );
+        }
+        assert_eq!(attacker_admissions.len(), config.max_connections_per_ip);
+        assert_eq!(
+            resources.try_admit_connection(attacker).err().as_deref(),
+            Some(SOURCE_CONNECTION_CAPACITY_ERROR)
+        );
+        let honest_admission = resources
+            .try_admit_connection(honest)
+            .expect("another source retains listener headroom");
+
+        drop(attacker_admissions.pop());
+        resources
+            .try_admit_connection(attacker)
+            .expect("released source slot is reusable");
+        drop(honest_admission);
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_cannot_bypass_source_accounting() {
+        let config = WebRtcDirectConfig::default();
+        let resources = ListenerResources::new(&config);
+        let v4: SocketAddr = "192.0.2.44:1000".parse().expect("IPv4 address");
+        let mapped: SocketAddr = "[::ffff:192.0.2.44]:2000".parse().expect("mapped address");
+        let mut admissions = vec![resources
+            .try_admit_connection(v4)
+            .expect("first connection")];
+        for _ in 1..config.max_connections_per_ip {
+            admissions.push(
+                resources
+                    .try_admit_connection(mapped)
+                    .expect("mapped source share"),
+            );
+        }
+        assert_eq!(admissions.len(), config.max_connections_per_ip);
+        assert_eq!(
+            resources.try_admit_connection(mapped).err().as_deref(),
+            Some(SOURCE_CONNECTION_CAPACITY_ERROR)
+        );
+    }
+
+    #[test]
+    fn request_token_bucket_refills_without_growing_state() {
+        let mut bucket = RequestRateBucket::new(2);
+        let start = bucket.last_refill;
+        assert!(bucket.allow(start));
+        assert!(bucket.allow(start));
+        assert!(!bucket.allow(start));
+        assert!(bucket.allow(start + Duration::from_millis(500)));
+        assert!(!bucket.allow(start + Duration::from_millis(500)));
+        assert!(bucket.allow(start + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn per_ip_request_rate_leaves_other_sources_admissible() {
+        let config = WebRtcDirectConfig {
+            max_requests_per_second: 4,
+            max_requests_per_second_per_ip: 2,
+            max_requests_per_second_per_connection: 2,
+            ..WebRtcDirectConfig::default()
+        };
+        let resources = ListenerResources::new(&config);
+        let attacker = resources
+            .try_admit_connection("198.51.100.1:1000".parse().expect("attacker"))
+            .expect("attacker connection");
+        let honest = resources
+            .try_admit_connection("203.0.113.2:2000".parse().expect("honest"))
+            .expect("honest connection");
+
+        assert!(attacker.context.try_admit_request().is_ok());
+        assert!(attacker.context.try_admit_request().is_ok());
+        assert_eq!(
+            attacker.context.try_admit_request().err().as_deref(),
+            Some(REQUEST_RATE_ERROR)
+        );
+        assert!(honest.context.try_admit_request().is_ok());
+    }
+
+    #[test]
+    fn reconnecting_does_not_reset_the_source_request_bucket() {
+        let config = WebRtcDirectConfig {
+            max_requests_per_second: 100,
+            max_requests_per_second_per_ip: 1,
+            max_requests_per_second_per_connection: 1,
+            ..WebRtcDirectConfig::default()
+        };
+        let resources = ListenerResources::new(&config);
+        let address = "198.51.100.1:1000".parse().expect("source");
+        let first = resources
+            .try_admit_connection(address)
+            .expect("first connection");
+        assert!(first.context.try_admit_request().is_ok());
+        drop(first);
+
+        let replacement = resources
+            .try_admit_connection(address)
+            .expect("replacement connection");
+        assert_eq!(
+            replacement.context.try_admit_request().err().as_deref(),
+            Some(REQUEST_RATE_ERROR)
+        );
+    }
+
+    #[test]
+    fn inactive_source_rate_state_has_a_hard_bound() {
+        let config = WebRtcDirectConfig::default();
+        let resources = ListenerResources::new(&config);
+        for index in 0..resources.max_tracked_sources + 10 {
+            let third = u8::try_from(index / 254).expect("third octet");
+            let host = u8::try_from(index % 254 + 1).expect("host octet");
+            let address = SocketAddr::from((Ipv4Addr::new(198, 51, third, host), 1000));
+            drop(
+                resources
+                    .try_admit_connection(address)
+                    .expect("sequential source"),
+            );
+        }
+        assert_eq!(
+            resources.source_state.lock().sources.len(),
+            resources.max_tracked_sources
+        );
+    }
+
+    #[test]
+    fn byte_reservations_are_per_source_global_and_raii_released() {
+        let config = WebRtcDirectConfig {
+            max_in_flight_bytes: 256,
+            max_in_flight_bytes_per_ip: 128,
+            ..WebRtcDirectConfig::default()
+        };
+        let resources = ListenerResources::new(&config);
+        let attacker = resources
+            .try_admit_connection("198.51.100.1:1000".parse().expect("attacker"))
+            .expect("attacker connection");
+        let honest = resources
+            .try_admit_connection("203.0.113.2:2000".parse().expect("honest"))
+            .expect("honest connection");
+
+        let attacker_bytes = attacker
+            .context
+            .try_reserve_bytes(128)
+            .expect("attacker source budget");
+        assert_eq!(resources.global_bytes.in_use(), 128);
+        assert_eq!(
+            attacker.context.try_reserve_bytes(1).err().as_deref(),
+            Some(SOURCE_BYTE_CAPACITY_ERROR)
+        );
+        let honest_bytes = honest
+            .context
+            .try_reserve_bytes(64)
+            .expect("another source retains byte headroom");
+        assert_eq!(resources.global_bytes.in_use(), 192);
+
+        drop(attacker_bytes);
+        drop(honest_bytes);
+        assert_eq!(resources.global_bytes.in_use(), 0);
+        assert_eq!(attacker.context.source.bytes.in_use(), 0);
+        assert_eq!(honest.context.source.bytes.in_use(), 0);
+    }
+
+    #[test]
+    fn global_byte_rejection_rolls_back_the_source_reservation() {
+        let config = WebRtcDirectConfig {
+            max_in_flight_bytes: 100,
+            max_in_flight_bytes_per_ip: 90,
+            ..WebRtcDirectConfig::default()
+        };
+        let resources = ListenerResources::new(&config);
+        let first = resources
+            .try_admit_connection("198.51.100.1:1000".parse().expect("first"))
+            .expect("first connection");
+        let second = resources
+            .try_admit_connection("203.0.113.2:2000".parse().expect("second"))
+            .expect("second connection");
+        let _first_bytes = first
+            .context
+            .try_reserve_bytes(60)
+            .expect("first reservation");
+
+        assert_eq!(
+            second.context.try_reserve_bytes(50).err().as_deref(),
+            Some(GLOBAL_BYTE_CAPACITY_ERROR)
+        );
+        assert_eq!(second.context.source.bytes.in_use(), 0);
+        assert_eq!(resources.global_bytes.in_use(), 60);
+    }
 
     #[test]
     fn derives_stable_high_port_from_native_port() {
