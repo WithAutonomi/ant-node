@@ -184,6 +184,50 @@ pub struct WebRtcDirectConfig {
     #[serde(default = "default_webrtc_direct_max_connections")]
     pub max_connections: usize,
 
+    /// Maximum simultaneously accepted browser sessions from one source IP.
+    ///
+    /// This must be lower than [`Self::max_connections`] so one public source
+    /// cannot occupy every listener slot.
+    #[serde(default = "default_webrtc_direct_max_connections_per_ip")]
+    pub max_connections_per_ip: usize,
+
+    /// Maximum simultaneously active `DataChannels` on one browser session.
+    #[serde(default = "default_webrtc_direct_max_channels_per_connection")]
+    pub max_channels_per_connection: usize,
+
+    /// Maximum simultaneously active `DataChannels` across the listener.
+    ///
+    /// Every admitted channel owns one handler task, so this is also the hard
+    /// global channel-task bound.
+    #[serde(default = "default_webrtc_direct_max_channels")]
+    pub max_channels: usize,
+
+    /// Maximum requests being read or processed across the listener.
+    #[serde(default = "default_webrtc_direct_max_concurrent_requests")]
+    pub max_concurrent_requests: usize,
+
+    /// Token-bucket request rate across the listener, in requests per second.
+    #[serde(default = "default_webrtc_direct_max_requests_per_second")]
+    pub max_requests_per_second: usize,
+
+    /// Token-bucket request rate for one source IP, in requests per second.
+    #[serde(default = "default_webrtc_direct_max_requests_per_second_per_ip")]
+    pub max_requests_per_second_per_ip: usize,
+
+    /// Token-bucket request rate for one browser session, in requests per
+    /// second.
+    #[serde(default = "default_webrtc_direct_max_requests_per_second_per_connection")]
+    pub max_requests_per_second_per_connection: usize,
+
+    /// Maximum bytes reserved by frames being assembled, decrypted, or sent
+    /// across the listener.
+    #[serde(default = "default_webrtc_direct_max_in_flight_bytes")]
+    pub max_in_flight_bytes: usize,
+
+    /// Maximum in-flight frame bytes attributable to one source IP.
+    #[serde(default = "default_webrtc_direct_max_in_flight_bytes_per_ip")]
+    pub max_in_flight_bytes_per_ip: usize,
+
     /// Maximum JSON request-header size, in bytes.
     ///
     /// Binary PUT content has a separate [`crate::ant_protocol::MAX_CHUNK_SIZE`]
@@ -200,6 +244,16 @@ impl Default for WebRtcDirectConfig {
             advertised_addr: None,
             certificate_path: None,
             max_connections: default_webrtc_direct_max_connections(),
+            max_connections_per_ip: default_webrtc_direct_max_connections_per_ip(),
+            max_channels_per_connection: default_webrtc_direct_max_channels_per_connection(),
+            max_channels: default_webrtc_direct_max_channels(),
+            max_concurrent_requests: default_webrtc_direct_max_concurrent_requests(),
+            max_requests_per_second: default_webrtc_direct_max_requests_per_second(),
+            max_requests_per_second_per_ip: default_webrtc_direct_max_requests_per_second_per_ip(),
+            max_requests_per_second_per_connection:
+                default_webrtc_direct_max_requests_per_second_per_connection(),
+            max_in_flight_bytes: default_webrtc_direct_max_in_flight_bytes(),
+            max_in_flight_bytes_per_ip: default_webrtc_direct_max_in_flight_bytes_per_ip(),
             max_request_bytes: default_webrtc_direct_max_request_bytes(),
         }
     }
@@ -211,6 +265,42 @@ fn default_webrtc_direct_bind() -> SocketAddr {
 
 const fn default_webrtc_direct_max_connections() -> usize {
     32
+}
+
+const fn default_webrtc_direct_max_connections_per_ip() -> usize {
+    4
+}
+
+const fn default_webrtc_direct_max_channels_per_connection() -> usize {
+    2
+}
+
+const fn default_webrtc_direct_max_channels() -> usize {
+    32
+}
+
+const fn default_webrtc_direct_max_concurrent_requests() -> usize {
+    16
+}
+
+const fn default_webrtc_direct_max_requests_per_second() -> usize {
+    256
+}
+
+const fn default_webrtc_direct_max_requests_per_second_per_ip() -> usize {
+    32
+}
+
+const fn default_webrtc_direct_max_requests_per_second_per_connection() -> usize {
+    16
+}
+
+const fn default_webrtc_direct_max_in_flight_bytes() -> usize {
+    64 * 1024 * 1024
+}
+
+const fn default_webrtc_direct_max_in_flight_bytes_per_ip() -> usize {
+    16 * 1024 * 1024
 }
 
 const fn default_webrtc_direct_max_request_bytes() -> usize {

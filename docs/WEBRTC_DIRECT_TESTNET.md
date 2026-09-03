@@ -149,6 +149,33 @@ secret key material. To disable the listener in a custom node configuration,
 set `webrtc_direct.enabled = false`. A minimal binary can omit the transport
 entirely with `--no-default-features`.
 
+Public listeners apply an independent resource envelope; the native QUIC
+limits are not shared with browser traffic. The defaults are:
+
+| Setting | Default | Scope |
+|---|---:|---|
+| `max_connections` | 32 | listener |
+| `max_connections_per_ip` | 4 | source IP |
+| `max_channels_per_connection` | 2 | association |
+| `max_channels` | 32 | listener and channel-handler tasks |
+| `max_concurrent_requests` | 16 | listener work slots |
+| `max_requests_per_second` | 256 | listener work token bucket |
+| `max_requests_per_second_per_ip` | 32 | source-IP work token bucket |
+| `max_requests_per_second_per_connection` | 16 | association work token bucket |
+| `max_in_flight_bytes` | 64 MiB | listener frame memory |
+| `max_in_flight_bytes_per_ip` | 16 MiB | source-IP frame memory |
+| `max_request_bytes` | 64 KiB | JSON request header |
+
+The per-IP ceilings must remain strictly below their corresponding global
+ceilings. The product of the per-IP connection and per-connection channel
+limits must also remain below both global channel and request concurrency.
+Invalid combinations fail node startup instead of silently removing the
+headroom reserved for other clients. IPv4-mapped IPv6 sources share the IPv4
+source's quota. Rate buckets permit a one-second burst; overload closes the
+offending channel or association without queueing more handler tasks. PQ
+handshakes consume the same work slots and rate tokens as RPCs, and response
+writes use size-scaled deadlines so slow readers release their reservations.
+
 Each node publishes its certificate-pinned WebRTC Direct multiaddress through
 Saorsa's extensible V2 address plane as transport `WebRtcDirect`, independently
 of its reachability class. Its signed identity capability selects V2 when the
