@@ -1022,7 +1022,7 @@ impl Devnet {
                     .as_ref()
                     .unwrap_or(&EvmNetwork::ArbitrumOne),
                 self.shutdown.clone(),
-                Arc::clone(&self.browser_endpoint_catalog),
+                Some(Arc::clone(&self.browser_endpoint_catalog)),
             )
             .await
             .map_err(|error| {
