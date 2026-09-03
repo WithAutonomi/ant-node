@@ -31,7 +31,9 @@ use tokio_util::sync::CancellationToken;
 #[cfg(feature = "webrtc-direct")]
 use crate::ant_protocol::{ChunkMessage, ChunkMessageBody, ChunkPutRequest, ChunkPutResponse};
 #[cfg(feature = "webrtc-direct")]
-use crate::browser::{BrowserBootstrapNode, BrowserPaymentNetwork, BrowserPublicFile};
+use crate::browser::{
+    browser_payment_network, BrowserBootstrapNode, BrowserPaymentNetwork, BrowserPublicFile,
+};
 #[cfg(feature = "webrtc-direct")]
 use crate::config::WebRtcDirectConfig;
 #[cfg(feature = "webrtc-direct")]
@@ -671,7 +673,7 @@ impl Devnet {
             .evm_network
             .as_ref()
             .unwrap_or(&EvmNetwork::ArbitrumOne);
-        BrowserPaymentNetwork::from_evm_network(network)
+        browser_payment_network(network)
     }
 
     #[cfg(feature = "webrtc-direct")]

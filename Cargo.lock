@@ -879,8 +879,9 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "2.3.1"
-source = "git+https://github.com/WithAutonomi/ant-protocol.git?rev=4dad14b6947b6264e0b5982c976a385f9fdac9e0#4dad14b6947b6264e0b5982c976a385f9fdac9e0"
+source = "git+https://github.com/WithAutonomi/ant-protocol.git?rev=c50488c64d349dc7619486d8a68c8342a3508413#c50488c64d349dc7619486d8a68c8342a3508413"
 dependencies = [
+ "base64",
  "blake3",
  "bytes",
  "chacha20poly1305",
@@ -893,6 +894,9 @@ dependencies = [
  "saorsa-core",
  "saorsa-pqc 0.5.1",
  "serde",
+ "serde_bytes",
+ "serde_json",
+ "thiserror 2.0.18",
  "tiny-keccak",
  "tokio",
  "tracing",
@@ -5590,6 +5594,16 @@ checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
 dependencies = [
  "serde_core",
  "serde_derive",
+]
+
+[[package]]
+name = "serde_bytes"
+version = "0.11.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5d440709e79d88e51ac01c4b72fc6cb7314017bb7da9eeff678aa94c10e3ea8"
+dependencies = [
+ "serde",
+ "serde_core",
 ]
 
 [[package]]

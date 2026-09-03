@@ -9,15 +9,21 @@ use crate::ant_protocol::{
     ChunkMessage, ChunkMessageBody, ChunkPutRequest, ChunkPutResponse, ChunkQuoteRequest,
     ChunkQuoteResponse, MAX_CHUNK_SIZE,
 };
-use crate::browser::{BrowserEndpoint, BrowserPaymentNetwork};
+use crate::browser::{browser_payment_network, BrowserEndpoint, BrowserPaymentNetwork};
 use crate::config::WebRtcDirectConfig;
 use crate::error::{Error, Result};
 use crate::logging::{debug, info, warn};
 use crate::payment::{serialize_single_node_proof, PaymentProof};
 use crate::storage::AntProtocol;
 use ant_protocol::web_rtc::{
-    accept_pq_session, decode_pq_frame, pq_frame_length, transfer_timeout, PqSession,
-    PQ_CLIENT_HELLO_BYTES, PQ_ENCRYPTED_OVERHEAD_BYTES, PQ_FRAME_PREFIX_BYTES,
+    accept_pq_session, decode_pq_frame, encode_response_frame, parse_request_header,
+    pq_frame_length, transfer_timeout, BrowserCommitmentArtifact, BrowserNode,
+    BrowserQuoteArtifact, BrowserRequest as Request, BrowserRequestBody as RequestBody,
+    BrowserResponse as Response, BrowserResponseBody as ResponseBody,
+    BrowserResponseStatus as ResponseStatus, PqSession, BROWSER_PROTOCOL_NAME,
+    BROWSER_PROTOCOL_VERSION, MAX_BROWSER_HEADER_BYTES, PQ_CLIENT_HELLO_BYTES,
+    PQ_ENCRYPTED_OVERHEAD_BYTES, PQ_FRAME_PREFIX_BYTES, WEBRTC_DIRECT_DATA_CHANNEL,
+    WEBRTC_WRITE_CHUNK_BYTES,
 };
 use evmlib::common::{Amount, TxHash};
 use evmlib::{EncodedPeerId, PaymentQuote, ProofOfPayment, RewardsAddress};
@@ -26,9 +32,7 @@ use saorsa_core::identity::NodeIdentity;
 use saorsa_core::{DHTNode, MultiAddr, P2PNode, PeerId};
 use saorsa_transport::webrtc_direct::{
     WebRtcCertificate, WebRtcDataChannel, WebRtcDirectConnection, WebRtcDirectListener,
-    MAX_DATA_CHANNEL_MESSAGE_SIZE,
 };
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
@@ -40,14 +44,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
-const PROTOCOL_VERSION: u16 = 4;
-const PROTOCOL_NAME: &str = "autonomi.web.poc.v4";
-const DATA_CHANNEL_LABEL: &str = "autonomi.web.v4";
 const MAX_FIND_NODE_RESULTS: usize = 20;
-const MAX_RESPONSE_HEADER_BYTES: usize = 64 * 1024;
 const REQUEST_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-const WEBRTC_WRITE_CHUNK_BYTES: usize = MAX_DATA_CHANNEL_MESSAGE_SIZE;
 const AUTOMATIC_PORT_MIN: u32 = 32_768;
 const AUTOMATIC_PORT_COUNT: u32 = 65_536 - AUTOMATIC_PORT_MIN;
 const TRACKED_SOURCE_MULTIPLIER: usize = 4;
@@ -507,8 +506,14 @@ pub async fn spawn(
     let advertised_addr = advertised_addr(config, local_addr)?;
     let peer_id = *p2p.peer_id();
     let identity = Arc::clone(p2p.transport().node_identity());
-    let browser_endpoint = BrowserEndpoint::new(advertised_addr, &peer_id, certificate_sha256)
-        .map_err(Error::Config)?;
+    let browser_endpoint =
+        BrowserEndpoint::new(advertised_addr, peer_id.to_bytes(), certificate_sha256)
+            .map_err(|error| Error::Config(error.to_string()))?;
+    let supplemental_endpoint = browser_endpoint.multiaddr.parse().map_err(|error| {
+        Error::Startup(format!(
+            "shared WebRTC endpoint codec produced an invalid transport address: {error}"
+        ))
+    })?;
     persist_browser_endpoint(root_dir, &browser_endpoint).await?;
     if let Some(catalog) = endpoint_catalog.as_ref() {
         catalog.insert(peer_id, browser_endpoint.clone());
@@ -518,7 +523,7 @@ pub async fn spawn(
         identity,
         p2p: Arc::clone(&p2p),
         ant_protocol,
-        payment: BrowserPaymentNetwork::from_evm_network(evm_network),
+        payment: browser_payment_network(evm_network),
         endpoint: browser_endpoint.clone(),
         endpoint_catalog,
     });
@@ -533,7 +538,7 @@ pub async fn spawn(
 
     let task = tokio::spawn(serve_webrtc(listener, state, resources, shutdown));
     p2p.dht_manager()
-        .set_supplemental_self_addresses(vec![browser_endpoint.multiaddr.clone()])
+        .set_supplemental_self_addresses(vec![supplemental_endpoint])
         .await;
     Ok(WebRtcDirectServer {
         endpoint: browser_endpoint,
@@ -633,9 +638,9 @@ fn validate_webrtc_config(config: &WebRtcDirectConfig) -> Result<()> {
                 .to_string(),
         ));
     }
-    if config.max_request_bytes == 0 || config.max_request_bytes > MAX_RESPONSE_HEADER_BYTES {
+    if config.max_request_bytes == 0 || config.max_request_bytes > MAX_BROWSER_HEADER_BYTES {
         return Err(Error::Config(format!(
-            "webrtc_direct.max_request_bytes must be between 1 and {MAX_RESPONSE_HEADER_BYTES}"
+            "webrtc_direct.max_request_bytes must be between 1 and {MAX_BROWSER_HEADER_BYTES}"
         )));
     }
     if config.advertised_addr.is_some_and(|addr| addr.port() == 0) {
@@ -844,7 +849,7 @@ async fn handle_webrtc_channel(
     state: Arc<ServerState>,
     resources: Arc<ConnectionResources>,
 ) -> ServerResult<()> {
-    if channel.label() != DATA_CHANNEL_LABEL {
+    if channel.label() != WEBRTC_DIRECT_DATA_CHANNEL {
         return Err(format!(
             "unsupported DataChannel label {:?}",
             channel.label()
@@ -877,12 +882,12 @@ async fn handle_webrtc_channel(
             _request_permit,
             _in_flight_bytes,
         } = admitted;
-        if request.version != PROTOCOL_VERSION {
+        if request.version != BROWSER_PROTOCOL_VERSION {
             let response = Response::error(
-                request.id,
+                request.request_id,
                 "unsupported_version",
                 format!(
-                    "protocol version {} is unsupported; expected {PROTOCOL_VERSION}",
+                    "protocol version {} is unsupported; expected {BROWSER_PROTOCOL_VERSION}",
                     request.version
                 ),
             );
@@ -893,7 +898,7 @@ async fn handle_webrtc_channel(
         let is_hello = matches!(&request.body, RequestBody::Hello);
         if !is_hello && !hello_completed {
             let response = Response::error(
-                request.id,
+                request.request_id,
                 "authentication_required",
                 "HELLO must initialize this encrypted WebRTC session first".to_string(),
             );
@@ -1001,7 +1006,8 @@ async fn read_webrtc_request(
     drop(encrypted_bytes);
     reservation.resize(frame.len())?;
 
-    let (request, content_offset) = parse_webrtc_request(&frame, max_header_bytes)?;
+    let (request, content_offset) =
+        parse_request_header(&frame, max_header_bytes).map_err(|error| error.to_string())?;
     let content_len = frame.len() - content_offset;
     let accounted_request_bytes = frame.len();
     // serde owns the parsed header and the body copy below owns the content.
@@ -1017,46 +1023,6 @@ async fn read_webrtc_request(
         _request_permit: request_permit,
         _in_flight_bytes: reservation,
     })
-}
-
-fn parse_webrtc_request(frame: &[u8], max_header_bytes: usize) -> ServerResult<(Request, usize)> {
-    if frame.len() < 4 {
-        return Err("request prefix is incomplete".to_string());
-    }
-    let header_len = u32::from_be_bytes(
-        frame[..4]
-            .try_into()
-            .map_err(|_| "request prefix is incomplete".to_string())?,
-    ) as usize;
-    if header_len == 0 || header_len > max_header_bytes {
-        return Err(format!(
-            "request header length {header_len} is outside 1..={max_header_bytes}"
-        ));
-    }
-    let content_offset = 4usize
-        .checked_add(header_len)
-        .ok_or_else(|| "request header length overflow".to_string())?;
-    if frame.len() < content_offset {
-        return Err("request JSON is truncated".to_string());
-    }
-    let request: Request = serde_json::from_slice(&frame[4..content_offset])
-        .map_err(|error| format!("request JSON is invalid: {error}"))?;
-    if request.content_length > MAX_CHUNK_SIZE {
-        return Err(format!(
-            "request content length {} exceeds {MAX_CHUNK_SIZE}",
-            request.content_length
-        ));
-    }
-    let expected_length = content_offset
-        .checked_add(request.content_length)
-        .ok_or_else(|| "request frame length overflow".to_string())?;
-    if frame.len() != expected_length {
-        return Err(format!(
-            "request contains {} bytes; declared {expected_length}",
-            frame.len()
-        ));
-    }
-    Ok((request, content_offset))
 }
 
 async fn receive_first_message(
@@ -1166,25 +1132,15 @@ async fn write_webrtc_response(
     // This reservation accounts only the new header, plaintext, and ciphertext
     // allocations made while encoding the response.
     let content = content.map_or(&[][..], |tracked| tracked.bytes.as_slice());
-    let mut reservation = resources.try_reserve_bytes(0)?;
-    let header = serde_json::to_vec(response)
-        .map_err(|error| format!("response JSON serialization failed: {error}"))?;
-    if header.len() > MAX_RESPONSE_HEADER_BYTES {
-        return Err("response header exceeds protocol limit".to_string());
-    }
-    reservation.try_grow(header.len())?;
-    let header_len = u32::try_from(header.len())
-        .map_err(|_| "response header length does not fit u32".to_string())?;
-    let plaintext_len = 4usize
-        .checked_add(header.len())
+    let encode_reservation = 4usize
+        .checked_add(MAX_BROWSER_HEADER_BYTES.saturating_mul(2))
         .and_then(|length| length.checked_add(content.len()))
         .ok_or_else(|| "response frame length overflow".to_string())?;
-    reservation.try_grow(plaintext_len)?;
-    let mut plaintext = Vec::with_capacity(plaintext_len);
-    plaintext.extend_from_slice(&header_len.to_be_bytes());
-    plaintext.extend_from_slice(&header);
-    plaintext.extend_from_slice(content);
-    let encrypted_len = plaintext_len
+    let mut reservation = resources.try_reserve_bytes(encode_reservation)?;
+    let plaintext = encode_response_frame(response, content).map_err(|error| error.to_string())?;
+    reservation.resize(plaintext.len())?;
+    let encrypted_len = plaintext
+        .len()
         .checked_add(PQ_ENCRYPTED_OVERHEAD_BYTES)
         .ok_or_else(|| "encrypted response length overflow".to_string())?;
     reservation.try_grow(encrypted_len)?;
@@ -1192,7 +1148,7 @@ async fn write_webrtc_response(
         .seal(&plaintext)
         .map_err(|error| format!("PQ session: {error}"))?;
     drop(plaintext);
-    reservation.resize(content.len() + header.len() + encrypted.len())?;
+    reservation.resize(content.len() + encrypted.len())?;
     write_framed_pq_payload(channel, &encrypted).await
 }
 
@@ -1234,7 +1190,7 @@ async fn process_request(
     if !matches!(&request.body, RequestBody::PutChunk { .. }) && !content.is_empty() {
         return Ok((
             Response::error(
-                request.id,
+                request.request_id,
                 "unexpected_content",
                 "only put_chunk accepts binary request content".to_string(),
             ),
@@ -1246,9 +1202,9 @@ async fn process_request(
             let peer_id = state.p2p.peer_id().to_hex();
             Ok((
                 Response::ok(
-                    request.id,
+                    request.request_id,
                     ResponseBody::Hello {
-                        protocol: PROTOCOL_NAME.to_string(),
+                        protocol: BROWSER_PROTOCOL_NAME.to_string(),
                         peer_id,
                         max_chunk_size: MAX_CHUNK_SIZE,
                         endpoint: state.endpoint.clone(),
@@ -1266,20 +1222,20 @@ async fn process_request(
             ))
         }
         RequestBody::FindNode { target, count } => {
-            Ok(process_find_node(request.id, target, count, state).await)
+            Ok(process_find_node(request.request_id, target, count, state).await)
         }
         RequestBody::GetChunk { address } => {
-            process_get_chunk(request.id, address, state, resources).await
+            process_get_chunk(request.request_id, address, state, resources).await
         }
         RequestBody::QuoteChunk { address, size } => {
-            Ok(process_quote_chunk(request.id, address, size, state).await)
+            Ok(process_quote_chunk(request.request_id, address, size, state).await)
         }
         RequestBody::PutChunk {
             address,
             quote,
             transaction_hash,
         } => Ok(process_put_chunk(
-            request.id,
+            request.request_id,
             address,
             *quote,
             transaction_hash,
@@ -1335,7 +1291,9 @@ fn browser_node_from_dht(
                 && address.peer_id().is_some_and(|peer| peer == &node.peer_id)
         })
         .cloned()
-        .map(|multiaddr| BrowserEndpoint { multiaddr });
+        .map(|multiaddr| BrowserEndpoint {
+            multiaddr: multiaddr.to_string(),
+        });
     BrowserNode {
         webrtc_direct: discovered_endpoint
             .or_else(|| endpoint_catalog.and_then(|catalog| catalog.get(&node.peer_id))),
@@ -1477,7 +1435,7 @@ async fn process_quote_chunk(
                     )
                 }
             };
-            let artifact = match BrowserQuoteArtifact::from_quote(
+            let artifact = match browser_quote_from_quote(
                 state.p2p.peer_id(),
                 &quote,
                 commitment.as_deref(),
@@ -1604,7 +1562,8 @@ fn build_payment_proof(
     quote: BrowserQuoteArtifact,
     transaction_hash: &str,
 ) -> ServerResult<Vec<u8>> {
-    let (peer_id, payment_quote, commitment) = quote.into_payment_quote(expected_content)?;
+    let (peer_id, payment_quote, commitment) =
+        payment_quote_from_browser_quote(quote, expected_content)?;
     let transaction_hash = TxHash::from_str(transaction_hash)
         .map_err(|error| format!("invalid EVM transaction hash: {error}"))?;
     let proof = PaymentProof {
@@ -1644,254 +1603,92 @@ fn decode_32_byte_hex(value: &str) -> ServerResult<[u8; 32]> {
 
 type ServerResult<T> = std::result::Result<T, String>;
 
-#[derive(Debug, Deserialize)]
-struct Request {
-    version: u16,
-    #[serde(rename = "request_id")]
-    id: u64,
-    content_length: usize,
-    #[serde(flatten)]
-    body: RequestBody,
+fn browser_quote_from_quote(
+    peer_id: &PeerId,
+    quote: &PaymentQuote,
+    commitment: Option<&[u8]>,
+) -> ServerResult<BrowserQuoteArtifact> {
+    let timestamp_secs = quote
+        .timestamp
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|error| format!("quote timestamp predates the Unix epoch: {error}"))?
+        .as_secs();
+    let commitment = commitment.map(browser_commitment_from_bytes).transpose()?;
+    Ok(BrowserQuoteArtifact {
+        peer_id: peer_id.to_hex(),
+        content: hex::encode(quote.content.0),
+        timestamp_secs,
+        price: quote.price.to_string(),
+        rewards_address: format!("{:?}", quote.rewards_address),
+        public_key: hex::encode(&quote.pub_key),
+        signature: hex::encode(&quote.signature),
+        committed_key_count: quote.committed_key_count,
+        commitment_pin: quote.commitment_pin.map(hex::encode),
+        quote_hash: hex::encode(quote.hash()),
+        commitment,
+    })
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum RequestBody {
-    Hello,
-    FindNode {
-        target: String,
-        #[serde(default)]
-        count: Option<usize>,
-    },
-    GetChunk {
-        address: String,
-    },
-    QuoteChunk {
-        address: String,
-        size: u64,
-    },
-    PutChunk {
-        address: String,
-        quote: Box<BrowserQuoteArtifact>,
-        transaction_hash: String,
-    },
-}
-
-#[derive(Debug, Serialize)]
-struct Response {
-    version: u16,
-    request_id: u64,
-    status: ResponseStatus,
-    content_length: usize,
-    #[serde(flatten)]
-    body: ResponseBody,
-}
-
-impl Response {
-    fn ok(request_id: u64, body: ResponseBody, content_length: usize) -> Self {
-        Self {
-            version: PROTOCOL_VERSION,
-            request_id,
-            status: ResponseStatus::Ok,
-            content_length,
-            body,
-        }
+fn payment_quote_from_browser_quote(
+    artifact: BrowserQuoteArtifact,
+    expected_content: [u8; 32],
+) -> ServerResult<([u8; 32], PaymentQuote, Option<Vec<u8>>)> {
+    let peer_id = decode_32_byte_hex(&artifact.peer_id)?;
+    let content = decode_32_byte_hex(&artifact.content)?;
+    if content != expected_content {
+        return Err("payment quote is for a different chunk address".to_string());
     }
-
-    fn not_found(request_id: u64, address: String) -> Self {
-        Self {
-            version: PROTOCOL_VERSION,
-            request_id,
-            status: ResponseStatus::NotFound,
-            content_length: 0,
-            body: ResponseBody::ChunkNotFound { address },
-        }
+    let price = Amount::from_str(&artifact.price)
+        .map_err(|error| format!("payment quote has an invalid price: {error}"))?;
+    let rewards_address = RewardsAddress::from_str(&artifact.rewards_address)
+        .map_err(|error| format!("payment quote has an invalid rewards address: {error}"))?;
+    let public_key = hex::decode(&artifact.public_key)
+        .map_err(|error| format!("payment quote public key is not hexadecimal: {error}"))?;
+    let signature = hex::decode(&artifact.signature)
+        .map_err(|error| format!("payment quote signature is not hexadecimal: {error}"))?;
+    let commitment_pin = artifact
+        .commitment_pin
+        .as_deref()
+        .map(decode_32_byte_hex)
+        .transpose()?;
+    let timestamp = SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_secs(artifact.timestamp_secs))
+        .ok_or_else(|| "payment quote timestamp is out of range".to_string())?;
+    let quote = PaymentQuote {
+        content: xor_name::XorName(content),
+        timestamp,
+        price,
+        rewards_address,
+        pub_key: public_key,
+        signature,
+        committed_key_count: artifact.committed_key_count,
+        commitment_pin,
+    };
+    if hex::encode(quote.hash()) != artifact.quote_hash.to_ascii_lowercase() {
+        return Err("payment quote hash does not match its signed fields".to_string());
     }
-
-    fn error(request_id: u64, code: &str, message: String) -> Self {
-        Self {
-            version: PROTOCOL_VERSION,
-            request_id,
-            status: ResponseStatus::Error,
-            content_length: 0,
-            body: ResponseBody::Error {
-                code: code.to_string(),
-                message,
-            },
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum ResponseStatus {
-    Ok,
-    NotFound,
-    Error,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ResponseBody {
-    Hello {
-        protocol: String,
-        peer_id: String,
-        max_chunk_size: usize,
-        endpoint: BrowserEndpoint,
-        payment: BrowserPaymentNetwork,
-        capabilities: Vec<String>,
-    },
-    Nodes {
-        target: String,
-        nodes: Vec<BrowserNode>,
-    },
-    Chunk {
-        address: String,
-        size: usize,
-    },
-    ChunkNotFound {
-        address: String,
-    },
-    StorageQuote {
-        address: String,
-        already_stored: bool,
-        quote: BrowserQuoteArtifact,
-    },
-    ChunkStored {
-        address: String,
-        already_stored: bool,
-    },
-    Error {
-        code: String,
-        message: String,
-    },
-}
-
-#[derive(Debug, Serialize)]
-struct BrowserNode {
-    peer_id: String,
-    native_addresses: Vec<String>,
-    reliability: f64,
-    webrtc_direct: Option<BrowserEndpoint>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BrowserQuoteArtifact {
-    peer_id: String,
-    content: String,
-    timestamp_secs: u64,
-    price: String,
-    rewards_address: String,
-    public_key: String,
-    signature: String,
-    committed_key_count: u32,
-    commitment_pin: Option<String>,
-    quote_hash: String,
-    commitment: Option<BrowserCommitmentArtifact>,
-}
-
-impl BrowserQuoteArtifact {
-    fn from_quote(
-        peer_id: &PeerId,
-        quote: &PaymentQuote,
-        commitment: Option<&[u8]>,
-    ) -> ServerResult<Self> {
-        let timestamp_secs = quote
-            .timestamp
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_err(|error| format!("quote timestamp predates the Unix epoch: {error}"))?
-            .as_secs();
-        let commitment = commitment
-            .map(BrowserCommitmentArtifact::from_bytes)
-            .transpose()?;
-        Ok(Self {
-            peer_id: peer_id.to_hex(),
-            content: hex::encode(quote.content.0),
-            timestamp_secs,
-            price: quote.price.to_string(),
-            rewards_address: format!("{:?}", quote.rewards_address),
-            public_key: hex::encode(&quote.pub_key),
-            signature: hex::encode(&quote.signature),
-            committed_key_count: quote.committed_key_count,
-            commitment_pin: quote.commitment_pin.map(hex::encode),
-            quote_hash: hex::encode(quote.hash()),
-            commitment,
+    let commitment = artifact
+        .commitment
+        .map(|artifact| {
+            hex::decode(artifact.encoded)
+                .map_err(|error| format!("commitment is not hexadecimal: {error}"))
         })
-    }
-
-    fn into_payment_quote(
-        self,
-        expected_content: [u8; 32],
-    ) -> ServerResult<([u8; 32], PaymentQuote, Option<Vec<u8>>)> {
-        let peer_id = decode_32_byte_hex(&self.peer_id)?;
-        let content = decode_32_byte_hex(&self.content)?;
-        if content != expected_content {
-            return Err("payment quote is for a different chunk address".to_string());
-        }
-        let price = Amount::from_str(&self.price)
-            .map_err(|error| format!("payment quote has an invalid price: {error}"))?;
-        let rewards_address = RewardsAddress::from_str(&self.rewards_address)
-            .map_err(|error| format!("payment quote has an invalid rewards address: {error}"))?;
-        let public_key = hex::decode(&self.public_key)
-            .map_err(|error| format!("payment quote public key is not hexadecimal: {error}"))?;
-        let signature = hex::decode(&self.signature)
-            .map_err(|error| format!("payment quote signature is not hexadecimal: {error}"))?;
-        let commitment_pin = self
-            .commitment_pin
-            .as_deref()
-            .map(decode_32_byte_hex)
-            .transpose()?;
-        let timestamp = SystemTime::UNIX_EPOCH
-            .checked_add(Duration::from_secs(self.timestamp_secs))
-            .ok_or_else(|| "payment quote timestamp is out of range".to_string())?;
-        let quote = PaymentQuote {
-            content: xor_name::XorName(content),
-            timestamp,
-            price,
-            rewards_address,
-            pub_key: public_key,
-            signature,
-            committed_key_count: self.committed_key_count,
-            commitment_pin,
-        };
-        if hex::encode(quote.hash()) != self.quote_hash.to_ascii_lowercase() {
-            return Err("payment quote hash does not match its signed fields".to_string());
-        }
-        let commitment = self
-            .commitment
-            .map(|artifact| {
-                hex::decode(artifact.encoded)
-                    .map_err(|error| format!("commitment is not hexadecimal: {error}"))
-            })
-            .transpose()?;
-        Ok((peer_id, quote, commitment))
-    }
+        .transpose()?;
+    Ok((peer_id, quote, commitment))
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BrowserCommitmentArtifact {
-    encoded: String,
-    root: String,
-    key_count: u32,
-    sender_peer_id: String,
-    sender_public_key: String,
-    signature: String,
-}
-
-impl BrowserCommitmentArtifact {
-    fn from_bytes(encoded: &[u8]) -> ServerResult<Self> {
-        let commitment: ::ant_protocol::payment::commitment::StorageCommitment =
-            rmp_serde::from_slice(encoded)
-                .map_err(|error| format!("node generated an invalid commitment: {error}"))?;
-        Ok(Self {
-            encoded: hex::encode(encoded),
-            root: hex::encode(commitment.root),
-            key_count: commitment.key_count,
-            sender_peer_id: hex::encode(commitment.sender_peer_id),
-            sender_public_key: hex::encode(commitment.sender_public_key),
-            signature: hex::encode(commitment.signature),
-        })
-    }
+fn browser_commitment_from_bytes(encoded: &[u8]) -> ServerResult<BrowserCommitmentArtifact> {
+    let commitment: ::ant_protocol::payment::commitment::StorageCommitment =
+        rmp_serde::from_slice(encoded)
+            .map_err(|error| format!("node generated an invalid commitment: {error}"))?;
+    Ok(BrowserCommitmentArtifact {
+        encoded: hex::encode(encoded),
+        root: hex::encode(commitment.root),
+        key_count: commitment.key_count,
+        sender_peer_id: hex::encode(commitment.sender_peer_id),
+        sender_public_key: hex::encode(commitment.sender_public_key),
+        signature: hex::encode(commitment.signature),
+    })
 }
 
 struct ServerState {
@@ -2194,8 +1991,8 @@ mod tests {
         )
         .expect("valid request");
 
-        assert_eq!(request.version, PROTOCOL_VERSION);
-        assert_eq!(request.id, 7);
+        assert_eq!(request.version, BROWSER_PROTOCOL_VERSION);
+        assert_eq!(request.request_id, 7);
         assert!(matches!(request.body, RequestBody::FindNode { .. }));
     }
 
@@ -2269,7 +2066,7 @@ mod tests {
         let peer_id = PeerId::from_bytes([0x42; 32]);
         let endpoint = BrowserEndpoint::new(
             "203.0.113.7:11000".parse().expect("socket address"),
-            &peer_id,
+            peer_id.to_bytes(),
             [0x24; 32],
         )
         .expect("browser endpoint");
@@ -2290,7 +2087,7 @@ mod tests {
         let peer_id = PeerId::from_bytes([0x31; 32]);
         let endpoint = BrowserEndpoint::new(
             "203.0.113.9:42768".parse().expect("socket address"),
-            &peer_id,
+            peer_id.to_bytes(),
             [0x52; 32],
         )
         .expect("browser endpoint");
@@ -2305,7 +2102,10 @@ mod tests {
             reliability: 0.75,
         };
 
-        let supplemental = endpoint.multiaddr.clone();
+        let supplemental = endpoint
+            .multiaddr
+            .parse()
+            .expect("WebRTC Direct multiaddress");
         let browser_node = browser_node_from_dht(&node, std::slice::from_ref(&supplemental), None);
 
         assert_eq!(browser_node.webrtc_direct, Some(endpoint));
@@ -2320,7 +2120,7 @@ mod tests {
         let peer_id = PeerId::from_bytes([0x32; 32]);
         let endpoint = BrowserEndpoint::new(
             "203.0.113.10:42768".parse().expect("socket address"),
-            &peer_id,
+            peer_id.to_bytes(),
             [0x53; 32],
         )
         .expect("browser endpoint");
