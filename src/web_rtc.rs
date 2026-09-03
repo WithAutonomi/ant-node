@@ -783,6 +783,7 @@ async fn handle_connection(
     shutdown: CancellationToken,
 ) -> ServerResult<()> {
     let remote_addr = connection.remote_addr();
+    let channel_shutdown = shutdown.child_token();
     let mut channel_tasks = JoinSet::new();
     let outcome = loop {
         let accepted = tokio::select! {
@@ -822,10 +823,16 @@ async fn handle_connection(
         };
         let channel_state = Arc::clone(&state);
         let channel_resources = Arc::clone(&resources);
+        let handler_shutdown = channel_shutdown.clone();
         channel_tasks.spawn(async move {
             let _channel_permit = channel_permit;
-            if let Err(error) =
-                handle_webrtc_channel(&channel, channel_state, channel_resources).await
+            if let Err(error) = handle_webrtc_channel(
+                &channel,
+                channel_state,
+                channel_resources,
+                handler_shutdown,
+            )
+            .await
             {
                 debug!(remote = %remote_addr, channel = channel.id(), "WebRTC Direct DataChannel ended: {error}");
             }
@@ -835,19 +842,27 @@ async fn handle_connection(
         });
     };
 
+    // Stop every handler before returning its storage/P2P state. Closing the
+    // association alone is not a sufficient wake-up guarantee for work that
+    // is currently inside an application request.
+    channel_shutdown.cancel();
     if let Err(error) = connection.close().await {
         debug!(remote = %remote_addr, %error, "Failed to close WebRTC Direct connection");
     }
-    channel_tasks.abort_all();
-    while channel_tasks.join_next().await.is_some() {}
+    while let Some(result) = channel_tasks.join_next().await {
+        if let Err(error) = result {
+            debug!(remote = %remote_addr, %error, "WebRTC Direct DataChannel task failed during shutdown");
+        }
+    }
     outcome
 }
 
-#[allow(clippy::significant_drop_tightening)]
+#[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
 async fn handle_webrtc_channel(
     channel: &WebRtcDataChannel,
     state: Arc<ServerState>,
     resources: Arc<ConnectionResources>,
+    shutdown: CancellationToken,
 ) -> ServerResult<()> {
     if channel.label() != WEBRTC_DIRECT_DATA_CHANNEL {
         return Err(format!(
@@ -856,23 +871,39 @@ async fn handle_webrtc_channel(
         ));
     }
 
-    let mut pq_session = establish_pq_session(channel, &state, &resources).await?;
+    let mut pq_session = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => return Ok(()),
+        result = establish_pq_session(channel, &state, &resources) => result?,
+    };
     let mut hello_completed = false;
     loop {
-        let admitted = match read_webrtc_request(
-            channel,
-            state.config.max_request_bytes,
-            &mut pq_session,
-            &resources,
-        )
-        .await
-        {
+        let admitted_result = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return Ok(()),
+            result = read_webrtc_request(
+                channel,
+                state.config.max_request_bytes,
+                &mut pq_session,
+                &resources,
+            ) => result,
+        };
+        let admitted = match admitted_result {
             Ok(request) => request,
             Err(error) if is_quiet_channel_close(&error) => return Ok(()),
             Err(error) => {
                 let response = Response::error(0, "invalid_request", error);
-                write_webrtc_response(channel, &mut pq_session, &response, None, &resources)
-                    .await?;
+                tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => return Ok(()),
+                    result = write_webrtc_response(
+                        channel,
+                        &mut pq_session,
+                        &response,
+                        None,
+                        &resources,
+                    ) => result?,
+                }
                 return Ok(());
             }
         };
@@ -891,7 +922,17 @@ async fn handle_webrtc_channel(
                     request.version
                 ),
             );
-            write_webrtc_response(channel, &mut pq_session, &response, None, &resources).await?;
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => return Ok(()),
+                result = write_webrtc_response(
+                    channel,
+                    &mut pq_session,
+                    &response,
+                    None,
+                    &resources,
+                ) => result?,
+            }
             continue;
         }
 
@@ -902,22 +943,39 @@ async fn handle_webrtc_channel(
                 "authentication_required",
                 "HELLO must initialize this encrypted WebRTC session first".to_string(),
             );
-            write_webrtc_response(channel, &mut pq_session, &response, None, &resources).await?;
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => return Ok(()),
+                result = write_webrtc_response(
+                    channel,
+                    &mut pq_session,
+                    &response,
+                    None,
+                    &resources,
+                ) => result?,
+            }
             continue;
         }
 
-        let (response, content) = process_request(request, content, &state, &resources).await?;
+        let (response, content) = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return Ok(()),
+            result = process_request(request, content, &state, &resources) => result?,
+        };
         if is_hello && matches!(&response.status, ResponseStatus::Ok) {
             hello_completed = true;
         }
-        write_webrtc_response(
-            channel,
-            &mut pq_session,
-            &response,
-            content.as_ref(),
-            &resources,
-        )
-        .await?;
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return Ok(()),
+            result = write_webrtc_response(
+                channel,
+                &mut pq_session,
+                &response,
+                content.as_ref(),
+                &resources,
+            ) => result?,
+        }
     }
 }
 
