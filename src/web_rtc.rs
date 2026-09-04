@@ -45,7 +45,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 const MAX_FIND_NODE_RESULTS: usize = 20;
-const REQUEST_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const REQUEST_IDLE_TIMEOUT: Duration = Duration::from_mins(1);
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const AUTOMATIC_PORT_MIN: u32 = 32_768;
 const AUTOMATIC_PORT_COUNT: u32 = 65_536 - AUTOMATIC_PORT_MIN;

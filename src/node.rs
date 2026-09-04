@@ -387,7 +387,7 @@ impl NodeBuilder {
         if let Ok(cache_dir) = upgrade_cache_dir() {
             monitor = monitor.with_release_cache(ReleaseCache::new(
                 cache_dir,
-                std::time::Duration::from_secs(3600),
+                std::time::Duration::from_hours(1),
             ));
         }
 
