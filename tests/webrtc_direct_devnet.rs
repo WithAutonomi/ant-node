@@ -80,7 +80,7 @@ async fn seeded_public_file_downloads_and_paid_uploads_over_direct_node_endpoint
     assert_eq!(hello["peer_id"], parsed_endpoint.peer_id);
     assert_eq!(
         hello["endpoint"]["multiaddr"],
-        endpoint.endpoint.multiaddr.to_string()
+        endpoint.endpoint.multiaddr.clone()
     );
     assert!(hello_content.is_empty());
 
