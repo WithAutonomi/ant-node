@@ -2,7 +2,7 @@
 //!
 //! The listener uses Saorsa's signaling-free WebRTC Direct transport for ICE,
 //! DTLS, SCTP, and reliable ordered `DataChannels`. A shared application layer
-//! in `ant-protocol` uses ML-KEM-768, ML-DSA-65, and ChaCha20-Poly1305 to bind
+//! in `saorsa-webrtc` uses ML-KEM-768, ML-DSA-65, and ChaCha20-Poly1305 to bind
 //! the node identity and protect every browser RPC without libp2p or Noise.
 
 use crate::ant_protocol::{
@@ -15,7 +15,15 @@ use crate::error::{Error, Result};
 use crate::logging::{debug, info, warn};
 use crate::payment::{serialize_single_node_proof, PaymentProof};
 use crate::storage::AntProtocol;
-use ant_protocol::web_rtc::{
+use evmlib::common::{Amount, TxHash};
+use evmlib::{EncodedPeerId, PaymentQuote, ProofOfPayment, RewardsAddress};
+use parking_lot::{Mutex, RwLock};
+use saorsa_core::identity::NodeIdentity;
+use saorsa_core::{DHTNode, MultiAddr, P2PNode, PeerId};
+use saorsa_transport::webrtc_direct::{
+    WebRtcCertificate, WebRtcDataChannel, WebRtcDirectConnection, WebRtcDirectListener,
+};
+use saorsa_webrtc::{
     accept_pq_session, decode_pq_frame, encode_response_frame, parse_request_header,
     pq_frame_length, transfer_timeout, BrowserCommitmentArtifact, BrowserNode,
     BrowserQuoteArtifact, BrowserRequest as Request, BrowserRequestBody as RequestBody,
@@ -24,14 +32,6 @@ use ant_protocol::web_rtc::{
     BROWSER_PROTOCOL_VERSION, MAX_BROWSER_HEADER_BYTES, PQ_CLIENT_HELLO_BYTES,
     PQ_ENCRYPTED_OVERHEAD_BYTES, PQ_FRAME_PREFIX_BYTES, WEBRTC_DIRECT_DATA_CHANNEL,
     WEBRTC_WRITE_CHUNK_BYTES,
-};
-use evmlib::common::{Amount, TxHash};
-use evmlib::{EncodedPeerId, PaymentQuote, ProofOfPayment, RewardsAddress};
-use parking_lot::{Mutex, RwLock};
-use saorsa_core::identity::NodeIdentity;
-use saorsa_core::{DHTNode, MultiAddr, P2PNode, PeerId};
-use saorsa_transport::webrtc_direct::{
-    WebRtcCertificate, WebRtcDataChannel, WebRtcDirectConnection, WebRtcDirectListener,
 };
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};

@@ -29,7 +29,7 @@ path = "src/bin/ant-devnet/main.rs"
 # musl Linux builds (and tends to beat glibc's allocator too).
 mimalloc = "0.1"
 
-# Wire protocol — the single version-pin shared with ant-client.
+# Native application wire protocol shared with ant-client.
 # Bumping ant-protocol's `evmlib`/`saorsa-core`/`saorsa-pqc` pins ripples
 # through here automatically; we keep a direct saorsa-core dep for
 # node-only DHT internals (DHTNode, TrustEvent, DhtNetworkEvent), which
@@ -40,6 +40,8 @@ mimalloc = "0.1"
 # (the rc-2026.4.2 branch) so Cargo can unify the wire types here
 # with ant-protocol's re-exports.
 ant-protocol = "2.3.5"
+# Portable WebRTC Direct profile shared by the node and browser WASM adapter.
+saorsa-webrtc = { git = "https://github.com/WithAutonomi/saorsa-transport.git", rev = "da3a6934d85eb3fb63d7f489c362abee158d6ce8" }
 
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
 saorsa-core = "0.27.3"
