@@ -880,7 +880,8 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "2.3.1"
-source = "git+https://github.com/WithAutonomi/ant-protocol.git?rev=427def148ae4c4c0898112a2dadcb7978b1fc5fd#427def148ae4c4c0898112a2dadcb7978b1fc5fd"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3081ee130dd45e8166bc8ac4d789aac17d143e2e7f54f1c3006503dc63cf3edb"
 dependencies = [
  "blake3",
  "bytes",
@@ -891,7 +892,6 @@ dependencies = [
  "saorsa-core",
  "saorsa-pqc 0.5.1",
  "serde",
- "tiny-keccak",
  "tokio",
  "tracing",
 ]
@@ -5395,7 +5395,7 @@ dependencies = [
 [[package]]
 name = "saorsa-webrtc"
 version = "0.1.0"
-source = "git+https://github.com/WithAutonomi/saorsa-transport.git?rev=ba6550b1e04942dc388aecb14d0d0aa55ba4f3d0#ba6550b1e04942dc388aecb14d0d0aa55ba4f3d0"
+source = "git+https://github.com/WithAutonomi/saorsa-transport.git?rev=9cf337b0dce2ee5b2f6b1b613a047d2be85a9754#9cf337b0dce2ee5b2f6b1b613a047d2be85a9754"
 dependencies = [
  "base64",
  "blake3",
@@ -5404,10 +5404,12 @@ dependencies = [
  "fips204",
  "getrandom 0.2.17",
  "hex",
+ "postcard",
  "serde",
  "serde_bytes",
  "serde_json",
  "thiserror 2.0.18",
+ "tiny-keccak",
  "zeroize",
 ]
 

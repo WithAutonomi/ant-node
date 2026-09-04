@@ -35,13 +35,9 @@ mimalloc = "0.1"
 # node-only DHT internals (DHTNode, TrustEvent, DhtNetworkEvent), which
 # Cargo unifies with ant-protocol's version constraint.
 #
-# TODO: swap to `ant-protocol = "2.0.0"` once 2.0.0 is on crates.io.
-# Until then, the git pin tracks the matching saorsa-core lineage
-# (the rc-2026.4.2 branch) so Cargo can unify the wire types here
-# with ant-protocol's re-exports.
 ant-protocol = "2.3.1"
 # Portable WebRTC Direct profile shared by the node and browser WASM adapter.
-saorsa-webrtc = { git = "https://github.com/WithAutonomi/saorsa-transport.git", rev = "ba6550b1e04942dc388aecb14d0d0aa55ba4f3d0" }
+saorsa-webrtc = { git = "https://github.com/WithAutonomi/saorsa-transport.git", rev = "9cf337b0dce2ee5b2f6b1b613a047d2be85a9754" }
 
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
 saorsa-core = "0.26.4"
@@ -196,7 +192,6 @@ webrtc-direct = [
 ]
 
 [patch.crates-io]
-ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol.git", rev = "427def148ae4c4c0898112a2dadcb7978b1fc5fd" }
 saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core.git", rev = "1432fa9751d46887dc86767928bd3320a24c6367" }
 saorsa-transport = { git = "https://github.com/WithAutonomi/saorsa-transport.git", rev = "2c6e23cd6cd4db79f475676e25af9334a044a343" }
 
