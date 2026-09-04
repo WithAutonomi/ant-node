@@ -1308,7 +1308,7 @@ mod tests {
         let peer = peer_id_from_byte(9);
         let mut state = NeighborSyncState::new_cycle(vec![peer]);
         let first_seen = Instant::now();
-        let grace = Duration::from_secs(60);
+        let grace = Duration::from_mins(1);
 
         assert_eq!(
             state.observe_bootstrap_claim(peer, first_seen, grace),
@@ -1337,7 +1337,7 @@ mod tests {
         let peer = peer_id_from_byte(10);
         let mut state = NeighborSyncState::new_cycle(vec![peer]);
         let first_seen = Instant::now();
-        let grace = Duration::from_secs(60);
+        let grace = Duration::from_mins(1);
 
         let _ = state.observe_bootstrap_claim(peer, first_seen, grace);
 

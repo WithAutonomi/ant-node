@@ -2399,7 +2399,7 @@ impl PaymentVerifier {
     /// at which point a second leader can race for the same pool (see
     /// [`InflightGuard::drop`]). At steady state the pool cache and pool
     /// signature verification gate keep this rare in practice.
-    const CLOSENESS_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
+    const CLOSENESS_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(4);
 
     /// Width of the storer's authoritative network lookup, in peers.
     ///
@@ -4610,7 +4610,7 @@ mod tests {
         let rewards_addr = RewardsAddress::new([1u8; 20]);
 
         // Create a quote that's 25 hours old (exceeds 24-hour max)
-        let old_timestamp = SystemTime::now() - Duration::from_secs(25 * 3600);
+        let old_timestamp = SystemTime::now() - Duration::from_hours(25);
         let quote = make_fake_quote(xorname, old_timestamp, rewards_addr);
 
         let mut peer_quotes = Vec::new();
@@ -4640,7 +4640,7 @@ mod tests {
         let rewards_addr = RewardsAddress::new([1u8; 20]);
 
         // Create a quote with a timestamp 1 hour in the future
-        let future_timestamp = SystemTime::now() + Duration::from_secs(3600);
+        let future_timestamp = SystemTime::now() + Duration::from_hours(1);
         let quote = make_fake_quote(xorname, future_timestamp, rewards_addr);
 
         let mut peer_quotes = Vec::new();
@@ -4701,7 +4701,7 @@ mod tests {
         let rewards_addr = RewardsAddress::new([1u8; 20]);
 
         // Quote 360 seconds in the future — exceeds 300s tolerance
-        let future_timestamp = SystemTime::now() + Duration::from_secs(360);
+        let future_timestamp = SystemTime::now() + Duration::from_mins(6);
         let quote = make_fake_quote(xorname, future_timestamp, rewards_addr);
 
         let mut peer_quotes = Vec::new();
@@ -4731,7 +4731,7 @@ mod tests {
         let rewards_addr = RewardsAddress::new([1u8; 20]);
 
         // Quote 23 hours old — within 24h max age
-        let old_timestamp = SystemTime::now() - Duration::from_secs(23 * 3600);
+        let old_timestamp = SystemTime::now() - Duration::from_hours(23);
         let quote = make_fake_quote(xorname, old_timestamp, rewards_addr);
 
         let mut peer_quotes = Vec::new();
@@ -6431,7 +6431,7 @@ mod tests {
         // failure mode from the trace in the doc comment will return.
         assert_eq!(
             PaymentVerifier::CLOSENESS_LOOKUP_TIMEOUT,
-            std::time::Duration::from_secs(240),
+            std::time::Duration::from_mins(4),
             "CLOSENESS_LOOKUP_TIMEOUT must be 240s; if changing this, update \
              the iteration trace in the doc comment and re-validate on a \
              fresh testnet"
@@ -7014,7 +7014,7 @@ mod tests {
         let built = test_built_commitment(5);
         let commitment = built.commitment().clone();
         let pin = built.hash();
-        let ttl = std::time::Duration::from_secs(3 * 3600);
+        let ttl = std::time::Duration::from_hours(3);
         let now = std::time::Instant::now();
 
         // Fresh AND matching pin -> resolves to the commitment.
