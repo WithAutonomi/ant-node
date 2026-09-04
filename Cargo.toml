@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/WithAutonomi/ant-node"
 keywords = ["p2p", "decentralized", "quantum-safe", "post-quantum", "dht"]
 categories = ["network-programming", "cryptography"]
-rust-version = "1.75"
+rust-version = "1.91"
 
 [lib]
 name = "ant_node"

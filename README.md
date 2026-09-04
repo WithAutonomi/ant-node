@@ -862,7 +862,7 @@ ant-node
 
 ### Prerequisites
 
-- Rust 1.75+ (for building from source)
+- Rust 1.91+ (for building from source)
 - Linux, macOS, or Windows
 
 ### Build from Source
