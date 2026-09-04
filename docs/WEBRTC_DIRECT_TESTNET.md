@@ -187,10 +187,11 @@ Consequently one pasted address is enough to enter the network and discover
 the browser endpoints of closest peers across independently deployed
 processes. Native QUIC dialing ignores the supplemental transport entry.
 
-On 2026-08-27 this path was exercised against the normal 60-node testnet from
-one bootstrap address. Headless Chromium traversed multiple independent nodes,
-obtained four storage quotes from four non-bootstrap closest nodes, submitted
-one payment, and stored all four encrypted records successfully. Nodes behind
-the testnet's deliberate inbound-NAT rules remain unreachable without relayed
-WebRTC, so their 10-second DataChannel timeouts currently make this smoke path
-slower than an all-public fleet.
+The 2026-08-27 public smoke run used the former protocol v3 and headless
+Chromium only. From one bootstrap address it traversed multiple independent
+nodes, obtained four storage quotes from non-bootstrap closest nodes,
+submitted one payment, and stored all four encrypted records. It is historical
+connectivity evidence, not v4 or cross-browser acceptance evidence. Nodes
+behind the testnet's deliberate inbound-NAT rules remain unreachable without
+relayed WebRTC, so their 10-second DataChannel timeouts currently make this
+smoke path slower than an all-public fleet.

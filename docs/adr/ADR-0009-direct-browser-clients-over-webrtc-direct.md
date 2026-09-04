@@ -749,28 +749,39 @@ pre-populates the devnet payment cache for those addresses, while
 content-address verification, DHT responsibility, payment-cache admission,
 LMDB storage, and verified reads remain active.
 
-### Protocol v4 local validation
+### Protocol v4 automated validation
 
-On 2026-09-03 the ignored five-node WebRTC Direct devnet integration test used
-the actual native client adapter and shared `ant-protocol` implementation to
-complete the ML-KEM/ML-DSA handshake, encrypted `HELLO`, iterative lookup,
-download, quote/payment-proof handling, paid upload, and read-back. Shared
-protocol unit tests additionally reject tampered and replayed records, wrong
-peer IDs, tampered node signatures, and invalid outer-frame lengths. The
-`ant-core` browser target builds and lints as WASM, and the browser SDK's
-generated bindings, type checks, and unit tests pass with protocol v4.
+Node CI explicitly runs the otherwise ignored five-node WebRTC Direct devnet
+integration test. Its native test adapter completes the ML-KEM/ML-DSA
+handshake and encrypted `HELLO`, asks a seed for closest nodes, dials an
+endpoint from that wire response, performs another lookup on the discovered
+node, and keeps each encrypted DataChannel open across multiple requests. It
+then downloads and reconstructs a public file, obtains a quote, submits a
+payment proof and upload, and reads the result back. The dev-only in-memory
+endpoint catalog helps nodes populate their lookup responses; the client no
+longer chooses its download peer from that out-of-band catalog.
+
+This harness proves direct endpoint discovery, encrypted session reuse, and
+the node request path. It does **not** execute the browser WASM iterative
+lookup state machine. `ant-client` CI builds and lints the WASM target and runs
+its generated bindings in Node, but browser-side iterative parity remains a
+promotion requirement below. Shared `ant-protocol` unit tests additionally
+cover record tampering and replay, wrong peer IDs, tampered node signatures,
+invalid outer frames, and version mismatch.
 
 Node-side resource tests additionally cover fail-fast headroom invariants,
 per-IP association isolation, IPv4-mapped IPv6 normalization, token-bucket
 refill, preservation of source rate state across reconnects, bounded inactive
 source state, global/per-source byte ceilings, rollback after failed global
-reservation, and RAII release. The devnet workflow exercises the same limits
-while transferring real encrypted chunks. The adversarial browser and fleet
-tests listed under Validation remain promotion requirements.
+reservation, and RAII release. The devnet workflow transfers real encrypted
+chunks, but it is not a browser resource-limit or fleet test. The adversarial
+browser and fleet tests listed under Validation remain promotion requirements.
 
-This is strong local integration evidence but not the required browser
-interoperability result. A real Chrome, Firefox, and Safari run against a
-matching deployed v4 node fleet remains an acceptance criterion.
+There is currently no automated real-browser v4 flow in browser CI. The
+historical smoke flow below ran only Chromium and used protocol v3. Therefore
+Chrome, Firefox, and Safari interoperability against a matching deployed v4
+node fleet, along with cold bootstrap from the production compiled seed list,
+remain unmet acceptance criteria rather than claimed results.
 
 ### Historical public Internet v3 smoke result
 
