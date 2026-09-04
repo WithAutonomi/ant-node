@@ -176,12 +176,14 @@ multistream selection, connection gater, protobuf stream envelope, or libp2p
 DataChannel close protocol. `saorsa-transport` owns ICE-lite/DTLS/SCTP setup,
 the shared UDP association mux, persisted certificates, native diagnostic
 dialing, and reliable ordered DataChannels. `saorsa-core` owns only the
-validated endpoint/address integration. `ant-protocol` owns the shared
-post-quantum handshake, encrypted-record layer, outer framing, and transfer
-limits. `ant-core` owns the runtime-neutral client algorithms and the browser
-WASM facade; `ant-node` owns the bounded browser RPC adapter. The two sides use
-the same Rust protocol implementation, while the browser transport adapter
-calls `RTCPeerConnection` directly through Web APIs.
+validated endpoint/address integration. The standalone `saorsa-webrtc` crate
+in the transport workspace owns the portable post-quantum handshake,
+encrypted-record layer, browser RPC schema, outer framing, address codec, and
+transfer limits. `ant-core` owns the runtime-neutral client algorithms and the
+browser WASM facade; `ant-node` owns the bounded browser RPC adapter. The two
+sides use the same Rust protocol implementation, while the browser transport
+adapter calls `RTCPeerConnection` directly through Web APIs. `ant-protocol`
+remains independent of the selected carrier transport.
 
 The native ML-KEM/ML-DSA transport remains the node-to-node transport and is
 not downgraded or replaced. The WebRTC listener has independent connection,
@@ -241,7 +243,7 @@ slot for a hypothetical channel reopen.
 Connection and channel handlers are children of bounded `JoinSet`s rather
 than detached tasks. Their semaphore permits and source counters are RAII
 guards. Normal shutdown drains connection tasks for five seconds, then aborts
-and joins any remainder; closing a connection also aborts and joins its
+and joins any remainder; closing a connection cancels and joins its
 remaining channel tasks. A channel waiting for its next frame has a 60-second
 idle deadline. Partial-frame reads and all response writes have total,
 size-scaled transfer deadlines, so slow senders and readers cannot retain work
@@ -601,7 +603,7 @@ Tokio/QUIC adapters; the WASM facade supplies browser timers and WebRTC Direct
 sessions. Both therefore use the same Rust policies without forcing existing
 native callers onto a new trait or configuration type.
 
-The browser and node adapters also consume the same `ant-protocol`
+The browser and node adapters also consume the same `saorsa-webrtc`
 post-quantum session and framing module. Cryptographic transcript construction,
 key derivation, sequence handling, record authentication, and frame bounds are
 not reimplemented in JavaScript or separately in `ant-node`. Existing native
@@ -683,7 +685,7 @@ The earlier feature-gated WebTransport PoC has been replaced by the
 - native `saorsa-transport` and `saorsa-core::MultiAddr` support for canonical,
   literal-IP `/webrtc-direct/certhash/.../p2p/...` addresses with exactly one
   fingerprint and no DNS form;
-- a protocol v4 browser session backed by the shared `ant-protocol`
+- a protocol v4 browser session backed by the shared `saorsa-webrtc`
   post-quantum session v1, which performs ephemeral ML-KEM-768 key
   establishment, authenticates the transcript and ANT peer ID with ML-DSA-65,
   derives direction-separated keys, and protects every later application frame
@@ -765,7 +767,7 @@ This harness proves direct endpoint discovery, encrypted session reuse, and
 the node request path. It does **not** execute the browser WASM iterative
 lookup state machine. `ant-client` CI builds and lints the WASM target and runs
 its generated bindings in Node, but browser-side iterative parity remains a
-promotion requirement below. Shared `ant-protocol` unit tests additionally
+promotion requirement below. Shared `saorsa-webrtc` unit tests additionally
 cover record tampering and replay, wrong peer IDs, tampered node signatures,
 invalid outer frames, and version mismatch.
 

@@ -2,11 +2,6 @@
 
 use ant_node::devnet::{Devnet, DevnetConfig};
 use ant_node::BrowserEndpoint;
-use ant_protocol::web_rtc::{
-    decode_pq_frame, encode_pq_frame, pq_frame_length, PqClientHandshake, PqSession,
-    BROWSER_PROTOCOL_NAME, BROWSER_PROTOCOL_VERSION, PQ_ENCRYPTED_OVERHEAD_BYTES,
-    PQ_SERVER_ACCEPT_BYTES, WEBRTC_DIRECT_DATA_CHANNEL, WEBRTC_WRITE_CHUNK_BYTES,
-};
 use ant_protocol::MAX_CHUNK_SIZE;
 use bytes::Bytes;
 use evmlib::common::{Amount, QuoteHash};
@@ -14,6 +9,11 @@ use evmlib::wallet::Wallet;
 use evmlib::RewardsAddress;
 use saorsa_transport::transport::{WebRtcCertificateHash, WebRtcDirectAddr};
 use saorsa_transport::webrtc_direct::{WebRtcDataChannel, WebRtcDirectClient};
+use saorsa_webrtc::{
+    decode_pq_frame, encode_pq_frame, pq_frame_length, PqClientHandshake, PqSession,
+    BROWSER_PROTOCOL_NAME, BROWSER_PROTOCOL_VERSION, PQ_ENCRYPTED_OVERHEAD_BYTES,
+    PQ_SERVER_ACCEPT_BYTES, WEBRTC_DIRECT_DATA_CHANNEL, WEBRTC_WRITE_CHUNK_BYTES,
+};
 use self_encryption::{DataMap, EncryptedChunk};
 use serde_json::{json, Value};
 use std::error::Error;
