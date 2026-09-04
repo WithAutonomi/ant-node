@@ -5368,10 +5368,12 @@ dependencies = [
  "fips204",
  "getrandom 0.2.17",
  "hex",
+ "postcard",
  "serde",
  "serde_bytes",
  "serde_json",
  "thiserror 2.0.18",
+ "tiny-keccak",
  "zeroize",
 ]
 
