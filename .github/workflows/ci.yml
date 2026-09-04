@@ -108,6 +108,22 @@ jobs:
       - name: Run unit tests without logging
         run: cargo test --lib --no-default-features
 
+  browser-devnet:
+    name: WebRTC Direct five-node devnet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+      - name: Run persistent-session discovery and transfer test
+        run: >-
+          cargo test --test webrtc_direct_devnet
+          -- --ignored --test-threads=1
+
   security:
     name: Security Audit
     runs-on: ubuntu-latest
