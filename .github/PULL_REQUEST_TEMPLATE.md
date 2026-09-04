@@ -1,6 +1,19 @@
 ## Linear issue
-<!-- REQUIRED. Link the issue: an issue key like V2-123, or a linear.app URL.
-     CI blocks PRs with no linked Linear issue. -->
+<!-- REQUIRED. Use a closing magic word + the issue key, one line per issue:
+
+         Closes V2-123
+
+     Any of Linear's closing words works, in any tense — close / fix / resolve /
+     complete / implement, plus their -s, -d and -ing forms, and the phrase
+     `linear issue`. The key may be a linear.app/<workspace>/issue/<key> URL.
+
+     The closing form is what makes Linear attach the PR to the issue and move
+     the issue to Merged when this lands on main. A bare `V2-123` does NOT link
+     the PR — Linear ignores it — so CI rejects it. Linear's linking-only words
+     (`ref`, `part of`, `towards`, `relates to`) do attach the PR but do not
+     drive the Merged transition, so CI does not accept those either. (An issue
+     key in the branch name or the PR title also links the PR, but write the
+     closing form here anyway.) -->
 
 ## Risk tier
 <!-- Check exactly one. Boundary question: does this change node behavior, the wire
