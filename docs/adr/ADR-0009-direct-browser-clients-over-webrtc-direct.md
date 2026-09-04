@@ -183,7 +183,9 @@ transfer limits. `ant-core` owns the runtime-neutral client algorithms and the
 browser WASM facade; `ant-node` owns the bounded browser RPC adapter. The two
 sides use the same Rust protocol implementation, while the browser transport
 adapter calls `RTCPeerConnection` directly through Web APIs. `ant-protocol`
-remains independent of the selected carrier transport.
+remains independent of the selected carrier transport; this design uses its
+released `2.3.1` API without WebRTC-specific source, feature, or dependency
+changes.
 
 The native ML-KEM/ML-DSA transport remains the node-to-node transport and is
 not downgraded or replaced. The WebRTC listener has independent connection,
