@@ -34,6 +34,7 @@ use saorsa_webrtc::{
     WEBRTC_WRITE_CHUNK_BYTES,
 };
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -45,6 +46,9 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 const MAX_FIND_NODE_RESULTS: usize = 20;
+// Browser dials use a 10-second channel-open timeout. Give successful clients
+// modest server-side headroom while bounding associations that never open one.
+const FIRST_DATA_CHANNEL_TIMEOUT: Duration = Duration::from_secs(15);
 const REQUEST_IDLE_TIMEOUT: Duration = Duration::from_mins(1);
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const AUTOMATIC_PORT_MIN: u32 = 32_768;
@@ -53,6 +57,7 @@ const TRACKED_SOURCE_MULTIPLIER: usize = 4;
 const MIN_TRACKED_SOURCES: usize = 64;
 const CONNECTION_CAPACITY_ERROR: &str = "global connection capacity exhausted";
 const SOURCE_CONNECTION_CAPACITY_ERROR: &str = "source connection capacity exhausted";
+const FIRST_DATA_CHANNEL_TIMEOUT_ERROR: &str = "DataChannel opening timed out";
 const CHANNEL_CAPACITY_ERROR: &str = "global DataChannel capacity exhausted";
 const REQUEST_CAPACITY_ERROR: &str = "global request capacity exhausted";
 const REQUEST_RATE_ERROR: &str = "request rate limit exceeded";
@@ -785,61 +790,70 @@ async fn handle_connection(
     let remote_addr = connection.remote_addr();
     let channel_shutdown = shutdown.child_token();
     let mut channel_tasks = JoinSet::new();
-    let outcome = loop {
-        let accepted = tokio::select! {
-            biased;
-            () = shutdown.cancelled() => break Ok(()),
-            completed = channel_tasks.join_next(), if !channel_tasks.is_empty() => {
-                if let Some(Err(error)) = completed {
-                    debug!(remote = %remote_addr, %error, "WebRTC Direct DataChannel task failed");
-                }
-                // The v4 protocol uses persistent channels; it has no channel
-                // reopen/continuation handshake. Once the last channel ends,
-                // close the association promptly instead of retaining a stale
-                // per-IP connection slot while waiting for another channel.
-                if channel_tasks.is_empty() {
-                    break Ok(());
-                }
-                continue;
-            }
-            result = connection.accept_data_channel() => result,
-        };
-        let channel = match accepted {
-            Ok(channel) => channel,
-            Err(error) => break Err(format!("DataChannel accept failed: {error}")),
-        };
-        if channel_tasks.len() >= state.config.max_channels_per_connection {
-            if let Err(error) = channel.close().await {
-                debug!(remote = %remote_addr, %error, "Failed to close excess DataChannel");
-            }
-            break Err("per-connection DataChannel capacity exhausted".to_string());
+
+    let outcome = 'connection: {
+        let first_channel =
+            match wait_for_first_data_channel(&shutdown, FIRST_DATA_CHANNEL_TIMEOUT, async {
+                connection
+                    .accept_data_channel()
+                    .await
+                    .map_err(|error| format!("DataChannel accept failed: {error}"))
+            })
+            .await
+            {
+                Ok(Some(channel)) => channel,
+                Ok(None) => break 'connection Ok(()),
+                Err(error) => break 'connection Err(error),
+            };
+        if let Err(error) = start_data_channel_task(
+            first_channel,
+            &mut channel_tasks,
+            &state,
+            &resources,
+            &channel_shutdown,
+            remote_addr,
+        )
+        .await
+        {
+            break 'connection Err(error);
         }
-        let Ok(channel_permit) = Arc::clone(&resources.listener.channel_limit).try_acquire_owned()
-        else {
-            if let Err(error) = channel.close().await {
-                debug!(remote = %remote_addr, %error, "Failed to close excess DataChannel");
-            }
-            break Err(CHANNEL_CAPACITY_ERROR.to_string());
-        };
-        let channel_state = Arc::clone(&state);
-        let channel_resources = Arc::clone(&resources);
-        let handler_shutdown = channel_shutdown.clone();
-        channel_tasks.spawn(async move {
-            let _channel_permit = channel_permit;
-            if let Err(error) = handle_webrtc_channel(
-                &channel,
-                channel_state,
-                channel_resources,
-                handler_shutdown,
+
+        loop {
+            let accepted = tokio::select! {
+                biased;
+                () = shutdown.cancelled() => break Ok(()),
+                completed = channel_tasks.join_next(), if !channel_tasks.is_empty() => {
+                    if let Some(Err(error)) = completed {
+                        debug!(remote = %remote_addr, %error, "WebRTC Direct DataChannel task failed");
+                    }
+                    // The v4 protocol uses persistent channels; it has no channel
+                    // reopen/continuation handshake. Once the last channel ends,
+                    // close the association promptly instead of retaining a stale
+                    // per-IP connection slot while waiting for another channel.
+                    if channel_tasks.is_empty() {
+                        break Ok(());
+                    }
+                    continue;
+                }
+                result = connection.accept_data_channel() => result,
+            };
+            let channel = match accepted {
+                Ok(channel) => channel,
+                Err(error) => break Err(format!("DataChannel accept failed: {error}")),
+            };
+            if let Err(error) = start_data_channel_task(
+                channel,
+                &mut channel_tasks,
+                &state,
+                &resources,
+                &channel_shutdown,
+                remote_addr,
             )
             .await
             {
-                debug!(remote = %remote_addr, channel = channel.id(), "WebRTC Direct DataChannel ended: {error}");
+                break Err(error);
             }
-            if let Err(error) = channel.close().await {
-                debug!(remote = %remote_addr, channel = channel.id(), %error, "Failed to close WebRTC Direct DataChannel");
-            }
-        });
+        }
     };
 
     // Stop every handler before returning its storage/P2P state. Closing the
@@ -855,6 +869,64 @@ async fn handle_connection(
         }
     }
     outcome
+}
+
+async fn wait_for_first_data_channel<T>(
+    shutdown: &CancellationToken,
+    timeout: Duration,
+    accept: impl Future<Output = ServerResult<T>>,
+) -> ServerResult<Option<T>> {
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => Ok(None),
+        result = tokio::time::timeout(timeout, accept) => result.map_or_else(
+            |_| Err(FIRST_DATA_CHANNEL_TIMEOUT_ERROR.to_string()),
+            |result| result.map(Some),
+        ),
+    }
+}
+
+async fn start_data_channel_task(
+    channel: WebRtcDataChannel,
+    channel_tasks: &mut JoinSet<()>,
+    state: &Arc<ServerState>,
+    resources: &Arc<ConnectionResources>,
+    channel_shutdown: &CancellationToken,
+    remote_addr: SocketAddr,
+) -> ServerResult<()> {
+    if channel_tasks.len() >= state.config.max_channels_per_connection {
+        if let Err(error) = channel.close().await {
+            debug!(remote = %remote_addr, %error, "Failed to close excess DataChannel");
+        }
+        return Err("per-connection DataChannel capacity exhausted".to_string());
+    }
+    let Ok(channel_permit) = Arc::clone(&resources.listener.channel_limit).try_acquire_owned()
+    else {
+        if let Err(error) = channel.close().await {
+            debug!(remote = %remote_addr, %error, "Failed to close excess DataChannel");
+        }
+        return Err(CHANNEL_CAPACITY_ERROR.to_string());
+    };
+    let channel_state = Arc::clone(state);
+    let channel_resources = Arc::clone(resources);
+    let handler_shutdown = channel_shutdown.clone();
+    channel_tasks.spawn(async move {
+        let _channel_permit = channel_permit;
+        if let Err(error) = handle_webrtc_channel(
+            &channel,
+            channel_state,
+            channel_resources,
+            handler_shutdown,
+        )
+        .await
+        {
+            debug!(remote = %remote_addr, channel = channel.id(), "WebRTC Direct DataChannel ended: {error}");
+        }
+        if let Err(error) = channel.close().await {
+            debug!(remote = %remote_addr, channel = channel.id(), %error, "Failed to close WebRTC Direct DataChannel");
+        }
+    });
+    Ok(())
 }
 
 #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
@@ -1796,6 +1868,49 @@ mod tests {
         let mut config = WebRtcDirectConfig::default();
         config.max_in_flight_bytes_per_ip = config.max_in_flight_bytes;
         assert!(validate_webrtc_config(&config).is_err());
+    }
+
+    #[tokio::test]
+    async fn first_data_channel_timeout_releases_connection_admission() {
+        let config = WebRtcDirectConfig::default();
+        let resources = ListenerResources::new(&config);
+        let remote_addr: SocketAddr = "198.51.100.1:1000".parse().expect("remote address");
+        let shutdown = CancellationToken::new();
+
+        let result = {
+            let _admission = resources
+                .try_admit_connection(remote_addr)
+                .expect("connection admission");
+            assert_eq!(
+                resources.connection_limit.available_permits(),
+                config.max_connections - 1
+            );
+            wait_for_first_data_channel(
+                &shutdown,
+                Duration::from_millis(10),
+                std::future::pending::<ServerResult<()>>(),
+            )
+            .await
+        };
+
+        assert_eq!(
+            result.err().as_deref(),
+            Some(FIRST_DATA_CHANNEL_TIMEOUT_ERROR)
+        );
+        assert_eq!(
+            resources.connection_limit.available_permits(),
+            config.max_connections
+        );
+        assert_eq!(
+            resources
+                .source_state
+                .lock()
+                .sources
+                .get(&remote_addr.ip())
+                .expect("tracked source")
+                .active_connections,
+            0
+        );
     }
 
     #[test]

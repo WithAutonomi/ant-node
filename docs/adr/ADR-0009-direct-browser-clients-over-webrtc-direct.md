@@ -235,7 +235,13 @@ limiter from becoming a source-churn memory attack.
 Admission is non-queueing above the application bounds. The server stops
 starting new transport accepts while all global association slots are in use.
 After accept, an association must obtain both its global and per-IP share. A
-connection may own at most `max_channels_per_connection` active DataChannels,
+newly admitted association has 15 seconds to open its first DataChannel. This
+deadline covers the remaining ICE, DTLS, SCTP, and DataChannel establishment
+work after transport accept; it gives the browser's 10-second dial deadline
+modest server-side headroom. An association that misses the deadline is closed,
+releasing both admission shares, so peers that never open an application
+channel cannot retain listener capacity indefinitely. A connection may own at
+most `max_channels_per_connection` active DataChannels,
 and every admitted channel must also own one of the global `max_channels`
 permits. Excess channels are closed and terminate the offending association.
 The v4 protocol expects persistent channels, so an association is closed when
@@ -930,7 +936,8 @@ The decision advances beyond PoC only after all of the following are covered:
   excessive channels, slow readers, connection floods, request amplification,
   reconnect churn, task cleanup, and global/per-client byte quotas. Tests must
   also show that one source at each configured ceiling leaves another source
-  admissible.
+  admissible, and that an association which opens no DataChannel times out and
+  releases its global and per-IP admission shares.
 - UDP-mux regression tests cover source-port reuse: a binding request carrying
   a new ICE credential must override a stale address mapping, while binding
   responses and non-STUN traffic continue to use the selected address mapping.
