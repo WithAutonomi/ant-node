@@ -20,12 +20,9 @@ use tokio::task::spawn_blocking;
 use tokio_util::task::TaskTracker;
 
 use crate::ant_protocol::XORNAME_LEN;
+use crate::storage::StorageStats;
 
-/// Bytes in one MiB.
-pub const MIB: u64 = 1024 * 1024;
-
-/// Bytes in one GiB.
-pub const GIB: u64 = 1024 * MIB;
+use crate::storage::{GIB, MIB};
 
 /// Default minimum free disk space to preserve on the storage partition.
 const DEFAULT_DISK_RESERVE: u64 = 500 * MIB;
@@ -142,25 +139,6 @@ impl LmdbStorageConfig {
     }
 }
 
-/// Statistics about storage operations.
-#[derive(Debug, Clone, Default)]
-pub struct StorageStats {
-    /// Total number of chunks stored.
-    pub chunks_stored: u64,
-    /// Total number of chunks retrieved.
-    pub chunks_retrieved: u64,
-    /// Total bytes stored.
-    pub bytes_stored: u64,
-    /// Total bytes retrieved.
-    pub bytes_retrieved: u64,
-    /// Number of duplicate writes (already exists).
-    pub duplicates: u64,
-    /// Number of verification failures on read.
-    pub verification_failures: u64,
-    /// Number of chunks currently persisted.
-    pub current_chunks: u64,
-}
-
 /// Content-addressed LMDB storage.
 ///
 /// Uses heed (LMDB wrapper) for memory-mapped, transactional chunk storage.
@@ -194,6 +172,17 @@ pub struct LmdbStorage {
     /// `data.mdb`, so the reserve is preserved by the allocator itself rather
     /// than by refusing every write up front.
     no_growth: Arc<AtomicBool>,
+    /// Keep the map pinned whatever the free space says.
+    ///
+    /// Set for the whole of the migration bridge. While both stores are open they each
+    /// measure the same free space and neither knows what the other is about to spend, so
+    /// a chunk written to both can be admitted twice against one lot of headroom and the
+    /// pair can cross the reserve together. Pinned, this environment cannot claim any new
+    /// disk at all: a write it cannot satisfy from its own free list is refused, and the
+    /// caller stores the chunk in files alone. That is the right answer anyway, because
+    /// this copy exists to make a rollback survivable, not to be the one that must
+    /// succeed.
+    growth_pinned: Arc<AtomicBool>,
     /// Serialises entering and leaving no-growth mode.
     ///
     /// Setting `no_growth` and resizing the map is one compound transition
@@ -315,6 +304,7 @@ impl LmdbStorage {
             env_lock: Arc::new(parking_lot::RwLock::new(())),
             last_disk_ok: parking_lot::Mutex::new(None),
             no_growth: Arc::new(AtomicBool::new(false)),
+            growth_pinned: Arc::new(AtomicBool::new(false)),
             growth_mode_lock: tokio::sync::Mutex::new(()),
             delete_growth_charged: Arc::new(AtomicU64::new(0)),
             blocking_tracker: TaskTracker::new(),
@@ -349,9 +339,26 @@ impl LmdbStorage {
     /// Returns an error if the write fails, content doesn't match address,
     /// or the disk is too full to accept new chunks.
     pub async fn put(&self, address: &XorName, content: &[u8]) -> Result<bool> {
+        self.put_inner(address, content, true).await
+    }
+
+    /// Store bytes under a key they do not hash to. Tests only.
+    ///
+    /// Stands in for a record that rotted in place, which is the one shape the ordinary
+    /// path refuses to create and the migration has to survive finding.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::put`], minus the address check.
+    #[cfg(test)]
+    pub(crate) async fn put_unchecked(&self, address: &XorName, content: &[u8]) -> Result<bool> {
+        self.put_inner(address, content, false).await
+    }
+
+    async fn put_inner(&self, address: &XorName, content: &[u8], verify: bool) -> Result<bool> {
         // Verify content address
         let computed = Self::compute_address(content);
-        if computed != *address {
+        if verify && computed != *address {
             return Err(Error::Storage(format!(
                 "Content address mismatch: expected {}, computed {}",
                 hex::encode(address),
@@ -796,6 +803,14 @@ impl LmdbStorage {
     /// Returns [`Error::Storage`] when the volume is below the reserve and the
     /// store holds less than one chunk of reusable space, or when the
     /// disk-space query itself fails.
+    /// Unused while the node is moving off this store.
+    ///
+    /// Capacity is now the file store's question, because that is where writes land, and
+    /// this predicate deliberately answers a different one: it counts pages this store can
+    /// reuse internally, which says nothing about whether the *file* about to be written
+    /// will fit. [`Self::capacity_verdict`] is still used, to decide whether the bridge's
+    /// copy into this store is worth attempting. Both go when this store does.
+    #[allow(dead_code)]
     pub(crate) fn check_capacity(&self) -> Result<()> {
         let Some(available) = self.available_space_cached()? else {
             return Ok(());
@@ -939,6 +954,13 @@ impl LmdbStorage {
         // Re-measured inside the lock: a caller that queued behind a transition
         // must act on the state that transition left behind, not the one it saw
         // before waiting.
+        // Pinned for the bridge: never unpinned by having room, because the room is not
+        // this environment's to spend while another store is measuring the same disk.
+        if self.growth_pinned.load(Ordering::Acquire) {
+            self.no_growth.store(true, Ordering::Release);
+            self.pin_map_to_high_water().await?;
+            return Ok(true);
+        }
         if self.available_space_cached()?.is_none() {
             // At or above the reserve: restore normal head-room if we pinned it.
             if self.no_growth.load(Ordering::Acquire) {
@@ -966,6 +988,20 @@ impl LmdbStorage {
         self.pin_map_to_high_water().await?;
 
         Ok(true)
+    }
+
+    /// Keep this environment from ever claiming new disk, until the process ends.
+    ///
+    /// For the migration bridge, where a second store measures the same free space and
+    /// neither knows what the other is about to spend. Pinned, this one writes only from
+    /// pages it already holds, so the other's accounting is the only claim on free disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] if the map cannot be pinned.
+    pub async fn pin_growth(&self) -> Result<()> {
+        self.growth_pinned.store(true, Ordering::Release);
+        self.sync_growth_mode().await.map(|_| ())
     }
 
     /// Pin the LMDB map to the size of `data.mdb` on disk.
@@ -1142,8 +1178,23 @@ impl LmdbStorage {
                 // stops being able to prune after its first assisted delete.
                 // Measured before the ceiling is restored, and before any error
                 // is propagated, so a committed delete is always accounted for.
-                let file_after = env.real_disk_size().unwrap_or(file_before);
-                let grew = file_after.saturating_sub(file_before);
+                //
+                // A measurement that fails is charged the whole slack rather than nothing.
+                // Reading it back as the size before the delete would say the file did not
+                // grow, and a delete that did grow would then spend disk the budget never
+                // saw. Repeat that and the ceiling stops meaning anything. Over-charging
+                // costs at worst one assisted delete; under-charging costs the reserve.
+                let grew = match env.real_disk_size() {
+                    Ok(file_after) => file_after.saturating_sub(file_before),
+                    Err(e) => {
+                        warn!(
+                            "Could not measure the LMDB file after an assisted delete \
+                             ({e}); charging the whole slack rather than assuming it cost \
+                             nothing"
+                        );
+                        DELETE_COW_SLACK
+                    }
+                };
                 if grew > 0 {
                     budget.fetch_add(grew, Ordering::AcqRel);
                 }
@@ -1386,9 +1437,22 @@ fn compute_map_size(db_dir: &Path, reserve: u64) -> Result<usize> {
     let available = fs2::available_space(db_dir)
         .map_err(|e| Error::Storage(format!("Failed to query available disk space: {e}")))?;
 
-    // The MDB data file may not exist yet on first run.
+    // The MDB data file may not exist yet on first run, and that is the only reason to
+    // read zero here. Any other failure is a question that was not answered, and answering
+    // it with zero sizes the map as though the database were empty, which on a node with a
+    // large one is a map far too small to open it.
     let mdb_file = db_dir.join("data.mdb");
-    let current_db_bytes = std::fs::metadata(&mdb_file).map_or(0, |m| m.len());
+    let current_db_bytes = match std::fs::metadata(&mdb_file) {
+        Ok(meta) => meta.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => {
+            return Err(Error::Storage(format!(
+                "Failed to measure {}: {e}. Refusing to size the map as though it were \
+                 empty.",
+                mdb_file.display()
+            )))
+        }
+    };
 
     let target = map_target_bytes(current_db_bytes, available, reserve);
 
