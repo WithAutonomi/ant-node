@@ -12,6 +12,15 @@ env:
   FOUNDRY_VERSION: v1.7.1
 
 jobs:
+  msrv:
+    name: Rust 1.91 MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets --all-features --locked
+
   fmt:
     name: Format Check
     runs-on: ubuntu-latest
@@ -50,6 +59,8 @@ jobs:
           version: ${{ env.FOUNDRY_VERSION }}
       - name: Run unit tests
         run: cargo test --lib --features test-utils
+      - name: Run browser RPC privacy regressions
+        run: cargo test --test webrtc_direct_devnet
       - name: Run e2e tests
         run: cargo test --test e2e --features test-utils -- --test-threads=1
       - name: Run v12 storage-bound audit attack PoCs
@@ -96,8 +107,28 @@ jobs:
         uses: foundry-rs/foundry-toolchain@v1
         with:
           version: ${{ env.FOUNDRY_VERSION }}
+      # Compile without cfg(test) too: browser unit tests can otherwise hide
+      # unused helpers whose production callers require webrtc-direct.
+      - name: Check library without default features
+        run: cargo check --lib --no-default-features --locked
       - name: Run unit tests without logging
         run: cargo test --lib --no-default-features
+
+  browser-devnet:
+    name: WebRTC Direct five-node devnet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+      - name: Run persistent-session discovery and transfer test
+        run: >-
+          cargo test --test webrtc_direct_devnet
+          -- --ignored --test-threads=1
 
   security:
     name: Security Audit
