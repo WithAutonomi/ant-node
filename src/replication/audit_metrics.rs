@@ -407,9 +407,12 @@ static DIGEST_DISPATCH_LATENCY_COUNT: AtomicU64 = AtomicU64::new(0);
 static DIGEST_DISPATCH_LATENCY_TOTAL_MS: AtomicU64 = AtomicU64::new(0);
 static DIGEST_DISPATCH_LATENCY_MAX_MS: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "logging")]
 impl AuditType {
     /// Stable structured-log label.
+    ///
+    /// Not gated on the `logging` feature: it is passed as an ordinary argument to the
+    /// penalty helper, which evaluates its arguments whether or not the log macro that
+    /// consumes them compiles to anything.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {

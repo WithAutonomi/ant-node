@@ -1,6 +1,6 @@
 [package]
 name = "ant-node"
-version = "0.17.2"
+version = "0.18.1"
 edition = "2021"
 authors = ["David Irvine <david.irvine@maidsafe.net>"]
 description = "Pure quantum-proof network node for the Autonomi decentralized network"
@@ -39,13 +39,13 @@ mimalloc = "0.1"
 # Until then, the git pin tracks the matching saorsa-core lineage
 # (the rc-2026.4.2 branch) so Cargo can unify the wire types here
 # with ant-protocol's re-exports.
-# Branch pin while the settlement-version wire types are in review
-# (WithAutonomi/ant-protocol#25). Swap back to a published `ant-protocol`
-# version pin once that PR merges and the release train publishes it.
-ant-protocol = { git = "https://github.com/grumbach/ant-protocol", branch = "reapply/pr-23-settlement-version" }
+# Pinned to the ant-protocol main commit that merged the settlement wire
+# types (WithAutonomi/ant-protocol#25). Swap back to a published version pin
+# once the release train publishes them.
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "88ad3f1" }
 
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
-saorsa-core = "0.27.1"
+saorsa-core = "0.27.3"
 saorsa-pqc = "0.5"
 
 # Payment verification - autonomi network lookup + EVM payment
@@ -215,3 +215,12 @@ unused_async = "allow"
 cognitive_complexity = "allow"
 # Allow non-const functions during initial development (may need runtime features later)
 missing_const_for_fn = "allow"
+
+# Temporary stacked-PR alignment, mirroring ant-client main: the git-sourced
+# ant-protocol (settlement branch, includes main) declares its saorsa-core as
+# the v2-903 route-diagnostics branch, so the node's registry saorsa-core must
+# resolve to the same source or the graph carries two MultiAddr types.
+# Remove together with the git ant-protocol pin once the release train
+# publishes ant-protocol with the released saorsa-core (WithAutonomi/saorsa-core#162).
+[patch.crates-io]
+saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core.git", branch = "feat/v2-903-download-route-diagnostics" }

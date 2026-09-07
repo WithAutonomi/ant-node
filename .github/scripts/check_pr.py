@@ -10,6 +10,11 @@ Two modes, each wired to its own required status check:
                          no-op that passes on rc-* so hotfix/regression PRs are
                          not forced to carry the full template).
 
+Linear only attaches a PR to an issue in three ways: the issue key in the branch
+name, the key in the PR title, or a closing magic word followed by the key in the
+PR description ("Closes V2-123"). A *bare* key in the description does not link
+the PR — Linear ignores it — so the linear check no longer accepts one (V2-1161).
+
 PR fields are read from the environment (set by the workflow from the event
 payload): PR_TITLE, PR_BODY, PR_BRANCH, PR_BASE.
 
@@ -28,14 +33,45 @@ LINEAR_TEAM_PREFIXES = ("V2", "AUTO", "REL", "INFRA", "QA")
 
 # Case-insensitive so it also matches Linear-generated branch names, which are
 # lower-cased (e.g. chrisoneil/v2-720-...).
-LINEAR_KEY = re.compile(
-    r"\b(?:" + "|".join(LINEAR_TEAM_PREFIXES) + r")-[0-9]+\b", re.IGNORECASE
-)
+LINEAR_KEY_PATTERN = r"\b(?:" + "|".join(LINEAR_TEAM_PREFIXES) + r")-[0-9]+\b"
+LINEAR_KEY = re.compile(LINEAR_KEY_PATTERN, re.IGNORECASE)
 # A real Linear issue URL: linear.app/<workspace>/issue/<KEY>[/<slug>]. Constrained
 # to the /issue/<key> path so generic pages (linear.app/changelog,
 # linear.app/not-an-issue) do not count as a linked issue.
-LINEAR_URL = re.compile(
-    r"linear\.app/[^/\s]+/issue/[A-Za-z][A-Za-z0-9]*-[0-9]+", re.IGNORECASE
+LINEAR_URL_PATTERN = r"linear\.app/[^/\s]+/issue/[A-Za-z][A-Za-z0-9]*-[0-9]+"
+LINEAR_URL = re.compile(LINEAR_URL_PATTERN, re.IGNORECASE)
+
+# Linear's *closing* magic words, verbatim from https://linear.app/docs/github.
+# Only these both attach the PR and drive the issue to Merged when it lands on
+# main. Linear's other families — "ref / refs / references", "part of /
+# contributes to / toward / towards", "relates to / related to" — attach the PR
+# without the status transition, so they are deliberately not accepted here.
+MAGIC_WORDS = (
+    "close", "closes", "closed", "closing",
+    "fix", "fixes", "fixed", "fixing",
+    "resolve", "resolves", "resolved", "resolving",
+    "complete", "completes", "completed", "completing",
+    "implement", "implements", "implemented", "implementing",
+    "linear issue",
+)
+# The five stems, for failure messages — spelling out all 21 forms is unreadable.
+MAGIC_WORD_STEMS = ("close", "fix", "resolve", "complete", "implement")
+# "<magic word> V2-123" or "<magic word> https://linear.app/<ws>/issue/V2-123/...".
+# This is the form the PR template asks for; a bare key does not match. The
+# separator is [ \t]+ rather than \s+ so the two halves must sit on the same
+# line — a paragraph that merely ends in "...closes." cannot pair up with a bare
+# key further down the body, and the template's own "## Linear issue" heading
+# cannot pair up with a bare key on the line beneath it. Longest alternative
+# first so "closes" is not shadowed by "close".
+LINEAR_CLOSES = re.compile(
+    r"\b(?:"
+    + "|".join(re.escape(w) for w in sorted(MAGIC_WORDS, key=len, reverse=True))
+    + r")[ \t]+(?:<)?(?:https?://)?(?:"
+    + LINEAR_URL_PATTERN
+    + r"|"
+    + LINEAR_KEY_PATTERN
+    + r")",
+    re.IGNORECASE,
 )
 
 # Canonical section headings, exactly as they appear in the template, keyed by
@@ -97,15 +133,35 @@ def sections(body):
 
 def check_linear():
     # Strip comments from the body so the template's own example does not count.
-    ref = linear_ref(env("PR_TITLE"), strip_comments(env("PR_BODY")), env("PR_BRANCH"))
+    closes = LINEAR_CLOSES.search(strip_comments(env("PR_BODY")))
+    if closes:
+        ok(f"✅ Linear link found in the PR body: {closes.group(0)}")
+    # A key in the branch name or the PR title also links the PR in Linear, so
+    # either is an accepted alternative to the closing form.
+    ref = linear_ref(env("PR_TITLE"), env("PR_BRANCH"))
     if ref:
-        ok(f"✅ Linear reference found: {ref}")
+        ok(f"✅ Linear link found in the PR title / branch name: {ref}")
     fail(
         "❌ No linked Linear issue found.\n\n"
-        "Every PR must reference a Linear issue — an issue key ("
-        + " / ".join(f"{p}-123" for p in LINEAR_TEAM_PREFIXES)
-        + "), or a linear.app/<workspace>/issue/<key> URL — in the PR title, body,\n"
-        "or branch name. Add it to the '## Linear issue' section and update the PR."
+        "Linear attaches a PR to an issue in exactly three ways. Use one:\n\n"
+        "  1. A closing magic word + the issue key in the PR body — preferred:\n\n"
+        "         Closes V2-123\n\n"
+        "     One line per issue if this PR closes several. Any of Linear's closing\n"
+        "     words works, in any tense — "
+        + " / ".join(MAGIC_WORD_STEMS)
+        + ", plus their -s, -d and -ing\n"
+        "     forms, and the phrase 'linear issue'. The key may be a\n"
+        "     linear.app/<workspace>/issue/<key> URL instead.\n"
+        "  2. The issue key in the branch name, e.g. chrisoneil/v2-123-short-slug.\n"
+        "  3. The issue key in the PR title.\n\n"
+        "A bare '"
+        + LINEAR_TEAM_PREFIXES[0]
+        + "-123' in the body does NOT link the PR — Linear ignores it, the PR never\n"
+        "appears on the issue, and the issue never moves to Merged when this lands.\n"
+        "Linear's linking-only words ('ref', 'part of', 'towards', 'relates to') do\n"
+        "attach the PR, but they do not drive the Merged transition, so this check\n"
+        "does not accept them either.\n"
+        "Put the closing form under the '## Linear issue' heading and update the PR."
     )
 
 
@@ -168,9 +224,15 @@ def check_template():
                 f"'## Compatibility': fill in {axis} (use 'none' if not applicable)"
             )
 
-    # Linear reference present in its own section (comments stripped).
-    if "linear issue" in secs and not linear_ref(strip_comments(secs["linear issue"])):
-        errors.append("'## Linear issue': add the issue key or a linear.app link")
+    # Linear reference present in its own section, in the closing form that
+    # actually links the PR (comments stripped so the template's example is inert).
+    if "linear issue" in secs and not LINEAR_CLOSES.search(
+        strip_comments(secs["linear issue"])
+    ):
+        errors.append(
+            "'## Linear issue': use the closing form, e.g. 'Closes V2-123' — a bare "
+            "key does not link the PR in Linear"
+        )
 
     # ADR must be filled explicitly: 'n/a' for T0/T1, a link for T2/T3.
     adr = strip_comments(secs.get("adr", "")).strip()
