@@ -244,7 +244,7 @@ channel cannot retain listener capacity indefinitely. A connection may own at
 most `max_channels_per_connection` active DataChannels,
 and every admitted channel must also own one of the global `max_channels`
 permits. Excess channels are closed and terminate the offending association.
-The v4 protocol expects persistent channels, so an association is closed when
+The v5 protocol expects persistent channels, so an association is closed when
 its last application channel ends rather than retaining a stale connection
 slot for a hypothetical channel reopen.
 
@@ -527,8 +527,8 @@ rejected.
 ### Browser protocol and DataChannel framing
 
 The public protocol is not the private Saorsa `WireMessage` or native Postcard
-DHT protocol. The application protocol name is `autonomi.web.poc.v4`, its
-DataChannel label is `autonomi.web.v4`, and the embedded post-quantum session
+DHT protocol. The application protocol name is `autonomi.web.poc.v5`, its
+DataChannel label is `autonomi.web.v5`, and the embedded post-quantum session
 has its own independently checked wire version 1. The initial methods are:
 
 - `HELLO`: return and validate protocol, peer, endpoint, capability, chunk-size,
@@ -550,9 +550,18 @@ has its own independently checked wire version 1. The initial methods are:
   handler, including content-address and on-chain payment verification.
 - `PING`: optional liveness method after the proof of concept.
 
+HELLO payment metadata contains only the EVM `chain_id`, payment-token address,
+and payment-vault address. It never includes the node operator's verification
+RPC URL, which may contain credentials or API keys. Built-in networks supply
+known chain IDs; custom networks resolve `eth_chainId` privately during listener
+startup and fail startup if resolution fails. Browser manifest v6 carries the
+same public identity. Applications and wallets select their own RPC providers,
+verify their chain before paying, and require upload nodes to agree on the chain
+and both contracts. This schema change requires protocol v5 on both sides.
+
 WebRTC DataChannels are messages, not byte streams. One persistent reliable
 ordered DataChannel carries a sequence of RPC request/response frames for one
-association. Protocol v4 has two framing layers:
+association. Protocol v5 has two framing layers:
 
 1. The plaintext inner frame is a four-byte JSON-header length, a bounded
    versioned JSON header, and the declared raw binary body. Chunk bytes are
@@ -693,7 +702,7 @@ The earlier feature-gated WebTransport PoC has been replaced by the
 - native `saorsa-transport` and `saorsa-core::MultiAddr` support for canonical,
   literal-IP `/webrtc-direct/certhash/.../p2p/...` addresses with exactly one
   fingerprint and no DNS form;
-- a protocol v4 browser session backed by the shared `saorsa-webrtc`
+- a protocol v5 browser session backed by the shared `saorsa-webrtc`
   post-quantum session v1, which performs ephemeral ML-KEM-768 key
   establishment, authenticates the transcript and ANT peer ID with ML-DSA-65,
   derives direction-separated keys, and protects every later application frame
@@ -731,7 +740,7 @@ production client is designed to accept the same endpoint values from a
 compiled constant list, without fetching a manifest or resolving DNS.
 
 This implementation currently uses the Saorsa v1 WebRTC
-connection-establishment profile and the v4 encrypted application protocol
+connection-establishment profile and the v5 encrypted application protocol
 described above. It is a PoC, not evidence that the production no-mutation gate
 has been met. Promotion remains blocked on the cross-browser validation listed
 below.
@@ -759,7 +768,7 @@ pre-populates the devnet payment cache for those addresses, while
 content-address verification, DHT responsibility, payment-cache admission,
 LMDB storage, and verified reads remain active.
 
-### Protocol v4 automated validation
+### Protocol v5 automated validation
 
 Node CI explicitly runs the otherwise ignored five-node WebRTC Direct devnet
 integration test. Its native test adapter completes the ML-KEM/ML-DSA
@@ -787,9 +796,9 @@ reservation, and RAII release. The devnet workflow transfers real encrypted
 chunks, but it is not a browser resource-limit or fleet test. The adversarial
 browser and fleet tests listed under Validation remain promotion requirements.
 
-There is currently no automated real-browser v4 flow in browser CI. The
+There is currently no automated real-browser v5 flow in browser CI. The
 historical smoke flow below ran only Chromium and used protocol v3. Therefore
-Chrome, Firefox, and Safari interoperability against a matching deployed v4
+Chrome, Firefox, and Safari interoperability against a matching deployed v5
 node fleet, along with cold bootstrap from the production compiled seed list,
 remain unmet acceptance criteria rather than claimed results.
 
@@ -798,7 +807,7 @@ remain unmet acceptance criteria rather than claimed results.
 The following results predate the v4 post-quantum record layer. They validate
 WebRTC Direct connectivity, decentralized lookup, paid storage, and browser
 client behavior, but they do not validate the v4 handshake or encrypted-record
-implementation and must be repeated with matching v4 clients and nodes.
+implementation and must be repeated with matching v5 clients and nodes.
 
 On 2026-08-27 a headless Chromium client loaded the local web application and
 dialed a literal public-IPv4 WebRTC Direct address on a DigitalOcean-hosted
@@ -906,8 +915,8 @@ round-trip tests.
   storage it comes from the normal wallet signature and payment proof.
 - Bootstrap peers do not perform lookup or proxy uploads/downloads; they
   answer the same bounded one-hop RPCs as other browser-capable nodes.
-- Application protocol v4 requires matching browser and node deployments;
-  plaintext v3 and encrypted v4 peers deliberately fail closed. Native QUIC
+- Application protocol v5 requires matching browser and node deployments;
+  older plaintext v3 and encrypted v4 peers deliberately fail closed. Native QUIC
   nodes and existing `ant-core`/`ant-cli` callers are unaffected.
 
 ## Validation
@@ -928,7 +937,7 @@ The decision advances beyond PoC only after all of the following are covered:
   bindings, malformed or version-mismatched PQ handshakes, invalid ML-DSA
   transcript signatures, modified KEM transcripts, replayed or out-of-order
   records, modified ciphertext, and sequence exhaustion. A v3 plaintext frame
-  sent to a v4 endpoint fails closed rather than downgrading.
+  sent to a v5 endpoint fails closed rather than downgrading.
 - Cryptographic tests cover both traffic directions, direction-separated key
   derivation, nonce/sequence uniqueness, transcript domain separation,
   handshake and frame bounds, tampering, replay, reordering, and key cleanup.

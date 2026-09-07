@@ -59,6 +59,8 @@ jobs:
           version: ${{ env.FOUNDRY_VERSION }}
       - name: Run unit tests
         run: cargo test --lib --features test-utils
+      - name: Run browser RPC privacy regressions
+        run: cargo test --test webrtc_direct_devnet
       - name: Run e2e tests
         run: cargo test --test e2e --features test-utils -- --test-threads=1
       - name: Run v12 storage-bound audit attack PoCs

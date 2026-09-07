@@ -37,7 +37,7 @@ mimalloc = "0.1"
 #
 ant-protocol = "2.3.5"
 # Portable WebRTC Direct profile shared by the node and browser WASM adapter.
-saorsa-webrtc = { git = "https://github.com/WithAutonomi/saorsa-transport.git", rev = "da3a6934d85eb3fb63d7f489c362abee158d6ce8" }
+saorsa-webrtc = { git = "https://github.com/WithAutonomi/saorsa-transport.git", rev = "79fe1d8aca0e3434c41a4f19af65ab098aac102a" }
 
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
 saorsa-core = "0.27.3"

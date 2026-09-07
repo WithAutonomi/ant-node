@@ -138,7 +138,7 @@ async fn main() -> color_eyre::Result<()> {
             network_id,
             created_at.clone(),
             devnet.browser_endpoints(),
-            devnet.browser_payment_network(),
+            devnet.browser_payment_network().await?,
             vec![public_file],
         ))
     } else {
