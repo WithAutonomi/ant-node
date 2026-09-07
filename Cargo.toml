@@ -37,7 +37,7 @@ mimalloc = "0.1"
 #
 ant-protocol = "2.3.5"
 # Portable WebRTC Direct profile shared by the node and browser WASM adapter.
-saorsa-webrtc = { git = "https://github.com/WithAutonomi/saorsa-transport.git", rev = "79fe1d8aca0e3434c41a4f19af65ab098aac102a" }
+saorsa-webrtc = { git = "https://github.com/WithAutonomi/saorsa-transport.git", rev = "d2147379ae45ecccc28fb8313ec1d42efac407f6" }
 
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
 saorsa-core = "0.27.3"
@@ -200,8 +200,8 @@ webrtc-direct = [
 ]
 
 [patch.crates-io]
-saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core.git", rev = "7b546f05b13f06ded8a24cffa89e4091b937c234" }
-saorsa-transport = { git = "https://github.com/WithAutonomi/saorsa-transport.git", rev = "5687db03e31384f35dff1785dedc09a5a1655a2b" }
+saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core.git", rev = "a87ebd641627aaabd5f5aea7b0d1c002c9f03915" }
+saorsa-transport = { git = "https://github.com/WithAutonomi/saorsa-transport.git", rev = "d2147379ae45ecccc28fb8313ec1d42efac407f6" }
 
 [profile.release]
 lto = true
