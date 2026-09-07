@@ -107,6 +107,10 @@ jobs:
         uses: foundry-rs/foundry-toolchain@v1
         with:
           version: ${{ env.FOUNDRY_VERSION }}
+      # Compile without cfg(test) too: browser unit tests can otherwise hide
+      # unused helpers whose production callers require webrtc-direct.
+      - name: Check library without default features
+        run: cargo check --lib --no-default-features --locked
       - name: Run unit tests without logging
         run: cargo test --lib --no-default-features
 
