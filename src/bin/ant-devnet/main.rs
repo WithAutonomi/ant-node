@@ -157,7 +157,16 @@ async fn main() -> color_eyre::Result<()> {
         evm: evm_info,
     };
 
-    let json = serde_json::to_string_pretty(&manifest)?;
+    let mut manifest_value = serde_json::to_value(&manifest)?;
+    if let Some(browser) = &browser_manifest {
+        let bootstrap_webrtc: Vec<&str> = browser
+            .endpoints
+            .iter()
+            .map(|node| node.endpoint.multiaddr.as_str())
+            .collect();
+        manifest_value["bootstrap_webrtc"] = serde_json::to_value(bootstrap_webrtc)?;
+    }
+    let json = serde_json::to_string_pretty(&manifest_value)?;
     let browser_json = browser_manifest
         .as_ref()
         .map(serde_json::to_string_pretty)
