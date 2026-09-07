@@ -3931,23 +3931,21 @@ impl ReplicationEngine {
                     let q = queues.read().await;
                     q.pending_keys().into_iter().collect()
                 };
-                let admission_futures = completed.iter().map(|(_, outcome)| async {
-                    match outcome {
-                        Some(outcome) if !outcome.response.bootstrapping => Some(
-                            admission::admit_hints(
-                                &self_id,
-                                &outcome.response.replica_hints,
-                                &outcome.response.paid_hints,
-                                &p2p,
-                                &config,
-                                &storage,
-                                &paid_list,
-                                &pending_keys,
-                            )
-                            .await,
-                        ),
-                        _ => None,
-                    }
+                let admission_futures = completed.iter().map(async |(_, outcome)| match outcome {
+                    Some(outcome) if !outcome.response.bootstrapping => Some(
+                        admission::admit_hints(
+                            &self_id,
+                            &outcome.response.replica_hints,
+                            &outcome.response.paid_hints,
+                            &p2p,
+                            &config,
+                            &storage,
+                            &paid_list,
+                            &pending_keys,
+                        )
+                        .await,
+                    ),
+                    _ => None,
                 });
                 let admitted = join_all(admission_futures).await;
 
