@@ -5453,7 +5453,7 @@ dependencies = [
 [[package]]
 name = "saorsa-webrtc"
 version = "0.1.0"
-source = "git+https://github.com/WithAutonomi/saorsa-transport.git?rev=da3a6934d85eb3fb63d7f489c362abee158d6ce8#da3a6934d85eb3fb63d7f489c362abee158d6ce8"
+source = "git+https://github.com/WithAutonomi/saorsa-transport.git?rev=79fe1d8aca0e3434c41a4f19af65ab098aac102a#79fe1d8aca0e3434c41a4f19af65ab098aac102a"
 dependencies = [
  "base64 0.22.1",
  "blake3",

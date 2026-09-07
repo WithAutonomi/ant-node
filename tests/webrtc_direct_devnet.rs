@@ -19,6 +19,165 @@ use serde_json::{json, Value};
 use std::error::Error;
 use std::io;
 use std::str::FromStr;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+struct MockChainRpc {
+    url: String,
+    task: tokio::task::JoinHandle<io::Result<()>>,
+}
+
+impl MockChainRpc {
+    async fn new(body: String) -> io::Result<Self> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!(
+            "http://dummy-user:dummy-password@{}/v2/dummy-path-key?api_key=dummy-query-key",
+            listener.local_addr()?
+        );
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await?;
+                let mut request = Vec::new();
+                loop {
+                    if socket.read_buf(&mut request).await? == 0 {
+                        return Err(io::Error::other("truncated RPC request"));
+                    }
+                    if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .ok_or_else(|| io::Error::other("missing RPC request length"))?;
+                        if request.len() >= end + 4 + length {
+                            let payload: Value = serde_json::from_slice(&request[end + 4..])?;
+                            assert_eq!(payload["method"], "eth_chainId");
+                            break;
+                        }
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await?;
+            }
+        });
+        Ok(Self { url, task })
+    }
+
+    fn network(&self) -> evmlib::Network {
+        evmlib::Network::new_custom(
+            &self.url,
+            "0x1111111111111111111111111111111111111111",
+            "0x2222222222222222222222222222222222222222",
+        )
+    }
+}
+
+impl Drop for MockChainRpc {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn encrypted_hello_and_manifest_never_disclose_verification_rpc() -> Result<(), Box<dyn Error>>
+{
+    let rpc =
+        MockChainRpc::new(json!({"jsonrpc":"2.0", "id":1, "result":"0x7a69"}).to_string()).await?;
+    let temp = tempfile::tempdir()?;
+    let mut config = DevnetConfig::minimal();
+    config.node_count = 2;
+    config.bootstrap_count = 1;
+    config.base_port = 0;
+    config.webrtc_direct = true;
+    config.data_dir = temp.path().join("rpc-privacy-devnet");
+    config.spawn_delay = std::time::Duration::from_millis(20);
+    config.evm_network = Some(rpc.network());
+    let mut devnet = Devnet::new(config).await?;
+    devnet.start().await?;
+    let endpoints = devnet.browser_endpoints();
+    let endpoint = endpoints
+        .first()
+        .ok_or_else(|| io::Error::other("missing browser endpoint"))?;
+    let payment = devnet.browser_payment_network().await?;
+    let manifest = ant_node::BrowserDevnetManifest::new(
+        "rpc-privacy".to_string(),
+        "2026-09-07T00:00:00Z".to_string(),
+        endpoints.clone(),
+        payment,
+        vec![],
+    );
+    let mut client = BrowserRpcClient::connect(&endpoint.endpoint).await?;
+    let (hello, content) = client
+        .rpc(
+            json!({
+                "version": BROWSER_PROTOCOL_VERSION, "request_id": 1, "type": "hello",
+            }),
+            &[],
+        )
+        .await?;
+    client.close().await?;
+    devnet.shutdown().await?;
+    assert_eq!(hello["status"], "ok");
+    assert!(content.is_empty());
+    assert_eq!(
+        hello["payment"],
+        json!({
+            "chain_id": 31337,
+            "payment_token_address": "0x1111111111111111111111111111111111111111",
+            "payment_vault_address": "0x2222222222222222222222222222222222222222",
+        })
+    );
+    assert_eq!(hello["payment"], serde_json::to_value(&manifest.payment)?);
+    let serialized = serde_json::to_string(&(hello, manifest))?;
+    for private in [
+        "rpc_url",
+        "dummy-user",
+        "dummy-password",
+        "dummy-path-key",
+        "dummy-query-key",
+        &rpc.url,
+    ] {
+        assert!(
+            !serialized.contains(private),
+            "browser metadata disclosed {private}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalid_chain_identity_fails_without_exposing_provider_response(
+) -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    for body in [
+        json!({"jsonrpc":"2.0", "id":1, "result":"0x01"}),
+        json!({"jsonrpc":"2.0", "id":1, "result":"0x10000000000000000"}),
+        json!({"jsonrpc":"2.0", "id":2, "result":"0x1"}),
+        json!({"jsonrpc":"2.0", "id":1, "error":{"message":"dummy-private-url"}}),
+    ] {
+        let rpc = MockChainRpc::new(body.to_string()).await?;
+        let mut config = DevnetConfig::minimal();
+        config.data_dir = temp.path().join("invalid-rpc");
+        config.evm_network = Some(rpc.network());
+        let mut devnet = Devnet::new(config).await?;
+        let error = devnet
+            .browser_payment_network()
+            .await
+            .err()
+            .ok_or_else(|| io::Error::other("accepted invalid chain identity"))?;
+        assert!(!error.to_string().contains("dummy"));
+        assert!(!error.to_string().contains(&rpc.url));
+        devnet.shutdown().await?;
+    }
+    Ok(())
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "starts a five-node local network"]
@@ -73,10 +232,8 @@ async fn seeded_public_file_downloads_and_paid_uploads_over_direct_node_endpoint
         .await?;
     assert_eq!(hello["status"], "ok");
     assert_eq!(hello["protocol"], BROWSER_PROTOCOL_NAME);
-    assert_eq!(
-        hello["payment"]["rpc_url"].as_str(),
-        Some(evm_testnet.to_network().rpc_url().as_str())
-    );
+    assert_eq!(hello["payment"]["chain_id"], 31337);
+    assert!(hello["payment"].get("rpc_url").is_none());
     assert_eq!(hello["peer_id"], parsed_endpoint.peer_id);
     assert_eq!(
         hello["endpoint"]["multiaddr"],

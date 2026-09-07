@@ -3,7 +3,7 @@
 This workflow starts a five-node local Autonomi network where every node has a
 direct WebRTC Direct endpoint. Startup publishes a default immutable test file
 and serves browser bootstrap metadata; the companion site lives in the sibling
-`ant-client-web-support` repository.
+`ant-client-browser-sdk` repository, with Rust/WASM from `ant-client-web-support`.
 
 ## Start the node testnet
 
@@ -48,33 +48,43 @@ node does not maintain a browser-specific multiaddress codec.
 
 `--webrtc-direct` requires an explicit payment network. For this local test,
 `--enable-evm` starts Anvil and startup prints a **Funded wallet private key**. This
-is a disposable local Anvil key for browser upload testing. The browser manifest
-contains only public RPC/token/vault configuration and never contains the
-key.
-If `HELLO.payment.rpc_url` shows `https://arb1.arbitrum.io/rpc`, the devnet was
-started without local Anvil; stop it and restart with the command above.
+is a disposable local Anvil key for browser upload testing. HELLO and the browser
+manifest contain only `chain_id`, `payment_token_address`, and
+`payment_vault_address`. Local Anvil uses chain ID 31337. Neither the verification
+RPC URL nor the funded key is included in browser metadata.
+
+Browser protocol v5 and browser manifest v6 require matching node, Rust/WASM
+client, and SDK versions. The application or wallet owns its payment provider;
+no browser RPC setting is needed on the node. For a custom EVM network, the node
+privately resolves `eth_chainId` from its verification RPC when starting the
+browser listener. Failure to resolve the chain ID fails listener startup.
+Built-in Arbitrum networks use their known chain IDs. Clients compare payment
+chain and contract identities, so they can use a different provider for the same
+network.
 
 ## Start the browser client
 
-In `ant-client-web-support/web`:
+In `ant-client-browser-sdk`:
 
 ```bash
 npm ci
+ANT_CLIENT_DIR=../ant-client-web-support npm run sync:wasm
 npm run dev
 ```
 
-Open `http://127.0.0.1:5173`. The app automatically loads the browser manifest.
-To upload, choose a file, paste the funded private key printed by ant-devnet,
-and use **Pay and upload file**. The page self-encrypts locally, verifies node
+Open the URL printed by Vite. Paste a node's WebRTC Direct multiaddress from
+the browser manifest and click **Connect**. To upload, choose a file, paste the
+Anvil JSON-RPC URL and funded private key printed by ant-devnet, and use
+**Pay and upload**. The page self-encrypts locally, verifies node
 quotes, signs the approval/payment locally, and sends only encrypted records
-and public payment proof to nodes. The key field is cleared immediately. The
+and public payment proof to nodes. The
 result address is placed into the download field automatically.
 
-Use **Download and save file** to fetch the public DataMap and every encrypted
+Use **Download and save** to fetch the public DataMap and every encrypted
 file chunk directly, reconstruct the complete file, validate its whole-file
 BLAKE3 hash, and save it under its original filename.
 
-For a browser-supported video, use **Prepare video stream** and then the native
+For a browser-supported video, use **Stream as media** and then the native
 video controls. The Rust/WASM reader fetches and decrypts only records
 overlapping the media element's requested byte ranges. A same-origin service
 worker provides standard HTTP range responses locally; no file bytes pass
@@ -83,7 +93,7 @@ through the manifest server or another gateway.
 ## Automated verification
 
 ```bash
-cargo test --test webrtc_direct_devnet -- --ignored
+cargo test --locked --test webrtc_direct_devnet -- --include-ignored
 ```
 
 This starts Anvil and the five-node network, self-encrypts and publishes a
@@ -92,6 +102,10 @@ entries, extracts a generated certificate pin from the advertised
 multiaddress, retrieves and reconstructs it, then obtains a real signed quote,
 pays it on-chain, uploads a fresh record through paid `PUT_CHUNK`, and reads it
 back through WebRTC Direct.
+
+The same suite checks that encrypted HELLO and browser manifests omit a custom
+verification URL containing dummy credentials and API keys, and that invalid
+chain-ID responses fail without exposing provider details.
 
 ## LAN testing
 
@@ -108,7 +122,7 @@ cargo run --bin ant-devnet -- \
 ```
 
 Expose the client dev server on the LAN with `npm run dev -- --host 0.0.0.0`
-and change its manifest URL to
+and obtain a bootstrap address from
 `http://192.168.1.50:25000/api/browser-manifest.json`. Both the native and
 WebRTC Direct UDP ranges must be reachable. Do not use this unsigned local
 manifest mode on a public network.
@@ -141,8 +155,8 @@ cat /var/lib/ant/node-0/webrtc-direct.multiaddr
 exit
 ```
 
-Start `ant-client-web-support/web`, paste that address into the demo, and use
-**Connect and use as bootstrap**. The operation installs the single address as
+Start `ant-client-browser-sdk`, paste that address into the demo, and use
+**Connect**. The operation installs the single address as
 the Rust browser client's seed without DNS or a browser manifest. The address
 contains only the public DTLS certificate hash and ANT peer ID; it contains no
 secret key material. To disable the listener in a custom node configuration,
@@ -191,7 +205,7 @@ The 2026-08-27 public smoke run used the former protocol v3 and headless
 Chromium only. From one bootstrap address it traversed multiple independent
 nodes, obtained four storage quotes from non-bootstrap closest nodes,
 submitted one payment, and stored all four encrypted records. It is historical
-connectivity evidence, not v4 or cross-browser acceptance evidence. Nodes
+connectivity evidence, not v5 or cross-browser acceptance evidence. Nodes
 behind the testnet's deliberate inbound-NAT rules remain unreachable without
 relayed WebRTC, so their 10-second DataChannel timeouts currently make this
 smoke path slower than an all-public fleet.

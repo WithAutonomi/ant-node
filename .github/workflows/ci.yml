@@ -110,6 +110,8 @@ jobs:
           # noticing. This is what makes that loud.
           grep -qE 'test result: ok\. [1-9]' /tmp/scale.log \
             || { echo 'scale ran no tests'; exit 1; }
+      - name: Run browser RPC privacy regressions
+        run: cargo test --test webrtc_direct_devnet
       - name: Run e2e tests
         run: cargo test --test e2e --features test-utils -- --test-threads=1
       - name: Run v12 storage-bound audit attack PoCs

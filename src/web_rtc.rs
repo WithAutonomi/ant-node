@@ -497,6 +497,7 @@ pub async fn spawn(
     endpoint_catalog: Option<Arc<BrowserEndpointCatalog>>,
 ) -> Result<WebRtcDirectServer> {
     validate_webrtc_config(config)?;
+    let payment = browser_payment_network(evm_network).await?;
     let certificate_path = certificate_path(config, root_dir);
     let certificate = load_or_generate_certificate(&certificate_path).await?;
     let certificate_sha256 = certificate
@@ -528,7 +529,7 @@ pub async fn spawn(
         identity,
         p2p: Arc::clone(&p2p),
         ant_protocol,
-        payment: browser_payment_network(evm_network),
+        payment,
         endpoint: browser_endpoint.clone(),
         endpoint_catalog,
     });
@@ -2160,7 +2161,7 @@ mod tests {
     #[test]
     fn parses_versioned_requests() {
         let request: Request = serde_json::from_str(
-            r#"{"version":4,"request_id":7,"content_length":0,"type":"find_node","target":"0000000000000000000000000000000000000000000000000000000000000000","count":20}"#,
+            r#"{"version":5,"request_id":7,"content_length":0,"type":"find_node","target":"0000000000000000000000000000000000000000000000000000000000000000","count":20}"#,
         )
         .expect("valid request");
 
@@ -2200,7 +2201,7 @@ mod tests {
             3,
         );
         let value = serde_json::to_value(response).expect("serialize response");
-        assert_eq!(value["version"], 4);
+        assert_eq!(value["version"], BROWSER_PROTOCOL_VERSION);
         assert_eq!(value["request_id"], 42);
         assert_eq!(value["status"], "ok");
         assert_eq!(value["content_length"], 3);

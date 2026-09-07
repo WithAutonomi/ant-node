@@ -710,16 +710,21 @@ impl Devnet {
         Ok(published)
     }
 
-    /// Public EVM configuration advertised to direct browser clients.
+    /// Public EVM chain and contracts advertised to direct browser clients.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DevnetError::Config` if a custom RPC cannot report its chain ID.
     #[cfg(feature = "webrtc-direct")]
-    #[must_use]
-    pub fn browser_payment_network(&self) -> BrowserPaymentNetwork {
+    pub async fn browser_payment_network(&self) -> Result<BrowserPaymentNetwork> {
         let network = self
             .config
             .evm_network
             .as_ref()
             .unwrap_or(&EvmNetwork::ArbitrumOne);
         browser_payment_network(network)
+            .await
+            .map_err(|error| DevnetError::Config(error.to_string()))
     }
 
     #[cfg(feature = "webrtc-direct")]
