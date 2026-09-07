@@ -354,6 +354,24 @@ fn merkle_required_multiplier(receipt_timestamp: u64, enforced_from: u64) -> u64
 /// scaling a 1x result is wrong. The order here — multiply the total, then
 /// divide once — is deliberate, and matches the contract, which computes
 /// `totalAmount` before splitting it.
+/// Does this underpayment look like a client that applied no multiplier at
+/// all, as opposed to one that merely paid too little?
+///
+/// Compares against the **bare** expectation rather than scaling the paid
+/// amount up by the required multiplier. [`merkle_expected_per_node`] floors
+/// after multiplying, so `expected(m)` is not generally `m * expected(1)`: at
+/// median 901 and depth 7 they differ by one wei. A scaled comparison
+/// therefore misses genuinely unmultiplied settlements at every depth that
+/// does not divide its leaf count evenly, and those are exactly the clients
+/// the upgrade advice exists for.
+fn underpayment_looks_like_a_stale_client(
+    paid: Amount,
+    expected_bare: Amount,
+    required_multiplier: u64,
+) -> bool {
+    required_multiplier > 1 && paid == expected_bare
+}
+
 fn merkle_expected_per_node(
     candidate_prices: &[Amount],
     depth: u8,
@@ -3363,11 +3381,36 @@ impl PaymentVerifier {
                 )));
             }
             if *paid_amount < expected_per_node {
+                // An exact `required_multiplier`x shortfall is the signature of
+                // a client that settles under the superseded rule: it applied
+                // no multiplier at all. That is not a pricing dispute, it is an
+                // outdated client, and the person reading this has already paid
+                // and cannot get it back. Say so, and say what to do about it,
+                // rather than leaving them with two integers to compare.
+                //
+                // This message is the only thing that reaches such a client.
+                // The settlement-version gate refuses these uploads before they
+                // pay, but only for clients new enough to declare a version,
+                // which by construction excludes every client this branch
+                // catches.
+                let looks_like_stale_client = underpayment_looks_like_a_stale_client(
+                    *paid_amount,
+                    expected_per_node_bare,
+                    required_multiplier,
+                );
+                let advice = if looks_like_stale_client {
+                    " This is exactly the pre-parity settlement amount, so the paying client is \
+                     too old to settle correctly. Run `ant update` to upgrade, or reinstall from \
+                     https://github.com/WithAutonomi/ant-client/releases/latest. Note the payment \
+                     that was already made cannot be recovered."
+                } else {
+                    ""
+                };
                 return Err(Error::Payment(format!(
                     "Underpayment for node at index {idx}: paid {paid_amount}, \
                      expected at least {expected_per_node} \
                      (median16 formula, depth={}, {required_multiplier}x required for a \
-                     receipt stamped {} vs parity boundary {parity_from})",
+                     receipt stamped {} vs parity boundary {parity_from}).{advice}",
                     payment_info.depth, payment_info.merkle_payment_timestamp
                 )));
             }
@@ -3630,6 +3673,39 @@ mod tests {
             bare * Amount::from(PAID_QUOTE_PAYMENT_MULTIPLIER) + Amount::from(1u64),
             "dividing before multiplying would lose this wei"
         );
+    }
+
+    /// The same non-linearity that test pins also breaks a naive check for
+    /// "did this client apply no multiplier".
+    ///
+    /// Scaling the paid amount up by the multiplier and comparing against the
+    /// parity expectation asks `49_426 == 49_425` at median 901 depth 7, which
+    /// is false, so a genuinely unmultiplied settlement is not recognised and
+    /// the payer never learns their client is too old. Comparing against the
+    /// bare expectation asks the same arithmetic the expectation was built
+    /// with, and holds at every depth.
+    #[test]
+    fn a_stale_client_is_recognised_where_depth_does_not_divide_its_leaves() {
+        let prices = prices_with_median(901);
+        let bare = merkle_expected_per_node(&prices, 7, 1).expect("bare expectation is payable");
+        let parity = merkle_expected_per_node(&prices, 7, PAID_QUOTE_PAYMENT_MULTIPLIER)
+            .expect("parity expectation is payable");
+
+        // The scaled comparison this replaced would have missed it.
+        assert_ne!(parity, bare * Amount::from(PAID_QUOTE_PAYMENT_MULTIPLIER));
+
+        assert!(
+            underpayment_looks_like_a_stale_client(bare, bare, PAID_QUOTE_PAYMENT_MULTIPLIER),
+            "an exactly-1x settlement must be recognised at depth 7"
+        );
+        // A merely-cheap payment still is not blamed on the client's version.
+        assert!(!underpayment_looks_like_a_stale_client(
+            bare.saturating_sub(Amount::from(1u64)),
+            bare,
+            PAID_QUOTE_PAYMENT_MULTIPLIER
+        ));
+        // And under the legacy regime there is nothing to upgrade away from.
+        assert!(!underpayment_looks_like_a_stale_client(bare, bare, 1));
     }
 
     /// The economic invariant ADR-0008 restores: a merkle **leaf** settles
@@ -7039,6 +7115,59 @@ mod tests {
         assert!(
             err_msg.contains("Underpayment") && err_msg.contains("3x required"),
             "Error should name the required multiplier: {err_msg}"
+        );
+        // An exact 1x settlement is an outdated client, not a pricing dispute.
+        // The payer has already spent money they cannot recover, so the
+        // rejection has to tell them what to do rather than hand them two
+        // integers. This is the only message that reaches a client too old to
+        // declare a settlement version at quote time.
+        assert!(
+            err_msg.contains("too old to settle correctly") && err_msg.contains("ant update"),
+            "Error should tell the user to upgrade: {err_msg}"
+        );
+    }
+
+    /// The upgrade advice is keyed on an EXACT multiplier shortfall, which is
+    /// what an unmultiplied settlement looks like. A merely-cheap payment is a
+    /// different fault and must not be blamed on the client's version, or the
+    /// advice stops meaning anything.
+    #[tokio::test]
+    async fn a_partial_shortfall_is_not_blamed_on_an_outdated_client() {
+        let verifier = merkle_test_verifier();
+        let (xorname, tagged_proof, pool_hash, ts) = make_valid_merkle_proof_bytes();
+
+        // One wei under parity: short, but not the 1x signature.
+        let almost = merkle_parity_per_node_depth2().saturating_sub(Amount::from(1u64));
+        {
+            let info = evmlib::merkle_payments::OnChainPaymentInfo {
+                depth: 2,
+                merkle_payment_timestamp: ts,
+                paid_node_addresses: vec![
+                    (RewardsAddress::new([0u8; 20]), 0, almost),
+                    (RewardsAddress::new([1u8; 20]), 1, almost),
+                ],
+            };
+            verifier.pool_cache.lock().put(pool_hash, info);
+        }
+
+        let err_msg = format!(
+            "{}",
+            verifier
+                .verify_payment(
+                    &xorname,
+                    Some(&tagged_proof),
+                    VerificationContext::ClientPut
+                )
+                .await
+                .expect_err("a short settlement must be refused")
+        );
+        assert!(
+            err_msg.contains("Underpayment"),
+            "Error should still name the underpayment: {err_msg}"
+        );
+        assert!(
+            !err_msg.contains("ant update"),
+            "A partial shortfall must not be reported as an outdated client: {err_msg}"
         );
     }
 

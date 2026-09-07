@@ -39,7 +39,10 @@ mimalloc = "0.1"
 # Until then, the git pin tracks the matching saorsa-core lineage
 # (the rc-2026.4.2 branch) so Cargo can unify the wire types here
 # with ant-protocol's re-exports.
-ant-protocol = "2.3.5"
+# Pinned to the ant-protocol main commit that merged the settlement wire
+# types (WithAutonomi/ant-protocol#25). Swap back to a published version pin
+# once the release train publishes them.
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "88ad3f1" }
 
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
 saorsa-core = "0.27.3"
@@ -212,3 +215,12 @@ unused_async = "allow"
 cognitive_complexity = "allow"
 # Allow non-const functions during initial development (may need runtime features later)
 missing_const_for_fn = "allow"
+
+# Temporary stacked-PR alignment, mirroring ant-client main: the git-sourced
+# ant-protocol (settlement branch, includes main) declares its saorsa-core as
+# the v2-903 route-diagnostics branch, so the node's registry saorsa-core must
+# resolve to the same source or the graph carries two MultiAddr types.
+# Remove together with the git ant-protocol pin once the release train
+# publishes ant-protocol with the released saorsa-core (WithAutonomi/saorsa-core#162).
+[patch.crates-io]
+saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core.git", branch = "feat/v2-903-download-route-diagnostics" }

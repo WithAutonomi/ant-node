@@ -81,6 +81,9 @@ mod fresh_offer_capacity;
 #[cfg(test)]
 mod verify_storage_gate;
 
+#[cfg(test)]
+mod settlement_version_gate;
+
 pub use anvil::TestAnvil;
 pub use harness::TestHarness;
 pub use testnet::{NetworkState, NodeState, TestNetwork, TestNetworkConfig, TestNode};
