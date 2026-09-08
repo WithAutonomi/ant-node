@@ -201,9 +201,9 @@ webrtc-direct = [
 [patch.crates-io]
 saorsa-pqc = { git = "https://github.com/saorsa-labs/saorsa-pqc", rev = "6d57e9dd73d537182fe85b0050e809a224f21154" }
 evmlib = { git = "https://github.com/WithAutonomi/evmlib", rev = "c80b7c7aee11bb62503b00d8b41e08da1a13039d" }
-ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "2054bc0c012fff7bc2945cab8990f1c39fd701b7" }
-saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core", rev = "580f4558b5446742b775d7f1bd163ed41d65f9d7" }
-saorsa-transport = { git = "https://github.com/WithAutonomi/saorsa-transport", rev = "c4398305ca19274dde3163a35833b99672f26233" }
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "5acbaee1280234fe45d474a492a3f778cd87cdcf" }
+saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core", rev = "2e6a3d525858926ff07188be9919e4b2b0ab96fa" }
+saorsa-transport = { git = "https://github.com/WithAutonomi/saorsa-transport", rev = "f3655297dbe26e1bd28739281ad88ae86213b0cc" }
 
 [profile.release]
 lto = true
