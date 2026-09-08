@@ -4,9 +4,10 @@ use ant_node::devnet::{Devnet, DevnetConfig};
 use ant_node::BrowserEndpoint;
 use ant_protocol::MAX_CHUNK_SIZE;
 use bytes::Bytes;
-use evmlib::common::{Amount, QuoteHash};
+use evmlib::common::Amount;
 use evmlib::wallet::Wallet;
-use evmlib::RewardsAddress;
+use evmlib::EncodedPeerId;
+use evmlib::{PaymentQuote, ProofOfPayment};
 use saorsa_transport::transport::{WebRtcCertificateHash, WebRtcDirectAddr};
 use saorsa_transport::webrtc_direct::{WebRtcDataChannel, WebRtcDirectClient};
 use saorsa_webrtc::{
@@ -18,7 +19,6 @@ use self_encryption::{DataMap, EncryptedChunk};
 use serde_json::{json, Value};
 use std::error::Error;
 use std::io;
-use std::str::FromStr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 struct MockChainRpc {
@@ -347,66 +347,73 @@ async fn seeded_public_file_downloads_and_paid_uploads_over_direct_node_endpoint
     assert_eq!(decrypted, content.as_slice());
 
     let upload_content = b"paid browser WebRtcDirect upload";
-    let upload_address = hex::encode(blake3::hash(upload_content).as_bytes());
-    let (quote_header, quote_content) = download_client
-        .rpc(
-            json!({
-                "version": BROWSER_PROTOCOL_VERSION,
-                "request_id": 50,
-                "type": "quote_chunk",
-                "address": upload_address,
-                "size": upload_content.len(),
-            }),
-            &[],
+    let upload_address = *blake3::hash(upload_content).as_bytes();
+    let response = download_client
+        .chunk_rpc(
+            50,
+            ant_protocol::ChunkMessageBody::QuoteRequest(ant_protocol::ChunkQuoteRequest::new(
+                upload_address,
+                upload_content.len() as u64,
+            )),
         )
         .await?;
-    assert_eq!(quote_header["status"], "ok");
-    assert_eq!(quote_header["type"], "storage_quote");
-    assert_eq!(quote_header["already_stored"], false);
-    assert!(quote_content.is_empty());
-    let quote = quote_header["quote"].clone();
-    let quote_hash = QuoteHash::from_str(required_string(&quote, "quote_hash")?)?;
-    let rewards_address = RewardsAddress::from_str(required_string(&quote, "rewards_address")?)?;
-    let price = Amount::from_str(required_string(&quote, "price")?)?;
+    let ant_protocol::ChunkMessageBody::QuoteResponse(ant_protocol::ChunkQuoteResponse::Success {
+        quote,
+        already_stored,
+        commitment,
+    }) = response
+    else {
+        return Err(io::Error::other("expected native quote response").into());
+    };
+    assert!(!already_stored);
+    let quote: PaymentQuote = rmp_serde::from_slice(&quote)?;
+    assert!(ant_protocol::payment::verify_quote_signature(&quote));
+    let quote_hash = quote.hash();
     let (payments, _) = wallet
-        .pay_for_quotes([(quote_hash, rewards_address, price * Amount::from(3))])
+        .pay_for_quotes([(
+            quote_hash,
+            quote.rewards_address,
+            quote.price * Amount::from(3),
+        )])
         .await
         .map_err(|error| io::Error::other(format!("storage payment failed: {error:?}")))?;
     let transaction_hash = payments
         .get(&quote_hash)
-        .ok_or_else(|| io::Error::other("payment returned no transaction hash for quote"))?;
-
-    let (put_header, put_content) = download_client
-        .rpc(
-            json!({
-                "version": BROWSER_PROTOCOL_VERSION,
-                "request_id": 51,
-                "type": "put_chunk",
-                "address": upload_address,
-                "quote": quote,
-                "transaction_hash": format!("{transaction_hash:?}"),
-            }),
-            upload_content,
+        .ok_or_else(|| io::Error::other("missing transaction hash"))?;
+    let proof = ant_protocol::payment::PaymentProof {
+        proof_of_payment: ProofOfPayment {
+            peer_quotes: vec![(EncodedPeerId::new(parsed_download.peer_id_bytes()?), quote)],
+        },
+        tx_hashes: vec![*transaction_hash],
+        commitment_sidecars: commitment.into_iter().collect(),
+    };
+    let proof = ant_protocol::payment::serialize_single_node_proof(&proof)?;
+    let response = download_client
+        .chunk_rpc(
+            51,
+            ant_protocol::ChunkMessageBody::PutRequest(
+                ant_protocol::ChunkPutRequest::with_payment(
+                    upload_address,
+                    Bytes::copy_from_slice(upload_content),
+                    proof,
+                ),
+            ),
         )
         .await?;
-    assert_eq!(put_header["status"], "ok");
-    assert_eq!(put_header["type"], "chunk_stored");
-    assert_eq!(put_header["address"], upload_address);
-    assert!(put_content.is_empty());
-
-    let (uploaded_header, uploaded_content) = download_client
-        .rpc(
-            json!({
-                "version": BROWSER_PROTOCOL_VERSION,
-                "request_id": 52,
-                "type": "get_chunk",
-                "address": upload_address,
-            }),
-            &[],
+    assert!(
+        matches!(response, ant_protocol::ChunkMessageBody::PutResponse(ant_protocol::ChunkPutResponse::Success { address }) if address == upload_address)
+    );
+    let response = download_client
+        .chunk_rpc(
+            52,
+            ant_protocol::ChunkMessageBody::GetRequest(ant_protocol::ChunkGetRequest::new(
+                upload_address,
+            )),
         )
         .await?;
-    assert_eq!(uploaded_header["status"], "ok");
-    assert_eq!(uploaded_content, upload_content);
+    assert!(
+        matches!(response, ant_protocol::ChunkMessageBody::GetResponse(ant_protocol::ChunkGetResponse::Success { address, content }) if address == upload_address && content == upload_content)
+    );
     assert!(seed_client.requests_sent() >= 2);
     assert!(download_client.requests_sent() >= 6);
 
@@ -415,12 +422,6 @@ async fn seeded_public_file_downloads_and_paid_uploads_over_direct_node_endpoint
 
     devnet.shutdown().await?;
     Ok(())
-}
-
-fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, io::Error> {
-    value[field]
-        .as_str()
-        .ok_or_else(|| io::Error::other(format!("quote omitted {field}")))
 }
 
 struct BrowserRpcClient {
@@ -466,6 +467,21 @@ impl BrowserRpcClient {
         })?;
         self.requests_sent += 1;
         Ok(result)
+    }
+
+    async fn chunk_rpc(
+        &mut self,
+        request_id: u64,
+        body: ant_protocol::ChunkMessageBody,
+    ) -> Result<ant_protocol::ChunkMessageBody, Box<dyn Error>> {
+        let message = ant_protocol::ChunkMessage { request_id, body }.encode()?;
+        let (header, content) = self.rpc(json!({
+            "version": BROWSER_PROTOCOL_VERSION, "request_id": request_id, "type": "chunk_protocol",
+        }), &message).await?;
+        assert_eq!(header["type"], "chunk_protocol");
+        let response = ant_protocol::ChunkMessage::decode(&content)?;
+        assert_eq!(response.request_id, request_id);
+        Ok(response.body)
     }
 
     const fn requests_sent(&self) -> usize {

@@ -882,8 +882,7 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "2.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd13dd1f51e3e9b3e871673b7d52a65054c9431b0656f4fa9589098126c3dafd"
+source = "git+https://github.com/WithAutonomi/ant-protocol?rev=8bd9b93d736d01bb7e929e96b419307211022edc#8bd9b93d736d01bb7e929e96b419307211022edc"
 dependencies = [
  "blake3",
  "bytes",
@@ -2599,12 +2598,14 @@ dependencies = [
 [[package]]
 name = "evmlib"
 version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83822a94669e50793b583817ed2681b67d2e7059bae652784d34a6ee40fbfd37"
+source = "git+https://github.com/WithAutonomi/evmlib?rev=5767d6ed366cc547a163b4a1f118e36cb9fbbb2b#5767d6ed366cc547a163b4a1f118e36cb9fbbb2b"
 dependencies = [
  "alloy",
  "ant-merkle",
  "exponential-backoff",
+ "futures-util",
+ "getrandom 0.2.17",
+ "gloo-timers",
  "hex",
  "rand 0.8.8",
  "rmp-serde",
@@ -2614,6 +2615,8 @@ dependencies = [
  "tiny-keccak",
  "tokio",
  "tracing",
+ "url",
+ "web-time",
  "xor_name",
 ]
 
@@ -2976,6 +2979,18 @@ name = "glob"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
+
+[[package]]
+name = "gloo-timers"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbb143cf96099802033e0d4f4963b19fd2e0b728bcf076cd9cf7f6634f092994"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "js-sys",
+ "wasm-bindgen",
+]
 
 [[package]]
 name = "group"
@@ -5308,7 +5323,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.27.3"
-source = "git+https://github.com/WithAutonomi/saorsa-core.git?rev=a87ebd641627aaabd5f5aea7b0d1c002c9f03915#a87ebd641627aaabd5f5aea7b0d1c002c9f03915"
+source = "git+https://github.com/WithAutonomi/saorsa-core?rev=c19a50e269ca1e66aceeb8158bcb009ed1e1bc57#c19a50e269ca1e66aceeb8158bcb009ed1e1bc57"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5341,7 +5356,7 @@ dependencies = [
 [[package]]
 name = "saorsa-dht-lookup"
 version = "0.1.0"
-source = "git+https://github.com/WithAutonomi/saorsa-core.git?rev=a87ebd641627aaabd5f5aea7b0d1c002c9f03915#a87ebd641627aaabd5f5aea7b0d1c002c9f03915"
+source = "git+https://github.com/WithAutonomi/saorsa-core?rev=c19a50e269ca1e66aceeb8158bcb009ed1e1bc57#c19a50e269ca1e66aceeb8158bcb009ed1e1bc57"
 dependencies = [
  "futures-core",
  "futures-util",
@@ -5350,8 +5365,7 @@ dependencies = [
 [[package]]
 name = "saorsa-pqc"
 version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2ed2e429e5673763625ca5285bcbf15270fa16918cb5e63fc95ababacbb1a4c"
+source = "git+https://github.com/saorsa-labs/saorsa-pqc?rev=6d57e9dd73d537182fe85b0050e809a224f21154#6d57e9dd73d537182fe85b0050e809a224f21154"
 dependencies = [
  "aead",
  "aes-gcm",
@@ -5362,18 +5376,16 @@ dependencies = [
  "fips203",
  "fips204",
  "fips205",
- "futures",
+ "getrandom 0.2.17",
  "hkdf",
  "hmac",
  "hpke",
- "libc",
  "log",
  "pbkdf2",
  "postcard",
  "rand 0.8.8",
  "rand_chacha 0.3.1",
  "rand_core 0.6.4",
- "rayon",
  "serde",
  "serde_json",
  "sha2",
@@ -5381,7 +5393,6 @@ dependencies = [
  "subtle",
  "thiserror 2.0.20",
  "time",
- "tokio",
  "tracing",
  "wide",
  "zeroize",
@@ -5390,7 +5401,7 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.36.3"
-source = "git+https://github.com/WithAutonomi/saorsa-transport.git?rev=d2147379ae45ecccc28fb8313ec1d42efac407f6#d2147379ae45ecccc28fb8313ec1d42efac407f6"
+source = "git+https://github.com/WithAutonomi/saorsa-transport?rev=52c800ae828a47d88ad9cb553a2cd1b5d364d3eb#52c800ae828a47d88ad9cb553a2cd1b5d364d3eb"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5453,16 +5464,15 @@ dependencies = [
 [[package]]
 name = "saorsa-webrtc"
 version = "0.1.0"
-source = "git+https://github.com/WithAutonomi/saorsa-transport.git?rev=d2147379ae45ecccc28fb8313ec1d42efac407f6#d2147379ae45ecccc28fb8313ec1d42efac407f6"
+source = "git+https://github.com/WithAutonomi/saorsa-transport?rev=52c800ae828a47d88ad9cb553a2cd1b5d364d3eb#52c800ae828a47d88ad9cb553a2cd1b5d364d3eb"
 dependencies = [
  "base64 0.22.1",
  "blake3",
  "chacha20poly1305",
- "fips203",
- "fips204",
  "getrandom 0.2.17",
  "hex",
  "postcard",
+ "saorsa-pqc",
  "serde",
  "serde_bytes",
  "serde_json",
