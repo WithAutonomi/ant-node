@@ -1370,32 +1370,21 @@ async fn process_request(
                 Some(TrackedBytes { bytes, reservation }),
             ))
         }
-        RequestBody::Hello => {
-            let peer_id = state.p2p.peer_id().to_hex();
-            Ok((
-                Response::ok(
-                    request.request_id,
-                    ResponseBody::Hello {
-                        protocol: BROWSER_PROTOCOL_NAME.to_string(),
-                        peer_id,
-                        max_chunk_size: MAX_CHUNK_SIZE,
-                        endpoint: state.endpoint.clone(),
-                        payment: state.payment.clone(),
-                        capabilities: vec![
-                            "chunk_protocol".to_string(),
-                            "find_node".to_string(),
-                            "get_chunk".to_string(),
-                            "quote_chunk".to_string(),
-                            "put_chunk".to_string(),
-                        ],
-                    },
-                    0,
-                ),
-                None,
-            ))
-        }
-        RequestBody::FindNode { target, count } => {
-            Ok(process_find_node(request.request_id, target, count, state).await)
+        RequestBody::Hello => Ok((hello_response(request.request_id, state), None)),
+        RequestBody::FindNode {
+            target,
+            count,
+            with_address_records,
+        } => {
+            process_find_node(
+                request.request_id,
+                target,
+                count,
+                with_address_records,
+                state,
+                resources,
+            )
+            .await
         }
         RequestBody::GetChunk { address } => {
             process_get_chunk(request.request_id, address, state, resources).await
@@ -1419,15 +1408,39 @@ async fn process_request(
     }
 }
 
+fn hello_response(request_id: u64, state: &ServerState) -> Response {
+    Response::ok(
+        request_id,
+        ResponseBody::Hello {
+            protocol: BROWSER_PROTOCOL_NAME.to_string(),
+            peer_id: state.p2p.peer_id().to_hex(),
+            max_chunk_size: MAX_CHUNK_SIZE,
+            endpoint: state.endpoint.clone(),
+            payment: state.payment.clone(),
+            capabilities: vec![
+                "chunk_protocol".into(),
+                "find_node".into(),
+                "signed_address_records".into(),
+                "get_chunk".into(),
+                "quote_chunk".into(),
+                "put_chunk".into(),
+            ],
+        },
+        0,
+    )
+}
+
 async fn process_find_node(
     request_id: u64,
     target: String,
     count: Option<usize>,
+    with_address_records: bool,
     state: &ServerState,
-) -> (Response, Option<TrackedBytes>) {
+    resources: &ConnectionResources,
+) -> ServerResult<(Response, Option<TrackedBytes>)> {
     let target_bytes = match decode_32_byte_hex(&target) {
         Ok(bytes) => bytes,
-        Err(error) => return (Response::error(request_id, "invalid_target", error), None),
+        Err(error) => return Ok((Response::error(request_id, "invalid_target", error), None)),
     };
     let count = count
         .unwrap_or(MAX_FIND_NODE_RESULTS)
@@ -1437,7 +1450,18 @@ async fn process_find_node(
         .find_closest_nodes_local_with_self(&target_bytes, count)
         .await;
     let mut nodes = Vec::with_capacity(dht_nodes.len());
+    let mut proofs = Vec::new();
+    let mut reservation = resources.try_reserve_bytes(if with_address_records {
+        2 * dht_nodes.len() * (saorsa_core::signed_address::MAX_SIGNED_ADDRESS_BYTES + 4)
+    } else {
+        0
+    })?;
     for node in dht_nodes {
+        if with_address_records {
+            if let Some(proof) = dht.signed_address_record_for_peer(&node.peer_id).await {
+                proofs.push(proof);
+            }
+        }
         let supplemental = dht.supplemental_addresses_for_peer(&node.peer_id).await;
         nodes.push(browser_node_from_dht(
             &node,
@@ -1445,10 +1469,17 @@ async fn process_find_node(
             state.endpoint_catalog.as_deref(),
         ));
     }
-    (
-        Response::ok(request_id, ResponseBody::Nodes { target, nodes }, 0),
-        None,
-    )
+    let bytes = saorsa_core::signed_address::encode_record_bundle(&proofs)?;
+    drop(proofs);
+    reservation.resize(bytes.len())?;
+    Ok((
+        Response::ok(
+            request_id,
+            ResponseBody::Nodes { target, nodes },
+            bytes.len(),
+        ),
+        Some(TrackedBytes { bytes, reservation }),
+    ))
 }
 
 fn browser_node_from_dht(
@@ -1468,6 +1499,7 @@ fn browser_node_from_dht(
             multiaddr: multiaddr.to_string(),
         });
     BrowserNode {
+        address_record: None,
         peer_record: rmp_serde::to_vec_named(node).ok().map(hex::encode),
         webrtc_direct: discovered_endpoint
             .or_else(|| endpoint_catalog.and_then(|catalog| catalog.get(&node.peer_id))),
@@ -2317,6 +2349,7 @@ mod tests {
             address_types: Vec::new(),
             distance: None,
             reliability: 0.75,
+            address_authority: None,
         };
 
         let supplemental = endpoint
@@ -2347,6 +2380,7 @@ mod tests {
             address_types: Vec::new(),
             distance: None,
             reliability: 0.75,
+            address_authority: None,
         };
         let catalog = BrowserEndpointCatalog::default();
         catalog.insert(peer_id, endpoint.clone());
