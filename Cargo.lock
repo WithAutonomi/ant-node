@@ -881,7 +881,7 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "2.3.5"
-source = "git+https://github.com/WithAutonomi/ant-protocol?rev=3cf4fe61664747f18c2d9247ff1400c6ea7e4171#3cf4fe61664747f18c2d9247ff1400c6ea7e4171"
+source = "git+https://github.com/WithAutonomi/ant-protocol?rev=64734ca6ce7472e80f20b7577d8d4cbd6dbfe972#64734ca6ce7472e80f20b7577d8d4cbd6dbfe972"
 dependencies = [
  "blake3",
  "bytes",
@@ -2597,7 +2597,7 @@ dependencies = [
 [[package]]
 name = "evmlib"
 version = "0.9.1"
-source = "git+https://github.com/WithAutonomi/evmlib?rev=545c6fa48cb05fecc411bed2d9d0a47d82ede6d1#545c6fa48cb05fecc411bed2d9d0a47d82ede6d1"
+source = "git+https://github.com/WithAutonomi/evmlib?rev=c80b7c7aee11bb62503b00d8b41e08da1a13039d#c80b7c7aee11bb62503b00d8b41e08da1a13039d"
 dependencies = [
  "alloy",
  "ant-merkle",
