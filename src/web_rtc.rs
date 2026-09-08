@@ -1114,7 +1114,7 @@ async fn read_webrtc_request(
     // Admission happens as soon as a client starts a frame. Idle persistent
     // channels consume neither request-rate tokens nor request worker slots.
     let request_permit = resources.try_admit_request()?;
-    let max_plaintext_bytes = 4 + max_header_bytes + MAX_CHUNK_SIZE;
+    let max_plaintext_bytes = 4 + max_header_bytes + ant_protocol::MAX_WIRE_MESSAGE_SIZE;
     let mut encrypted = read_pq_payload_after_first(
         first_message,
         channel,
@@ -1318,17 +1318,52 @@ async fn process_request(
     state: &ServerState,
     resources: &ConnectionResources,
 ) -> ServerResult<(Response, Option<TrackedBytes>)> {
-    if !matches!(&request.body, RequestBody::PutChunk { .. }) && !content.is_empty() {
+    if !matches!(
+        &request.body,
+        RequestBody::PutChunk { .. } | RequestBody::ChunkProtocol
+    ) && !content.is_empty()
+    {
         return Ok((
             Response::error(
                 request.request_id,
                 "unexpected_content",
-                "only put_chunk accepts binary request content".to_string(),
+                "only put_chunk and chunk_protocol accept binary request content".to_string(),
             ),
             None,
         ));
     }
     match request.body {
+        RequestBody::ChunkProtocol => {
+            let Some(protocol) = state.ant_protocol.as_ref() else {
+                return Ok((
+                    Response::error(
+                        request.request_id,
+                        "storage_disabled",
+                        "chunk storage is disabled".to_string(),
+                    ),
+                    None,
+                ));
+            };
+            // Charge the response before the shared handler can allocate it.
+            // Requests retain the existing connection/rate/byte admission limits.
+            let mut reservation =
+                resources.try_reserve_bytes(2 * ant_protocol::MAX_WIRE_MESSAGE_SIZE)?;
+            let response = protocol
+                .try_handle_request(&content)
+                .await
+                .map_err(|error| format!("chunk protocol request failed: {error}"))?
+                .ok_or_else(|| "chunk protocol handler returned no response".to_string())?;
+            if response.len() > ant_protocol::MAX_WIRE_MESSAGE_SIZE {
+                return Err("chunk protocol response exceeds wire limit".to_string());
+            }
+            let bytes = response.to_vec();
+            drop(response);
+            reservation.resize(bytes.len())?;
+            Ok((
+                Response::ok(request.request_id, ResponseBody::ChunkProtocol, bytes.len()),
+                Some(TrackedBytes { bytes, reservation }),
+            ))
+        }
         RequestBody::Hello => {
             let peer_id = state.p2p.peer_id().to_hex();
             Ok((
@@ -1341,6 +1376,7 @@ async fn process_request(
                         endpoint: state.endpoint.clone(),
                         payment: state.payment.clone(),
                         capabilities: vec![
+                            "chunk_protocol".to_string(),
                             "find_node".to_string(),
                             "get_chunk".to_string(),
                             "quote_chunk".to_string(),
