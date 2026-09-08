@@ -881,7 +881,7 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "2.3.5"
-source = "git+https://github.com/WithAutonomi/ant-protocol?rev=63c8525563e14f48374d52f7079bad8530e8b62b#63c8525563e14f48374d52f7079bad8530e8b62b"
+source = "git+https://github.com/WithAutonomi/ant-protocol?rev=9bf7024564ebd9c7a7badd76f3c16e8a7b73c17d#9bf7024564ebd9c7a7badd76f3c16e8a7b73c17d"
 dependencies = [
  "blake3",
  "bytes",
@@ -2597,7 +2597,7 @@ dependencies = [
 [[package]]
 name = "evmlib"
 version = "0.9.1"
-source = "git+https://github.com/WithAutonomi/evmlib?rev=5767d6ed366cc547a163b4a1f118e36cb9fbbb2b#5767d6ed366cc547a163b4a1f118e36cb9fbbb2b"
+source = "git+https://github.com/WithAutonomi/evmlib?rev=545c6fa48cb05fecc411bed2d9d0a47d82ede6d1#545c6fa48cb05fecc411bed2d9d0a47d82ede6d1"
 dependencies = [
  "alloy",
  "ant-merkle",
@@ -5322,7 +5322,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.27.3"
-source = "git+https://github.com/WithAutonomi/saorsa-core?rev=3b4ce11930fcf59361120f20ffb47e3810daa674#3b4ce11930fcf59361120f20ffb47e3810daa674"
+source = "git+https://github.com/WithAutonomi/saorsa-core?rev=4eb17758eceb0c709cee0143d161ea777870d1cd#4eb17758eceb0c709cee0143d161ea777870d1cd"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5390,7 +5390,7 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.36.3"
-source = "git+https://github.com/WithAutonomi/saorsa-transport?rev=a2c6f4b165410015ee639178c9941610c6e2d164#a2c6f4b165410015ee639178c9941610c6e2d164"
+source = "git+https://github.com/WithAutonomi/saorsa-transport?rev=0ce2ea865242942b09a40cd0cea03ff0d0557065#0ce2ea865242942b09a40cd0cea03ff0d0557065"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5416,7 +5416,6 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "pin-project-lite",
- "postcard",
  "quinn-udp 0.6.1",
  "rand 0.8.8",
  "rcgen 0.13.2",
@@ -5440,7 +5439,6 @@ dependencies = [
  "system-configuration",
  "thiserror 2.0.20",
  "time",
- "tiny-keccak",
  "tinyvec",
  "tokio",
  "tokio-util",

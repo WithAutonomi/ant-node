@@ -78,29 +78,7 @@ pub fn node_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
 // `commitment_hash` is re-exported from `ant-protocol` above (single source of
 // truth for the pin), so the paying client and the node compute the same pin.
 
-/// Canonical bytes the ML-DSA signature covers: the commitment fields
-/// minus the signature itself.
-///
-/// `sender_public_key` is included so an adversary cannot keep the body
-/// and re-sign under a different key (the audit-time verifier would
-/// otherwise accept the swap because verification uses the embedded key).
-fn commitment_signed_payload(
-    root: &[u8; 32],
-    key_count: u32,
-    sender_peer_id: &[u8; 32],
-    sender_public_key: &[u8],
-) -> Vec<u8> {
-    let mut v = Vec::with_capacity(32 + 4 + 32 + 4 + sender_public_key.len());
-    v.extend_from_slice(root);
-    v.extend_from_slice(&key_count.to_le_bytes());
-    v.extend_from_slice(sender_peer_id);
-    // Length-prefix the pubkey so two different (key, suffix) splits cannot
-    // produce the same byte stream (canonical encoding).
-    let pk_len = u32::try_from(sender_public_key.len()).unwrap_or(u32::MAX);
-    v.extend_from_slice(&pk_len.to_le_bytes());
-    v.extend_from_slice(sender_public_key);
-    v
-}
+use ant_protocol::payment::commitment::commitment_signed_payload;
 
 // ---------------------------------------------------------------------------
 // Merkle tree
