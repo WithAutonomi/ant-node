@@ -881,7 +881,7 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "2.3.5"
-source = "git+https://github.com/WithAutonomi/ant-protocol?rev=5acbaee1280234fe45d474a492a3f778cd87cdcf#5acbaee1280234fe45d474a492a3f778cd87cdcf"
+source = "git+https://github.com/WithAutonomi/ant-protocol?rev=f091b13b79aef643b6a6e6e47d7ba17351af3b36#f091b13b79aef643b6a6e6e47d7ba17351af3b36"
 dependencies = [
  "blake3",
  "bytes",
@@ -5322,7 +5322,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.27.3"
-source = "git+https://github.com/WithAutonomi/saorsa-core?rev=2e6a3d525858926ff07188be9919e4b2b0ab96fa#2e6a3d525858926ff07188be9919e4b2b0ab96fa"
+source = "git+https://github.com/WithAutonomi/saorsa-core?rev=91a929bbb329e9f9a348476de37116317267299f#91a929bbb329e9f9a348476de37116317267299f"
 dependencies = [
  "anyhow",
  "async-trait",
