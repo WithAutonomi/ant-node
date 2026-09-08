@@ -31,7 +31,8 @@ use saorsa_transport::webrtc::{
     WEBRTC_WRITE_CHUNK_BYTES,
 };
 use saorsa_transport::webrtc_direct::{
-    WebRtcCertificate, WebRtcDataChannel, WebRtcDirectConnection, WebRtcDirectListener,
+    WebRtcAdmissionLimits, WebRtcCertificate, WebRtcDataChannel, WebRtcDirectConnection,
+    WebRtcDirectListener,
 };
 use std::collections::HashMap;
 use std::future::Future;
@@ -503,11 +504,16 @@ pub async fn spawn(
     let certificate_sha256 = certificate
         .sha256_digest()
         .map_err(|error| Error::Startup(error.to_string()))?;
-    let listener = WebRtcDirectListener::bind(config.bind, certificate)
-        .await
-        .map_err(|error| {
-            Error::Startup(format!("failed to bind WebRTC Direct listener: {error}"))
-        })?;
+    let listener = WebRtcDirectListener::bind_with_limits(
+        config.bind,
+        certificate,
+        WebRtcAdmissionLimits {
+            max_connections: config.max_connections,
+            max_connections_per_ip: config.max_connections_per_ip,
+        },
+    )
+    .await
+    .map_err(|error| Error::Startup(format!("failed to bind WebRTC Direct listener: {error}")))?;
     let local_addr = listener.local_addr();
     let advertised_addr = advertised_addr(config, local_addr)?;
     let peer_id = *p2p.peer_id();
