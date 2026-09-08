@@ -9,12 +9,12 @@ use evmlib::wallet::Wallet;
 use evmlib::EncodedPeerId;
 use evmlib::{PaymentQuote, ProofOfPayment};
 use saorsa_transport::transport::{WebRtcCertificateHash, WebRtcDirectAddr};
-use saorsa_transport::webrtc_direct::{WebRtcDataChannel, WebRtcDirectClient};
-use saorsa_webrtc::{
+use saorsa_transport::webrtc::{
     decode_pq_frame, encode_pq_frame, pq_frame_length, PqClientHandshake, PqSession,
     BROWSER_PROTOCOL_NAME, BROWSER_PROTOCOL_VERSION, PQ_ENCRYPTED_OVERHEAD_BYTES,
     PQ_SERVER_ACCEPT_BYTES, WEBRTC_DIRECT_DATA_CHANNEL, WEBRTC_WRITE_CHUNK_BYTES,
 };
+use saorsa_transport::webrtc_direct::{WebRtcDataChannel, WebRtcDirectClient};
 use self_encryption::{DataMap, EncryptedChunk};
 use serde_json::{json, Value};
 use std::error::Error;

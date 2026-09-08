@@ -857,7 +857,6 @@ dependencies = [
  "saorsa-core",
  "saorsa-pqc",
  "saorsa-transport",
- "saorsa-webrtc",
  "self-replace",
  "self_encryption",
  "semver 1.0.28",
@@ -882,7 +881,7 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "2.3.5"
-source = "git+https://github.com/WithAutonomi/ant-protocol?rev=005fe74c8d2ba3370e2d3eb0635431a27768151b#005fe74c8d2ba3370e2d3eb0635431a27768151b"
+source = "git+https://github.com/WithAutonomi/ant-protocol?rev=5b2b7e025c8d0391e4cdb43b2fe657428aa4394c#5b2b7e025c8d0391e4cdb43b2fe657428aa4394c"
 dependencies = [
  "blake3",
  "bytes",
@@ -5323,7 +5322,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.27.3"
-source = "git+https://github.com/WithAutonomi/saorsa-core?rev=17264c91b7d2668cbbf4247942c57e1132643e43#17264c91b7d2668cbbf4247942c57e1132643e43"
+source = "git+https://github.com/WithAutonomi/saorsa-core?rev=19d3cc41d39c71713a0a12f43ed1c7c91fc0551f#19d3cc41d39c71713a0a12f43ed1c7c91fc0551f"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5391,7 +5390,7 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.36.3"
-source = "git+https://github.com/WithAutonomi/saorsa-transport?rev=52c800ae828a47d88ad9cb553a2cd1b5d364d3eb#52c800ae828a47d88ad9cb553a2cd1b5d364d3eb"
+source = "git+https://github.com/WithAutonomi/saorsa-transport?rev=aff9876341e710627426977fafacccee1595a898#aff9876341e710627426977fafacccee1595a898"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5399,6 +5398,7 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "bytes",
+ "chacha20poly1305",
  "chrono",
  "clap",
  "core-foundation 0.9.4",
@@ -5416,6 +5416,7 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "pin-project-lite",
+ "postcard",
  "quinn-udp 0.6.1",
  "rand 0.8.8",
  "rcgen 0.13.2",
@@ -5430,6 +5431,7 @@ dependencies = [
  "rustls-post-quantum",
  "saorsa-pqc",
  "serde",
+ "serde_bytes",
  "serde_json",
  "serde_yaml",
  "slab",
@@ -5438,6 +5440,7 @@ dependencies = [
  "system-configuration",
  "thiserror 2.0.20",
  "time",
+ "tiny-keccak",
  "tinyvec",
  "tokio",
  "tokio-util",
@@ -5448,26 +5451,6 @@ dependencies = [
  "webrtc",
  "windows",
  "x25519-dalek",
- "zeroize",
-]
-
-[[package]]
-name = "saorsa-webrtc"
-version = "0.1.0"
-source = "git+https://github.com/WithAutonomi/saorsa-transport?rev=52c800ae828a47d88ad9cb553a2cd1b5d364d3eb#52c800ae828a47d88ad9cb553a2cd1b5d364d3eb"
-dependencies = [
- "base64 0.22.1",
- "blake3",
- "chacha20poly1305",
- "getrandom 0.2.17",
- "hex",
- "postcard",
- "saorsa-pqc",
- "serde",
- "serde_bytes",
- "serde_json",
- "thiserror 2.0.20",
- "tiny-keccak",
  "zeroize",
 ]
 

@@ -5,7 +5,7 @@
 //! records: browsers sign EVM transactions locally and send only payment
 //! receipts to nodes.
 
-pub use saorsa_webrtc::{BrowserEndpoint, BrowserPaymentNetwork, WebRtcDirectEndpoint};
+pub use saorsa_transport::webrtc::{BrowserEndpoint, BrowserPaymentNetwork, WebRtcDirectEndpoint};
 use serde::{Deserialize, Serialize};
 
 /// Version of the local browser bootstrap manifest.
