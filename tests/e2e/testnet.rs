@@ -23,7 +23,7 @@ use ant_node::payment::{
     QuotingMetricsTracker,
 };
 use ant_node::replication::config::MAX_REPLICATION_MESSAGE_SIZE;
-use ant_node::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
+use ant_node::storage::{AntProtocol, ChunkStore, ChunkStoreConfig};
 use ant_node::{ReplicationConfig, ReplicationEngine};
 use bytes::Bytes;
 use evmlib::Network as EvmNetwork;
@@ -448,7 +448,7 @@ impl TestNode {
         info!("Shutting down test node {}", self.index);
 
         // Shut down replication engine and await its background tasks so all
-        // Arc<LmdbStorage> clones are released before we drop the engine.
+        // Arc<ChunkStore> clones are released before we drop the engine.
         if let Some(ref mut engine) = self.replication_engine {
             engine.shutdown().await;
         }
@@ -1128,12 +1128,12 @@ impl TestNetwork {
         identity: &saorsa_core::identity::NodeIdentity,
     ) -> Result<AntProtocol> {
         // Create LMDB storage
-        let storage_config = LmdbStorageConfig {
+        let storage_config = ChunkStoreConfig {
             root_dir: data_dir.to_path_buf(),
             disk_reserve,
-            ..LmdbStorageConfig::test_default()
+            ..ChunkStoreConfig::test_default()
         };
-        let storage = LmdbStorage::new(storage_config)
+        let storage = ChunkStore::new(storage_config)
             .await
             .map_err(|e| TestnetError::Core(format!("Failed to create LMDB storage: {e}")))?;
 

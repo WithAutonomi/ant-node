@@ -68,6 +68,15 @@ fi
 # Create directories
 mkdir -p "$BASE_DIR" "$LOG_DIR"
 
+# The per-volume migration lock. Every node on this host shares it and nothing else, so
+# they can serialise their copies off LMDB without being able to reach each other's data.
+# It needs its own directory because PrivateTmp=true below gives each unit a /tmp of its
+# own, and the node's default lock location is in there: without this every node takes a
+# lock nobody else can see, all of them start copying at once, and the host runs out of
+# space with several half-finished migrations on it.
+LOCK_DIR="${BASE_DIR%/*}/migration"
+mkdir -p "$LOCK_DIR"
+
 # Create ant user if not exists
 if ! id -u ant &>/dev/null; then
     useradd -r -s /bin/false ant || true
@@ -90,6 +99,8 @@ for i in $(seq 0 $((NODE_COUNT - 1))); do
     # Create node directory
     mkdir -p "$NODE_DIR"
     chown ant:ant "$NODE_DIR"
+    chown ant:ant "$LOCK_DIR"
+    chmod 0750 "$LOCK_DIR"
 
     # Create systemd service
     cat > "/etc/systemd/system/$SERVICE_NAME.service" <<EOF
@@ -120,6 +131,10 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=$NODE_DIR
+# Only the lock lives here. Granting write access to the shared node directory instead
+# would let every node write into every other node's data.
+ReadWritePaths=$LOCK_DIR
+Environment=ANT_MIGRATION_LOCK_DIR=$LOCK_DIR
 PrivateTmp=true
 ProtectKernelTunables=true
 ProtectKernelModules=true

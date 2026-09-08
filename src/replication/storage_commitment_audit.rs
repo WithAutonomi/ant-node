@@ -33,7 +33,7 @@ use crate::replication::subtree::{
     select_subtree_path, subtree_plan, verify_subtree_proof, StructureVerdict, SubtreeProof,
 };
 use crate::replication::types::{AuditFailureReason, AuditFailureSummary, FailureEvidence};
-use crate::storage::LmdbStorage;
+use crate::storage::ChunkStore;
 use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
 use tokio::sync::RwLock;
@@ -79,7 +79,7 @@ const AUDIT_READ_RETRY_BACKOFF: Duration = Duration::from_millis(200);
 /// an `Err` (transient IO) is. A persistent `Err` is returned so the caller emits
 /// `RejectKind::Transient` (timeout lane).
 async fn get_raw_retrying(
-    storage: &LmdbStorage,
+    storage: &ChunkStore,
     key: &XorName,
 ) -> crate::error::Result<Option<Vec<u8>>> {
     let mut attempt = 1u32;
@@ -1230,7 +1230,7 @@ fn subtree_failure_summary(reason: &AuditFailureReason) -> AuditFailureSummary {
 /// grace removed, the auditor treats as a confirmed failure for an in-window pin).
 pub async fn handle_subtree_challenge(
     challenge: &SubtreeAuditChallenge,
-    storage: &LmdbStorage,
+    storage: &ChunkStore,
     self_peer_id: &PeerId,
     is_bootstrapping: bool,
     commitment_state: Option<&Arc<ResponderCommitmentState>>,
@@ -1267,7 +1267,7 @@ pub struct Round1Work {
 /// it performed so the caller can charge it on every exit path.
 pub async fn handle_subtree_challenge_measured(
     challenge: &SubtreeAuditChallenge,
-    storage: &LmdbStorage,
+    storage: &ChunkStore,
     self_peer_id: &PeerId,
     is_bootstrapping: bool,
     commitment_state: Option<&Arc<ResponderCommitmentState>>,
@@ -1297,7 +1297,7 @@ pub async fn handle_subtree_challenge_measured(
 #[allow(clippy::too_many_lines)]
 async fn subtree_challenge_response(
     challenge: &SubtreeAuditChallenge,
-    storage: &LmdbStorage,
+    storage: &ChunkStore,
     self_peer_id: &PeerId,
     is_bootstrapping: bool,
     commitment_state: Option<&Arc<ResponderCommitmentState>>,
@@ -1547,7 +1547,7 @@ fn build_slice_items_for_key(
 /// an answer against.
 pub async fn handle_subtree_slice_challenge(
     challenge: &SubtreeSliceChallenge,
-    storage: &LmdbStorage,
+    storage: &ChunkStore,
     self_peer_id: &PeerId,
     is_bootstrapping: bool,
     commitment_state: Option<&Arc<ResponderCommitmentState>>,
@@ -1713,7 +1713,7 @@ enum KeyServe {
 /// `indices` is already deduplicated by the caller.
 async fn serve_committed_key_openings(
     challenge: &SubtreeSliceChallenge,
-    storage: &LmdbStorage,
+    storage: &ChunkStore,
     key: XorName,
     indices: Vec<u32>,
 ) -> KeyServe {

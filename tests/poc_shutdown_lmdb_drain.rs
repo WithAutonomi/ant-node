@@ -15,7 +15,7 @@
 //!
 //! ## The fix
 //!
-//! `LmdbStorage` and `PaidList` track their blocking tasks in a
+//! `ChunkStore` (via its file store) and `PaidList` track their blocking tasks in a
 //! `TaskTracker`; `shutdown()` awaits `wait_idle()` on both after draining
 //! its own tasks. This test parks a chunk-store write inside its blocking
 //! closure, drops the awaiter (the exact leak shape), and asserts that
@@ -33,7 +33,7 @@ use ant_node::payment::{
     EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, PriceFloorConfig,
 };
 use ant_node::replication::paid_list::PaidList;
-use ant_node::storage::{LmdbStorage, LmdbStorageConfig};
+use ant_node::storage::{ChunkStore, ChunkStoreConfig};
 use ant_node::{ReplicationConfig, ReplicationEngine};
 use evmlib::{Network as EvmNetwork, RewardsAddress};
 use rand::Rng;
@@ -95,9 +95,9 @@ async fn shutdown_waits_for_detached_lmdb_op_and_envs_reopen() {
 
     // The chunk store the engine will hold (and whose env we reopen below).
     let storage = Arc::new(
-        LmdbStorage::new(LmdbStorageConfig {
+        ChunkStore::new(ChunkStoreConfig {
             root_dir: root_dir.clone(),
-            ..LmdbStorageConfig::test_default()
+            ..ChunkStoreConfig::test_default()
         })
         .await
         .expect("create storage"),
@@ -136,7 +136,7 @@ async fn shutdown_waits_for_detached_lmdb_op_and_envs_reopen() {
     // mid-flight — the exact shape of a select! losing to the shutdown token
     // while `storage.put()` awaits `spawn_blocking`.
     let content = b"held-open write must block engine shutdown";
-    let address = LmdbStorage::compute_address(content);
+    let address = ChunkStore::compute_address(content);
     let gate = storage.test_put_gate();
     let parked = gate.write();
     tokio::select! {
@@ -155,7 +155,7 @@ async fn shutdown_waits_for_detached_lmdb_op_and_envs_reopen() {
         let blocked = tokio::time::timeout(SHUTDOWN_BLOCKED_PROBE, shutdown_fut.as_mut()).await;
         assert!(
             blocked.is_err(),
-            "shutdown() returned while an LMDB blocking op was in flight"
+            "shutdown() returned while a store write was in flight"
         );
 
         // Release the write; shutdown must now run to completion.
@@ -178,9 +178,9 @@ async fn shutdown_waits_for_detached_lmdb_op_and_envs_reopen() {
     drop(storage);
 
     // Both LMDB environments reopen cleanly from the same directory.
-    let reopened = LmdbStorage::new(LmdbStorageConfig {
+    let reopened = ChunkStore::new(ChunkStoreConfig {
         root_dir: root_dir.clone(),
-        ..LmdbStorageConfig::test_default()
+        ..ChunkStoreConfig::test_default()
     })
     .await
     .expect("reopen chunk store");
