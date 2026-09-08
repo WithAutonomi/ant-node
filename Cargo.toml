@@ -1,6 +1,6 @@
 [package]
 name = "ant-node"
-version = "0.18.1"
+version = "0.19.0-rc.1"
 edition = "2021"
 authors = ["David Irvine <david.irvine@maidsafe.net>"]
 description = "Pure quantum-proof network node for the Autonomi decentralized network"
@@ -42,10 +42,10 @@ mimalloc = "0.1"
 # Pinned to the ant-protocol main commit that merged the settlement wire
 # types (WithAutonomi/ant-protocol#25). Swap back to a published version pin
 # once the release train publishes them.
-ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "88ad3f1" }
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", branch = "rc-2026.9.2" }
 
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
-saorsa-core = "0.27.3"
+saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core", branch = "rc-2026.9.2" }
 saorsa-pqc = "0.5"
 
 # Payment verification - autonomi network lookup + EVM payment
@@ -244,11 +244,3 @@ cognitive_complexity = "allow"
 # Allow non-const functions during initial development (may need runtime features later)
 missing_const_for_fn = "allow"
 
-# Temporary stacked-PR alignment, mirroring ant-client main: the git-sourced
-# ant-protocol (settlement branch, includes main) declares its saorsa-core as
-# the v2-903 route-diagnostics branch, so the node's registry saorsa-core must
-# resolve to the same source or the graph carries two MultiAddr types.
-# Remove together with the git ant-protocol pin once the release train
-# publishes ant-protocol with the released saorsa-core (WithAutonomi/saorsa-core#162).
-[patch.crates-io]
-saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core.git", branch = "feat/v2-903-download-route-diagnostics" }
