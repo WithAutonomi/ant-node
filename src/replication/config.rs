@@ -216,7 +216,7 @@ pub const MAX_DIGEST_AUDIT_RESPONSES_PER_PEER: u32 = 8;
 ///
 /// Each window is reset after logging, so the ranked origins describe current
 /// testnet load rather than being permanently dominated by an old burst.
-pub const AUDIT_RESPONDER_SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
+pub const AUDIT_RESPONDER_SUMMARY_INTERVAL: Duration = Duration::from_mins(1);
 
 /// Number of busiest source peers included in each responder summary window.
 pub const AUDIT_RESPONDER_TOP_ORIGINS: usize = 10;
@@ -243,7 +243,7 @@ pub const MAX_SUBTREE_ROUND1_PER_PEER: u32 = 1;
 /// per peer per 30 min, so matching that as a responder-side floor costs honest
 /// traffic nothing while bounding the sustained round-1 work a single identity
 /// can extract (a concurrency cap alone lets a peer refill its slot forever).
-pub const SUBTREE_ROUND1_RESPONDER_COOLDOWN: Duration = Duration::from_secs(30 * 60);
+pub const SUBTREE_ROUND1_RESPONDER_COOLDOWN: Duration = Duration::from_mins(30);
 
 /// Lifetime of a single-use round-1 → round-2 session.
 ///
@@ -252,7 +252,7 @@ pub const SUBTREE_ROUND1_RESPONDER_COOLDOWN: Duration = Duration::from_secs(30 *
 /// send round 2, far shorter than commitment retention; ephemeral, so a loss
 /// across a restart just
 /// drops that round to the (graced) timeout lane.
-pub const SUBTREE_SESSION_TTL: Duration = Duration::from_secs(2 * 60);
+pub const SUBTREE_SESSION_TTL: Duration = Duration::from_mins(2);
 
 /// Capacity backstop on the live round-1 session map (bounds memory if many
 /// peers open sessions; oldest are evicted past this).

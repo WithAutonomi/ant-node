@@ -342,7 +342,7 @@ pub fn verify_nonced_block(
     let mut node_index = index as usize;
     let mut cur = nonced_block_leaf(nonce, peer, key, index, block);
     for sibling in siblings {
-        cur = if node_index % 2 == 0 {
+        cur = if node_index.is_multiple_of(2) {
             nonced_block_node(&cur, sibling)
         } else {
             nonced_block_node(sibling, &cur)
