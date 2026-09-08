@@ -1462,6 +1462,7 @@ fn browser_node_from_dht(
             multiaddr: multiaddr.to_string(),
         });
     BrowserNode {
+        peer_record: rmp_serde::to_vec_named(node).ok().map(hex::encode),
         webrtc_direct: discovered_endpoint
             .or_else(|| endpoint_catalog.and_then(|catalog| catalog.get(&node.peer_id))),
         peer_id: node.peer_id.to_hex(),
