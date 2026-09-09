@@ -88,8 +88,10 @@ unmigrated when this release landed, and that is exactly the population the prev
 fleet signal exists to count and wait out.
 
 It is not penalty-free, and it is worth being exact about what remains rather than rounding it
-to nothing. This release restores the close-group unheld-chunk penalty, and that is a separate
-lane from the commitment-bound audit. A node carrying an old store it cannot read is a node
+to nothing. This release does NOT restore the close-group unheld-chunk penalty; that waits for
+the release after it, for the reason given below. What it cannot hold off is the
+commitment-bound audit, which is a separate lane and is enforced in every release. A node
+carrying an old store it cannot read is a node
 with that much less disk, and a node short of disk fails to take on the chunks it is
 responsible for and is penalised on that lane like any other full node. That is not a penalty
 for having migrated badly; it is the ordinary consequence of a full disk, arriving through a
@@ -232,7 +234,7 @@ release breaks the fleet, and it outranks the objective that no migration code s
 ### Positive
 
 - One store, one name, and about 5,600 lines of bridge and driver gone.
-- The penalty means what it always meant again.
+- The unheld-chunk penalty is still held off, and the release after this one restores it.
 - No node is ever left unable to start by anything this release does.
 - The per-volume migration lock and its deployment settings go with the migration.
 
