@@ -9980,7 +9980,29 @@ async fn rebuild_and_rotate_commitment(
     // this filter the pruner's reprieve would keep re-committing stale keys
     // forever (the rebuild reads all_keys, so a retained-on-disk key would be
     // re-committed and re-gossiped every rotation — a permanent pin).
-    let storage_empty = stored_keys.is_empty();
+    // "Empty" has to mean this node holds no bytes at all, not that it has nothing left to
+    // COMMIT to. Once the migration has settled, `committable_keys` narrows to the file-backed
+    // set, so a node that could not copy anything before its disk filled reports an empty set
+    // while a full legacy environment sits beside it. Reading that as "the bytes are gone"
+    // takes the `clear_all` branch below and drops every retained root, and an auditor still
+    // holding a valid pin then gets `UnknownCommitment`, which is graded as a confirmed
+    // failure. That node can answer the challenge: the bytes are right there in the legacy
+    // store. It is the `retire_current` branch it belongs in.
+    // Asked of what is physically on disk, not of what this node will currently answer for.
+    // The two differ: `all_keys` drops a file the store has marked suspect or known-wrong, so
+    // a node whose last readable file has gone transiently bad has an empty committable set
+    // while the bytes are still there and may be readable again in a moment. So does a node
+    // that could not copy anything before its disk filled, whose keys are all still in the
+    // legacy store. Reading either as "the bytes are gone" takes the `clear_all` branch below
+    // and drops every retained root, and an auditor holding a valid pin then gets
+    // `UnknownCommitment`, graded as a confirmed failure, on a node that could have answered.
+    //
+    // `current_chunks` is the union of the raw file index, suspect entries included, and the
+    // legacy-only set, which is exactly the question. An error reads as not-empty on purpose:
+    // being wrong that way costs a `retire_current` where `clear_all` would have done, which
+    // stops advertising the root and stays answerable until the gossip TTL lapses. Being wrong
+    // the other way costs a trust penalty on a node that did nothing.
+    let storage_empty = stored_keys.is_empty() && storage.current_chunks().unwrap_or(1) == 0;
     let self_id = *p2p.peer_id();
     let mut keys = Vec::with_capacity(stored_keys.len());
     for k in stored_keys {

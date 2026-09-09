@@ -370,6 +370,49 @@ belief carry its own expiry — the directory carries its mark, the proof carrie
 saw, the write carries its note — rather than to check again and hope the check is close
 enough to the act.
 
+## Amendment: the schedule belongs to the build
+
+Shipped after this record's release, as a patch on top of it.
+
+`MigrationConfig` is now `serde(skip)` on every field. A `[storage.migration]` section left in
+an operator's file still parses and is ignored. The release that later deletes the old store
+has to be able to assume every node ran the same schedule, and it cannot assume that while the
+schedule belongs to whoever last edited a config. `wave_hours` goes from 24 to 12 so the whole
+schedule fits inside the window before that release.
+
+Two behaviour changes follow from it and are intended, not accidents:
+
+- A node whose file says `enabled = false` migrates anyway. Nobody may opt out.
+- A node an operator had paused resumes with its hold and its waves already spent, because the
+  marker is stamped when the store opens rather than when the copier starts. Nothing
+  distinguishes it from a node whose disk filled on day one, and restamping both would add
+  three days of waiting to the nodes with the least room. What is lost is the stagger, not the
+  safety: a chunk is still only given up once all but one of the close group has proven it
+  holds a copy. Pinned by a test.
+
+Halving the wave spacing only ever moves a node earlier. Both schedules share the same base and
+the same wave index and only the multiplier shrinks, so no wave that had opened closes again.
+While the fleet is mixed the two schedules can put different waves in the same slot, which
+costs churn and not data.
+
+The one path that deleted a chunk without a possession check is gone. When the file store
+refused a legacy value for exceeding the per-chunk ceiling, the copier deleted it outright.
+That case cannot occur — `MAX_CHUNK_SIZE` has been 4 MiB since ant-protocol's first commit,
+the chunk store and its size check arrived together in v0.4.0, replication arrived already
+checking on receive and fetch, and `FileStore::put` checks the address before the size — but a
+branch that destroys a chunk it cannot replace does not get to rely on being unreachable. The
+generic error path now handles it: refuse, name the key and the size, release the volume lock,
+retry. Pinned by a test, because an impossible case is the one a later reader tidies away.
+
+`storage_empty` in the commitment rotation now means no bytes anywhere, not "nothing left to
+commit to". Two nodes reported an empty set while holding data: one that could not copy
+anything before its disk filled, whose keys are all still in the legacy store, and one whose
+last readable file has gone transiently bad, since `all_keys` drops anything marked suspect or
+known-wrong. Both took the `clear_all` branch and dropped every retained root, and an auditor
+holding a valid pin then got `UnknownCommitment`, graded as a confirmed failure, on a node that
+could have answered. Emptiness is now asked of `current_chunks`, the union of the raw file
+index and the legacy-only set, and a read error reads as not-empty.
+
 ## Consequences
 
 ### Positive

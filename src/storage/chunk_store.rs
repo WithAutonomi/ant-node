@@ -1119,31 +1119,6 @@ impl ChunkStore {
                 }
                 Err(e) => {
                     let message = format!("{e}");
-                    // Bigger than this build will ever serve. The legacy store took it
-                    // through an API with no size bound; the file store will not, and no
-                    // amount of retrying changes that. Counted as unusable and removed,
-                    // like a record whose bytes do not match, or one such record would
-                    // stop this node and every node sharing its disk from ever reclaiming
-                    // space.
-                    if message.contains("byte maximum") {
-                        warn!(
-                            "Chunk {} in the legacy environment is larger than this build \
-                             will store; removing it. It cannot be served either way.",
-                            hex::encode(key)
-                        );
-                        match legacy.lmdb.delete(key).await {
-                            Ok(_) => {
-                                legacy.only.write().remove(key);
-                                report.unusable += 1;
-                            }
-                            Err(e) => warn!(
-                                "Oversized chunk {} could not be removed from the legacy \
-                                 environment: {e}. The environment stays.",
-                                hex::encode(key)
-                            ),
-                        }
-                        continue;
-                    }
                     if message.contains("Content address mismatch") {
                         // The legacy bytes do not hash to their own key, so this chunk
                         // cannot be reproduced and was never servable. Stop advertising
@@ -4724,6 +4699,63 @@ mod tests {
         assert!(store.has_legacy());
     }
 
+    /// A legacy value too large for the file store is refused, never deleted.
+    ///
+    /// It cannot happen. `MAX_CHUNK_SIZE` has been 4 MiB since the protocol's first commit;
+    /// the chunk store and its size check arrived together in v0.4.0; replication arrived
+    /// already carrying the same check on its receive and fetch paths; and every production
+    /// caller of `put` is guarded. `FileStore::put` also checks the address before the size,
+    /// so reaching it needs a value over the ceiling that hashes to its own key.
+    ///
+    /// The migration used to answer that impossible case by deleting the record, with no
+    /// possession check and nothing able to replace it. The branch is gone. What is left is
+    /// the generic error path, which refuses the value, names the key and the size, releases
+    /// the volume lock so no other node on the disk is held up, and retries. A node that
+    /// stops making progress and says why is a page; a chunk deleted on a warning is nothing.
+    #[tokio::test]
+    async fn an_oversized_legacy_value_is_refused_rather_than_destroyed() {
+        let dir = TempDir::new().expect("temp dir");
+        let content = vec![0xA5u8; crate::ant_protocol::MAX_CHUNK_SIZE + 4096];
+        let addr = crate::client::compute_address(&content);
+        {
+            let lmdb = LmdbStorage::new(LmdbStorageConfig {
+                root_dir: dir.path().to_path_buf(),
+                verify_on_read: false,
+                // Bounded rather than derived. A derived map is sized from free disk, and
+                // this is the one legacy fixture in the suite that writes a whole oversized
+                // chunk into it; the unit tests run in the same job as the test that measures
+                // how much disk retirement gives back, and an env sized from the volume is
+                // enough to move that measurement.
+                max_map_size: 64 * 1024 * 1024,
+                disk_reserve: 0,
+            })
+            .await
+            .expect("open legacy");
+            lmdb.put(&addr, &content).await.expect("put");
+            lmdb.wait_idle().await;
+        }
+        let store = open(&dir).await;
+
+        let err = store
+            .copy_batch(&store.legacy_only_keys(), 0, 0, &never_cancelled())
+            .await
+            .expect_err("an oversized value must fail the pass, not be swallowed");
+        assert!(
+            format!("{err}").contains("byte maximum"),
+            "the error must say why it refused, got: {err}"
+        );
+        assert_eq!(
+            store.legacy_only_keys(),
+            vec![addr],
+            "the key must stay on the copier's list"
+        );
+        assert_eq!(
+            store.get(&addr).await.expect("get").expect("still stored"),
+            content,
+            "and the value must still be there"
+        );
+    }
+
     /// A legacy record whose bytes do not hash to its key is removed, not passed around.
     ///
     /// Leaving it in the environment while dropping it from the key set puts it in
@@ -4779,24 +4811,32 @@ mod tests {
     }
 
     #[test]
-    fn the_release_switches_are_never_written_to_an_operator_config_file() {
-        // A node writes its effective configuration back to disk. If these round-tripped,
-        // R1's values would be baked into every operator's file and the next release
-        // would change nothing.
+    fn no_migration_setting_is_ever_written_to_an_operator_config_file() {
+        // A node writes its effective configuration back to disk. When these round-tripped,
+        // one release's values were baked into every operator's file and the next release
+        // changed nothing. This used to hold for the release switches alone, with the
+        // schedule left as genuine operator controls; the whole struct is a build constant
+        // now, because the release that deletes the old store can only assume every node ran
+        // the same schedule while no file can change one.
         let mut config = MigrationConfig::default();
         config.retire_legacy = !config.retire_legacy;
         config.allow_shed = false;
         config.shed_hold_hours = 5;
+        config.wave_hours = 9999;
 
         let encoded = toml::to_string(&config).expect("encode");
-        assert!(!encoded.contains("retire_legacy"), "{encoded}");
+        assert_eq!(
+            encoded.trim(),
+            "",
+            "a migration section must not be written out at all, got: {encoded}"
+        );
 
         let decoded: MigrationConfig = toml::from_str(&encoded).expect("decode");
-        let fresh = MigrationConfig::default();
-        assert_eq!(decoded.retire_legacy, fresh.retire_legacy);
-        // Genuine operator controls do survive.
-        assert!(!decoded.allow_shed);
-        assert_eq!(decoded.shed_hold_hours, 5);
+        assert_eq!(
+            decoded,
+            MigrationConfig::default(),
+            "every field must come back from the build, not from the file"
+        );
     }
 
     #[test]

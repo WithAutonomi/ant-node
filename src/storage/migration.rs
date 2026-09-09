@@ -98,18 +98,36 @@ const VOLUME_LOCK_COOLDOWN: Duration = Duration::from_secs(120);
 /// rotation, which is what makes the retention window meaningful.
 pub const REQUIRED_REBUILDS_BEFORE_RETIRE: u32 = 2;
 
-/// Operator-facing controls for the migration.
-// Four independent switches, three of which are operator controls and one of which is a
-// release constant. Collapsing them into an enum would tie choices together that are
-// deliberately separate.
+/// The migration's policy and timing, as release constants.
+///
+/// **None of this is read from a node's configuration file.** Every field is `serde(skip)`,
+/// so a value in `config.toml` is ignored and a node cannot be configured out of migrating
+/// or into a schedule of its own. The release that deletes the old store has to be able to
+/// assume every node ran the same schedule, and it cannot assume that while the schedule
+/// belongs to whoever last edited a file.
+///
+/// What this buys is one schedule, not a guarantee that it completes. Several waits in the
+/// migration still have no deadline — a close group that never acknowledges a commitment, a
+/// rebuild that keeps failing, a wedged read, a foreign holder of the volume lock — and a
+/// node in one of those keeps both stores indefinitely. That is what the fleet signal is for:
+/// those nodes are meant to be counted, not assumed away.
+///
+/// A node's effective configuration is written back to disk, so these were also the fields
+/// most likely to be baked into an operator's file by one release and then honoured by the
+/// next. Skipping them on the way in and on the way out ends both halves of that.
+///
+/// The fields stay public because tests set them directly to compress a schedule that would
+/// otherwise take days. Only the file is refused, not assignment.
+// The booleans are deliberately separate rather than an enum: they answer different
+// questions and collapsing them would tie choices together that are not tied.
 #[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MigrationConfig {
     /// Run the background copier at all.
     ///
-    /// Turning this off leaves a node reading the union of both stores forever. It never
-    /// frees the LMDB's disk, so it is an escape hatch rather than a supported mode.
-    #[serde(default = "default_true")]
+    /// Release policy, not a setting: see the note on [`MigrationConfig`]. Off, a node reads
+    /// the union of both stores forever and never frees the LMDB's disk.
+    #[serde(skip, default = "default_true")]
     pub enabled: bool,
 
     /// Write every new chunk to the legacy environment as well as the file store.
@@ -118,14 +136,15 @@ pub struct MigrationConfig {
     /// the ability to roll the fleet back: a chunk uploaded during the bridge to holders
     /// that all revert to a pre-migration build would otherwise be gone from every one
     /// of them. Automatically irrelevant once the legacy environment is retired.
-    #[serde(default = "default_true")]
+    #[serde(skip, default = "default_true")]
     pub dual_write_legacy: bool,
 
     /// Allow a node that cannot fit its payload to drop its furthest keys.
     ///
-    /// An operator who would rather add disk than shed can set this to `false`. The node
-    /// then keeps both stores and never frees the LMDB's space.
-    #[serde(default = "default_true")]
+    /// Release policy, not a setting: see the note on [`MigrationConfig`]. Off, a node that
+    /// cannot fit its payload keeps both stores and never frees the LMDB's space, which is
+    /// why it ships on.
+    #[serde(skip, default = "default_true")]
     pub allow_shed: bool,
 
     /// Delete `chunks.mdb` once the retirement gate is satisfied.
@@ -149,21 +168,21 @@ pub struct MigrationConfig {
     ///
     /// Long enough for peers still on a pre-R1 build to upgrade, because one of those
     /// still penalises a shedder at the full audit weight.
-    #[serde(default = "default_shed_hold_hours")]
+    #[serde(skip, default = "default_shed_hold_hours")]
     pub shed_hold_hours: u64,
 
     /// Hours between committing to the file-backed key set and deleting `chunks.mdb`.
     ///
     /// Clamped up to [`MIN_RETIRE_DELAY_HOURS`]. Longer buys a rollback window on nodes
     /// that can afford to hold both copies.
-    #[serde(default = "default_retire_delay_hours")]
+    #[serde(skip, default = "default_retire_delay_hours")]
     pub retire_delay_hours: u64,
 
     /// Free megabytes the copier leaves untouched, on top of the disk reserve.
     ///
     /// The copier stops here rather than filling to the brink, so a node that is
     /// mid-migration still has room to accept a chunk it is paid for.
-    #[serde(default = "default_copier_slack_mb")]
+    #[serde(skip, default = "default_copier_slack_mb")]
     pub copier_slack_mb: u64,
 
     /// Copy rate ceiling, in mebibytes per second.
@@ -171,7 +190,7 @@ pub struct MigrationConfig {
     /// The quiet responsible audit lane is where audit timeouts actually cost trust, and
     /// an unthrottled copier competing with it for I/O is the fastest way to turn a
     /// storage migration into an audit incident.
-    #[serde(default = "default_copier_throttle_mib_per_sec")]
+    #[serde(skip, default = "default_copier_throttle_mib_per_sec")]
     pub copier_throttle_mib_per_sec: u64,
 
     /// Hours between one migration wave opening and the next.
@@ -181,15 +200,15 @@ pub struct MigrationConfig {
     /// long a wave gets to finish copying, retiring and refetching before the next one may
     /// start. Only nodes that have to give something up wait for their wave; a node with
     /// room migrates immediately.
-    #[serde(default = "default_wave_hours")]
+    #[serde(skip, default = "default_wave_hours")]
     pub wave_hours: u64,
 
     /// Seconds between copier ticks.
-    #[serde(default = "default_tick_secs")]
+    #[serde(skip, default = "default_tick_secs")]
     pub tick_secs: u64,
 
     /// Chunks copied per tick before yielding.
-    #[serde(default = "default_batch_chunks")]
+    #[serde(skip, default = "default_batch_chunks")]
     pub batch_chunks: usize,
 
     /// Where the volume lock lives, overriding the filesystem this node's root sits on.
@@ -263,7 +282,7 @@ const fn default_retire_delay_hours() -> u64 {
 }
 
 const fn default_wave_hours() -> u64 {
-    24
+    12
 }
 
 const fn default_copier_slack_mb() -> u64 {
@@ -769,8 +788,7 @@ pub struct CopyReport {
     pub copied: u64,
     /// Bytes copied.
     pub bytes: u64,
-    /// Keys skipped because the legacy bytes did not hash to their address, or were
-    /// larger than a chunk may be.
+    /// Keys dropped because the legacy bytes did not hash to their own address.
     pub unusable: u64,
     /// Keys that could not be copied for a reason that may clear on a later pass.
     pub failed: u64,
@@ -841,8 +859,8 @@ pub fn wave_has_opened(state: &MigrationState, config: &MigrationConfig, wave: u
 /// When a given wave opens, in Unix seconds.
 ///
 /// Measured from the END of the shed hold, not from first start. Measured from the start
-/// the two settings cancel each other out: with a 72 hour hold and 24 hour waves, waves
-/// would open at 0, 24, 48 and 72 hours while nothing at all may shed until hour 72, so
+/// the two settings cancel each other out: with a 72 hour hold and 12 hour waves, waves
+/// would open at 0, 12, 24 and 36 hours while nothing at all may shed until hour 72, so
 /// every wave would be open the moment the first one could act and the whole close group
 /// would migrate together. That is the pile-up the waves exist to prevent.
 #[must_use]
@@ -1747,9 +1765,9 @@ async fn evaluate_shed(
 
     if !config.allow_shed {
         warn!(
-            "This node cannot fit {short_by} chunk(s) in the file store and shedding is \
-             turned off. Add disk, or set storage.migration.allow_shed. Until then it \
-             keeps serving from both stores and the legacy environment stays."
+            "This node cannot fit {short_by} chunk(s) in the file store and this build does \
+             not shed. Add disk. Until then it keeps serving from both stores and the \
+             legacy environment stays."
         );
         return false;
     }
@@ -2985,16 +3003,101 @@ mod tests {
         );
     }
 
+    /// A node that was paused comes back with its hold already spent, and that is known.
+    ///
+    /// The marker is stamped when the store opens, not when the copier starts, so a node run
+    /// with `enabled = false` still recorded a first start. This release ignores that setting,
+    /// so such a node measures its 72-hour hold and all its waves from a stamp that may be
+    /// weeks old and arrives at the shed path with no hold and no stagger.
+    ///
+    /// Pinned rather than fixed: the only way to tell that node from one whose disk filled on
+    /// day one is that neither has copied anything, and restamping both would delay exactly
+    /// the nodes with the least room. What is lost is the stagger, not the safety — the
+    /// possession gate is unchanged and a group shedding together fails each other's checks.
+    /// This test exists so the behaviour is a decision on the record and not a surprise.
+    #[test]
+    fn a_paused_node_resumes_with_its_hold_already_spent() {
+        let config = MigrationConfig::default();
+        assert!(
+            config.enabled,
+            "the switch is a build constant now, which is what creates this case"
+        );
+
+        let mut state = MigrationState::new(MigrationPhase::Bridging);
+        // Stamped weeks ago, when the store first opened under a build that then did nothing
+        // with it.
+        state.first_start_unix = now_unix().saturating_sub(21 * 24 * 3600);
+
+        for wave in 0..migration_wave_count(7) {
+            assert!(
+                wave_has_opened(&state, &config, wave),
+                "wave {wave} is open on resume, so the stagger is spent as well as the hold"
+            );
+        }
+    }
+
+    /// Halving the wave spacing under a node that is already migrating never delays it.
+    ///
+    /// This is the one thing the schedule change has to promise on upgrade. #216 shipped
+    /// with 24 hour waves and is already running on a fleet; this release makes them 12. A
+    /// node picks the new value up mid-migration, against a `first_start_unix` that was
+    /// persisted under the old one, so the question is whether any node's wave can move
+    /// later — a node that had been cleared to shed becoming blocked again, after it may
+    /// already have acted on the earlier answer.
+    ///
+    /// It cannot: the two schedules share the same base and the same wave index, and only
+    /// the multiplier shrinks, so every wave opens at or before where it did. What the
+    /// change does do is compress the gaps, and while the fleet is mixed two nodes on
+    /// different builds can land in the same slot (wave 2 at 12 hours opens exactly when
+    /// wave 1 at 24 does). That is churn, not loss: the possession gate is what stops a
+    /// chunk being given up, and it is unchanged.
+    #[test]
+    fn halving_the_wave_spacing_never_moves_a_node_backwards() {
+        let old = MigrationConfig {
+            wave_hours: 24,
+            ..MigrationConfig::default()
+        };
+        let new = MigrationConfig::default();
+        assert_eq!(new.wave_hours, 12);
+        assert_eq!(old.shed_hold_hours, new.shed_hold_hours);
+
+        let mut state = MigrationState::new(MigrationPhase::Bridging);
+        // Across every wave a close group of seven can produce, and every age from before
+        // the hold to well past the last wave.
+        for wave in 0..migration_wave_count(7) {
+            for hours_ago in 0..(72 + 24 * 8) {
+                state.first_start_unix = now_unix().saturating_sub(hours_ago * 3600);
+                let then = wave_opens_at(&state, &old, wave);
+                let now = wave_opens_at(&state, &new, wave);
+                assert!(
+                    now <= then,
+                    "wave {wave} opens later under the new schedule at {hours_ago}h old: \
+                     {now} > {then}"
+                );
+                if wave_has_opened(&state, &old, wave) {
+                    assert!(
+                        wave_has_opened(&state, &new, wave),
+                        "wave {wave} had opened at {hours_ago}h old and the new schedule \
+                         closed it again"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn waves_are_actually_staggered_under_the_shipped_defaults() {
         // The combination is what matters, not either setting alone. Measured from first
-        // start, a 72 hour hold and 24 hour waves cancel out: waves would open at 0, 24,
-        // 48 and 72 hours while nothing may shed until 72, so every wave is open the
+        // start, a 72 hour hold and 12 hour waves cancel out: waves would open at 0, 12,
+        // 24 and 36 hours while nothing may shed until 72, so every wave is open the
         // moment the first one can act and the whole close group moves together. Measured
         // from the end of the hold, they stagger as intended.
         let config = MigrationConfig::default();
         assert_eq!(config.shed_hold_hours, 72);
-        assert_eq!(config.wave_hours, 24);
+        // Pinned, because the whole schedule has to fit inside the two weeks between this
+        // release and the one that deletes the old store, and the shipped value is the only
+        // one that matters now the field is no longer read from anyone's file.
+        assert_eq!(config.wave_hours, 12);
 
         let mut state = MigrationState::new(MigrationPhase::Bridging);
         let waves = migration_wave_count(7);
@@ -3021,7 +3124,8 @@ mod tests {
 
         // Each later wave opens one wave_hours after the one before it.
         for open in 1..waves {
-            state.first_start_unix = now_unix().saturating_sub((72 + open * 24) * 3600 + 60);
+            state.first_start_unix =
+                now_unix().saturating_sub((72 + open * config.wave_hours) * 3600 + 60);
             for w in 0..=open {
                 assert!(wave_has_opened(&state, &config, w));
             }

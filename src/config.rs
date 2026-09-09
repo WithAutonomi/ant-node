@@ -613,25 +613,50 @@ mod tests {
 
     #[test]
     fn the_shipped_storage_config_parses() {
-        // The migration section is operator-facing, so a typo in it would only surface on
-        // a node that had already shipped. Only `[storage]` is checked: the rest of
-        // `production.toml` does not currently deserialize as a `NodeConfig` (its
-        // `evm_network` is a bare string where an internally tagged enum is expected),
-        // which is a separate, pre-existing problem.
+        // Only `[storage]` is checked: the rest of `production.toml` does not currently
+        // deserialize as a `NodeConfig` (its `evm_network` is a bare string where an
+        // internally tagged enum is expected), which is a separate, pre-existing problem.
         let raw = include_str!("../config/production.toml");
         let doc: toml::Value = toml::from_str(raw).expect("production.toml must be valid TOML");
         let storage = doc.get("storage").expect("a [storage] section").clone();
         let config: StorageConfig = storage.try_into().expect("[storage] must deserialize");
 
-        assert!(config.migration.enabled);
-        assert!(config.migration.dual_write_legacy);
-        assert_eq!(config.migration.shed_hold_hours, 72);
-        assert_eq!(config.migration.copier_throttle_mib_per_sec, 32);
-        assert_eq!(config.migration.copier_slack_mb, 2048);
-        // The release switches are absent from the file on purpose, so they come from the
-        // build rather than from whatever an operator's config last recorded.
-        let build = MigrationConfig::default();
-        assert_eq!(config.migration.retire_legacy, build.retire_legacy);
+        // Every migration setting comes from the build. The shipped file no longer carries
+        // a `[storage.migration]` section at all, and would be ignored if it did.
+        assert_eq!(config.migration, MigrationConfig::default());
+    }
+
+    /// A config file cannot put a node on a schedule of its own.
+    ///
+    /// This is the whole guarantee the release that deletes the old chunk store rests on:
+    /// it may assume every node ran the same migration schedule, and it may only assume
+    /// that while no file can change one. The obvious way to break this is to give one of
+    /// these fields a `serde(default)` again, which looks like a tidy-up and is not, so it
+    /// is worth a test rather than a comment. Every value below is deliberately different
+    /// from the build's.
+    #[test]
+    fn a_config_file_cannot_change_the_migration_schedule() {
+        let hostile = r"
+enabled = true
+[migration]
+enabled = false
+dual_write_legacy = false
+allow_shed = false
+shed_hold_hours = 9999
+retire_delay_hours = 9999
+wave_hours = 9999
+copier_slack_mb = 1
+copier_throttle_mib_per_sec = 1
+tick_secs = 9999
+batch_chunks = 1
+";
+        let config: StorageConfig =
+            toml::from_str(hostile).expect("an old or hostile file must still parse");
+        assert_eq!(
+            config.migration,
+            MigrationConfig::default(),
+            "the file changed the migration schedule, which the final release cannot survive"
+        );
     }
 
     #[test]
