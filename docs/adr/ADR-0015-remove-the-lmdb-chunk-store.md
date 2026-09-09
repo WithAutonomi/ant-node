@@ -1,4 +1,4 @@
-# ADR-0015: Remove the LMDB Chunk Store and Restore the Close-Group Penalty
+# ADR-0015: Remove the LMDB Chunk Store
 
 - **Status:** Proposed
 - **Date:** 2026-08-28
@@ -23,11 +23,16 @@ actually has to happen is larger, and two parts of it are decisions rather than 
 
 ## Decision
 
-**Restore the penalty, and keep its switch.** The constant goes back to `false`. The
-process-wide atomic, the `ANT_SUSPEND_UNHELD_CHUNK_PENALTY` override and the startup
-announcement all stay. They are not migration machinery: they are one release-level policy
-that several audit paths have to obey identically, and the release that restores a penalty
-is exactly the one most likely to need it undone in a hurry. Removing them would discard the
+**Do not restore the penalty here.** It stays suspended for one more release, and the
+release after this one turns it back on. The reasoning is in *The penalty is restored by the
+release after this one* below: a node that was away while the migration ran arrives here
+holding a store this build cannot read, and restoring the accusation in the release that
+stranded it would slash it for a state it had no chance to leave.
+
+The switch itself stays. The process-wide atomic, the `ANT_SUSPEND_UNHELD_CHUNK_PENALTY`
+override and the startup announcement are not migration machinery: they are one release-level
+policy that several audit paths have to obey identically, and the release that restores a
+penalty is exactly the one most likely to need it undone in a hurry. Removing them would discard the
 cheapest lever at the moment it is most useful. A test now pins the shipped value, because
 the existing tests set the switch both ways on purpose and so could never notice which way
 it was compiled.
