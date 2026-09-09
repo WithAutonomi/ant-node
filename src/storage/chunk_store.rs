@@ -618,14 +618,6 @@ pub struct ChunkStore {
     writing: Arc<parking_lot::Mutex<HashMap<XorName, usize>>>,
     /// Woken when [`Self::writing`] loses its last entry for a key.
     write_finished: Arc<tokio::sync::Notify>,
-    /// Bumped whenever a chunk stops being servable.
-    ///
-    /// A caller that reads every chunk and then reuses the result rather than re-reading
-    /// can tell from this that the store has not changed underneath it: the result carries
-    /// the value it saw, and a file that has since gone or stopped being readable makes it
-    /// stale. The verification pass before the old store was deleted worked this way; the
-    /// counter outlived it because the property is general.
-    health: Arc<std::sync::atomic::AtomicU64>,
     /// Size-aware free-space predicate.
     capacity: Arc<CapacityGuard>,
     /// Monotonic counter that makes temp filenames unique within this store.
@@ -771,7 +763,6 @@ impl ChunkStore {
             known_wrong: Arc::new(parking_lot::RwLock::new(HashSet::new())),
             writing: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             write_finished: Arc::new(tokio::sync::Notify::new()),
-            health: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             capacity,
             temp_seq: AtomicU64::new(0),
             nonce: rand::random(),
@@ -1123,39 +1114,6 @@ impl ChunkStore {
         }
     }
 
-    /// Flush every directory a chunk can live in, so the names in them are durable.
-    ///
-    /// Byte integrity is not the whole of what a verification pass establishes. A chunk
-    /// whose contents are on the platter but whose *name* is not is still lost to a power
-    /// loss, and a publish whose rename landed and whose directory flush failed leaves
-    /// exactly that: the next attempt sees the name, the next verification reads the right
-    /// bytes, and nothing goes back to retry the flush. So the pass flushes
-    /// them itself rather than trusting that each publish did.
-    ///
-    /// Cheap: at most 257 directory flushes for a store of any size, and nothing off Unix,
-    /// where directories cannot be flushed and the retirement marker covers the same
-    /// ground instead.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Storage`] on the first directory that cannot be flushed. The
-    /// caller must treat that as a proof it did not get.
-    pub fn flush_namespace(&self) -> Result<()> {
-        fsync_dir(&self.chunks_dir).map_err(|e| {
-            Error::Storage(format!(
-                "Could not flush {}: {e}",
-                self.chunks_dir.display()
-            ))
-        })?;
-        let present = *self.shards_present.lock();
-        for (shard, _) in present.iter().enumerate().filter(|(_, here)| **here) {
-            let dir = self.chunks_dir.join(format!("{shard:02x}"));
-            fsync_dir(&dir)
-                .map_err(|e| Error::Storage(format!("Could not flush {}: {e}", dir.display())))?;
-        }
-        Ok(())
-    }
-
     /// Decide what to do about a write of a chunk the index already names.
     ///
     /// `None` means the index was wrong and there is nothing on disk, so the caller
@@ -1199,18 +1157,6 @@ impl ChunkStore {
                 hex::encode(address)
             )))),
         }
-    }
-
-    /// The size of the file behind `address`, if there is one.
-    ///
-    /// One `metadata` call, no read. Used where an indexed name has to be checked against
-    /// what a caller is offering before that offer is turned away.
-    #[must_use]
-    pub fn stored_len(&self, address: &XorName) -> Option<usize> {
-        std::fs::metadata(self.chunk_path(address))
-            .ok()
-            .filter(std::fs::Metadata::is_file)
-            .and_then(|m| usize::try_from(m.len()).ok())
     }
 
     /// Whether the file already stored under `address` really hashes to it.
@@ -1558,7 +1504,6 @@ impl ChunkStore {
     /// suspended.
     fn mark_suspect(&self, address: &XorName) {
         if self.suspect.write().insert(*address) {
-            self.note_health_changed();
             warn!(
                 "Chunk {} is on disk but could not be read; this node stops answering for \
                  it until a read succeeds",
@@ -1567,20 +1512,11 @@ impl ChunkStore {
         }
     }
 
-    /// Record that a chunk stopped being servable.
-    fn note_health_changed(&self) {
-        self.health
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    }
-
     /// Stop answering for a chunk a read has proven wrong.
     ///
     /// Unlike a chunk that merely could not be read, a later read does not clear this.
     /// The bytes are wrong, and reading them again says the same thing; only replacing
-    /// them or removing them settles it. Bumping health matters as much as the suppression: a chunk that
-    /// has become unservable since the last pre-retirement pass must invalidate that pass,
-    /// or a repair that fails leaves the node deleting the copy it would have repaired
-    /// from.
+    /// them or removing them settles it.
     ///
     /// For callers outside this module that have proven it themselves.
     pub fn note_known_wrong(&self, address: &XorName) {
@@ -1590,7 +1526,6 @@ impl ChunkStore {
     /// Stop answering for a chunk a read has proven wrong.
     fn mark_known_wrong(&self, address: &XorName) {
         if self.known_wrong.write().insert(*address) {
-            self.note_health_changed();
             warn!(
                 "Chunk {} does not match its name; this node stops answering for it until \
                  it is repaired or removed",
@@ -1851,7 +1786,6 @@ impl ChunkStore {
         // drops the caller — and the index change it was meant to announce still lands.
         // A cached pre-retirement proof would then stay valid over a store that had
         // quietly lost a chunk.
-        let health = Arc::clone(&self.health);
         self.blocking_tracker
             .spawn_blocking(move || {
                 let _lane = lanes.get(lane).map(parking_lot::Mutex::lock);
@@ -1859,9 +1793,6 @@ impl ChunkStore {
                     return false;
                 }
                 let forgotten = index.write().remove(&key);
-                if forgotten {
-                    health.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                }
                 forgotten
             })
             .await
@@ -1881,7 +1812,6 @@ impl ChunkStore {
         let key = *address;
         // For the reason given on `forget_if_absent`: this closure outlives its awaiter,
         // and the change it makes has to be announced by the same thread that makes it.
-        let health = Arc::clone(&self.health);
         // And the store-lock lease, for the reason `put`, `repair`, `delete` and the
         // startup scan carry it: this closure outlives its awaiter, so without it a
         // cancelled verification whose caller dropped the last `ChunkStore` would unlink
@@ -1901,7 +1831,6 @@ impl ChunkStore {
                             .map_err(|e| std::io::Error::other(e.to_string()))?,
                         Ok(None) => {
                             index.write().remove(&key);
-                            health.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                             return Ok(true);
                         }
                         Err(e) => return Err(std::io::Error::other(e.to_string())),
@@ -1922,7 +1851,6 @@ impl ChunkStore {
                         fsync_dir_best_effort(shard);
                     }
                     index.write().remove(&key);
-                    health.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                     Ok(true)
                 })
                 .await;

@@ -106,11 +106,11 @@ impl NodeBuilder {
         // Ensure root directory exists
         std::fs::create_dir_all(&self.config.root_dir)?;
 
-        // One release-level decision, applied before anything can audit. It was suspended
-        // for two releases while the fleet moved off the old chunk store, because a node
-        // that has to give chunks up cannot stop its peers punishing it for that. This
-        // release restores it, so a peer is penalised again for failing to hold a chunk it
-        // was supposed to be holding. The commitment-bound audit penalised throughout.
+        // One release-level decision, applied before anything can audit. It stays suspended
+        // here: this release deletes the old chunk store, and a node that was away while the
+        // migration ran arrives holding one it cannot read, so restoring the accusation now
+        // would slash it in the release that stranded it. The release after this one restores
+        // it. The commitment-bound audit has penalised throughout and still does.
         crate::replication::config::apply_close_group_storage_penalty_policy();
 
         // Create shutdown token
