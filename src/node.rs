@@ -317,6 +317,26 @@ impl NodeBuilder {
             }
         }
 
+        // Say on the wire whether this node still has an old chunk store. It costs no new
+        // message and no new field: saorsa-core already sends a user agent with every signed
+        // message and keeps each peer's, so this is a different value in a string that was
+        // already there. It is the only thing that tells us anything at all about the nodes we
+        // do not run and have no logs from. It cannot establish that the fleet has finished:
+        // a node sees only the peers it is connected to, and each answers as of its own last
+        // start, so the most this shows is that some peer reported an old store when it last
+        // started. It can never show that no node has one.
+        //
+        // Read from the filesystem here rather than from the store, because the store is
+        // built later and a node with storage switched off never builds one at all, while
+        // the directory on its disk is just as real either way.
+        //
+        // Fixed for the life of the process: saorsa-core copies the string when it builds
+        // the transport. A node that finishes migrating goes on saying `legacy` until it
+        // restarts, which overstates how much is left rather than understating it, and is
+        // the direction a release gate should err in.
+        let signal = crate::storage::migration_signal::MigrationSignal::from_disk(&config.root_dir);
+        core_config.custom_user_agent = Some(crate::storage::migration_signal::user_agent(signal));
+
         // Persist close group peers + trust scores across restarts.
         // Default to root_dir (alongside node_identity.key) when not explicitly set.
         core_config.close_group_cache_dir = Some(
@@ -653,6 +673,22 @@ impl RunningNode {
                 engine.start(dht_events);
             }
             info!("Replication engine started");
+        }
+
+        // Say where this node is with the move off the old chunk store, and what it can see
+        // of its neighbours. The release that deletes that store may only go out once the
+        // fleet has moved, and no calendar establishes that: our own logs cover the nodes we
+        // run, and this is the only view we get of the ones we do not.
+        {
+            // Weak on purpose: see `report_until_shutdown`. A reporter that kept the node
+            // alive would keep its port bound after the node was dropped.
+            let p2p = Arc::downgrade(&self.p2p_node);
+            let root_dir = self.config.root_dir.clone();
+            let shutdown = self.shutdown.clone();
+            tokio::spawn(async move {
+                crate::storage::migration_signal::report_until_shutdown(p2p, root_dir, shutdown)
+                    .await;
+            });
         }
 
         // Start upgrade monitor if enabled

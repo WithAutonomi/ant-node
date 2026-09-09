@@ -370,6 +370,50 @@ belief carry its own expiry — the directory carries its mark, the proof carrie
 saw, the write carries its note — rather than to check again and hope the check is close
 enough to the act.
 
+## Amendment: see what the neighbours say, and stop the migration slashing anyone
+
+Shipped as a patch on top of this record's release, which had already merged. It changes no
+on-disk format and writes no migration state: a node part-way through re-reads its marker, its
+first-start time and its remaining keys and carries on. That is asserted by a test rather than
+argued.
+
+**A node holding data no longer clears its own commitments.** `storage_empty` asked whether
+there was anything left to *commit to*, not whether there were any bytes. Once the migration
+settles the commitment narrows to the file-backed set, and `all_keys` drops a file marked
+suspect, so two nodes that hold data reported empty: one whose disk filled before it could copy
+anything, and one whose last readable file went transiently bad. Both took the `clear_all`
+branch, which drops every retained root with no answerability window. An auditor holding a root
+gossiped minutes earlier then got `UnknownCommitment` — a confirmed failure on the
+commitment-bound lane, which is deliberately enforced in every release and is *not* the lane
+the migration holds off. The node slashed itself for data it still had, and no switch could
+stop it. Those nodes now take `retire_current`: stop advertising, stay answerable until the
+gossip TTL lapses, bytes on disk. That is the staged narrowing this migration was designed
+around; the predicate is what routes a node into it.
+
+**Every node says whether it still has an old chunk store, and reads what its neighbours say.**
+The state rides the user agent `saorsa-core` already sends with every signed message and keeps
+per peer, so this costs no new message, no new field and no protocol version, and the `node/`
+prefix that gates DHT membership is preserved. Three states, never folded into two: a directory
+that could not be read is not one that is not there.
+
+What the peer half means, in the fewest words that are all true, because a release decision
+rests on it.
+
+It counts what the peers a node is connected to **announced**, each as of that peer's own last
+start. `saorsa-core` copies the user agent when it builds the transport, so a node that finishes
+migrating goes on announcing `legacy` until it restarts.
+
+Two consequences, running in opposite directions, so the tally bounds nothing. A peer announcing
+`legacy` may have finished since, so the count can be too high. A node that is offline, or simply
+not connected to, is absent from it, so the count can be too low. An all-zero tally proves
+nothing on its own either, because a node connected to nobody produces one; the number of peers
+seen is what tells that apart.
+
+So this can surface nodes that have not finished. It cannot establish that none remain, and no
+amount of it adds up to that. `outstanding` counts `legacy`, `unknown` and `unreported`
+together, because a peer whose disk could not be read and a peer on a build from before this
+existed are both as far from finished as `legacy` is.
+
 ## Consequences
 
 ### Positive
@@ -519,10 +563,10 @@ restored.
   matching prediction.
 - The second gates on a soak of the first, plus a verified retirement returning the
   predicted space.
-- The third gates on migration-complete lines across the fleet, refetch backlogs drained, and the
-  recorded audit failure rate back to its pre-migration baseline. The first release's
-  observability is
-  what makes that decidable.
+- The third gates on migration-complete lines from the nodes we run, refetch backlogs drained,
+  and the recorded audit failure rate back to its pre-migration baseline. The observability
+  added here informs that call; it does not decide it. Nothing here can establish that a node
+  we neither run nor are connected to has finished.
 - **How often a short-of-disk node can actually clear the possession gate.** A node whose
   close group is also short of space will not clear it, will not free its disk, and will
   tell its operator to add storage. That is the intended answer, but the fleet needs to

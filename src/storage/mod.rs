@@ -52,6 +52,7 @@ pub(crate) mod file_store;
 mod handler;
 pub(crate) mod lmdb;
 pub mod migration;
+pub(crate) mod migration_signal;
 
 pub use crate::ant_protocol::XorName;
 pub use chunk_store::{ChunkStore, ChunkStoreConfig, VerifyReport, LEGACY_ENV_DIR};
