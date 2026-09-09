@@ -1420,7 +1420,7 @@ fn hello_response(request_id: u64, state: &ServerState) -> Response {
             capabilities: vec![
                 "chunk_protocol".into(),
                 "find_node".into(),
-                "signed_address_records".into(),
+                saorsa_core::signed_address::ADDRESS_V2_CAPABILITY.into(),
                 "get_chunk".into(),
                 "quote_chunk".into(),
                 "put_chunk".into(),
@@ -1458,9 +1458,10 @@ async fn process_find_node(
     })?;
     for node in dht_nodes {
         if with_address_records {
-            if let Some(proof) = dht.signed_address_record_for_peer(&node.peer_id).await {
-                proofs.push(proof);
-            }
+            let Some(proof) = dht.signed_address_record_for_peer(&node.peer_id).await else {
+                continue;
+            };
+            proofs.push(proof);
         }
         let supplemental = dht.supplemental_addresses_for_peer(&node.peer_id).await;
         nodes.push(browser_node_from_dht(
