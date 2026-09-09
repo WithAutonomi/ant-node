@@ -106,19 +106,6 @@ impl NodeBuilder {
         // Ensure root directory exists
         std::fs::create_dir_all(&self.config.root_dir)?;
 
-        // As soon as the root is known, and before anything is built on top of it. The
-        // store's own constructor asks this too, but a node with `storage.enabled = false`
-        // never builds a store and would walk straight past it, and turning storage off is
-        // not consent to run beside chunks this build cannot read while the commitment that
-        // claims them is still live.
-        //
-        // Ahead of the P2P node specifically. That binds transports and spawns background
-        // tasks, so asking afterwards means a bind failure can mask this answer, and a
-        // caller that does see the refusal has already been charged for a transport it is
-        // about to throw away.
-        crate::storage::legacy_artifacts::refuse_if_unmigrated(&self.config.root_dir)
-            .map_err(|e| Error::Startup(e.to_string()))?;
-
         // One release-level decision, applied before anything can audit. It was suspended
         // for two releases while the fleet moved off the old chunk store, because a node
         // that has to give chunks up cannot stop its peers punishing it for that. This
@@ -165,6 +152,35 @@ impl NodeBuilder {
             info!("Chunk storage disabled");
             (None, None)
         };
+
+        // Only now, and only if a store was actually opened. Clearing up after the storage
+        // migration deletes directories the previous release had finished with, and
+        // "finished with" means their chunks are in the file store — which is only true if
+        // the file store is there. Doing this earlier put the deletion in front of a
+        // constructor that can still fail on an unreadable layout, a directory it cannot
+        // create, or a lock another process has not let go of, and a node that lost both
+        // stores that way had nothing to go back to.
+        //
+        // A node with storage switched off never builds one at all, so it never establishes
+        // that anything was copied anywhere, and it does not delete. It also has no use for
+        // the disk it would recover. Leaving the directory costs space on a node that is not
+        // storing anything anyway, and keeps its contents recoverable by the release that
+        // can read them.
+        //
+        // Waiting costs nothing in what this node reports. Its user agent was fixed when the
+        // transport was built a moment ago, but everything removed here is a leftover the
+        // signal already reads as finished with — carrying the mark or being empty is both
+        // what makes it removable and what makes it harmless — so the node announces `files`
+        // whether the deletion has finished, is still running, or has not started.
+        if ant_protocol.is_some() {
+            crate::storage::legacy_artifacts::clean_up(&self.config.root_dir);
+        } else {
+            info!(
+                "Chunk storage is disabled, so anything the storage migration left behind is \
+                 being left where it is: nothing here can establish that its chunks were \
+                 copied anywhere."
+            );
+        }
 
         let p2p_arc = Arc::new(p2p_node);
 
@@ -1104,20 +1120,22 @@ mod tests {
         node.shutdown.cancel();
     }
 
-    /// A node with chunks in a store this build cannot read does not start, however it is
-    /// configured.
+    /// A node with chunks in a store this build cannot read STARTS, however it is
+    /// configured, and does not lose them.
     ///
-    /// Both ways, because they are different code paths and only one of them was covered.
-    /// The store's own constructor asks the question, but a node with `storage.enabled =
-    /// false` never builds a store and so never reaches it. Turning storage off is not
-    /// consent to run beside chunks that this node's own published commitment still claims
-    /// and that this build cannot read, so the question is asked before anything is built.
+    /// This asserted the opposite until the release that shipped it was reconsidered twice.
+    /// First it refused to start, which serves nothing at all and cannot be recovered by
+    /// hand, because nothing can hold a node on an older build. Then it deleted whatever it
+    /// found, which is data loss for exactly the node that most needs the data: the upgrade
+    /// monitor picks the newest eligible release rather than the next one, so a node that was
+    /// offline through the previous release arrives here with everything it owns in that
+    /// directory and nothing in the file store.
     ///
-    /// Goes through `build()` rather than the check directly. The failure worth catching
-    /// here is the call site going missing, which is what happened: the check existed and
-    /// one of the two routes into the node walked straight past it.
+    /// Both configurations, because they are different code paths: a node with
+    /// `storage.enabled = false` never builds a store, and the old environment is on its disk
+    /// just the same.
     #[tokio::test]
-    async fn a_node_with_an_unmigrated_store_refuses_to_build_however_it_is_configured() {
+    async fn a_node_with_an_unmigrated_store_starts_and_keeps_it() {
         for storage_enabled in [true, false] {
             let dir = TempDir::new().expect("temp dir");
             let root = dir.path().join("node");
@@ -1130,46 +1148,118 @@ mod tests {
             let mut config = local_node_config(&root, port);
             config.storage.enabled = storage_enabled;
 
-            let err = NodeBuilder::new(config)
-                .build()
-                .await
-                .err()
-                .unwrap_or_else(|| {
-                    panic!(
-                        "a node with an unmigrated store built with storage.enabled = \
-                         {storage_enabled}"
-                    )
-                });
-            let said = err.to_string();
+            let node = NodeBuilder::new(config).build().await.unwrap_or_else(|e| {
+                panic!(
+                    "a node with an unmigrated store must start (storage.enabled = \
+                     {storage_enabled}): {e}"
+                )
+            });
+            settle();
             assert!(
-                said.contains("chunks.mdb"),
-                "the refusal must name the directory (storage.enabled = {storage_enabled}): \
-                 {said}"
+                env.join("data.mdb").exists(),
+                "chunks that were never copied out were deleted (storage.enabled = \
+                 {storage_enabled})"
             );
+            node.shutdown.cancel();
         }
+    }
 
-        // And it answers before the transport is built, not after. Asking afterwards means
-        // a bind failure masks this answer, and a caller that does see it has already been
-        // charged for a transport it is about to throw away. Staged with a privileged port,
-        // which an ordinary user cannot bind, so P2P construction would fail if it were
-        // reached: the refusal still has to be the one that comes back.
+    /// A node with storage switched off deletes nothing, even a leftover marked finished.
+    ///
+    /// It never builds a store, so nothing about this node establishes that those chunks were
+    /// copied anywhere: the mark is a claim made by a previous release about a file store
+    /// this process has not opened and will not open. It also has no use for the disk. So the
+    /// directory stays and stays recoverable.
+    #[tokio::test]
+    async fn a_node_with_storage_disabled_deletes_nothing() {
         let dir = TempDir::new().expect("temp dir");
         let root = dir.path().join("node");
         let env = root.join(crate::storage::LEGACY_ENV_DIR);
         std::fs::create_dir_all(&env).expect("mkdir");
-        std::fs::write(env.join("data.mdb"), b"never copied out").expect("seed");
+        std::fs::write(env.join("data.mdb"), b"already copied out").expect("seed");
+        std::fs::write(env.join("RETIRED"), b"retired").expect("mark");
 
-        let said = NodeBuilder::new(local_node_config(&root, 1))
+        let port = rand::thread_rng().gen_range(TEST_PORT_RANGE);
+        let mut config = local_node_config(&root, port);
+        config.storage.enabled = false;
+        let node = NodeBuilder::new(config).build().await.expect("must start");
+        settle();
+        assert!(
+            env.join("data.mdb").exists(),
+            "a node that never opened a store deleted one on the strength of a mark it \
+             could not check"
+        );
+        node.shutdown.cancel();
+    }
+
+    /// A store the migration finished with is removed, once the file store has opened.
+    #[tokio::test]
+    async fn a_finished_store_is_removed_once_the_replacement_opens() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("node");
+        let env = root.join(crate::storage::LEGACY_ENV_DIR);
+        std::fs::create_dir_all(&env).expect("mkdir");
+        std::fs::write(env.join("data.mdb"), b"already copied out").expect("seed");
+        std::fs::write(env.join("RETIRED"), b"retired").expect("mark");
+
+        let port = rand::thread_rng().gen_range(TEST_PORT_RANGE);
+        let node = NodeBuilder::new(local_node_config(&root, port))
             .build()
             .await
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
+            .expect("a node with a finished leftover must start");
+        assert!(wait_gone(&env));
+        node.shutdown.cancel();
+    }
+
+    /// Nothing is deleted until the store that replaced it has actually opened.
+    ///
+    /// "Finished with" means the chunks are in the file store, which is only true if the file
+    /// store opens. An earlier version deleted first and let the constructor fail behind it,
+    /// on an unreadable layout or a directory it could not create, and a node that lost both
+    /// stores that way had nothing left to go back to.
+    #[tokio::test]
+    async fn a_finished_store_survives_a_file_store_that_will_not_open() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("node");
+        let env = root.join(crate::storage::LEGACY_ENV_DIR);
+        std::fs::create_dir_all(&env).expect("mkdir");
+        std::fs::write(env.join("data.mdb"), b"already copied out").expect("seed");
+        std::fs::write(env.join("RETIRED"), b"retired").expect("mark");
+
+        // A file where the chunk directory has to be, so the store cannot create it.
+        std::fs::write(root.join("chunks"), b"not a directory").expect("block the store");
+
+        let port = rand::thread_rng().gen_range(TEST_PORT_RANGE);
+        let built = NodeBuilder::new(local_node_config(&root, port))
+            .build()
+            .await;
         assert!(
-            said.contains("chunks.mdb"),
-            "the store answer must come back before the transport is built, got: {said}"
+            built.is_err(),
+            "the file store was supposed to fail to open"
+        );
+        settle();
+        assert!(
+            env.join("data.mdb").exists(),
+            "the old store was deleted before the one replacing it could open"
         );
     }
+
+    /// The removal runs on its own thread.
+    fn settle() {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    /// The removal runs on its own thread, so give it a moment.
+    fn wait_gone(path: &std::path::Path) -> bool {
+        for _ in 0..200 {
+            if !path.exists() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
+
     use super::*;
     use crate::config::NODES_SUBDIR;
 

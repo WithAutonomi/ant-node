@@ -685,10 +685,11 @@ impl ChunkStore {
     /// is unreadable or describes a layout this build does not implement, or the scan
     /// fails.
     pub async fn new(config: ChunkStoreConfig) -> Result<Self> {
-        // Before anything is created. A node that still has chunks in the store this build
-        // cannot read must not start, and it must not leave a half-made file store behind
-        // when it declines to.
-        crate::storage::legacy_artifacts::refuse_if_unmigrated(&config.root_dir)?;
+        // Deliberately nothing about the old chunk store here. Clearing up after the storage
+        // migration happens once, in `NodeBuilder::build`, and only after this constructor
+        // has succeeded: what it deletes are directories whose chunks are in this store, so
+        // it may not run until this store is open. Asking here as well would put that
+        // decision in front of itself.
 
         let chunks_dir = config.root_dir.join(CHUNKS_DIR_NAME);
         std::fs::create_dir_all(&chunks_dir).map_err(|e| {
