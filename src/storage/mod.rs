@@ -52,6 +52,7 @@ pub(crate) mod file_store;
 mod handler;
 pub(crate) mod lmdb;
 pub mod migration;
+pub mod migration_signal;
 
 pub use crate::ant_protocol::XorName;
 pub use chunk_store::{ChunkStore, ChunkStoreConfig, VerifyReport, LEGACY_ENV_DIR};
@@ -61,6 +62,7 @@ pub(crate) use handler::ChunkRequestContext;
 pub(crate) use lmdb::CapacityVerdict;
 pub use lmdb::{LmdbStorage, LmdbStorageConfig};
 pub use migration::{MigrationConfig, MigrationPhase, MigrationState};
+pub use migration_signal::{peer_state, MigrationSignal, PeerMigrationState};
 
 /// Bytes in one MiB.
 pub const MIB: u64 = 1024 * 1024;

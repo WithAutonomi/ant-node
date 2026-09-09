@@ -12,6 +12,7 @@ use crate::error::{Error, Result};
 use crate::logging::{debug, info, warn};
 use crate::upgrade::release_cache::ReleaseCache;
 use crate::upgrade::rollout::StagedRollout;
+use crate::upgrade::rollout_state::RolloutState;
 use crate::upgrade::UpgradeInfo;
 use semver::Version;
 use serde::Deserialize;
@@ -57,8 +58,15 @@ pub struct UpgradeMonitor {
     staged_rollout: Option<StagedRollout>,
     /// Disk cache for GitHub release metadata (shared across instances).
     release_cache: Option<ReleaseCache>,
-    /// When the current pending upgrade was first detected.
+    /// When the current pending upgrade was first detected, for this process only.
     pending_upgrade_detected: Option<Instant>,
+    /// Where that moment is written down, so it survives a restart.
+    ///
+    /// Without it the window restarts every time the node does, and a node that restarts
+    /// more often than its own delay never reaches the end of one. `None` keeps the old
+    /// in-process behaviour, which is what tests and any caller without a root directory
+    /// get.
+    rollout_state: Option<RolloutState>,
     /// The version of the pending upgrade (for tracking rollout state).
     pending_upgrade_version: Option<Version>,
 }
@@ -94,6 +102,7 @@ impl UpgradeMonitor {
             staged_rollout: None,
             release_cache: None,
             pending_upgrade_detected: None,
+            rollout_state: None,
             pending_upgrade_version: None,
         }
     }
@@ -124,6 +133,18 @@ impl UpgradeMonitor {
         self
     }
 
+    /// Remember when a release was first seen, under this node's root directory.
+    ///
+    /// The rollout delay is measured from the moment a node first sees a version. Kept only
+    /// in memory, that moment is lost on every restart, so a node that restarts inside its
+    /// own delay starts the window again and can defer an upgrade indefinitely. The release
+    /// that later assumes the fleet has had its window cannot assume it while that is true.
+    #[must_use]
+    pub fn with_rollout_state(mut self, root_dir: &std::path::Path) -> Self {
+        self.rollout_state = Some(RolloutState::new(root_dir));
+        self
+    }
+
     /// Create a monitor with a custom current version (for testing).
     #[cfg(test)]
     #[must_use]
@@ -151,6 +172,7 @@ impl UpgradeMonitor {
             staged_rollout: None,
             release_cache: None,
             pending_upgrade_detected: None,
+            rollout_state: None,
             pending_upgrade_version: None,
         }
     }
@@ -298,35 +320,40 @@ impl UpgradeMonitor {
             .as_ref()
             .map_or(true, |v| *v != info.version);
 
+        let delay = rollout.calculate_delay_for_version(&info.version);
+
         if is_new_version {
             // New version detected - start rollout timer
             self.pending_upgrade_detected = Some(Instant::now());
             self.pending_upgrade_version = Some(info.version.clone());
-
-            let delay = rollout.calculate_delay_for_version(&info.version);
-            let restart_time = chrono::Utc::now()
-                + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::hours(1));
             info!(
                 new_version = %info.version,
                 delay_hours = delay.as_secs() / 3600,
                 delay_minutes = (delay.as_secs() % 3600) / 60,
                 "New version detected, staged rollout delay calculated"
             );
-            info!(
-                "Node will stop/restart for upgrade at {}",
-                restart_time.to_rfc3339()
-            );
         }
 
-        // Calculate if we're past the rollout delay
-        let Some(detected_at) = self.pending_upgrade_detected else {
+        // How long this node has been waiting. Taken from the record on disk when there is
+        // one, so a restart does not start the window again: a node restarting more often
+        // than its own delay would otherwise never reach the end of one, and would sit on an
+        // old release for as long as it kept restarting.
+        //
+        // Every way of failing to establish the answer ends in "upgrade now". A node that
+        // cannot say when it started waiting cannot show it has finished, and a node left
+        // behind is a worse outcome than one that upgrades a few hours early.
+        let Some(elapsed) = self.waited_for(&info.version, rollout.max_delay_hours(), delay) else {
             // Should not happen, but handle gracefully
             warn!("Pending upgrade detected but no timestamp recorded");
             return Ok(Some(info));
         };
 
-        let delay = rollout.calculate_delay_for_version(&info.version);
-        let elapsed = detected_at.elapsed();
+        // Deliberately no "will restart at" line here. The caller already logs the deadline
+        // from `time_until_upgrade`, which measures the same way this does, and a second one
+        // said before the download, the signature check and the replacement have succeeded
+        // promises something this cannot know. The version-detected branch above cannot say
+        // it either: a restart makes the version look new to this process while the recorded
+        // moment says most of the wait is already done.
 
         if elapsed >= delay {
             info!(
@@ -379,16 +406,48 @@ impl UpgradeMonitor {
     pub fn time_until_upgrade(&self) -> Option<Duration> {
         let rollout = self.staged_rollout.as_ref()?;
         let version = self.pending_upgrade_version.as_ref()?;
-        let detected_at = self.pending_upgrade_detected?;
-
         let delay = rollout.calculate_delay_for_version(version);
-        let elapsed = detected_at.elapsed();
+        // The same measurement the readiness check uses. When these were two calculations
+        // they disagreed after a restart: readiness read the recorded moment and said one
+        // hour was left, while this read a process-local clock that had just started and
+        // told the caller to sleep for nearly another day.
+        let elapsed = self.waited_for(version, rollout.max_delay_hours(), delay)?;
 
         if elapsed >= delay {
             Some(Duration::ZERO)
         } else {
             Some(delay.saturating_sub(elapsed))
         }
+    }
+
+    /// How long this node has been waiting for `version`.
+    ///
+    /// One measurement, used by both the readiness check and the sleep the caller takes
+    /// between checks, because two of them drift apart across a restart and the node ends up
+    /// eligible and asleep at the same time.
+    ///
+    /// From the record on disk when there is one, so a restart does not start the window
+    /// again. `spent` is what to answer when the record cannot be established at all: a node
+    /// that cannot say when it began waiting cannot show that it has finished, and being left
+    /// behind is a far worse outcome than upgrading early with its share of the fleet.
+    fn waited_for(
+        &self,
+        version: &Version,
+        window_hours: u64,
+        spent: Duration,
+    ) -> Option<Duration> {
+        if let Some(state) = self.rollout_state.as_ref() {
+            return Some(
+                state
+                    .first_seen(version, window_hours)
+                    .map_or(spent, |first_seen| {
+                        Duration::from_secs(
+                            now_unix().unwrap_or(first_seen).saturating_sub(first_seen),
+                        )
+                    }),
+            );
+        }
+        self.pending_upgrade_detected.map(|at| at.elapsed())
     }
 
     /// Check if staged rollout is enabled.
@@ -679,6 +738,14 @@ fn build_platform_patterns(arch: &str, os: &str) -> Vec<String> {
     }
 
     patterns
+}
+
+/// Now, in Unix seconds.
+fn now_unix() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
 }
 
 #[cfg(test)]

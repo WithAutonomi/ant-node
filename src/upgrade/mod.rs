@@ -13,6 +13,7 @@ mod cache_dir;
 mod monitor;
 mod release_cache;
 mod rollout;
+mod rollout_state;
 mod signature;
 
 pub use apply::{AutoApplyUpgrader, RESTART_EXIT_CODE};
@@ -21,6 +22,7 @@ pub use cache_dir::upgrade_cache_dir;
 pub use monitor::{find_platform_asset, version_from_tag, Asset, GitHubRelease, UpgradeMonitor};
 pub use release_cache::ReleaseCache;
 pub use rollout::StagedRollout;
+pub use rollout_state::RolloutState;
 pub use signature::{
     verify_binary_signature, verify_binary_signature_with_key, verify_from_file,
     verify_from_file_with_key, PUBLIC_KEY_SIZE, SIGNATURE_SIZE, SIGNING_CONTEXT,
