@@ -695,10 +695,19 @@ pub const AUDIT_FAILURE_TRUST_WEIGHT: f64 = 5.0;
 
 /// Whether this build penalises a peer for not holding a chunk it was supposed to hold.
 ///
-/// **`false` again.** It was `true` for two releases while the fleet moved off the legacy
-/// LMDB chunk store, because a node that has to give up chunks cannot stop its peers
-/// penalising it for that, so the peers had to stop first. The fleet is on the file store
-/// now, so the accusation means what it used to mean and is enforced again.
+/// **Still `true`, and deliberately not flipped by this release.** It was raised while the
+/// fleet moved off the legacy LMDB chunk store, because a node that has to give up chunks
+/// cannot stop its peers penalising it for that, so the peers had to stop first.
+///
+/// Restoring it belongs in a release *after* this one, not in this one. The upgrade monitor
+/// picks the newest eligible release rather than the next, so a node that was offline while
+/// the migration ran arrives here having never migrated, holding a legacy store this build
+/// cannot read. This release keeps that store rather than deleting it, which is the right
+/// answer for its data, but the node cannot serve those chunks. Restoring the penalty in the
+/// same release would slash exactly that node, for a state it had no chance to leave, in the
+/// release that stranded it. Two changes, two releases: this one removes the old store, and
+/// the next one restores the accusation once the fleet has been observed clean for long
+/// enough to include the nodes that were away.
 ///
 /// Deliberately narrow. It covers exactly one accusation: "you did not have a chunk you
 /// were supposed to be holding". It does **not** cover the commitment-bound subtree audit,
@@ -713,7 +722,7 @@ pub const AUDIT_FAILURE_TRUST_WEIGHT: f64 = 5.0;
 /// A build constant rather than a config field on purpose: a node writes its effective
 /// configuration back to disk, so shipping this as an ordinary setting would bake this
 /// release's value into every operator's file and the next release would change nothing.
-pub const RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY: bool = false;
+pub const RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY: bool = true;
 
 /// Environment override for [`RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY`], for a canary.
 ///
@@ -1522,22 +1531,23 @@ mod tests {
     /// would race each other under the default parallel runner.
     #[test]
     #[serial]
-    fn this_release_penalises_a_peer_for_not_holding_a_close_group_chunk() {
-        // The one assertion that names the value on purpose. The suspension existed for
-        // two releases so the fleet could move off a store that never returned disk, and
-        // leaving it on after that is a network that has quietly stopped enforcing the
-        // thing it suspended: nodes could drop close-group chunks and nobody would say so.
+    fn this_release_still_holds_the_unheld_chunk_penalty_off() {
+        // Named on purpose, because the value matters and nothing else asserts it. This is
+        // the release that deletes the old chunk store, and the upgrade monitor picks the
+        // newest eligible release rather than the next one, so a node that was away while
+        // the migration ran arrives here having never migrated. It keeps its legacy store,
+        // which this build cannot read, so it cannot serve those chunks. Restoring the
+        // accusation here would slash that node in the release that stranded it.
         //
-        // A switch nobody notices is the failure this guards. Flipping it back is a
-        // legitimate emergency lever, and it should cost a deliberate edit to a test that
-        // says why, not a one-character change nothing reports.
-        // Asked of the live switch after applying this release's policy, rather than of
-        // the constant. Clippy rejects an assertion on a constant, and going through the
-        // switch is the better question anyway: what a node actually does.
+        // Restoring it is a one-line change in the release after this one, once the fleet
+        // has been observed clean for long enough to include the nodes that were away.
+        // Asked of the live switch after applying the policy rather than of the constant:
+        // clippy rejects an assertion on a constant, and what a node actually does is the
+        // better question.
         apply_and_announce(RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY);
         assert!(
-            !close_group_storage_penalty_suspended(),
-            "this release restores the penalty; suspending it again needs a reason"
+            close_group_storage_penalty_suspended(),
+            "this release must not restore the penalty; it can strand a node it then slashes"
         );
     }
 

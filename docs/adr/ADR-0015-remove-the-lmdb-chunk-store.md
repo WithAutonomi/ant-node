@@ -201,6 +201,27 @@ That the cleanup does not touch these today is a property of the exact-name matc
 accident, and it is stated here because a future widening of that match would be a silent
 data loss rather than an obvious one.
 
+### The penalty is restored by the release after this one, not by this one
+
+The original plan had this release delete the old store and restore the close-group storage
+penalty together. They are now separated, and the separation is the point.
+
+The upgrade monitor picks the newest eligible release rather than the next one. A node that was
+offline while the migration ran therefore arrives here having never migrated, holding a legacy
+store this build cannot read. This release keeps that store rather than deleting it, which is
+right for its data, but the node cannot serve those chunks and its close group will notice.
+Restoring the accusation in the same release would slash that node for a state it had no chance
+to leave, in the release that put it there.
+
+So this release ships with the penalty still held off, and the release after it restores the
+penalty once the fleet has been observed clean for long enough to include the nodes that were
+away. That is a one-line change to a build constant, and it costs one extra release to stop the
+cleanup and the accusation landing on a stranded node at the same moment.
+
+What this leaves is one migration-era constant still in the tree after the release that was
+meant to remove them all. That is a deliberate trade: the objective this protects is that no
+release breaks the fleet, and it outranks the objective that no migration code survives.
+
 ## Consequences
 
 ### Positive
