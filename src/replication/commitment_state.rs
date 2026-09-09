@@ -945,6 +945,51 @@ fn prune_slots(inner: &mut Inner, now: Instant) {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+
+    /// Retiring keeps an in-window pin answerable; clearing repudiates it.
+    ///
+    /// This is why the commitment rotation no longer has a "storage is empty" branch. That
+    /// branch called `clear_all`, and it was reached from a key count that was wrong in the
+    /// same direction every time it was fixed: a node whose disk filled before it could copy
+    /// anything, then one whose file had been dropped from the index by a failed read, then a
+    /// files-only node that had published bytes but not yet indexed them.
+    ///
+    /// The cost of being wrong is what settles it, and it is what this measures. Clearing
+    /// repudiates a root a peer is still pinning, which answers `UnknownCommitment` and is
+    /// graded a confirmed failure. Retiring stops advertising and stays answerable until the
+    /// gossip TTL lapses. Both stop advertising; only one throws the answer away.
+    #[test]
+    fn retiring_keeps_a_pinned_root_answerable_and_clearing_does_not() {
+        let (pk, sk) = keypair();
+        let pk_bytes = pk.to_bytes();
+        let peer_id = *blake3::hash(&pk.to_bytes()).as_bytes();
+
+        let retired = ResponderCommitmentState::new();
+        let c = BuiltCommitment::build(vec![(key(1), bh(1))], &peer_id, &sk, &pk_bytes).unwrap();
+        let h = c.hash();
+        retired.rotate(c);
+        retired.mark_gossiped(h);
+        retired.retire_current();
+        assert!(
+            retired.current().is_none(),
+            "retiring must stop the node advertising the root"
+        );
+        assert!(
+            retired.lookup_by_hash(&h).is_some(),
+            "but a peer still pinning it must get an answer, not a repudiation"
+        );
+
+        let cleared = ResponderCommitmentState::new();
+        let c2 = BuiltCommitment::build(vec![(key(1), bh(1))], &peer_id, &sk, &pk_bytes).unwrap();
+        let h2 = c2.hash();
+        cleared.rotate(c2);
+        cleared.mark_gossiped(h2);
+        cleared.clear_all();
+        assert!(
+            cleared.lookup_by_hash(&h2).is_none(),
+            "clearing throws the same pin away, which is the confirmed failure this avoids"
+        );
+    }
     use super::*;
     use crate::replication::commitment::{commitment_hash, leaf_hash, verify_path};
     use saorsa_pqc::api::sig::ml_dsa_65;

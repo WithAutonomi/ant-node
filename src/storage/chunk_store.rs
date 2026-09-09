@@ -3172,6 +3172,67 @@ mod tests {
         assert!(!store.exists(&target).expect("exists"));
     }
 
+    /// A store left partway through by the release that shipped is picked up, not restarted.
+    ///
+    /// This release lands on nodes that are already migrating under the one before it, so what
+    /// matters is not what it does to a fresh store but what it does to a half-finished one.
+    /// It must re-read that state and change nothing: the phase, the first-start time the
+    /// waves are measured from, what the node committed to giving up, and the keys still only
+    /// in the legacy store all have to survive, or a node restarts a clock it had nearly run
+    /// down, or re-copies what it already copied.
+    ///
+    /// Nothing in this release writes migration state, and this is what says so.
+    #[tokio::test]
+    async fn a_store_left_midway_by_the_previous_release_keeps_its_place() {
+        let dir = TempDir::new().expect("temp dir");
+        let keys = seed_legacy(&dir, &["k1", "k2", "k3"]).await;
+
+        let started_at = {
+            let store = open(&dir).await;
+            // Partway: one copied, two still only in the legacy store, which is where a node
+            // that ran out of disk under the previous release sits.
+            store
+                .copy_batch(&keys[..1], 0, 0, &never_cancelled())
+                .await
+                .expect("copy");
+            store.commit_to_files().expect("commit");
+            assert_eq!(store.migration_phase(), MigrationPhase::Committed);
+            assert_eq!(store.legacy_only_keys().len(), 2);
+            store.migration_state().first_start_unix
+        };
+
+        // The upgrade: a new process opening the same directory.
+        let store = open(&dir).await;
+        assert_eq!(
+            store.migration_phase(),
+            MigrationPhase::Committed,
+            "an upgrade must not put a committed node back to bridging"
+        );
+        assert_eq!(
+            store.migration_state().first_start_unix,
+            started_at,
+            "the waves are measured from this, so restarting it restarts the schedule"
+        );
+        assert_eq!(
+            store.migration_state().shed_key_count,
+            2,
+            "what the node committed to giving up must survive the upgrade"
+        );
+        assert_eq!(
+            store.legacy_only_keys().len(),
+            2,
+            "the keys still to copy must not be recounted from scratch"
+        );
+
+        // And everything is still servable, out of whichever store holds it.
+        for key in &keys {
+            assert!(
+                store.get(key).await.expect("get").is_some(),
+                "a chunk stopped being servable across the upgrade"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn committing_narrows_the_commitment_but_not_what_is_served() {
         let dir = TempDir::new().expect("temp dir");
