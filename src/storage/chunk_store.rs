@@ -1567,16 +1567,6 @@ impl ChunkStore {
         }
     }
 
-    /// What the store's health looked like at this moment.
-    ///
-    /// Compare a value taken before a long-running check with one taken after, or after
-    /// taking a lock: different means a chunk stopped being servable in between and any
-    /// conclusion drawn from that check is out of date.
-    #[must_use]
-    pub fn health_generation(&self) -> u64 {
-        self.health.load(std::sync::atomic::Ordering::Acquire)
-    }
-
     /// Record that a chunk stopped being servable.
     fn note_health_changed(&self) {
         self.health
@@ -1707,14 +1697,6 @@ impl ChunkStore {
     /// Returns [`Error::Storage`] when the write would not fit above the reserve.
     pub fn check_capacity_for(&self, bytes: u64) -> Result<()> {
         self.capacity.check(bytes)
-    }
-
-    /// Force the next capacity question to re-measure the filesystem.
-    ///
-    /// Called after the legacy environment is removed, because that is a step change in
-    /// free space that the short-lived cache would otherwise hide for a few seconds.
-    pub fn invalidate_capacity_cache(&self) {
-        self.capacity.invalidate();
     }
 
     /// Test-only handle to the put gate.
