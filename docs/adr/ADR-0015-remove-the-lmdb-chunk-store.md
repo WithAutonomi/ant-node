@@ -188,16 +188,11 @@ does not need the race to delete anything in it.
 ### What this release does NOT delete
 
 The cleanup matches exactly `chunks.mdb`, `chunks.mdb.retired` and `chunks.mdb.retired.<n>`
-for `n` in `1..=64`, and nothing else. Three things under the node root are deliberately
+for `n` in `1..=64`, and nothing else. Two things under the node root are deliberately
 outside that set and must stay outside it:
 
-- **`oversized-chunks/`.** The release before this one preserved there any legacy value the
-  file store would not accept, rather than destroying it, on the grounds that no peer can
-  hold a copy of a chunk over the size ceiling and no repair can fetch one. Those are the
-  only copies of that data anywhere. Nothing in this release reads, indexes, serves or
-  removes them, and nothing should start doing so without deciding what happens to the bytes.
-- **The migration marker and the rollout stamp.** Small, harmless, and useful evidence if a
-  node's history is ever in question.
+- **The migration marker.** Small, harmless, and useful evidence if a node's history is ever
+  in question.
 - **Anything else an operator put there.** A prefix match would claim a
   `chunks.mdb.retired-keep-this`, which is why names are matched exactly rather than by
   prefix.
