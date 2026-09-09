@@ -726,11 +726,10 @@ pub const RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY: bool = true;
 
 /// Environment override for [`RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY`], for a canary.
 ///
-/// Kept after the flip rather than removed with the rest of the bridge. It is the cheapest
-/// lever there is if restoring the penalty turns out to have been early, and the moment it
-/// is most likely to be needed is the release that restores it. It suspends only the
-/// penalties this node hands out, so an emergency suspension has to go to the fleet, not to
-/// the node being penalised.
+/// Kept rather than removed with the rest of the bridge. This release does not flip the
+/// constant, but the release after it does, and that is the moment the lever is most likely to
+/// be needed. It suspends only the penalties this node hands out, so an emergency suspension
+/// has to go to the fleet, not to the node being penalised.
 ///
 /// The one-way guard the previous release added is kept and is now inert by construction: it
 /// refuses to un-suspend only while the release constant says to hold the penalty off, and
