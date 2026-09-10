@@ -161,14 +161,14 @@ pub struct WebRtcDirectConfig {
     /// Enable the browser listener.
     pub enabled: bool,
 
-    /// UDP address for the WebRTC Direct listener.
+    /// UDP address for the WebRTC Direct listener. Port zero asks the OS to choose.
     pub bind: SocketAddr,
 
     /// Literal public UDP address advertised to browsers.
     ///
-    /// When omitted, a wildcard listener uses the native transport's observed
-    /// external IP (or the host's routed IP) and an automatically assigned,
-    /// stable high UDP port.
+    /// When omitted, a wildcard listener uses the native self-address view's
+    /// first non-relay IP in the bind family and the actual WebRTC bound port.
+    /// Publication waits when native address discovery has no usable IP.
     pub advertised_addr: Option<SocketAddr>,
 
     /// PEM file used to persist the stable DTLS certificate and private key.
