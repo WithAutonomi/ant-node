@@ -48,7 +48,12 @@ verify_on_read = true
 
 # --- Upgrade ---
 [upgrade]
-enabled = false
+# There is no `enabled` setting, and there never was one. This file used to carry
+# `enabled = false`, which serde ignored: `UpgradeConfig` has no such field, so every node
+# reading this was self-upgrading while its own configuration appeared to say otherwise.
+# Removed rather than annotated, because a line that does nothing is worse than an absent one
+# — and this one said the opposite of the truth about the mechanism a release rollback would
+# have to go through.
 channel = "stable"
 check_interval_hours = 1
 github_repo = "WithAutonomi/ant-node"
