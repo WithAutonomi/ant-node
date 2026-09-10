@@ -7,10 +7,11 @@ and serves browser bootstrap metadata; the companion site lives in the sibling
 
 ## Start the node testnet
 
-Rust 1.88 or newer is required by the Saorsa WebRTC Direct transport.
+Rust 1.91 or newer is the shared native/WASM baseline.
+The startup and transport policy is recorded in [ADR-0013](adr/ADR-0013-direct-browser-clients-over-webrtc-direct.md).
 
 ```bash
-cargo run --bin ant-devnet -- \
+cargo run --bin ant-devnet --features test-utils -- \
   --preset minimal \
   --base-port 23000 \
   --webrtc-direct \
@@ -19,6 +20,11 @@ cargo run --bin ant-devnet -- \
   --enable-evm \
   --enable-logging
 ```
+
+`test-utils` explicitly enables development-only prepaid file seeding. Without
+it, the listeners and ordinary paid uploads still work, but manifests contain
+`files: []`; an explicit `--public-file` is rejected before startup. Production
+builds do not expose the prepaid cache insertion API.
 
 The services are:
 
@@ -93,7 +99,7 @@ through the manifest server or another gateway.
 ## Automated verification
 
 ```bash
-cargo test --locked --test webrtc_direct_devnet -- --include-ignored
+cargo test --locked --test webrtc_direct_devnet --features test-utils -- --include-ignored
 ```
 
 This starts Anvil and the five-node network, self-encrypts and publishes a
@@ -112,7 +118,7 @@ chain-ID responses fail without exposing provider details.
 Use `--host <LAN_IPV4>` to advertise the literal LAN address:
 
 ```bash
-cargo run --bin ant-devnet -- \
+cargo run --bin ant-devnet --features test-utils -- \
   --preset minimal \
   --host 192.168.1.50 \
   --webrtc-direct \
@@ -129,12 +135,25 @@ manifest mode on a public network.
 
 ## Public Internet smoke testing
 
-The standard `ant-node` build now includes and enables WebRTC Direct, so the
-sibling `ant-testnet` tool needs no browser-specific preset or flags. On its
-ordinary public droplets, a node maps its native UDP port deterministically
-into the existing allowed UDP 32768-65535 range and advertises the external IP
-learned by the native transport (falling back to the host's routed IP). Its
-persisted DTLS certificate keeps the complete address stable across restarts.
+The standard `ant-node` build includes and enables WebRTC Direct. An enabled
+listener's configuration, payment-network, certificate, or bind failure aborts
+node startup. Use `--disable-webrtc-direct` (or
+`ANT_DISABLE_WEBRTC_DIRECT=true`) to disable it explicitly.
+
+Like native QUIC, port `0` asks the OS to choose an available UDP port; an
+explicit `--webrtc-direct-port` remains fixed. Wildcard listeners advertise a
+same-family non-relay IP from the canonical native address view. They wait for
+usable native address discovery, refresh the published endpoint as it changes,
+and never fabricate a route-probe or loopback fallback. The endpoint file is
+created only once an address is known.
+
+Configure an explicit WebRTC port and permit inbound UDP on that port when a
+stable bootstrap endpoint or firewall rule is needed. Retain the node identity
+and certificate and use a fixed public IP. Certificate persistence alone does
+not keep an OS-assigned port stable. An explicit
+`--webrtc-direct-advertised-addr` can override the public IP and external port
+without a bind override. The development launcher above uses explicit port
+ranges separately for its in-process nodes.
 
 Deploy the normal testnet against this checkout, for example:
 
@@ -160,8 +179,9 @@ Start `ant-client-browser-sdk`, paste that address into the demo, and use
 the Rust browser client's seed without DNS or a browser manifest. The address
 contains only the public DTLS certificate hash and ANT peer ID; it contains no
 secret key material. To disable the listener in a custom node configuration,
-set `webrtc_direct.enabled = false`. A minimal binary can omit the transport
-entirely with `--no-default-features`.
+set `webrtc_direct.enabled = false` or use `--disable-webrtc-direct`. A build
+with `--no-default-features` omits the listener stack; it still uses the same
+pinned native core and protocol dependencies. This is not a dependency rollback.
 
 Public listeners apply an independent resource envelope; the native QUIC
 limits are not shared with browser traffic. The defaults are:
@@ -169,34 +189,38 @@ limits are not shared with browser traffic. The defaults are:
 | Setting | Default | Scope |
 |---|---:|---|
 | `max_connections` | 32 | listener |
-| `max_connections_per_ip` | 4 | source IP |
+| `max_connections_per_ip` | 4 | IPv4 address or IPv6 /64 |
 | `max_channels_per_connection` | 2 | association |
 | `max_channels` | 32 | listener and channel-handler tasks |
 | `max_concurrent_requests` | 16 | listener work slots |
 | `max_requests_per_second` | 256 | listener work token bucket |
-| `max_requests_per_second_per_ip` | 32 | source-IP work token bucket |
+| `max_requests_per_second_per_ip` | 32 | source-prefix work token bucket |
 | `max_requests_per_second_per_connection` | 16 | association work token bucket |
 | `max_in_flight_bytes` | 64 MiB | listener frame memory |
-| `max_in_flight_bytes_per_ip` | 16 MiB | source-IP frame memory |
+| `max_in_flight_bytes_per_ip` | 16 MiB | source-prefix frame memory |
 | `max_request_bytes` | 64 KiB | JSON request header |
 
 The per-IP ceilings must remain strictly below their corresponding global
 ceilings. The product of the per-IP connection and per-connection channel
 limits must also remain below both global channel and request concurrency.
 Invalid combinations fail node startup instead of silently removing the
-headroom reserved for other clients. IPv4-mapped IPv6 sources share the IPv4
-source's quota. Rate buckets permit a one-second burst; overload closes the
+headroom reserved for other clients. Native IPv6 sources share a /64 quota,
+and IPv4-mapped IPv6 shares its IPv4 quota. The transport's pre-association
+admission and application budgets use the same source-key function. Rate buckets permit a one-second burst; overload closes the
 offending channel or association without queueing more handler tasks. PQ
 handshakes consume the same work slots and rate tokens as RPCs, and response
 writes use size-scaled deadlines so slow readers release their reservations.
 
 Each node publishes its certificate-pinned WebRTC Direct multiaddress through
 Saorsa's extensible V2 address plane as transport `WebRtcDirect`, independently
-of its reachability class. Its signed identity capability selects V2 when the
-remote peer supports it; older peers continue receiving the unchanged V1
-`Quic` address projection. `FindNodeV2` returns browser endpoints separately
-from QUIC addresses, and the browser verifies the peer-ID and certificate
-binding during HELLO.
+of its reachability class. Native peers send both signed V2 records and the
+unchanged V1 QUIC projection; native publication does not negotiate a version
+through identity capabilities. Older peers process V1 and ignore the separate
+V2 topic. `FindNodeV2` forwards original owner-signed records. The browser
+verifies these proofs before dialing and verifies the peer-ID and certificate
+binding during the PQ session and HELLO. V2 uses nonempty replacements with
+no withdrawal operation or routine expiry. The browser RPC `addr-v2` capability
+requests these records and is independent of native publication.
 Consequently one pasted address is enough to enter the network and discover
 the browser endpoints of closest peers across independently deployed
 processes. Native QUIC dialing ignores the supplemental transport entry.

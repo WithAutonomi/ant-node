@@ -32,7 +32,7 @@ pub struct Cli {
     #[arg(long, env = "ANT_DISABLE_WEBRTC_DIRECT")]
     pub disable_webrtc_direct: bool,
 
-    /// Override the default ADR-0009 WebRTC Direct UDP bind address.
+    /// Override the default ADR-0013 WebRTC Direct UDP bind address.
     ///
     /// Port zero asks the OS to choose an available UDP port.
     #[arg(long, env = "ANT_WEBRTC_DIRECT_BIND")]

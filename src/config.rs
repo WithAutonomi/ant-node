@@ -150,7 +150,7 @@ pub struct NodeConfig {
     pub log_level: String,
 }
 
-/// Configuration for the ADR-0009 WebRTC Direct proof of concept.
+/// Configuration for the ADR-0013 WebRTC Direct browser listener.
 ///
 /// This listener is deliberately separate from the native Saorsa QUIC port.
 /// It exposes local closest-node lookup, immutable chunk reads, and paid

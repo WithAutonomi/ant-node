@@ -190,7 +190,7 @@ logging = ["tracing", "tracing-subscriber", "tracing-appender"]
 # Expose test helpers (cache_insert, payment_verifier accessor) for
 # integration tests and downstream test harnesses.
 test-utils = []
-# Direct browser transport from ADR-0009. Enabled by default; minimal
+# Direct browser transport from ADR-0013. Enabled by default; minimal
 # native-only builds can omit it with `--no-default-features`.
 webrtc-direct = [
     "saorsa-transport/default",

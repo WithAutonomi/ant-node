@@ -124,7 +124,7 @@ async fn payment_chain_id(rpc_url: &reqwest::Url) -> crate::Result<u64> {
 ///
 /// This manifest is intentionally a local testnet bootstrap artifact. The
 /// production design replaces it with the ML-DSA-signed endpoint records from
-/// ADR-0009.
+/// ADR-0013.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserDevnetManifest {
     /// Manifest schema version.
