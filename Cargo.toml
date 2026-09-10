@@ -117,6 +117,11 @@ bao = "0.13.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# Safe wrappers for `openat`/`unlinkat`, so the storage-migration cleanup can delete relative
+# to a directory handle it opened `O_NOFOLLOW` rather than by re-resolving a path it has
+# already checked. Adds nothing to the build: `tempfile`, a direct dependency, already pulls
+# this exact crate and version in with the `fs` feature on.
+rustix = { version = "1", features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]
 self-replace = "1"

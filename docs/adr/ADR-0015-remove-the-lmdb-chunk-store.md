@@ -254,14 +254,38 @@ unfinished, the other would leave it reporting `files` while paying for the disk
 There is a test that stages every shape a root can present and checks both directions of that
 correspondence, so a re-introduced private classifier fails there rather than on a fleet.
 
-**One accepted risk, stated rather than half-fixed.** The checks name a path and the unlinking
-names it again, so anything that can replace that directory between the two wins the race. It
-cuts both ways: an entry created inside a directory this found empty is deleted with it, and an
-entry created after the mark has gone leaves an unmarked directory with something in it, which
-every later start then keeps for good. Closing either needs a directory handle held across the
-whole operation and `unlinkat` against it, which Rust's standard library does not offer
-portably. Both are accepted because whoever can win that race already has write access to this
-node's data directory and does not need the race to delete anything in it.
+**The deletion is made against a directory handle, not against a path.** An earlier draft of
+this decision named a path for the checks and named it again for the unlinking, and accepted the
+window between them on the ground that whoever could win it already had write access to the data
+directory. That reasoning was wrong, and independent review caught it: it covers deleting things
+*inside* the data directory and says nothing about the variant that reaches outside. `read_dir`
+follows a link. Point that name at a target elsewhere on the disk in the window, and the node
+empties the target instead — and the node reaches far more of the filesystem than the actor who
+moved the name does, and on many installations runs as root. That is privilege escalation, not
+one more way to lose a chunk.
+
+So on Unix the directory is opened once, `O_NOFOLLOW | O_DIRECTORY`, and every unlink is made
+against that handle with `unlinkat`; subdirectories are opened the same way from the same handle
+and emptied the same way. A link cannot produce a handle, so no unlink can be redirected through
+one. The pattern and the reasoning are already in this codebase: `open_regular` refuses a link
+and a FIFO on the handle rather than on the path, for the same class of reason.
+
+The directory itself still goes by path, and that is safe on its own terms: `rmdir` refuses a
+symlink, so a swapped name fails the call rather than following it.
+
+What is pinned by test is the primitive, not the interleaving, and the difference is worth being
+exact about. The race cannot be staged without instrumenting the deleter. What the tests assert
+is that a link never yields a handle, and that a *marked* target behind a link is untouched —
+marked deliberately, because an unmarked one is refused by the gates even by a deleter that
+follows links, so testing against one would pass while proving nothing. Both fail if `O_NOFOLLOW`
+is dropped.
+
+**Two things this still does not close, both stated rather than half-fixed.** Off Unix there is
+no `unlinkat`, so that build keeps the path-based deleter and its window; its exposure is what
+the previous release's deleter already had. And on either build the empty-directory case cuts
+both ways within the data directory: an entry created inside a directory this found empty is
+deleted with it, and an entry created after the mark has gone leaves an unmarked directory with
+something in it, which every later start then keeps for good.
 
 ### What this release does NOT delete
 
@@ -289,8 +313,9 @@ reader does not reopen it from the sidecar's remains.
 first commit, and every released path by which data enters a node from the network enforces it
 before anything is stored: the protocol handler on a paid store, and replication on both the
 receive and the fetch path. **So no value over the ceiling has ever entered this network as a
-chunk.** One found in a legacy environment is not data with a copy elsewhere and it is not data
-whose owner is waiting for it. It is not a chunk at all.
+chunk.** It does not follow that none can exist on a disk — one can, and the next paragraph says
+how — only that anything which does is not a chunk: not data with a copy elsewhere, not data
+whose owner is waiting for it, and nothing any peer would accept or serve.
 
 **The one way such a value could reach a disk was ours.** Not the network's. The bridge's
 public `ChunkStore::put` wrote to the legacy environment *first* — `LmdbStorage::put` has no
@@ -539,10 +564,18 @@ Named rather than implied. None is a regression; each is the state before this c
   and returns in the release after. What such a node is exposed to is the commitment-bound
   lane, which every release enforces. The remedy is the operator's, and the warning names the
   directory.
-- **The path check and the unlink are not one operation** in either release's deleter. Closing
-  that needs a directory handle held across the whole operation and `unlinkat` against it,
-  which `std` does not offer portably. Accepted because whoever can win that race already has
-  write access to the node's data directory.
+- **Off Unix the path check and the unlink are not one operation.** They are on Unix, where the
+  deletion is made against a handle opened `O_NOFOLLOW`; `std` offers no portable `unlinkat`, so
+  the other platforms keep the path-based deleter and the window the previous release's deleter
+  also had.
+- **On a case-folding filesystem a leftover can be kept that should have gone.** Tombstone names
+  are matched exactly, as strings, against what `read_dir` reports, while NTFS and a
+  default-configured APFS compare names case-insensitively. A directory stored as
+  `CHUNKS.MDB.RETIRED` is the same file to the filesystem and a different string to the matcher,
+  so it is not recognised and is kept for ever. That is the safe direction — the failure is disk
+  not returned, never data removed — and it takes an operator having renamed something, since
+  retirement only ever writes lower case. The live name is unaffected: it is looked up by name
+  rather than matched from a listing, so the filesystem's own comparison finds it.
 - **`deploy/terraform/cloud-init/worker.yml` still cannot start a node**: it passes no rewards
   address, which production mode requires. The binary also sits in `/usr/local/bin` while the
   unit runs under `ProtectSystem=strict`, so an in-process upgrade cannot replace it. Both

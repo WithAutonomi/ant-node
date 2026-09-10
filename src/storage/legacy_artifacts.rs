@@ -211,28 +211,157 @@ fn remove_all(dirs: Vec<PathBuf>) {
 /// Done this way there is no such moment. At every point either the mark is still there, and
 /// the next start resumes, or the directory is empty or gone, which is also finished with.
 ///
-/// What this does NOT close, and does not pretend to: the checks above name a path, and the
-/// unlinking below names it again. Anything that can replace the directory between the two
-/// wins. It cuts both ways, and both are accepted rather than half-fixed. An entry created
-/// inside a directory this found empty is deleted with it; and an entry created after the
-/// mark has gone leaves an unmarked directory with something in it, which every later start
-/// then keeps for good. Closing either properly needs a directory handle held across the
-/// whole operation and `unlinkat` against it, which Rust's standard library does not offer
-/// portably. Whoever can win that race already has write access to this node's data
-/// directory and does not need the race to delete anything in it.
+/// **On Unix nothing here names a path twice.** An earlier version checked
+/// `symlink_metadata(dir)` and then re-opened the same path with `read_dir`, which follows a
+/// link. Anything that could replace the directory between the two — a local actor with write
+/// access to the node's data directory — could point it at a target elsewhere on the disk and
+/// have this process delete that target's contents instead. The node can reach more of the
+/// filesystem than such an actor can, so that is not one more way to lose data inside the data
+/// directory: it is a way to reach outside it. The directory is now opened once, `O_NOFOLLOW`
+/// and `O_DIRECTORY`, and every unlink is made against that handle, so the answer that
+/// authorises the deletion and the deletion itself are about the same inode by construction
+/// rather than by hope.
+///
+/// The directory itself still goes by path, and that is safe on its own terms: `rmdir` refuses
+/// a symlink, so a swapped name fails the call rather than following it.
+///
+/// Off Unix there is no `unlinkat`, so the path-based version stays. Its exposure is the same
+/// as the previous release's deleter had, and it is written down in ADR-0015 rather than
+/// implied.
 fn delete_mark_last(dir: &Path) -> std::io::Result<()> {
-    // Asked again, here, on the thread that does the deleting. The classification that got
-    // this path happened on another thread and is already in the past, and what is at a path
-    // is not a property of the path: swap the directory for a link between the two moments
-    // and everything below would follow it and delete through it. Cheap to re-ask, and the
-    // thing being asked about is the deletion of every chunk under this name.
+    empty_but_for_the_mark(dir)?;
+    // Now, and only now, the thing that said it was safe to do any of the above.
+    remove_the_mark(dir)?;
+    // `rmdir`, not `unlink`: it refuses a symlink outright, so this one path cannot be
+    // followed anywhere even if the name were swapped between the emptying and here.
+    std::fs::remove_dir(dir)
+}
+
+/// The gates, and then the contents, all against one directory handle.
+#[cfg(unix)]
+fn empty_but_for_the_mark(dir: &Path) -> std::io::Result<()> {
+    let dirfd = open_dir_nofollow(dir)?;
+
+    // Asked again, here, on the thread that does the deleting, and asked of the handle. The
+    // classification that got this path happened on another thread and is already in the past.
+    // Opening with `O_NOFOLLOW | O_DIRECTORY` is what makes the re-ask sound: a link or a
+    // non-directory fails the open rather than being examined and then acted on separately.
+    let marked = matches!(
+        rustix::fs::statat(&dirfd, RETIRED_MARKER, rustix::fs::AtFlags::SYMLINK_NOFOLLOW),
+        Ok(stat) if stat.st_mode & rustix::fs::FileType::RegularFile.as_raw_mode()
+            == rustix::fs::FileType::RegularFile.as_raw_mode()
+    );
+    if !marked && !is_empty_but_for_the_mark(&dirfd)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "it no longer carries the mark that said it was finished with, and it is not \
+             empty either",
+        ));
+    }
+    empty_at(&dirfd, true)
+}
+
+/// Open a directory, refusing a link or anything that is not one, on the handle.
+#[cfg(unix)]
+fn open_dir_nofollow(dir: &Path) -> std::io::Result<std::os::fd::OwnedFd> {
+    use rustix::fs::{Mode, OFlags};
+
+    rustix::fs::open(
+        dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| {
+        // A link, or something that is not a directory at all, arrives here as ELOOP or
+        // ENOTDIR. Both mean the same thing to this caller and it is worth saying which.
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} is no longer the directory that was found to be finished with ({e})",
+                dir.display()
+            ),
+        )
+    })
+}
+
+/// Is there anything in here besides the mark?
+#[cfg(unix)]
+fn is_empty_but_for_the_mark(dirfd: &std::os::fd::OwnedFd) -> std::io::Result<bool> {
+    for name in read_names(dirfd)? {
+        if name.as_bytes() != RETIRED_MARKER.as_bytes() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Unlink everything under `dirfd`, optionally sparing the mark, recursing on handles.
+#[cfg(unix)]
+fn empty_at(dirfd: &std::os::fd::OwnedFd, spare_the_mark: bool) -> std::io::Result<()> {
+    use rustix::fs::AtFlags;
+
+    for name in read_names(dirfd)? {
+        if spare_the_mark && name.as_bytes() == RETIRED_MARKER.as_bytes() {
+            continue;
+        }
+        // Try the plain unlink first. A directory answers EISDIR (EPERM on some systems), and
+        // that answer is about the inode the handle names, so it cannot be redirected. Doing
+        // it this way round also means the common case — a file — costs one syscall.
+        match rustix::fs::unlinkat(dirfd, name.as_c_str(), AtFlags::empty()) {
+            // Gone already is the outcome this wanted.
+            Ok(()) | Err(rustix::io::Errno::NOENT) => continue,
+            // A directory: EISDIR on Linux, EPERM on the BSDs and macOS. Both answers are
+            // about the inode the handle names, so neither can have been redirected.
+            Err(rustix::io::Errno::ISDIR | rustix::io::Errno::PERM) => {}
+            Err(e) => return Err(e.into()),
+        }
+        // A subdirectory. Opened `O_NOFOLLOW` from this handle, emptied the same way, then
+        // removed by name against the handle that named it.
+        let child = rustix::fs::openat(
+            dirfd,
+            name.as_c_str(),
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )?;
+        empty_at(&child, false)?;
+        drop(child);
+        rustix::fs::unlinkat(dirfd, name.as_c_str(), AtFlags::REMOVEDIR)?;
+    }
+    Ok(())
+}
+
+/// Every name in a directory handle, without `.` and `..`.
+///
+/// Collected rather than streamed: the unlinking below changes what a live iterator would see
+/// next, and reading the whole list first is both simpler to reason about and small — these
+/// directories hold a database file, a lock file and a mark.
+#[cfg(unix)]
+fn read_names(dirfd: &std::os::fd::OwnedFd) -> std::io::Result<Vec<std::ffi::CString>> {
+    let mut names = Vec::new();
+    let dir = rustix::fs::Dir::read_from(dirfd)?;
+    for entry in dir {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        names.push(name.to_owned());
+    }
+    Ok(names)
+}
+
+/// The path-based version, for the platforms with no `unlinkat`.
+#[cfg(not(unix))]
+fn empty_but_for_the_mark(dir: &Path) -> std::io::Result<()> {
     if !matches!(std::fs::symlink_metadata(dir), Ok(meta) if meta.is_dir()) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "it is no longer the directory that was found to be finished with",
         ));
     }
-    // And the same two things `classify` accepted: it carries the mark, or it is empty.
     let marked = matches!(
         std::fs::symlink_metadata(dir.join(RETIRED_MARKER)),
         Ok(meta) if meta.is_file()
@@ -255,13 +384,29 @@ fn delete_mark_last(dir: &Path) -> std::io::Result<()> {
             std::fs::remove_file(entry.path())?;
         }
     }
-    // Now, and only now, the thing that said it was safe to do any of the above.
-    match std::fs::remove_file(dir.join(RETIRED_MARKER)) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
+    Ok(())
+}
+
+/// Remove the mark, which is what said any of the above was allowed.
+#[cfg(unix)]
+fn remove_the_mark(dir: &Path) -> std::io::Result<()> {
+    let dirfd = open_dir_nofollow(dir)?;
+    match rustix::fs::unlinkat(&dirfd, RETIRED_MARKER, rustix::fs::AtFlags::empty()) {
+        // Already gone is success: something else finished this, or there was never a mark
+        // because the directory qualified by being empty.
+        Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
+        Err(e) => Err(e.into()),
     }
-    std::fs::remove_dir(dir)
+}
+
+/// Remove the mark, which is what said any of the above was allowed.
+#[cfg(not(unix))]
+fn remove_the_mark(dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(dir.join(RETIRED_MARKER)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]
@@ -513,6 +658,11 @@ mod tests {
     fn the_deleting_thread_refuses_a_path_that_is_no_longer_what_was_classified() {
         let root = TempDir::new().unwrap();
         let elsewhere = env_with_chunks(root.path(), "elsewhere");
+        // MARKED, and that is the whole point of this test. An unmarked target would be
+        // refused by the gates even by a deleter that happily followed the link, so the test
+        // would pass while proving nothing about following it. Marked, the target satisfies
+        // every gate: anything that reaches it through the link deletes it.
+        mark_retired(&elsewhere);
         let swapped = root.path().join(LEGACY_ENV_DIR);
         std::os::unix::fs::symlink(&elsewhere, &swapped).unwrap();
 
@@ -520,13 +670,59 @@ mod tests {
             delete_mark_last(&swapped).is_err(),
             "the deletion followed a link that appeared after the classification"
         );
-        assert!(elsewhere.join("data.mdb").exists());
+        assert!(
+            elsewhere.join("data.mdb").exists(),
+            "the link was followed and the contents of somewhere else were deleted"
+        );
+        assert!(elsewhere.join(RETIRED_MARKER).exists());
 
         // And a directory that lost its mark in between: it might be a store nothing
         // migrated, so it is not deleted on the strength of an answer given earlier.
         let unmarked = env_with_chunks(root.path(), "chunks.mdb.retired.9");
         assert!(delete_mark_last(&unmarked).is_err());
         assert!(unmarked.join("data.mdb").exists());
+    }
+
+    /// A link never yields a directory handle, which is what leaves no window to win.
+    ///
+    /// The test above stages a link that is already there when the deletion starts, and the
+    /// path-based version caught that too, by asking `symlink_metadata` first. What it could
+    /// not catch is a link that arrives *between* that question and the `read_dir` that acted
+    /// on the answer: `read_dir` resolves the path again and follows what it finds. A local
+    /// actor with write access to the node's data directory could point that name at a target
+    /// elsewhere on the disk, and the node — which reaches more of the filesystem than the
+    /// actor does, and on plenty of installations runs as root — would empty the target
+    /// instead. Not one more way to lose data inside the data directory: a way out of it.
+    ///
+    /// That interleaving cannot be staged from a test without instrumenting the deleter, so
+    /// what is pinned here is the primitive that removes the window rather than the race
+    /// itself. The directory is opened once, and every unlink is made against that handle, so
+    /// if a link can never produce a handle then no unlink can ever be redirected through one.
+    /// This is the "can never produce a handle" half, and it is the half that a change would
+    /// silently undo: drop `O_NOFOLLOW` and the open below starts succeeding.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_never_yields_a_directory_handle() {
+        let root = TempDir::new().unwrap();
+        let real = env_with_chunks(root.path(), "real");
+
+        assert!(
+            open_dir_nofollow(&real).is_ok(),
+            "a directory that is what it says it is has to open, or nothing is ever cleaned up"
+        );
+
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(
+            open_dir_nofollow(&link).is_err(),
+            "a link produced a handle, so every unlink made against it lands on the target"
+        );
+
+        // The other thing that must never be mistaken for a store. A FIFO would block a
+        // plain open forever; refusing on the handle refuses it without opening it.
+        let not_a_dir = root.path().join("file");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+        assert!(open_dir_nofollow(&not_a_dir).is_err());
     }
 
     /// The cleanup removes exactly what the fleet signal calls finished with, and nothing else.
