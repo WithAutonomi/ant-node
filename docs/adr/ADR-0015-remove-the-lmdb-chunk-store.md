@@ -111,9 +111,27 @@ nothing at all in the file store. Deleting that is destroying data that may have
 copy, in order to reclaim disk.
 
 The evidence that separates the two is the mark the previous release wrote *inside* the
-directory before it deleted anything. A directory carrying `RETIRED` has already had its
-contents copied out and is pure cost. So is an empty one, which is what a cleanup interrupted
-between emptying a tombstone and removing it leaves. Those go, and their disk comes back.
+directory before it deleted anything. A directory carrying `RETIRED` is one whose retirement
+gates were all satisfied, and it is pure cost. So is an empty one, which is what a cleanup
+interrupted between emptying a tombstone and removing it leaves. Those go, and their disk comes
+back.
+
+**Be exact about what those gates were, because "its contents were copied out" is not it** and
+an earlier draft of this record said so four times. Retirement cleared a directory on two
+different grounds, and only the first is a local copy:
+
+- every chunk the node was **keeping** was copied into the file store and re-hashed there, byte
+  for byte, before the mark went down; and
+- every chunk the node was **shedding** was proven to be held by its close group — all but one
+  of them answering a possession challenge with a cryptographic proof, after the reduced
+  commitment had been delivered — and was then deliberately *not* copied. The pre-retirement
+  verification pass skips exactly these keys, because re-hashing a chunk the node is giving up
+  into a file store that is not going to keep it would defeat the point of shedding it.
+
+So a marked directory can, entirely legitimately, contain bytes that are in no file store on
+this node and never will be. The previous release was about to delete those bytes itself; this
+one finishes that. The safety argument for them is the close group's proofs, not a local copy,
+and it is the network that holds them afterwards.
 
 | what is on disk | what the cleanup does | what the node then serves | disk back |
 |---|---|---|---|
@@ -171,11 +189,12 @@ or a FIFO wearing the name proves nothing, and this is the answer that authorise
 every chunk underneath it. Testing existence alone would let anything at that path clear an
 unmigrated store for deletion.
 
-**The mark is believed, and not re-checked against the file store.** It is worth stating as an
+**The mark is believed, and not re-checked against anything.** It is worth stating as an
 assumption rather than leaving it to be inferred, because it is the one that authorises every
-deletion here. `RETIRED` records that the *previous release* had copied that directory's
-contents out and verified them before it began deleting. This build cannot confirm that
-independently: it has no LMDB reader, so it cannot compare what is in the directory against
+deletion here. `RETIRED` records that the *previous release* satisfied both gates above — the
+copy-and-re-hash for what it kept, the close-group possession proofs for what it shed. This
+build cannot confirm either independently: it cannot re-run a possession challenge for keys it
+cannot enumerate, and it has no LMDB reader, so it cannot compare what is in the directory against
 what is in the file store, and no cheaper check is available — a file store that opens is not
 evidence that it holds any particular key, and counting keys proves nothing about which ones.
 
@@ -197,8 +216,9 @@ the node would report itself unfinished to the whole network for as long as it l
 contents go, then the mark, then the directory: at every point either the mark is still there
 and the next start resumes, or the directory is empty, which is also finished with.
 
-**None of it happens until the file store has actually opened.** "Finished with" means the
-chunks are in the file store, and that is only true if the file store is there to hold them.
+**None of it happens until the file store has actually opened.** "Finished with" means
+retirement's gates were met, and for everything the node kept that means the chunks are in the
+file store, which is only true if the file store is there to hold them.
 An earlier draft ran this as soon as the root was known, which put the deletion in front of a
 constructor that can still fail on an unreadable layout, a directory it cannot create, or a
 lock another process has not let go of — and a node that lost both stores that way had
@@ -327,7 +347,9 @@ release breaks the fleet, and it outranks the objective that no migration code s
 
 - One store, one name, and about 5,600 lines of bridge and driver gone.
 - The unheld-chunk penalty is still held off, and the release after this one restores it.
-- No node is ever left unable to start by anything this release does.
+- **The cleanup never vetoes a start.** Not the same as "every node starts": the file store
+  is built first and one that cannot open still stops the node, exactly as before. What is
+  gone is the other reason, the refusal this release's first draft introduced.
 - The per-volume migration lock and its deployment settings go with the migration.
 
 ### Negative / Trade-offs
@@ -338,12 +360,18 @@ release breaks the fleet, and it outranks the objective that no migration code s
   why this one is not published until the count is clean. Such a node runs and serves what it
   migrated; what it does not do is reclaim the space, which it could not do safely under any
   of the three answers considered here.
-- Restoring the penalty and deleting the bridge in one release means the emergency lever for
-  the first is a switch, while the second can only be undone by rolling back the binary.
-  Shipping them as separate releases was considered and is a legitimate call for whoever
-  cuts the train; the two are separate commits so that remains possible.
-- `ChunkStore` and its module were renamed from `FileStore` and `file_store.rs`. Callers did
-  not change, because they already used the facade's name.
+- **The two halves have very different emergency levers, which is why they are not in the same
+  release.** Restoring the penalty is a switch, undoable in minutes and from the fleet side.
+  Deleting the bridge can only be undone by not shipping the release at all — and not even by
+  rolling the binary back, since the upgrade monitor takes the node forward again. That
+  asymmetry is the reason the penalty waits for the release after this one rather than riding
+  along with the deletion, and it is a decision rather than a scheduling accident.
+- `ChunkStore` and its module were renamed from `FileStore` and `file_store.rs`. Callers of
+  the facade did not change, because they already used that name — but **`FileStore`,
+  `FileStoreConfig`, `StoreLayout`, `VerifyReport` and `LEGACY_ENV_DIR` were exported too**,
+  and all five are gone from the public API along with the LMDB and migration types. A
+  downstream crate importing any of them stops compiling, so they belong in the release
+  notes and not only in this list.
 
 ### Neutral / Operational
 
@@ -354,7 +382,10 @@ release breaks the fleet, and it outranks the objective that no migration code s
   worse than one that is absent. Nothing declares `deny_unknown_fields`, so a config file
   written by the previous release still loads with both keys in it, which is what stops
   every node on the fleet failing to start at once on upgrade. There is a test for that,
-  because adding that attribute later would look harmless.
+  because adding that attribute later would look harmless. Worth knowing what that test is: a
+  hand-written fragment carrying the two removed keys, not a complete file emitted by the
+  previous release. It proves those two keys are tolerated; it does not prove a whole persisted
+  config round-trips, and an incompatibility in a field it omits would not be caught by it.
 - There is no supported way to make this build read an old chunk store, and no way to stop
   it clearing one up. A leftover it declines to touch — a link, an unmarked store with chunks
   in it, or one whose state cannot be established — is named in a warning carrying
@@ -386,20 +417,45 @@ Mutation-checked: with the size branch deleted the test fails, which is what say
 the ceiling rather than testing that something went wrong.
 
 Three further properties are pinned that the earlier draft had no test for, because it had no
-code for them either. **The correspondence with the fleet signal**: every shape a root can present is
-staged at once, each is classified before anything is removed, and afterwards each is asserted
-gone exactly when it was called harmless and still there exactly when it was not — both
-directions, so a classifier that drifts either way fails here. **Sixty-six leftovers**, the
-whole namespace this release accepts, are removed by one start. And **a root that cannot be
-listed** has nothing removed from it, which is the case that used to return silently and left
-this record promising a warning nothing emitted.
+code for them either.
+
+**The correspondence with the fleet signal.** A root is staged carrying at least one shape for
+every verdict the classifier can return — harmless three ways (a marked live environment, a
+marked tombstone, an empty one), holding two (an unmarked tombstone with chunks in it, a link
+wearing a tombstone's name), unreadable two (something that is not the mark using the mark's
+name, and a plain file wearing a tombstone's name) — plus the near misses that are not in the
+name set at all. Each is classified before anything is removed, and afterwards each is asserted
+gone exactly when it was called harmless and still there exactly when it was not. Both
+directions, so a classifier that drifts either way fails here; mutation-checked by making a link
+classify harmless, which the test catches.
+
+**A marked directory is removed even when nothing was copied into this node's file store**,
+staged with no file store at all. That is a shedding node's ordinary state, and pinning it is
+what stops somebody later adding a local-copy check that would strand every such directory for
+ever.
+
+**Sixty-six leftovers**, the whole namespace this release accepts, are removed by one start. And
+**a root that cannot be listed** has nothing removed from it, which is the case that used to
+return silently and left this record promising a warning nothing emitted.
+
+**What these do NOT prove, said rather than implied.** The sixty-six-leftover test asserts that
+all of them go; it does not observe how many threads did it, so it would still pass if the one
+sequential worker went back to one per directory. The deletion ORDER — mark last — has its
+failure half asserted only on Unix, because staging a part-way failure needs a permission bit
+there and an open handle on Windows; off Unix that test proves only that a successful deletion
+leaves nothing behind. And the entry-level unreadable case is not staged: the test that makes a
+root unlistable exercises `read_dir` itself failing, not one `DirEntry` failing inside a
+readable root, so turning that arm from a refusal into a skip would restore the false-green and
+stay green here.
 
 Through `NodeBuilder::build()`: a node with an unmigrated store starts under both
 `storage.enabled = true` and `false` and still has its chunks afterwards; a node with a marked
 one starts and the leftover goes; and a node whose file store cannot open — staged with a file
 where the chunk directory has to be — fails to build with its old store still intact, which is
-what pins the deletion behind the replacement. Restoring the penalty is pinned by a test that
-fails if the constant is flipped back.
+what pins the deletion behind the replacement. The penalty staying SUSPENDED is pinned by a test
+on the shipped constant, which fails if it is flipped — in either direction. The existing tests
+set the switch both ways on purpose, so none of them could ever notice which way it was
+compiled, which is how a suspension outlives the thing it was suspended for.
 
 **Deleted, and what replaced it.** ADR-0014's validation section describes four harnesses.
 Most of three of them existed to prove the bridge worked: that the disk came back when the
@@ -477,9 +533,12 @@ on the strength of one.
 
 Named rather than implied. None is a regression; each is the state before this change.
 
-- **A node that kept an unreadable store does not get that disk back**, and a node short of
-  disk is penalised on the unheld-chunk lane like any other full node. The remedy is the
-  operator's, and the warning names the directory.
+- **A node that kept an unreadable store does not get that disk back**, and being short of disk
+  is how that costs it: it fails to take on chunks it is responsible for. Note that this
+  release does not add the unheld-chunk accusation on top — that lane is still suspended here
+  and returns in the release after. What such a node is exposed to is the commitment-bound
+  lane, which every release enforces. The remedy is the operator's, and the warning names the
+  directory.
 - **The path check and the unlink are not one operation** in either release's deleter. Closing
   that needs a directory handle held across the whole operation and `unlinkat` against it,
   which `std` does not offer portably. Accepted because whoever can win that race already has
@@ -506,9 +565,15 @@ Named rather than implied. None is a regression; each is the state before this c
   The fix is an upgrade-subsystem one — a persisted disable, or a version ceiling — and it is
   deliberately not in this release: it changes the mechanism every node uses to take every
   release, which is not a change to make in the release that also deletes a store. It belongs
-  in its own change, with its own evidence. What this release does instead is not need it:
-  nothing it deletes is a directory whose contents were not already copied out, so there is no
-  state it creates that a rollback would have been the remedy for.
+  in its own change, with its own evidence.
+
+  What must not be said here, and an earlier draft of this record did say it, is that no state
+  this release creates would ever have wanted a rollback. A marked directory can hold shed
+  chunks, which are bytes the previous release proved the close group holds and deliberately did
+  not copy locally. Deleting them is right and is what that release was about to do — but it is
+  irreversible on this node, and rolling back would not bring them back either, because the
+  previous release would have deleted them too. The remedy for those keys was never local: it is
+  replication fetching them from the peers that proved they hold them.
 
 ## Notes for AI-assisted work
 
