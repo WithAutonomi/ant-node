@@ -202,7 +202,7 @@ mod tests {
     // -----------------------------------------------------------------------
     // AdmissionResult construction helpers for pure-logic tests
     //
-    // The full `admit_hints` function requires a live DHT + LMDB backend.
+    // The full `admit_hints` function requires a live DHT and chunk store.
     // For unit tests we directly exercise:
     //   1. Cross-set precedence logic
     //   2. Deduplication logic

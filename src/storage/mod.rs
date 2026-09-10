@@ -1,8 +1,8 @@
 //! Storage subsystem for chunk persistence.
 //!
-//! This module provides content-addressed LMDB storage for chunks,
-//! along with a protocol handler that integrates with saorsa-core's
-//! `Protocol` trait for automatic message routing.
+//! This module provides content-addressed storage for chunks, one immutable file per
+//! chunk, along with a protocol handler that integrates with saorsa-core's `Protocol`
+//! trait for automatic message routing.
 //!
 //! # Architecture
 //!
@@ -19,7 +19,7 @@
 //! │   QuoteRequest           ChunkPutRequest    ChunkGetRequest
 //! │         │                         │                 │  │
 //! │         ▼                         ▼                 ▼  │
-//! │   QuoteGenerator          PaymentVerifier   LmdbStorage│
+//! │   QuoteGenerator          PaymentVerifier    ChunkStore│
 //! │         │                         │                 │  │
 //! │         └─────────────────────────┴─────────────────┘  │
 //! │                           │                             │
@@ -31,11 +31,11 @@
 //!
 //! ```rust,ignore
 //! use std::sync::Arc;
-//! use ant_node::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
+//! use ant_node::storage::{AntProtocol, ChunkStore, ChunkStoreConfig};
 //!
 //! // Create storage
-//! let config = LmdbStorageConfig::default();
-//! let storage = Arc::new(LmdbStorage::new(config).await?);
+//! let config = ChunkStoreConfig::default();
+//! let storage = Arc::new(ChunkStore::new(config).await?);
 //!
 //! // Create protocol handler
 //! let protocol = AntProtocol::new(storage, Arc::new(payment_verifier), Arc::new(quote_generator));
@@ -44,23 +44,33 @@
 //! listener.register_protocol(protocol).await?;
 //! ```
 
-pub(crate) mod chunk_store;
+// `test-utils` makes this module public so integration tests and downstream harnesses can
+// reach the store directly, and that is not a narrow door: with the feature on, every `pub`
+// item inside it — `StoreLayout`, `CapacityVerdict`, every inherent method on `ChunkStore` —
+// is importable from outside the crate. The re-export list below is the boundary for the
+// DEFAULT build only. Anything relying on the wider surface is relying on a test feature, and
+// this comment is here so that is a decision rather than a discovery.
 #[cfg(any(test, feature = "test-utils"))]
-pub mod file_store;
+pub mod chunk_store;
 #[cfg(not(any(test, feature = "test-utils")))]
-pub(crate) mod file_store;
+pub(crate) mod chunk_store;
 mod handler;
-pub(crate) mod lmdb;
-pub mod migration;
+// Both are this crate's own business. The cleanup is called once, from the node builder, and
+// the signal was `pub(crate)` in the release that added it; exporting either would publish a
+// migration this release exists to finish.
+pub(crate) mod legacy_artifacts;
+// Carried forward from the release before this one. Without it a node on this release reads
+// to its peers as one that never reported at all, and the fleet gate that authorised this
+// release could never come back clean again.
+pub(crate) mod migration_signal;
 
 pub use crate::ant_protocol::XorName;
-pub use chunk_store::{ChunkStore, ChunkStoreConfig, VerifyReport, LEGACY_ENV_DIR};
-pub use file_store::{FileStore, FileStoreConfig, StoreLayout};
+pub use chunk_store::{ChunkStore, ChunkStoreConfig};
+// Crate-private, as it was before the two stores became one: `CapacityVerdict` was
+// `pub(crate)` on the old store and has no caller outside this crate.
+pub(crate) use chunk_store::CapacityVerdict;
 pub use handler::AntProtocol;
 pub(crate) use handler::ChunkRequestContext;
-pub(crate) use lmdb::CapacityVerdict;
-pub use lmdb::{LmdbStorage, LmdbStorageConfig};
-pub use migration::{MigrationConfig, MigrationPhase, MigrationState};
 
 /// Bytes in one MiB.
 pub const MIB: u64 = 1024 * 1024;

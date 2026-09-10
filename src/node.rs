@@ -39,14 +39,6 @@ use tokio_util::task::TaskTracker;
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
 
-/// How long shutdown waits for the storage migration to reach a stopping point.
-///
-/// Generous, because interrupting a copy mid-chunk costs nothing (every step is
-/// idempotent and re-derived at the next start) but interrupting the drain that precedes
-/// removing the legacy store is worth avoiding. Bounded, because a step that will not
-/// finish must not hold the process open.
-const MIGRATION_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
-
 /// How long shutdown waits for in-flight request handlers to finish.
 ///
 /// Short, because these are single request/response exchanges and the peer will retry.
@@ -114,10 +106,11 @@ impl NodeBuilder {
         // Ensure root directory exists
         std::fs::create_dir_all(&self.config.root_dir)?;
 
-        // One release-level decision, applied before anything can audit: while the fleet
-        // moves off the legacy chunk store, a peer is not penalised for failing to hold a
-        // chunk it was supposed to be holding. It is still penalised for failing a
-        // commitment-bound audit. Audits of both kinds run and record throughout.
+        // One release-level decision, applied before anything can audit. It stays suspended
+        // here: this release deletes the old chunk store, and a node that was away while the
+        // migration ran arrives holding one it cannot read, so restoring the accusation now
+        // would slash it in the release that stranded it. The release after this one restores
+        // it. The commitment-bound audit has penalised throughout and still does.
         crate::replication::config::apply_close_group_storage_penalty_policy();
 
         // Create shutdown token
@@ -160,6 +153,35 @@ impl NodeBuilder {
             (None, None)
         };
 
+        // Only now, and only if a store was actually opened. Clearing up after the storage
+        // migration deletes directories the previous release had finished with, and
+        // "finished with" means their chunks are in the file store — which is only true if
+        // the file store is there. Doing this earlier put the deletion in front of a
+        // constructor that can still fail on an unreadable layout, a directory it cannot
+        // create, or a lock another process has not let go of, and a node that lost both
+        // stores that way had nothing to go back to.
+        //
+        // A node with storage switched off never builds one at all, so it never establishes
+        // that anything was copied anywhere, and it does not delete. It also has no use for
+        // the disk it would recover. Leaving the directory costs space on a node that is not
+        // storing anything anyway, and keeps its contents recoverable by the release that
+        // can read them.
+        //
+        // Waiting costs nothing in what this node reports. Its user agent was fixed when the
+        // transport was built a moment ago, but everything removed here is a leftover the
+        // signal already reads as finished with — carrying the mark or being empty is both
+        // what makes it removable and what makes it harmless — so the node announces `files`
+        // whether the deletion has finished, is still running, or has not started.
+        if ant_protocol.is_some() {
+            crate::storage::legacy_artifacts::clean_up(&self.config.root_dir);
+        } else {
+            info!(
+                "Chunk storage is disabled, so anything the storage migration left behind is \
+                 being left where it is: nothing here can establish that its chunks were \
+                 copied anywhere."
+            );
+        }
+
         let p2p_arc = Arc::new(p2p_node);
 
         // Wire the P2PNode handle into AntProtocol so payment proofs can query
@@ -168,7 +190,7 @@ impl NodeBuilder {
             protocol.attach_p2p_node(Arc::clone(&p2p_arc));
         }
 
-        let (replication_engine, migration_task) = match (&ant_protocol, fresh_write_rx) {
+        let replication_engine = match (&ant_protocol, fresh_write_rx) {
             (Some(protocol), Some(fresh_rx)) => {
                 Self::build_replication_engine(
                     protocol,
@@ -181,7 +203,7 @@ impl NodeBuilder {
                 )
                 .await?
             }
-            _ => (None, None),
+            _ => None,
         };
 
         let node = RunningNode {
@@ -194,7 +216,6 @@ impl NodeBuilder {
             ant_protocol,
             replication_engine,
             protocol_task: None,
-            migration_task,
             protocol_children: TaskTracker::new(),
             upgrade_exit_code: Arc::new(AtomicI32::new(-1)),
         };
@@ -202,18 +223,13 @@ impl NodeBuilder {
         Ok(node)
     }
 
-    /// Start the replication engine and, if this node still has one, the migration off
-    /// the legacy chunk store.
-    ///
-    /// The two are built together because the migration cannot run without the engine:
-    /// it needs the commitment state, which holds the veto on deleting the old store,
-    /// and the live routing view that says which chunks this node must never give up.
+    /// Start the replication engine.
     ///
     /// # Errors
     ///
-    /// Returns an error only when the engine fails to start on a node that has a legacy
-    /// store to migrate. On a node with nothing to migrate an engine failure is logged
-    /// and the node runs without one, as it always has.
+    /// Never, currently: an engine that fails to start is logged and the node runs without
+    /// one, as it always has. The signature keeps its `Result` because the caller's does,
+    /// and because the migration release did have a case that had to refuse.
     async fn build_replication_engine(
         protocol: &Arc<AntProtocol>,
         repl_config: ReplicationConfig,
@@ -222,7 +238,7 @@ impl NodeBuilder {
         root_dir: &Path,
         fresh_rx: UnboundedReceiver<FreshWriteEvent>,
         shutdown: &CancellationToken,
-    ) -> Result<(Option<ReplicationEngine>, Option<JoinHandle<()>>)> {
+    ) -> Result<Option<ReplicationEngine>> {
         let engine = match ReplicationEngine::new(
             repl_config,
             Arc::clone(p2p),
@@ -237,22 +253,8 @@ impl NodeBuilder {
         {
             Ok(engine) => engine,
             Err(e) => {
-                // A node that still has a legacy chunk store depends on this engine for
-                // the commitment state, the routing view and the possession challenges
-                // the migration cannot proceed without. Carrying on would leave it
-                // serving from both stores forever, never reclaiming its disk, which is
-                // the condition this release exists to end. Refuse to start instead of
-                // running in it indefinitely.
-                if protocol.storage().has_legacy() {
-                    return Err(Error::Startup(format!(
-                        "This node has a legacy chunk store to migrate but the \
-                         replication engine did not start: {e}. Without it the \
-                         migration cannot run and the disk is never reclaimed. \
-                         Fix the cause rather than running on."
-                    )));
-                }
                 warn!("Failed to initialize replication engine: {e}");
-                return Ok((None, None));
+                return Ok(None);
             }
         };
 
@@ -274,10 +276,7 @@ impl NodeBuilder {
             .payment_verifier_arc()
             .attach_monetized_pin_sender(engine.monetized_pin_sender());
 
-        let migration_task =
-            Self::spawn_storage_migration(protocol.storage(), p2p, &engine, shutdown.clone());
-
-        Ok((Some(engine), migration_task))
+        Ok(Some(engine))
     }
 
     /// Build the saorsa-core `NodeConfig` from our config.
@@ -316,6 +315,26 @@ impl NodeBuilder {
                 core_config.diversity_config = Some(CoreDiversityConfig::permissive());
             }
         }
+
+        // Say on the wire whether this node still has an old chunk store. It costs no new
+        // message and no new field: saorsa-core already sends a user agent with every signed
+        // message and keeps each peer's, so this is a different value in a string that was
+        // already there. It is the only thing that tells us anything at all about the nodes we
+        // do not run and have no logs from. It cannot establish that the fleet has finished:
+        // a node sees only the peers it is connected to, and each answers as of its own last
+        // start, so the most this shows is that some peer reported an old store when it last
+        // started. It can never show that no node has one.
+        //
+        // Read from the filesystem here rather than from the store, because the store is
+        // built later and a node with storage switched off never builds one at all, while
+        // the directory on its disk is just as real either way.
+        //
+        // Fixed for the life of the process: saorsa-core copies the string when it builds
+        // the transport. A node that finishes migrating goes on saying `legacy` until it
+        // restarts, which overstates how much is left rather than understating it, and is
+        // the direction a release gate should err in.
+        let signal = crate::storage::migration_signal::MigrationSignal::from_disk(&config.root_dir);
+        core_config.custom_user_agent = Some(crate::storage::migration_signal::user_agent(signal));
 
         // Persist close group peers + trust scores across restarts.
         // Default to root_dir (alongside node_identity.key) when not explicitly set.
@@ -448,58 +467,23 @@ impl NodeBuilder {
 
         monitor
     }
-
-    /// Start moving this node off the legacy LMDB chunk store, if it still has one.
-    ///
-    /// Started after the replication engine rather than with the store, because the
-    /// copier needs two things only the engine has: the commitment state, which owns the
-    /// retention veto on deleting the old store, and live routing, which is how the node
-    /// knows which chunks it is among the closest to and therefore must never give up.
-    fn spawn_storage_migration(
-        store: Arc<ChunkStore>,
-        p2p: &Arc<P2PNode>,
-        engine: &ReplicationEngine,
-        shutdown: CancellationToken,
-    ) -> Option<JoinHandle<()>> {
-        if !crate::storage::migration::should_migrate(&store) {
-            return None;
-        }
-        let context = crate::storage::migration::MigrationContext {
-            p2p: Some(Arc::clone(p2p)),
-            self_id: Some(*p2p.peer_id()),
-            self_xor: crate::client::peer_id_to_xor_name(&p2p.peer_id().to_string()),
-            commitment: Some(Arc::clone(engine.commitment_state())),
-            replication: Some(Arc::clone(engine.config())),
-            sync_state: Some(Arc::clone(engine.sync_state())),
-            audit_challenge_coordinator: Some(Arc::clone(engine.audit_challenge_coordinator())),
-            peer_commitments: Some(Arc::clone(engine.last_commitment_by_peer())),
-            close_group_size: engine.config().close_group_size,
-        };
-        Some(tokio::spawn(async move {
-            crate::storage::migration::run(store, context, shutdown).await;
-        }))
-    }
-
     /// Build the ANT protocol handler from config.
     ///
-    /// Initializes LMDB storage, payment verifier, and quote generator.
+    /// Initializes the chunk store, payment verifier, and quote generator.
     /// Wires ML-DSA-65 signing from the node's identity into the quote generator.
     async fn build_ant_protocol(
         config: &NodeConfig,
         identity: &NodeIdentity,
         close_group_size: usize,
     ) -> Result<AntProtocol> {
-        // Create LMDB storage
         let storage_config = ChunkStoreConfig {
             root_dir: config.root_dir.clone(),
             verify_on_read: config.storage.verify_on_read,
-            max_map_size: config.storage.db_size_gb.saturating_mul(1024 * 1024 * 1024),
             disk_reserve: config.storage.disk_reserve_mb.saturating_mul(MIB),
-            migration: config.storage.migration.clone(),
         };
         let storage = ChunkStore::new(storage_config)
             .await
-            .map_err(|e| Error::Startup(format!("Failed to create LMDB storage: {e}")))?;
+            .map_err(|e| Error::Startup(format!("Failed to create the chunk store: {e}")))?;
 
         // Parse rewards address (required — node must know where to receive payments)
         let rewards_address = match config.payment.rewards_address {
@@ -565,17 +549,12 @@ pub struct RunningNode {
     replication_engine: Option<ReplicationEngine>,
     /// Protocol message routing background task.
     protocol_task: Option<JoinHandle<()>>,
-    /// The task moving this node off the legacy chunk store, if it has one.
-    ///
-    /// Awaited before the replication engine and the P2P layer are torn down, because it
-    /// holds handles to both and is in the middle of reading and writing the chunk store.
-    migration_task: Option<JoinHandle<()>>,
     /// The per-message handler tasks the protocol loop spawns.
     ///
     /// Tracked rather than detached so shutdown can stop accepting work and then wait for
     /// what is already in flight. Aborting only the loop leaves its children running, and
-    /// a chunk read that outlives the loop keeps the legacy store busy exactly while the
-    /// migration is trying to drain it.
+    /// a chunk read that outlives the loop keeps working against a store the shutdown is
+    /// about to tear down.
     protocol_children: TaskTracker,
     /// Exit code requested by a successful upgrade (-1 = no upgrade exit pending).
     upgrade_exit_code: Arc<AtomicI32>,
@@ -653,6 +632,22 @@ impl RunningNode {
                 engine.start(dht_events);
             }
             info!("Replication engine started");
+        }
+
+        // Say where this node is with the move off the old chunk store, and what it can see
+        // of its neighbours. The release that deletes that store may only go out once the
+        // fleet has moved, and no calendar establishes that: our own logs cover the nodes we
+        // run, and this is the only view we get of the ones we do not.
+        {
+            // Weak on purpose: see `report_until_shutdown`. A reporter that kept the node
+            // alive would keep its port bound after the node was dropped.
+            let p2p = Arc::downgrade(&self.p2p_node);
+            let root_dir = self.config.root_dir.clone();
+            let shutdown = self.shutdown.clone();
+            tokio::spawn(async move {
+                crate::storage::migration_signal::report_until_shutdown(p2p, root_dir, shutdown)
+                    .await;
+            });
         }
 
         // Start upgrade monitor if enabled
@@ -800,34 +795,26 @@ impl RunningNode {
             });
         }
 
-        // A node that still has a legacy chunk store and no task moving it off one is the
-        // failure this cannot be allowed to have silently: the store opens, serves the
-        // union of both, and never frees a byte. It happened once, during a rebase that
-        // dropped the spawn, and nothing noticed because a node without a legacy store
-        // starts no migration and every test built the store directly. Say so loudly.
-        if let Some(ref protocol) = self.ant_protocol {
-            if protocol.storage().has_legacy() && self.migration_task.is_none() {
-                error!(
-                    migration_event = "not_started",
-                    "This node still has a legacy chunk store but nothing is migrating it. \
-                     Its disk will never be reclaimed. This is a wiring fault, not a \
-                     configuration one: report it rather than working around it."
-                );
-            }
-        }
-
         info!("Node running, waiting for shutdown signal");
 
-        // Run the main event loop with signal handling
+        // The main event loop, with signal handling. Everything above this starts
+        // something; this is where the node waits.
         self.run_event_loop().await?;
 
-        // Protocol routing stops FIRST, loop and children both. The migration's last step
-        // drains the legacy store's in-flight reads, and inbound protocol traffic keeps
-        // starting new ones, so waiting on the migration while still serving requests can
-        // keep that drain from ever completing and hang shutdown. Aborting the accept loop
-        // alone would not do it: the requests already in flight run in their own tasks.
+        // Protocol routing stops first, loop and children both. The routing loop waits on
+        // `events.recv()` and has no cancellation branch of its own, and it holds an `Arc`
+        // on the P2P node that keeps the sender it is waiting on alive, so nothing else
+        // here will ever wake it. Left running it holds the chunk store and its
+        // single-process lock open after the node has returned. Aborting the accept loop
+        // alone is not enough either: the requests already in flight run in their own
+        // tasks, which is what the drain below is for.
         if let Some(handle) = self.protocol_task.take() {
             handle.abort();
+            // Awaited, not just asked to stop. `abort` schedules cancellation; it does not
+            // establish that the task is gone, and what matters here is that it has
+            // dropped its `Arc` on the protocol and with it the store's single-process
+            // lock before this function returns. The join resolves as cancelled.
+            let _ = handle.await;
         }
         // Cancelled first, so anything still queued behind the concurrency permits gives
         // up rather than starting fresh storage work, then given a moment to finish what
@@ -844,30 +831,6 @@ impl RunningNode {
                 self.protocol_children.len(),
                 PROTOCOL_DRAIN_GRACE.as_secs()
             );
-        }
-
-        // Then the migration, awaited rather than aborted: it is mid-way through reading
-        // and writing the chunk store, and it holds the commitment state and the routing
-        // handle that the shutdown below is about to invalidate. It watches the same
-        // cancellation token, so this returns as soon as its current step does. Bounded,
-        // because a step that will not finish must not hold the process open.
-        if let Some(mut handle) = self.migration_task.take() {
-            // Awaited by reference, so a timeout leaves the handle here to abort rather
-            // than dropping it and letting the task run on detached through the engine and
-            // P2P teardown it depends on.
-            match tokio::time::timeout(MIGRATION_SHUTDOWN_GRACE, &mut handle).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => warn!("Storage migration task did not stop cleanly: {e}"),
-                Err(_) => {
-                    warn!(
-                        "Storage migration did not stop within {}s; stopping it. \
-                         Everything it does is idempotent and re-derived at the next start.",
-                        MIGRATION_SHUTDOWN_GRACE.as_secs()
-                    );
-                    handle.abort();
-                    let _ = handle.await;
-                }
-            }
         }
 
         // Shutdown replication engine before P2P so background tasks don't
@@ -1101,6 +1064,8 @@ mod tests {
     use rand::Rng;
     use tempfile::TempDir;
 
+    use crate::storage::migration_signal::LEGACY_ENV_DIR;
+
     /// The e2e port range, so a test bind never lands on a production or dev instance.
     const TEST_PORT_RANGE: std::ops::Range<u16> = 20000..60000;
 
@@ -1109,79 +1074,6 @@ mod tests {
 
     /// A well-formed address that receives nothing; no chain is contacted in these tests.
     const TEST_REWARDS_ADDRESS: &str = "0x0000000000000000000000000000000000000001";
-
-    /// A node with a legacy chunk store must get a migration task; one without must not.
-    ///
-    /// The spawn helper is tested directly because its *absence* is the failure mode that
-    /// already happened here: a rebase dropped the call, the store still opened and still
-    /// served, and no test could tell the difference.
-    #[tokio::test]
-    async fn a_legacy_store_gets_a_migration_task_and_a_fresh_node_does_not() {
-        let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join("node");
-        std::fs::create_dir_all(&root).expect("mkdir");
-
-        // Fresh node: nothing to migrate, so no task.
-        let fresh = Arc::new(
-            crate::storage::ChunkStore::new(crate::storage::ChunkStoreConfig {
-                root_dir: root.clone(),
-                ..crate::storage::ChunkStoreConfig::test_default()
-            })
-            .await
-            .expect("open fresh"),
-        );
-        assert!(!fresh.has_legacy());
-        assert!(
-            !crate::storage::migration::should_migrate(&fresh),
-            "a node with no legacy store has nothing to migrate"
-        );
-        drop(fresh);
-
-        // Seed a legacy store, then reopen: now there is something to migrate.
-        {
-            let lmdb = crate::storage::LmdbStorage::new(crate::storage::LmdbStorageConfig {
-                root_dir: root.clone(),
-                verify_on_read: true,
-                max_map_size: 0,
-                disk_reserve: 0,
-            })
-            .await
-            .expect("open legacy");
-            let content = b"a chunk from before the migration";
-            let addr = crate::client::compute_address(content);
-            lmdb.put(&addr, content).await.expect("put");
-            lmdb.wait_idle().await;
-        }
-        let upgrading = Arc::new(
-            crate::storage::ChunkStore::new(crate::storage::ChunkStoreConfig {
-                root_dir: root.clone(),
-                ..crate::storage::ChunkStoreConfig::test_default()
-            })
-            .await
-            .expect("open upgrading"),
-        );
-        assert!(upgrading.has_legacy());
-        assert!(
-            crate::storage::migration::should_migrate(&upgrading),
-            "a node with a legacy store must be migrated, or its disk is never reclaimed"
-        );
-    }
-
-    /// Seed a legacy LMDB store under `root` with one chunk, then close it.
-    async fn seed_legacy_store(root: &std::path::Path) {
-        let lmdb = crate::storage::LmdbStorage::new(crate::storage::LmdbStorageConfig {
-            root_dir: root.to_path_buf(),
-            verify_on_read: true,
-            max_map_size: 0,
-            disk_reserve: 0,
-        })
-        .await
-        .expect("open legacy");
-        let content = b"a chunk written before the migration";
-        let addr = crate::client::compute_address(content);
-        lmdb.put(&addr, content).await.expect("put");
-        lmdb.wait_idle().await;
-    }
 
     /// A node config that builds without touching a chain or a real network.
     fn local_node_config(root: &std::path::Path, port: u16) -> NodeConfig {
@@ -1198,96 +1090,190 @@ mod tests {
         }
     }
 
-    /// A real, fully built node with a legacy store is actually migrating it.
+    /// A node builds on a root with nothing left over from the old store.
+    #[tokio::test]
+    async fn a_node_builds_on_a_clean_root() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("node");
+        std::fs::create_dir_all(&root).expect("mkdir");
+
+        let mut built = None;
+        let mut last_err = String::new();
+        for _ in 0..BIND_ATTEMPTS {
+            let port = rand::thread_rng().gen_range(TEST_PORT_RANGE);
+            match NodeBuilder::new(local_node_config(&root, port))
+                .build()
+                .await
+            {
+                Ok(node) => {
+                    built = Some(node);
+                    break;
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+            }
+        }
+        let Some(node) = built else {
+            panic!("could not build a node after {BIND_ATTEMPTS} attempts: {last_err}");
+        };
+
+        node.shutdown.cancel();
+    }
+
+    /// A node with chunks in a store this build cannot read STARTS, however it is
+    /// configured, and does not lose them.
     ///
-    /// This goes through `build()` rather than calling the spawn helper, because the
-    /// failure that already happened here was the *call site* going missing, not the
-    /// helper being wrong. A test of the helper alone stays green through exactly that
-    /// bug. Deleting the spawn from `build()` must turn this red.
+    /// This asserted the opposite until the release that shipped it was reconsidered twice.
+    /// First it refused to start, which serves nothing at all and cannot be recovered by
+    /// hand, because nothing can hold a node on an older build. Then it deleted whatever it
+    /// found, which is data loss for exactly the node that most needs the data: the upgrade
+    /// monitor picks the newest eligible release rather than the next one, so a node that was
+    /// offline through the previous release arrives here with everything it owns in that
+    /// directory and nothing in the file store.
+    ///
+    /// Both configurations, because they are different code paths: a node with
+    /// `storage.enabled = false` never builds a store, and the old environment is on its disk
+    /// just the same.
     #[tokio::test]
-    async fn a_built_node_with_a_legacy_store_is_migrating_it() {
-        let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join("node");
-        std::fs::create_dir_all(&root).expect("mkdir");
-        seed_legacy_store(&root).await;
+    async fn a_node_with_an_unmigrated_store_starts_and_keeps_it() {
+        for storage_enabled in [true, false] {
+            let dir = TempDir::new().expect("temp dir");
+            let root = dir.path().join("node");
+            let env = root.join(LEGACY_ENV_DIR);
+            std::fs::create_dir_all(&env).expect("mkdir");
+            std::fs::write(env.join("data.mdb"), b"chunks that were never copied out")
+                .expect("seed");
 
-        // Ports are picked at random from the test range and a freshly released one can
-        // still be held for a moment, so a bind failure is retried rather than reported
-        // as a wiring fault.
-        let mut built = None;
-        let mut last_err = String::new();
-        for _ in 0..BIND_ATTEMPTS {
             let port = rand::thread_rng().gen_range(TEST_PORT_RANGE);
-            match NodeBuilder::new(local_node_config(&root, port))
-                .build()
-                .await
-            {
-                Ok(node) => {
-                    built = Some(node);
-                    break;
-                }
-                Err(e) => {
-                    last_err = e.to_string();
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                }
-            }
-        }
-        let Some(node) = built else {
-            panic!("could not build a node after {BIND_ATTEMPTS} attempts: {last_err}");
-        };
+            let mut config = local_node_config(&root, port);
+            config.storage.enabled = storage_enabled;
 
-        let storage_has_legacy = node
-            .ant_protocol
-            .as_ref()
-            .is_some_and(|p| p.storage().has_legacy());
-        assert!(
-            storage_has_legacy,
-            "the node must have opened the legacy store this test seeded"
-        );
-        assert!(
-            node.migration_task.is_some(),
-            "a node holding a legacy chunk store came up with nothing migrating it, so \
-             its disk would never be reclaimed"
-        );
-
-        node.shutdown.cancel();
-        if let Some(handle) = node.migration_task {
-            handle.abort();
+            let node = NodeBuilder::new(config).build().await.unwrap_or_else(|e| {
+                panic!(
+                    "a node with an unmigrated store must start (storage.enabled = \
+                     {storage_enabled}): {e}"
+                )
+            });
+            settle();
+            assert!(
+                env.join("data.mdb").exists(),
+                "chunks that were never copied out were deleted (storage.enabled = \
+                 {storage_enabled})"
+            );
+            node.shutdown.cancel();
         }
     }
 
-    /// A node with nothing to migrate does not start a driver for it.
+    /// A node with storage switched off deletes nothing, even a leftover marked finished.
+    ///
+    /// It never builds a store, so nothing about this node establishes that those chunks were
+    /// copied anywhere: the mark is a claim made by a previous release about a file store
+    /// this process has not opened and will not open. It also has no use for the disk. So the
+    /// directory stays and stays recoverable.
     #[tokio::test]
-    async fn a_built_node_without_a_legacy_store_starts_no_migration() {
+    async fn a_node_with_storage_disabled_deletes_nothing() {
         let dir = TempDir::new().expect("temp dir");
         let root = dir.path().join("node");
-        std::fs::create_dir_all(&root).expect("mkdir");
+        let env = root.join(LEGACY_ENV_DIR);
+        std::fs::create_dir_all(&env).expect("mkdir");
+        std::fs::write(
+            env.join("data.mdb"),
+            b"bytes retirement had already cleared",
+        )
+        .expect("seed");
+        std::fs::write(env.join("RETIRED"), b"retired").expect("mark");
 
-        let mut built = None;
-        let mut last_err = String::new();
-        for _ in 0..BIND_ATTEMPTS {
-            let port = rand::thread_rng().gen_range(TEST_PORT_RANGE);
-            match NodeBuilder::new(local_node_config(&root, port))
-                .build()
-                .await
-            {
-                Ok(node) => {
-                    built = Some(node);
-                    break;
-                }
-                Err(e) => {
-                    last_err = e.to_string();
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                }
-            }
-        }
-        let Some(node) = built else {
-            panic!("could not build a node after {BIND_ATTEMPTS} attempts: {last_err}");
-        };
-
-        assert!(node.migration_task.is_none());
+        let port = rand::thread_rng().gen_range(TEST_PORT_RANGE);
+        let mut config = local_node_config(&root, port);
+        config.storage.enabled = false;
+        let node = NodeBuilder::new(config).build().await.expect("must start");
+        settle();
+        assert!(
+            env.join("data.mdb").exists(),
+            "a node that never opened a store deleted one on the strength of a mark it \
+             could not check"
+        );
         node.shutdown.cancel();
     }
+
+    /// A store the migration finished with is removed, once the file store has opened.
+    #[tokio::test]
+    async fn a_finished_store_is_removed_once_the_replacement_opens() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("node");
+        let env = root.join(LEGACY_ENV_DIR);
+        std::fs::create_dir_all(&env).expect("mkdir");
+        std::fs::write(
+            env.join("data.mdb"),
+            b"bytes retirement had already cleared",
+        )
+        .expect("seed");
+        std::fs::write(env.join("RETIRED"), b"retired").expect("mark");
+
+        let port = rand::thread_rng().gen_range(TEST_PORT_RANGE);
+        let node = NodeBuilder::new(local_node_config(&root, port))
+            .build()
+            .await
+            .expect("a node with a finished leftover must start");
+        assert!(wait_gone(&env));
+        node.shutdown.cancel();
+    }
+
+    /// Nothing is deleted until the store that replaced it has actually opened.
+    ///
+    /// "Finished with" means the chunks are in the file store, which is only true if the file
+    /// store opens. An earlier version deleted first and let the constructor fail behind it,
+    /// on an unreadable layout or a directory it could not create, and a node that lost both
+    /// stores that way had nothing left to go back to.
+    #[tokio::test]
+    async fn a_finished_store_survives_a_file_store_that_will_not_open() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("node");
+        let env = root.join(LEGACY_ENV_DIR);
+        std::fs::create_dir_all(&env).expect("mkdir");
+        std::fs::write(
+            env.join("data.mdb"),
+            b"bytes retirement had already cleared",
+        )
+        .expect("seed");
+        std::fs::write(env.join("RETIRED"), b"retired").expect("mark");
+
+        // A file where the chunk directory has to be, so the store cannot create it.
+        std::fs::write(root.join("chunks"), b"not a directory").expect("block the store");
+
+        let port = rand::thread_rng().gen_range(TEST_PORT_RANGE);
+        let built = NodeBuilder::new(local_node_config(&root, port))
+            .build()
+            .await;
+        assert!(
+            built.is_err(),
+            "the file store was supposed to fail to open"
+        );
+        settle();
+        assert!(
+            env.join("data.mdb").exists(),
+            "the old store was deleted before the one replacing it could open"
+        );
+    }
+
+    /// The removal runs on its own thread.
+    fn settle() {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    /// The removal runs on its own thread, so give it a moment.
+    fn wait_gone(path: &std::path::Path) -> bool {
+        for _ in 0..200 {
+            if !path.exists() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
+
     use super::*;
     use crate::config::NODES_SUBDIR;
 

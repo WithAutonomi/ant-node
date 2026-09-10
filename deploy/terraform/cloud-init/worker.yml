@@ -79,31 +79,24 @@ write_files:
       Type=simple
       User=ant
       Group=ant
-      ExecStart=$${BINARY_PATH} --root-dir $${NODE_DIR} --port 0 --metrics-port $${METRICS_PORT} $${BOOTSTRAP_ARGS}
+      # --enable-logging is not optional here, whatever it looks like. Without it the
+      # binary installs no tracing subscriber and emits nothing at all, so a node on this
+      # unit is silent: no migration progress, no warnings, and nothing said about whether
+      # it still has an old chunk store. That last one does not make the fleet's state
+      # decidable, and nothing does; it is what lets a node on this unit surface itself as
+      # unfinished at all. JSON because what reads these lines is a query, and the fields
+      # that matter are structured.
+      ExecStart=$${BINARY_PATH} --root-dir $${NODE_DIR} --port 0 --metrics-port $${METRICS_PORT} --enable-logging --log-format json $${BOOTSTRAP_ARGS}
       Restart=always
       RestartSec=10
       MemoryMax=350M
       CPUQuota=15%
-
-      # Every node on this host shares one disk, and the migration off LMDB copies every
-      # chunk before it deletes anything, so two nodes copying at once need two full
-      # copies of the disk at the same time. The node takes a per-volume lock to stop
-      # that, and the lock only works if all the nodes on the host can see the same file.
-      # PrivateTmp=true gives each unit a tmpfs of its own, so the default location in
-      # /tmp is private to each node and every one of them takes its own lock. This names
-      # a directory on the shared volume instead, holding nothing but the lock, and grants
-      # write access to that one directory.
-      Environment=ANT_MIGRATION_LOCK_DIR=/var/lib/ant/migration
 
       # Security hardening
       NoNewPrivileges=true
       ProtectSystem=strict
       ProtectHome=true
       ReadWritePaths=$${NODE_DIR}
-      # Only the lock lives here. Granting write access to the shared nodes/ directory
-      # instead would let every node write into every other node's data directory, which
-      # is what ReadWritePaths=$${NODE_DIR} exists to prevent.
-      ReadWritePaths=/var/lib/ant/migration
       PrivateTmp=true
 
       [Install]
@@ -188,11 +181,7 @@ runcmd:
 
   # Create data directories
   - mkdir -p /var/lib/ant/nodes
-  # The per-volume migration lock. Shared by every node on this host and nothing else, so
-  # they can serialise their copies without being able to reach each other's data.
-  - mkdir -p /var/lib/ant/migration
   - chown -R ant:ant /var/lib/ant
-  - chmod 0750 /var/lib/ant/migration
 
   # Increase file limits
   - echo "* soft nofile 65535" >> /etc/security/limits.conf

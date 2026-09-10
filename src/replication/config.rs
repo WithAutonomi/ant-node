@@ -230,7 +230,7 @@ pub const AUDIT_RESPONDER_TOP_ORIGINS: usize = 10;
 /// round-1 proofs from starving the light audits, and bounds concurrent
 /// multi-gigabyte hashing to this many at once. Two allows overlap without
 /// admitting many simultaneous full-subtree hashes; there is little benefit in
-/// more concurrent large LMDB scans against one disk.
+/// more concurrent large store scans against one disk.
 pub const MAX_CONCURRENT_SUBTREE_ROUND1: usize = 2;
 
 /// Per-peer concurrency cap for the heavy subtree-audit round 1. One in-flight
@@ -293,7 +293,7 @@ pub const SUBTREE_ROUND1_WORK_BURST_BYTES: i64 = 8 * 1024 * 1024 * 1024;
 /// Floor charged against the round-1 work budget per leaf attempted, in bytes.
 ///
 /// The budget counts content bytes, which is the right unit for the hashing but
-/// misses what a leaf costs before its size is known: an LMDB point lookup with
+/// misses what a leaf costs before its size is known: a point lookup with
 /// its retries, and a `spawn_blocking` dispatch and join. Nothing bounds a
 /// chunk from below, so a commitment made of a million tiny records would run a
 /// full subtree of reads and task round-trips per audit while charging almost
@@ -631,7 +631,7 @@ pub const MAX_VERIFICATION_KEYS_PER_CYCLE: usize = 8_192;
 ///
 /// Senders aggregate all keys for a peer into one request. Matching this limit
 /// to the cycle bound lets an honest round use one request per peer while still
-/// bounding the LMDB work performed on the responder's serial replication
+/// bounding the storage work performed on the responder's serial replication
 /// message path. Oversized requests are rejected as an empty, wire-compatible
 /// verification response.
 pub const MAX_INCOMING_VERIFICATION_KEYS: usize = MAX_VERIFICATION_KEYS_PER_CYCLE;
@@ -693,10 +693,25 @@ pub(crate) const CAPACITY_BLOCKED_RETRY: Duration =
 /// Trust event weight for confirmed audit failures.
 pub const AUDIT_FAILURE_TRUST_WEIGHT: f64 = 5.0;
 
-/// Whether this build penalises a peer for not holding a chunk it was supposed to hold.
+/// Whether this build HOLDS OFF the penalty for not holding a chunk it was supposed to hold.
 ///
-/// **`true` while the fleet moves off the legacy LMDB chunk store; back to `false` once it
-/// has.** Flipping it is a one-line change in one release.
+/// `true` suspends the penalty. The name says `SUSPEND`; read it that way, because a reader who
+/// takes it as "does this build penalise" gets the answer backwards, which is how a comment
+/// three lines down came to claim the opposite of what ships.
+///
+/// **Still `true`, and deliberately not flipped by this release.** It was raised while the
+/// fleet moved off the legacy LMDB chunk store, because a node that has to give up chunks
+/// cannot stop its peers penalising it for that, so the peers had to stop first.
+///
+/// Restoring it belongs in a release *after* this one, not in this one. The upgrade monitor
+/// picks the newest eligible release rather than the next, so a node that was offline while
+/// the migration ran arrives here having never migrated, holding a legacy store this build
+/// cannot read. This release keeps that store rather than deleting it, which is the right
+/// answer for its data, but the node cannot serve those chunks. Restoring the penalty in the
+/// same release would slash exactly that node, for a state it had no chance to leave, in the
+/// release that stranded it. Two changes, two releases: this one removes the old store, and
+/// the next one restores the accusation once the fleet has been observed clean for long
+/// enough to include the nodes that were away.
 ///
 /// Deliberately narrow. It covers exactly one accusation: "you did not have a chunk you
 /// were supposed to be holding". It does **not** cover the commitment-bound subtree audit,
@@ -714,6 +729,19 @@ pub const AUDIT_FAILURE_TRUST_WEIGHT: f64 = 5.0;
 pub const RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY: bool = true;
 
 /// Environment override for [`RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY`], for a canary.
+///
+/// Kept rather than removed with the rest of the bridge. This release does not flip the
+/// constant, but the release after it does, and that is the moment the lever is most likely to
+/// be needed. It suspends only the penalties this node hands out, so an emergency suspension
+/// has to go to the fleet, not to the node being penalised.
+///
+/// The one-way guard the previous release added is kept, and in this release it is ACTIVE: it
+/// refuses to un-suspend while the release constant says to hold the penalty off, and this
+/// release says exactly that. So the override can suspend and cannot un-suspend, and a host
+/// setting it to `0` is told so and ignored — which is the point, because one host penalising
+/// its close group for behaving as the release asked would slash all of them. It becomes inert
+/// in the release that restores the penalty, and it stays there rather than being deleted so
+/// that the meaning does not silently change if the constant ever goes back.
 pub const SUSPEND_CLOSE_GROUP_STORAGE_PENALTY_ENV: &str = "ANT_SUSPEND_UNHELD_CHUNK_PENALTY";
 
 /// The live switch.
@@ -736,7 +764,7 @@ pub fn apply_close_group_storage_penalty_policy() {
         apply_and_announce(RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY);
         return;
     };
-    let suspended = match raw.trim().to_ascii_lowercase().as_str() {
+    let asked = match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => true,
         "0" | "false" | "no" | "off" => false,
         other => {
@@ -747,7 +775,22 @@ pub fn apply_close_group_storage_penalty_policy() {
             RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY
         }
     };
-    apply_and_announce(suspended);
+    // Suspending is always allowed. Un-suspending is not, while the release says to hold
+    // off: this node would hand out full-weight trust failures to peers that are doing what
+    // the release asked of them, and they have no way to stop it or to see where it came
+    // from.
+    if !asked && RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY {
+        warn!(
+            "{SUSPEND_CLOSE_GROUP_STORAGE_PENALTY_ENV} asks this node to penalise peers for \
+             not holding a close-group chunk, and this release holds that penalty off while \
+             the fleet moves off the old chunk store. Ignoring it: a node giving chunks up \
+             cannot stop a peer punishing it for doing so, so one host set this way would \
+             slash its whole close group for behaving correctly."
+        );
+        apply_and_announce(RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY);
+        return;
+    }
+    apply_and_announce(asked);
 }
 
 /// Set the switch and say so, once, where an operator will see it.
@@ -786,7 +829,11 @@ fn apply_and_announce(suspended: bool) {
     }
 }
 
-/// Set whether failing to hold a close-group chunk penalises.
+/// Set whether the close-group unheld-chunk penalty is SUSPENDED.
+///
+/// `true` holds the penalty off; `false` lets it be handed out. The parameter is the
+/// suspension, not the punishment, and reading it the other way round is how a caller meaning
+/// to switch punishing on switches it off.
 ///
 /// Startup applies the release policy through this. Tests that mean to exercise the
 /// penalty itself set it explicitly, so what they assert is not an accident of whichever
@@ -795,7 +842,10 @@ pub fn set_close_group_storage_penalty_suspended(suspended: bool) {
     CLOSE_GROUP_STORAGE_PENALTY_SUSPENDED.store(suspended, Ordering::Relaxed);
 }
 
-/// Whether failing to hold a close-group chunk currently penalises.
+/// Whether the close-group unheld-chunk penalty is currently SUSPENDED.
+///
+/// `true` means this node hands out no such penalty. The name says `suspended` and so does the
+/// value; it is not a report of whether the lane penalises.
 #[must_use]
 pub fn close_group_storage_penalty_suspended() -> bool {
     CLOSE_GROUP_STORAGE_PENALTY_SUSPENDED.load(Ordering::Relaxed)
@@ -1424,6 +1474,41 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
+    /// The override can hold the penalty off. It cannot switch it back on.
+    ///
+    /// The direction is the whole point. A node giving chunks up during the migration cannot
+    /// stop a peer punishing it for doing so, so one host with this set the wrong way is not
+    /// a local choice about that host: it hands full-weight trust failures to every node in
+    /// its close group that is doing what the release asked. Set it right and it is a no-op
+    /// this release; set it wrong and it is a slashing incident nobody can trace.
+    #[test]
+    #[serial]
+    fn the_penalty_override_can_only_hold_the_penalty_off() {
+        // The switch is process-wide by design and this test is serialised, so nothing
+        // else is reading the variable or the switch while it runs.
+        std::env::set_var(SUSPEND_CLOSE_GROUP_STORAGE_PENALTY_ENV, "0");
+        apply_close_group_storage_penalty_policy();
+        assert_eq!(
+            close_group_storage_penalty_suspended(),
+            RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY,
+            "an operator switched the penalty back on and would slash their own close group"
+        );
+
+        std::env::set_var(SUSPEND_CLOSE_GROUP_STORAGE_PENALTY_ENV, "1");
+        apply_close_group_storage_penalty_policy();
+        assert!(
+            close_group_storage_penalty_suspended(),
+            "holding the penalty off is the safe direction and must still work"
+        );
+
+        std::env::remove_var(SUSPEND_CLOSE_GROUP_STORAGE_PENALTY_ENV);
+        apply_close_group_storage_penalty_policy();
+        assert_eq!(
+            close_group_storage_penalty_suspended(),
+            RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY
+        );
+    }
+
     #[test]
     fn defaults_pass_validation() {
         let config = ReplicationConfig::default();
@@ -1457,6 +1542,28 @@ mod tests {
 
     /// One test rather than several, because the switch is process-wide: separate tests
     /// would race each other under the default parallel runner.
+    #[test]
+    #[serial]
+    fn this_release_still_holds_the_unheld_chunk_penalty_off() {
+        // Named on purpose, because the value matters and nothing else asserts it. This is
+        // the release that deletes the old chunk store, and the upgrade monitor picks the
+        // newest eligible release rather than the next one, so a node that was away while
+        // the migration ran arrives here having never migrated. It keeps its legacy store,
+        // which this build cannot read, so it cannot serve those chunks. Restoring the
+        // accusation here would slash that node in the release that stranded it.
+        //
+        // Restoring it is a one-line change in the release after this one, once the fleet
+        // has been observed clean for long enough to include the nodes that were away.
+        // Asked of the live switch after applying the policy rather than of the constant:
+        // clippy rejects an assertion on a constant, and what a node actually does is the
+        // better question.
+        apply_and_announce(RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY);
+        assert!(
+            close_group_storage_penalty_suspended(),
+            "this release must not restore the penalty; it can strand a node it then slashes"
+        );
+    }
+
     #[test]
     #[serial]
     fn the_unheld_chunk_penalty_switch_follows_the_release_it_is_compiled_into() {
