@@ -5,6 +5,8 @@
 //! in `saorsa_transport::webrtc` uses ML-KEM-768, ML-DSA-65, and ChaCha20-Poly1305 to bind
 //! the node identity and protect every browser RPC without libp2p or Noise.
 
+mod errors;
+
 use crate::ant_protocol::{
     ChunkMessage, ChunkMessageBody, ChunkPutRequest, ChunkPutResponse, ChunkQuoteRequest,
     ChunkQuoteResponse, MAX_CHUNK_SIZE,
@@ -15,6 +17,7 @@ use crate::error::{Error, Result};
 use crate::logging::{debug, info, warn};
 use crate::payment::{serialize_single_node_proof, PaymentProof};
 use crate::storage::AntProtocol;
+use errors::{decode_response, error_response, public_error};
 use evmlib::common::{Amount, TxHash};
 use evmlib::{EncodedPeerId, PaymentQuote, ProofOfPayment, RewardsAddress};
 use parking_lot::{Mutex, RwLock};
@@ -1345,12 +1348,15 @@ async fn process_request(
             let response = protocol
                 .try_handle_request(&content)
                 .await
-                .map_err(|error| format!("chunk protocol request failed: {error}"))?
+                .map_err(|error| public_error("chunk_protocol_failed", error))?
                 .ok_or_else(|| "chunk protocol handler returned no response".to_string())?;
             if response.len() > ant_protocol::MAX_WIRE_MESSAGE_SIZE {
                 return Err("chunk protocol response exceeds wire limit".to_string());
             }
-            let bytes = response.to_vec();
+            let response = decode_response(response)?;
+            let bytes = response
+                .encode()
+                .map_err(|error| public_error("invalid_response", error))?;
             drop(response);
             reservation.resize(bytes.len())?;
             Ok((
@@ -1567,14 +1573,7 @@ async fn process_get_chunk(
             None,
         )),
         Ok(None) => Ok((Response::not_found(request_id, address), None)),
-        Err(error) => Ok((
-            Response::error(
-                request_id,
-                "storage_error",
-                format!("chunk read failed: {error}"),
-            ),
-            None,
-        )),
+        Err(error) => Ok((error_response(request_id, "storage_error", error), None)),
     };
     response
 }
@@ -1616,7 +1615,7 @@ async fn process_quote_chunk(
     };
     let response = match handle_ant_message(ant_protocol, &message).await {
         Ok(response) => response,
-        Err(error) => return (Response::error(request_id, "quote_failed", error), None),
+        Err(error) => return (error_response(request_id, "quote_failed", error), None),
     };
     match response.body {
         ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success {
@@ -1626,16 +1625,7 @@ async fn process_quote_chunk(
         }) => {
             let quote: PaymentQuote = match rmp_serde::from_slice(&quote) {
                 Ok(quote) => quote,
-                Err(error) => {
-                    return (
-                        Response::error(
-                            request_id,
-                            "invalid_quote",
-                            format!("node generated an invalid quote: {error}"),
-                        ),
-                        None,
-                    )
-                }
+                Err(error) => return (error_response(request_id, "invalid_quote", error), None),
             };
             let artifact = match browser_quote_from_quote(
                 state.p2p.peer_id(),
@@ -1643,7 +1633,7 @@ async fn process_quote_chunk(
                 commitment.as_deref(),
             ) {
                 Ok(artifact) => artifact,
-                Err(error) => return (Response::error(request_id, "invalid_quote", error), None),
+                Err(error) => return (error_response(request_id, "invalid_quote", error), None),
             };
             (
                 Response::ok(
@@ -1663,10 +1653,10 @@ async fn process_quote_chunk(
             None,
         ),
         other => (
-            Response::error(
+            error_response(
                 request_id,
                 "invalid_quote_response",
-                format!("unexpected storage response: {other:?}"),
+                format_args!("{other:?}"),
             ),
             None,
         ),
@@ -1715,7 +1705,7 @@ async fn process_put_chunk(
     };
     let response = match handle_ant_message(ant_protocol, &message).await {
         Ok(response) => response,
-        Err(error) => return (Response::error(request_id, "put_failed", error), None),
+        Err(error) => return (error_response(request_id, "put_failed", error), None),
     };
     match response.body {
         ChunkMessageBody::PutResponse(ChunkPutResponse::Success { address }) => (
@@ -1749,10 +1739,10 @@ async fn process_put_chunk(
             None,
         ),
         other => (
-            Response::error(
+            error_response(
                 request_id,
                 "invalid_put_response",
-                format!("unexpected storage response: {other:?}"),
+                format_args!("{other:?}"),
             ),
             None,
         ),
@@ -1791,8 +1781,7 @@ async fn handle_ant_message(
         .await
         .map_err(|error| format!("storage request failed: {error}"))?
         .ok_or_else(|| "storage handler returned no response".to_string())?;
-    ChunkMessage::decode(&response)
-        .map_err(|error| format!("storage response decoding failed: {error}"))
+    decode_response(response)
 }
 
 fn decode_32_byte_hex(value: &str) -> ServerResult<[u8; 32]> {
