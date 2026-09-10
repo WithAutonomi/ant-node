@@ -1,4 +1,4 @@
-//! Live ADR-0009 local-devnet protocol test.
+//! Live ADR-0013 local-devnet protocol test.
 
 use ant_node::devnet::{Devnet, DevnetConfig};
 use ant_node::BrowserEndpoint;

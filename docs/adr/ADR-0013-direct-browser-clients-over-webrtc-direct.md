@@ -1,8 +1,8 @@
-# ADR-0009: Direct browser clients over WebRTC Direct
+# ADR-0013: Direct browser clients over WebRTC Direct
 
 - **Status:** Proposed
 - **Date:** 2026-08-03
-- **Last amended:** 2026-09-03
+- **Last amended:** 2026-09-10
 - **Decision owners:** <pending>
 - **Reviewers:** <pending>
 - **Supersedes:** none
@@ -174,23 +174,50 @@ The transport is implemented and versioned by Saorsa. It does not use libp2p
 libraries or wire layers: there is no libp2p peer ID, Noise handshake,
 multistream selection, connection gater, protobuf stream envelope, or libp2p
 DataChannel close protocol. `saorsa-transport` owns ICE-lite/DTLS/SCTP setup,
-the shared UDP association mux, persisted certificates, native diagnostic
-dialing, and reliable ordered DataChannels. `saorsa-core` owns only the
+the shared UDP association mux, certificate types, native diagnostic
+dialing, and reliable ordered DataChannels. `ant-node` owns certificate generation,
+filesystem persistence, and listener startup. `saorsa-core` owns only the
 validated endpoint/address integration. The `saorsa_transport::webrtc` module owns the portable post-quantum handshake,
 encrypted-record layer, browser RPC schema, outer framing, address codec, and
 transfer limits. `ant-core` owns the runtime-neutral client algorithms and the
 browser WASM facade; `ant-node` owns the bounded browser RPC adapter. The two
 sides use the same Rust protocol implementation, while the browser transport
 adapter calls `RTCPeerConnection` directly through Web APIs. `ant-protocol`
-remains independent of the selected carrier transport; this design uses its
-released `2.3.1` API without WebRTC-specific source, feature, or dependency
-changes.
+is shared by native and WASM clients. Its `2.3.5` web-support branch exposes
+portable chunk, payment, and transport interfaces, re-exporting the shared
+WebRTC types. Native runtime support is feature gated; browser clients use
+the same protocol and client algorithms without compiling node services.
 
 The native ML-KEM/ML-DSA transport remains the node-to-node transport and is
 not downgraded or replaced. The WebRTC listener has independent connection,
 channel, request, timeout, message, and byte limits. Its write surface accepts
 only content-addressed chunks accompanied by a verifiable native payment
 proof.
+
+### Startup and upgrade policy
+
+The default node build includes `webrtc-direct`, and `WebRtcDirectConfig::default()`
+enables the listener. This is intentional deployment behavior. When enabled,
+invalid configuration, payment-network resolution failure, certificate I/O
+failure, or UDP bind failure aborts node startup. The node must not silently
+continue with its configured browser service unavailable. Native P2P is shut
+down on listener startup failure. An address still awaiting native discovery
+is a valid pending state, rather than a listener startup failure.
+
+An operator can disable the listener with `webrtc_direct.enabled = false`,
+`--disable-webrtc-direct`, or `ANT_DISABLE_WEBRTC_DIRECT=true`. The disable switch
+wins over endpoint overrides. Partial configuration tables inherit the same
+container defaults as ordinary node startup. An advertised-address override
+does not require a bind override. Builds without the `webrtc-direct` feature
+reject an explicit request to enable it.
+
+Web support preserves the pre-existing upgrade lifecycle. Standalone upgrade
+spawns the replacement process before the current process exits; service mode
+continues to rely on its existing service-manager restart path. This change
+introduces neither a readiness handshake nor a new restart/retry protocol.
+Consequently an explicit fixed WebRTC socket can contend during overlapping
+standalone startup, just as an explicit native socket can. Operators needing
+ordered process replacement use the existing service-manager deployment path.
 
 ### Public-listener resource isolation
 
@@ -202,15 +229,15 @@ server defaults are:
 | Setting | Default | Scope |
 |---|---:|---|
 | `max_connections` | 32 | listener |
-| `max_connections_per_ip` | 4 | source IP |
+| `max_connections_per_ip` | 4 | IPv4 address or IPv6 /64 |
 | `max_channels_per_connection` | 2 | association |
 | `max_channels` | 32 | listener and channel-handler tasks |
 | `max_concurrent_requests` | 16 | listener work slots |
 | `max_requests_per_second` | 256 | listener work token bucket |
-| `max_requests_per_second_per_ip` | 32 | source-IP work token bucket |
+| `max_requests_per_second_per_ip` | 32 | source-prefix work token bucket |
 | `max_requests_per_second_per_connection` | 16 | association work token bucket |
 | `max_in_flight_bytes` | 64 MiB | listener frame memory |
-| `max_in_flight_bytes_per_ip` | 16 MiB | source-IP frame memory |
+| `max_in_flight_bytes_per_ip` | 16 MiB | source-prefix frame memory |
 | `max_request_bytes` | 64 KiB | JSON request header |
 
 These are independent controls, not alternative ways to express one shared
@@ -224,9 +251,11 @@ single source retains strict headroom for other sources in each global pool:
   per-connection rate does not exceed the per-IP rate; and
 - the per-IP in-flight byte ceiling is lower than the global byte ceiling.
 
-The source key is the observed remote IP; an IPv4-mapped IPv6 address maps to
-the same key as its IPv4 form. Per-IP rate and byte state is shared by every
-association from that source. Normal reconnects reuse retained rate state, so
+The shared `saorsa_transport::webrtc::source_ip_bucket` function keys sources
+by IPv4 address or native IPv6 /64 prefix; IPv4-mapped IPv6 shares its IPv4 key.
+The UDP mux, returned-cookie admission cache, and application resource budgets
+all use this key. Cookies remain authenticated against the full source socket.
+Per-source rate and byte state is shared by every association in that bucket. Normal reconnects reuse retained rate state, so
 reconnecting alone does not refill a depleted bucket. The source table itself
 has a hard bound and evicts only the oldest inactive entry, preventing the
 limiter from becoming a source-churn memory attack.
@@ -366,9 +395,12 @@ The new address plane uses a separate `/dht/address/2.0.0` topic and complete
 replacement records:
 
 ```text
-PublishAddressSetV2 {
-    seq: u64,
-    records: [TransportAddressRecord]
+SignedAddressRecord {
+    owner: PeerId,
+    sequence: u64,
+    records: [TransportAddressRecord],
+    public_key: bytes,
+    signature: bytes
 }
 
 TransportAddressRecord {
@@ -400,13 +432,20 @@ records. This keeps extension addresses out of the legacy `DHTNode` shape while
 allowing sequence-bearing DHT gossip to distribute WebRTC endpoints beyond the
 direct recipients of a publish.
 
-Support is advertised by the `addr-v2` capability in the signed identity user
-agent. During migration, a new node sends V2 publish and lookup operations to
-capable peers and the unchanged V1 operations to older peers. Thus new-to-old
-and old-to-new links continue to propagate QUIC addresses, while WebRTC and
-future records flow only between upgraded nodes. The V2 topic is separate, so
-an old node also ignores an accidentally delivered V2 frame instead of trying
-to deserialize an unknown operation.
+Native peers publish both the unchanged V1 QUIC projection and signed V2
+records. Native publication does not select a version from identity user-agent
+capabilities. Older peers continue processing V1 and ignore the separate V2
+topic. Upgraded peers verify V2 owner proofs and retain the signed originals
+when forwarding records through `FindNodeV2`; unsigned third-party gossip has
+no authority to replace owner-published addresses. The browser RPC `addr-v2`
+capability is separate: it enables signed address records in browser lookup
+responses and does not negotiate the native address publication version.
+
+V2 uses nonempty full replacements, matching V1's publication lifecycle while
+allowing extensible transport types. It has no withdrawal operation or routine
+record expiry. A verified V2 publication takes precedence over V1 information;
+a newer V2 sequence replaces the older V2 set. An empty publication is ignored,
+and a nonempty supplemental-only set can remove its old QUIC projection.
 
 Reachability classification, relay acquisition, relay loss, and rebinding
 mutate the one canonical address set and derive both wire projections from it;
@@ -424,35 +463,14 @@ establishment. A malicious DHT responder can omit an endpoint or make a client
 spend a bounded failed dial, but cannot authenticate an endpoint as another
 peer.
 
-A later hardening phase may add a separately versioned, independently
-cacheable record without changing the existing Postcard `DHTNode` shape:
-
-```text
-BrowserEndpointRecord {
-    network_id,
-    peer_id,
-    sequence,
-    expires_at,
-    webrtc_multiaddrs,
-    capabilities,
-    protocol_versions,
-    max_chunk_size,
-    node_public_key,
-    ml_dsa_signature
-}
-```
-
-Such independently cacheable records would expire because IP addresses, ports,
-relay allocations, and capabilities can change. That expiry would not apply to
-the separately configured bootstrap trust anchors and would not be driven by
-routine DTLS certificate rotation.
-
-For that optional record, the ML-DSA signature covers a canonical,
-domain-separated encoding. The browser would verify the public-key-to-peer-ID
-binding, signature, network ID, monotonic sequence, expiry, capabilities, and
-the entire multiaddress before dialing. An address received through an
-unauthenticated channel is not made trustworthy merely by containing a
-certificate hash.
+The implemented V2 owner proof uses a canonical, domain-separated encoding
+of the owner, sequence, and complete transport records. Receivers verify the
+ML-DSA public-key-to-peer-ID binding, signature, sequence, bounded payloads, and
+known endpoint codecs before using the publication. Relays forward the original
+signed record rather than signing a filtered projection. Routing admission is
+still required before native nodes retain third-party records. Address freshness
+comes from newer owner replacements and normal routing lifecycle; it does not
+introduce an independent expiration clock.
 
 The multiaddress is the complete dialing input: no separate IP address,
 certificate fingerprint, or peer-ID argument is accepted by the browser
@@ -460,8 +478,8 @@ client. This prevents those values from being accidentally mixed between
 nodes.
 
 The address is represented by the network's native address types rather than
-an application-owned string. `saorsa-transport` will own a validated WebRTC
-Direct transport component, and `saorsa-core::MultiAddr` will own the
+an application-owned string. `saorsa-transport` owns a validated WebRTC
+Direct transport component, and `saorsa-core::MultiAddr` owns the
 `/p2p/<ant-peer-id>` suffix. Canonical formatting, parsing, and string-based
 Serde are the single Rust codec used by endpoint records, bootstrap lists,
 `HELLO`, and `FIND_NODE`. `ant-node` must not maintain a second WebRTC Direct
@@ -479,13 +497,27 @@ the browser demo without scraping structured logs or running a manifest
 service. This is an operability aid, not the endpoint-discovery protocol; peer
 endpoints propagate through DHT address sets.
 
-With no explicit listener configuration, the node binds IPv4 wildcard and
-maps its native UDP port deterministically into UDP 32768-65535. It advertises
-the same-family non-relay external IP observed by the native transport, or the
-host routing table's selected IP when no observation is available yet. The
-automatic port and persisted certificate make the resulting multiaddress
-stable across routine restarts. Explicit bind and advertised addresses remain
-available for multi-homed and otherwise unusual deployments.
+With no explicit listener configuration, the node binds IPv4 wildcard with
+port `0`, asking the OS to assign an available UDP port, just as native QUIC
+does. Explicit ports remain fixed; no port is derived from the native listener.
+An explicit advertised address wins and may use a different external port for
+NAT forwarding. A concrete bind can advertise its actual socket directly.
+
+For a wildcard bind, WebRTC reads `DhtNetworkManager::local_dht_node()`, the
+canonical native self-address view, takes the first non-relay IP in the bind
+family, and uses the actual WebRTC bound port. It does not invent a route-probe
+or loopback fallback. If no usable IP exists, publication remains pending and
+the stale endpoint file from a previous run is removed. A listener-owned task
+refreshes the native view every second, updating the endpoint file, HELLO state,
+and signed V2 publication when the address changes. Publication work runs
+independently of accepting browser sessions and is cancelled during shutdown.
+The last nonempty publication is retained when discovery temporarily has no
+replacement, consistent with native replacement semantics. Native QUIC reachability
+proofs never establish reachability of the separate WebRTC socket.
+
+A stable bootstrap multiaddress requires a fixed reachable IP, an explicit
+WebRTC port, and retained certificate and peer identity. A persisted certificate
+alone does not make an OS-assigned port stable across restarts.
 
 ### WebRTC Direct interoperability status
 
@@ -515,8 +547,9 @@ association without modifying browser-owned local credentials or using a
 signaling service. New browser and native diagnostic dials use v2 with no v1
 fallback; the listener accepts v1 during migration.
 
-Production promotion remains conditional on current Chrome, Firefox, and
-Safari interoperability tests for this v2 flow. Saorsa does not depend on
+Current Chrome, Firefox, and Safari interoperability tests remain outstanding
+acceptance evidence for this v2 flow. They do not alter the intentional
+default-on, fail-fast startup policy above. Saorsa does not depend on
 libp2p adopting or shipping it. The ANT ML-KEM/ML-DSA application session
 remains the only ANT node-identity and application-encryption protocol on the
 WebRTC connection; the pinned DTLS fingerprint remains the transport
@@ -738,11 +771,10 @@ The local manifest remains test scaffolding for ephemeral loopback ports. The
 production client is designed to accept the same endpoint values from a
 compiled constant list, without fetching a manifest or resolving DNS.
 
-This implementation currently uses the Saorsa v1 WebRTC
-connection-establishment profile and the v5 encrypted application protocol
-described above. It is a PoC, not evidence that the production no-mutation gate
-has been met. Promotion remains blocked on the cross-browser validation listed
-below.
+This implementation uses the Saorsa v2 WebRTC connection-establishment
+profile and the v5 encrypted application protocol described above. Default node
+builds enable it. Cross-browser validation below remains outstanding evidence;
+this ADR does not claim those tests have passed.
 
 ### Local testnet implementation slice
 
@@ -760,17 +792,31 @@ multiaddresses, public-file metadata, public EVM RPC and contract addresses,
 and a resolved public root DataMap; it never performs lookup or carries file
 bytes and never includes wallet secrets.
 
-At startup the launcher uses `self_encryption 0.36` to produce encrypted file
+With the explicit `test-utils` build feature, startup uses `self_encryption 0.36` to produce encrypted file
 chunks and the same public MessagePack `DataMap` used by `ant-client`. It
 publishes every record through each candidate node's ordinary PUT handler. It
 pre-populates the devnet payment cache for those addresses, while
 content-address verification, DHT responsibility, payment-cache admission,
-LMDB storage, and verified reads remain active.
+LMDB storage, and verified reads remain active. Prepaid cache insertion and
+file-seeding APIs are compiled only with both `webrtc-direct` and `test-utils`.
+Without `test-utils`, devnet manifests have an empty `files` list and the
+listener accepts ordinary paid uploads. An explicit `--public-file` is rejected
+before startup when this development feature is absent.
+
+### Browser error boundary
+
+Native handlers retain their structured errors and diagnostic text. The browser
+adapter logs backend details locally and replaces storage paths, provider errors,
+quote-generation failures, and internal diagnostics with fixed public messages.
+This applies to JSON RPC responses and the shared binary `ChunkProtocol` path.
+Binary responses preserve protocol error variants and safe size/address validation
+fields so clients can still distinguish payment, storage, and validation failures.
+Unknown response variants require explicit boundary handling before exposure.
 
 ### Protocol v5 automated validation
 
 Node CI explicitly runs the otherwise ignored five-node WebRTC Direct devnet
-integration test. Its native test adapter completes the ML-KEM/ML-DSA
+integration test with `--features test-utils`. Its native test adapter completes the ML-KEM/ML-DSA
 handshake and encrypted `HELLO`, asks a seed for closest nodes, dials an
 endpoint from that wire response, performs another lookup on the discovered
 node, and keeps each encrypted DataChannel open across multiple requests. It
@@ -783,17 +829,18 @@ This harness proves direct endpoint discovery, encrypted session reuse, and
 the node request path. It does **not** execute the browser WASM iterative
 lookup state machine. `ant-client` CI builds and lints the WASM target and runs
 its generated bindings in Node, but browser-side iterative parity remains a
-promotion requirement below. Shared `saorsa_transport::webrtc` unit tests additionally
+outstanding acceptance criterion below. Shared `saorsa_transport::webrtc` unit tests additionally
 cover record tampering and replay, wrong peer IDs, tampered node signatures,
 invalid outer frames, and version mismatch.
 
 Node-side resource tests additionally cover fail-fast headroom invariants,
-per-IP association isolation, IPv4-mapped IPv6 normalization, token-bucket
+per-source association isolation, IPv4-mapped IPv6 normalization, IPv6 /64
+budget sharing, token-bucket
 refill, preservation of source rate state across reconnects, bounded inactive
 source state, global/per-source byte ceilings, rollback after failed global
 reservation, and RAII release. The devnet workflow transfers real encrypted
 chunks, but it is not a browser resource-limit or fleet test. The adversarial
-browser and fleet tests listed under Validation remain promotion requirements.
+browser and fleet tests listed under Validation remain outstanding acceptance criteria.
 
 There is currently no automated real-browser v5 flow in browser CI. The
 historical smoke flow below ran only Chromium and used protocol v3. Therefore
@@ -821,7 +868,8 @@ The result was repeated with the unchanged stock `ant-testnet` workflow after
 WebRTC Direct became a default node feature. A normal 60-node deployment used
 no browser-specific build, service, firewall, or advertised-address flags;
 bootstrap node 0 automatically published its public IPv4 endpoint on the
-derived UDP 42768 port.
+derived UDP 42768 port. That historical allocation policy has since been
+replaced by the native-style OS-assigned/fixed-port policy described above.
 
 Using the pre-V2 address-dissemination prototype, Chromium bootstrapped from
 that one address, traversed routing views from dozens of independent peer
@@ -847,7 +895,7 @@ round-trip tests.
 
 - A web client can bootstrap from months-old constant IP multiaddresses
   without DNS, Web PKI, a fresh manifest, or a signaling server.
-- Routine node restarts and certificate maintenance do not change the
+- With a fixed IP and explicit WebRTC port, routine node restarts and certificate maintenance do not change the
   advertised address.
 - Operators do not manage DNS names or CA certificate issuance; node software
   creates and persists the browser transport credential.
@@ -924,7 +972,7 @@ The decision advances beyond PoC only after all of the following are covered:
 
 - A browser bootstraps with networking disabled for manifest/DNS services and
   only the compiled literal-IP multiaddresses available.
-- A bootstrap multiaddress and certificate fingerprint remain byte-identical
+- With a fixed IP and explicit WebRTC port, a bootstrap multiaddress and certificate fingerprint remain byte-identical
   across node restarts and simulated passage of at least one month.
 - Documented recovery tests cover certificate compromise, deliberate identity
   rotation, one retired bootstrap seed, and overlap between old and new
@@ -951,7 +999,7 @@ The decision advances beyond PoC only after all of the following are covered:
   responses and non-STUN traffic continue to use the selected address mapping.
 - Browser-side iterative lookup parity tests cover XOR ordering, `K`, `ALPHA`,
   convergence, retained routing entries, grace cancellation, failure cooldown,
-  changed endpoints, expired discovered records, and unavailable endpoints.
+  changed endpoints, stale owner sequences, and unavailable endpoints.
 - Reliable downloads and uploads work at 0 bytes, typical sizes, and 4 MiB,
   with BLAKE3 verification, bounded memory, fragmentation, cancellation, and
   backpressure measurements.
@@ -975,7 +1023,7 @@ The decision advances beyond PoC only after all of the following are covered:
   protocol v4 as a coordinated browser-client and node rollout.
 - WebRTC and the recorded WebTransport baseline are benchmarked for setup
   latency, CPU and memory, sustained 4 MiB throughput, cancellation, loss
-  recovery, and concurrent request behavior before production promotion.
+  recovery, and concurrent request behavior as outstanding acceptance evidence.
 - Review triggers fire when WebRTC Direct v2, browser SDP enforcement, SCTP
   DataChannel behavior, node storage placement, or Saorsa relay APIs change
   materially.

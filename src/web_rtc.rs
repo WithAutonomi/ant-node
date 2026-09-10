@@ -1,4 +1,4 @@
-//! ADR-0009 WebRTC Direct browser transport.
+//! ADR-0013 WebRTC Direct browser transport.
 //!
 //! The listener uses Saorsa's signaling-free WebRTC Direct transport for ICE,
 //! DTLS, SCTP, and reliable ordered `DataChannels`. A shared application layer
@@ -468,7 +468,7 @@ pub async fn spawn(
     }
     let resources = ListenerResources::new(config);
     info!(bind = %local_addr, certificate = %certificate_path.display(),
-        "ADR-0009 WebRTC Direct listening");
+        "ADR-0013 WebRTC Direct listening");
     let root_dir = root_dir.to_path_buf();
     let task = tokio::spawn(async move {
         // Both futures are owned by the listener task. Address publication cannot
@@ -776,7 +776,7 @@ async fn serve_webrtc(
         connection_tasks.abort_all();
         while connection_tasks.join_next().await.is_some() {}
     }
-    info!("ADR-0009 WebRTC Direct stopped");
+    info!("ADR-0013 WebRTC Direct stopped");
 }
 
 async fn handle_connection(

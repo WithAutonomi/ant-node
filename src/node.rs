@@ -608,7 +608,7 @@ pub struct RunningNode {
     /// a chunk read that outlives the loop keeps the legacy store busy exactly while the
     /// migration is trying to drain it.
     protocol_children: TaskTracker,
-    /// ADR-0009 experimental browser listener task.
+    /// ADR-0013 browser listener task.
     #[cfg(feature = "webrtc-direct")]
     webrtc_direct_task: Option<JoinHandle<()>>,
     /// Exit code requested by a successful upgrade (-1 = no upgrade exit pending).
