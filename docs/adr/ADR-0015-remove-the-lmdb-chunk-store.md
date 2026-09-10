@@ -115,20 +115,29 @@ directory before it deleted anything. A directory carrying `RETIRED` has already
 contents copied out and is pure cost. So is an empty one, which is what a cleanup interrupted
 between emptying a tombstone and removing it leaves. Those go, and their disk comes back.
 
-| what is on disk | what happens |
-|---|---|
-| nothing, or a root that does not exist yet | start |
-| a leftover carrying its `RETIRED` mark | start, remove it in the background, report the space once it is back |
-| a leftover with nothing in it | start, remove it |
-| a leftover with chunks in it and no mark | start, **keep it**, name it once |
-| a leftover whose contents or mark cannot be established | start, keep it, name it once |
-| a link at either name | start, keep it, name it once |
-| a name retirement never created | start, ignore it entirely |
+| what is on disk | what the cleanup does | what the node then serves | disk back |
+|---|---|---|---|
+| nothing, or a root that does not exist yet | nothing | whatever it stores from here | n/a |
+| a leftover carrying its `RETIRED` mark | remove it in the background, report the space once it is back | its file store, which is all of it | yes |
+| a leftover with nothing in it | remove it | its file store | yes |
+| a leftover with chunks in it and no mark | **keep it**, name it once | its file store only — **not** what is in that directory | no |
+| a leftover whose contents or mark cannot be established | keep it, name it once | its file store only | no |
+| a link at either name | keep it, name it once | its file store only | no |
+| a name retirement never created | ignore it entirely | its file store | no |
 
-The rows that keep something are the point. A node in one of those states runs, serves its
-file store, keeps its old one, and tells its operator exactly what it is and what to do about
-it. It does not get its disk back, which is the honest cost of not being able to prove that
-directory is safe to delete.
+The rows that keep something are the point, and the third column is the part it would be easy
+to round off. **Kept is not the same as available.** There is no LMDB reader in this build, so
+a node that keeps a directory keeps its bytes on disk and cannot serve one of them. For a node
+that was part-way through the migration that is the tail it had not copied yet; for a node that
+skipped the previous release altogether it is everything it holds, and such a node serves only
+what it refetches from here on, exactly as a new node would, while its old bytes sit there
+costing disk.
+
+That is worth being plain about because it is the whole price of the decision: the data is
+kept so that it is still there to be recovered by hand or by a future build, not because this
+release can do anything with it. What the node gets is its own service back; what it does not
+get is that disk, which is the honest cost of not being able to prove the directory is safe to
+delete.
 
 Two things are never done, both because a name is not evidence of what is behind it.
 
@@ -143,9 +152,14 @@ a `chunks.mdb.retired-keep-this` an operator put there, and `.007` and `.999999`
 retirement cannot have produced. The suffix is parsed and written back out so it has to match
 itself, and there is a test that plants every near miss.
 
-The deletion runs on its own thread and nothing waits for it. `remove_dir_all` over a store
-with millions of files runs for minutes and must not be on the startup path. It deletes in
-place: there is nothing to get out of the way, because the directory holds no chunks and this
+The deletion runs on **one** background thread and nothing waits for it. `remove_dir_all` over
+a store with millions of files runs for minutes and must not be on the startup path. One
+thread rather than one per directory, and they are deleted in turn: the names this release
+recognises are the live directory, the unnumbered tombstone and sixty-four numbered ones, so a
+root that has been through enough restore cycles can present sixty-six at once, and a thread
+each would put sixty-six concurrent recursive deletions on the disk that is also serving
+chunks, at the moment a node is starting. Nothing is waiting on them, so doing them in turn
+costs nothing that matters. It deletes in place: there is nothing to get out of the way, because the directory holds no chunks and this
 build has no code that would read it if it did. An earlier draft renamed first and could run
 out of names to rename to, at which point it stopped removing anything at all, permanently.
 The space is only reported as returned once the deletion has actually finished, because a
@@ -156,6 +170,24 @@ name. It is written with `create_new`, so it is always an ordinary file; a direc
 or a FIFO wearing the name proves nothing, and this is the answer that authorises deleting
 every chunk underneath it. Testing existence alone would let anything at that path clear an
 unmigrated store for deletion.
+
+**The mark is believed, and not re-checked against the file store.** It is worth stating as an
+assumption rather than leaving it to be inferred, because it is the one that authorises every
+deletion here. `RETIRED` records that the *previous release* had copied that directory's
+contents out and verified them before it began deleting. This build cannot confirm that
+independently: it has no LMDB reader, so it cannot compare what is in the directory against
+what is in the file store, and no cheaper check is available — a file store that opens is not
+evidence that it holds any particular key, and counting keys proves nothing about which ones.
+
+So the mark is taken as final. For every state the previous release can actually produce, that
+is correct: it wrote the mark after the copy and the re-hash, and a marked directory in this
+release is one whose deletion was interrupted. The state it is wrong for is one no release
+produces — an operator restoring an old marked directory alongside a file store that is not the
+one it was retired against, or putting a file called `RETIRED` inside an environment by hand.
+This release will delete such a directory. That is accepted: the alternative is to keep every
+marked leftover for ever, which returns no disk on any node and defeats the release, and the
+states that would be protected are ones a person constructed. **An operator restoring a backup
+of `chunks.mdb` must not leave the `RETIRED` file in it.**
 
 **The mark is removed last.** `remove_dir_all` gives no promise about the order it unlinks
 things in, and if the mark went before the chunks did and the process stopped there, the next
@@ -185,12 +217,31 @@ replaced it has opened, and only over directories that provably hold no chunks. 
 never opens one, because storage is switched off, deletes nothing at all — it has established
 nothing about where those chunks went, and it has no use for the disk either.
 
+Said precisely, because the looser version of it is not true: **nothing here vetoes a start**.
+That is not the same as "every node starts". The file store is built before this runs, and a
+store that cannot open — an unreadable layout, a directory it cannot create, a lock another
+process holds — still stops the node, exactly as it did in the release before this one. What
+this release removes is the *other* reason a node could fail to start, the one its first draft
+introduced: being refused for what it was found carrying.
+
+**What may be deleted is decided by the previous release's own classifier**, not by a second
+reading of the same directory. The signal ADR-0014 put on the wire reports a node as finished
+when nothing under its root is holding chunks or unreadable, and this release is published on
+the strength of that count; so the cleanup calls that same function rather than carrying its
+own idea of which directories are finished with. Two classifiers could drift, and either
+direction is a fault: one would let a node delete a directory it was still reporting as
+unfinished, the other would leave it reporting `files` while paying for the disk for ever.
+There is a test that stages every shape a root can present and checks both directions of that
+correspondence, so a re-introduced private classifier fails there rather than on a fleet.
+
 **One accepted risk, stated rather than half-fixed.** The checks name a path and the unlinking
-names it again, so anything that can replace that directory between the two wins the race and
-is deleted through. Closing it needs a directory handle held across the whole operation and
-`unlinkat` against it, which Rust's standard library does not offer portably. It is accepted
-because whoever can win that race already has write access to this node's data directory and
-does not need the race to delete anything in it.
+names it again, so anything that can replace that directory between the two wins the race. It
+cuts both ways: an entry created inside a directory this found empty is deleted with it, and an
+entry created after the mark has gone leaves an unmarked directory with something in it, which
+every later start then keeps for good. Closing either needs a directory handle held across the
+whole operation and `unlinkat` against it, which Rust's standard library does not offer
+portably. Both are accepted because whoever can win that race already has write access to this
+node's data directory and does not need the race to delete anything in it.
 
 ### What this release does NOT delete
 
@@ -286,6 +337,15 @@ a subdirectory made unremovable, the attempt fails and the mark has to still be 
 that is what lets the next start recognise the directory rather than treat it as unmigrated
 forever.
 
+Three properties are pinned that the earlier draft had no test for, because it had no code for
+them either. **The correspondence with the fleet signal**: every shape a root can present is
+staged at once, each is classified before anything is removed, and afterwards each is asserted
+gone exactly when it was called harmless and still there exactly when it was not — both
+directions, so a classifier that drifts either way fails here. **Sixty-six leftovers**, the
+whole namespace this release accepts, are removed by one start. And **a root that cannot be
+listed** has nothing removed from it, which is the case that used to return silently and left
+this record promising a warning nothing emitted.
+
 Through `NodeBuilder::build()`: a node with an unmigrated store starts under both
 `storage.enabled = true` and `false` and still has its chunks afterwards; a node with a marked
 one starts and the leftover goes; and a node whose file store cannot open — staged with a file
@@ -361,6 +421,22 @@ Named rather than implied. None is a regression; each is the state before this c
   chunk name over partial bytes, and a commitment built before anything reads it claims a
   chunk the node cannot produce. ADR-0014 states this; the forced power-loss run is still an
   open gate.
+- **There is no supported way to hold a node on an earlier release.** This is named here
+  because it is what makes the fleet gate a gate rather than a preference. The on-disk format
+  rolls back cleanly — the previous release reads the same one-file-per-chunk layout, and a
+  legacy directory this release kept is one it can still pick up and finish — but the
+  *operation* does not: `build_upgrade_monitor` is called unconditionally, `UpgradeConfig` has
+  no field that disables it, and the monitor takes the newest eligible release, so a node put
+  back on the previous binary is dragged forward again within the hour. Rolling back to
+  v0.18.1 is worse than unsupported, because chunks this release accepted exist only in the
+  file store that build does not have.
+
+  The fix is an upgrade-subsystem one — a persisted disable, or a version ceiling — and it is
+  deliberately not in this release: it changes the mechanism every node uses to take every
+  release, which is not a change to make in the release that also deletes a store. It belongs
+  in its own change, with its own evidence. What this release does instead is not need it:
+  nothing it deletes is a directory whose contents were not already copied out, so there is no
+  state it creates that a rollback would have been the remedy for.
 
 ## Notes for AI-assisted work
 
