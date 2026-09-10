@@ -19,7 +19,7 @@ use evmlib::common::{Amount, TxHash};
 use evmlib::{EncodedPeerId, PaymentQuote, ProofOfPayment, RewardsAddress};
 use parking_lot::{Mutex, RwLock};
 use saorsa_core::identity::NodeIdentity;
-use saorsa_core::{DHTNode, MultiAddr, P2PNode, PeerId};
+use saorsa_core::{AddressType, DHTNode, MultiAddr, P2PNode, PeerId};
 use saorsa_transport::webrtc::{
     accept_pq_session, decode_pq_frame, encode_response_frame, parse_request_header,
     pq_frame_length, source_ip_bucket, transfer_timeout, BrowserCommitmentArtifact, BrowserNode,
@@ -36,7 +36,7 @@ use saorsa_transport::webrtc_direct::{
 };
 use std::collections::HashMap;
 use std::future::Future;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -52,8 +52,7 @@ const MAX_FIND_NODE_RESULTS: usize = 20;
 const FIRST_DATA_CHANNEL_TIMEOUT: Duration = Duration::from_secs(15);
 const REQUEST_IDLE_TIMEOUT: Duration = Duration::from_mins(1);
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-const AUTOMATIC_PORT_MIN: u32 = 32_768;
-const AUTOMATIC_PORT_COUNT: u32 = 65_536 - AUTOMATIC_PORT_MIN;
+const ADDRESS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const TRACKED_SOURCE_MULTIPLIER: usize = 4;
 const MIN_TRACKED_SOURCES: usize = 64;
 const CONNECTION_CAPACITY_ERROR: &str = "global connection capacity exhausted";
@@ -71,72 +70,6 @@ const SOURCE_BYTE_CAPACITY_ERROR: &str = "source in-flight byte capacity exhaust
 /// bound and is safe for deployment tooling to copy or print. Its contents are
 /// public bootstrap metadata, not key material.
 pub const WEBRTC_DIRECT_MULTIADDR_FILENAME: &str = "webrtc-direct.multiaddr";
-
-/// Resolve the zero-configuration listener values used by ordinary nodes.
-///
-/// A zero bind port is mapped deterministically from the native QUIC port into
-/// the high UDP range. That keeps the complete browser multiaddress stable
-/// across restarts and fits the high-port firewall range used by `ant-testnet`.
-/// A wildcard bind without an explicit advertised address prefers the public
-/// IP observed by the native transport and otherwise uses the IP selected by
-/// the host routing table.
-pub fn resolve_automatic_config(
-    config: &WebRtcDirectConfig,
-    native_port: u16,
-    observed_ip: Option<IpAddr>,
-) -> WebRtcDirectConfig {
-    let mut resolved = config.clone();
-    if resolved.bind.port() == 0 {
-        let port = resolved
-            .advertised_addr
-            .map_or_else(|| automatic_webrtc_port(native_port), |addr| addr.port());
-        resolved.bind.set_port(port);
-    }
-
-    if resolved.advertised_addr.is_none() && resolved.bind.ip().is_unspecified() {
-        let bind_is_ipv4 = resolved.bind.is_ipv4();
-        let advertised_ip = observed_ip
-            .filter(|ip| ip.is_ipv4() == bind_is_ipv4 && !ip.is_unspecified())
-            .or_else(|| routed_local_ip(bind_is_ipv4))
-            .unwrap_or({
-                if bind_is_ipv4 {
-                    IpAddr::V4(Ipv4Addr::LOCALHOST)
-                } else {
-                    IpAddr::V6(Ipv6Addr::LOCALHOST)
-                }
-            });
-        resolved.advertised_addr = Some(SocketAddr::new(advertised_ip, resolved.bind.port()));
-    }
-
-    resolved
-}
-
-fn automatic_webrtc_port(native_port: u16) -> u16 {
-    let native = u32::from(native_port);
-    let offset = if native < AUTOMATIC_PORT_MIN {
-        native
-    } else {
-        (native - AUTOMATIC_PORT_MIN + AUTOMATIC_PORT_COUNT / 2) % AUTOMATIC_PORT_COUNT
-    };
-    u16::try_from(AUTOMATIC_PORT_MIN + offset).unwrap_or(u16::MAX)
-}
-
-fn routed_local_ip(ipv4: bool) -> Option<IpAddr> {
-    let (bind, route_probe) = if ipv4 {
-        (
-            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
-            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 1), 9)),
-        )
-    } else {
-        (
-            SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
-            SocketAddr::from((Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1), 9)),
-        )
-    };
-    let socket = UdpSocket::bind(bind).ok()?;
-    socket.connect(route_probe).ok()?;
-    socket.local_addr().ok().map(|addr| addr.ip())
-}
 
 /// Browser endpoints known to one or more listeners in the same process.
 ///
@@ -474,8 +407,9 @@ impl Drop for ConnectionAdmission {
 
 /// A running browser listener and the endpoint clients use to reach it.
 pub struct WebRtcDirectServer {
-    /// Direct endpoint with its certificate pin embedded in the multiaddress.
-    pub endpoint: BrowserEndpoint,
+    /// Initial endpoint, absent until native address discovery yields a usable IP.
+    /// Later updates are published through the DHT and the endpoint file.
+    pub endpoint: Option<BrowserEndpoint>,
     /// Listener background task.
     pub task: JoinHandle<()>,
 }
@@ -508,47 +442,99 @@ pub async fn spawn(
     .await
     .map_err(|error| Error::Startup(format!("failed to bind WebRTC Direct listener: {error}")))?;
     let local_addr = listener.local_addr();
-    let advertised_addr = advertised_addr(config, local_addr)?;
-    let peer_id = *p2p.peer_id();
     let identity = Arc::clone(p2p.transport().node_identity());
-    let browser_endpoint =
-        BrowserEndpoint::new(advertised_addr, peer_id.to_bytes(), certificate_sha256)
-            .map_err(|error| Error::Config(error.to_string()))?;
-    let supplemental_endpoint = browser_endpoint.multiaddr.parse().map_err(|error| {
-        Error::Startup(format!(
-            "shared WebRTC endpoint codec produced an invalid transport address: {error}"
-        ))
-    })?;
-    persist_browser_endpoint(root_dir, &browser_endpoint).await?;
-    if let Some(catalog) = endpoint_catalog.as_ref() {
-        catalog.insert(peer_id, browser_endpoint.clone());
-    }
     let state = Arc::new(ServerState {
         config: config.clone(),
         identity,
-        p2p: Arc::clone(&p2p),
+        p2p,
         ant_protocol,
         payment,
-        endpoint: browser_endpoint.clone(),
+        endpoint: RwLock::new(None),
         endpoint_catalog,
     });
+    refresh_browser_endpoint(&state, root_dir, local_addr, certificate_sha256).await?;
+    let browser_endpoint = state.endpoint.read().clone();
+    if browser_endpoint.is_none() {
+        // Do not leave a previous run's socket advertised while discovery is pending.
+        let path = root_dir.join(WEBRTC_DIRECT_MULTIADDR_FILENAME);
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
     let resources = ListenerResources::new(config);
-
-    info!(
-        bind = %local_addr,
-        multiaddr = %browser_endpoint.multiaddr,
-        certificate = %certificate_path.display(),
-        "ADR-0009 WebRTC Direct listening"
-    );
-
-    let task = tokio::spawn(serve_webrtc(listener, state, resources, shutdown));
-    p2p.dht_manager()
-        .set_supplemental_self_addresses(vec![supplemental_endpoint])
-        .await;
+    info!(bind = %local_addr, certificate = %certificate_path.display(),
+        "ADR-0009 WebRTC Direct listening");
+    let root_dir = root_dir.to_path_buf();
+    let task = tokio::spawn(async move {
+        // Both futures are owned by the listener task. Address publication cannot
+        // block accepting sessions, and shutdown cancels a pending publication.
+        tokio::join!(
+            serve_webrtc(listener, Arc::clone(&state), resources, shutdown.clone()),
+            async {
+                let refresh = async {
+                    let mut interval = tokio::time::interval(ADDRESS_REFRESH_INTERVAL);
+                    loop {
+                        interval.tick().await;
+                        if let Err(error) = refresh_browser_endpoint(
+                            &state,
+                            &root_dir,
+                            local_addr,
+                            certificate_sha256,
+                        )
+                        .await
+                        {
+                            warn!(%error, "Failed to update WebRTC Direct endpoint");
+                        }
+                    }
+                };
+                tokio::select! {
+                    () = shutdown.cancelled() => {},
+                    () = refresh => {},
+                }
+            },
+        );
+    });
     Ok(WebRtcDirectServer {
         endpoint: browser_endpoint,
         task,
     })
+}
+
+async fn refresh_browser_endpoint(
+    state: &ServerState,
+    root_dir: &Path,
+    local_addr: SocketAddr,
+    certificate_sha256: [u8; 32],
+) -> Result<()> {
+    let native = state.p2p.dht_manager().local_dht_node().await;
+    let Some(address) = advertised_addr(&state.config, local_addr, &native.typed_addresses())
+    else {
+        // As with native publication, keep the last nonempty address set.
+        return Ok(());
+    };
+    let peer_id = *state.p2p.peer_id();
+    let endpoint = BrowserEndpoint::new(address, peer_id.to_bytes(), certificate_sha256)
+        .map_err(|error| Error::Config(error.to_string()))?;
+    if state.endpoint.read().as_ref() == Some(&endpoint) {
+        return Ok(());
+    }
+    let supplemental = endpoint
+        .multiaddr
+        .parse()
+        .map_err(|error| Error::Startup(format!("invalid WebRTC transport address: {error}")))?;
+    persist_browser_endpoint(root_dir, &endpoint).await?;
+    if let Some(catalog) = state.endpoint_catalog.as_ref() {
+        catalog.insert(peer_id, endpoint.clone());
+    }
+    *state.endpoint.write() = Some(endpoint);
+    state
+        .p2p
+        .dht_manager()
+        .set_supplemental_self_addresses(vec![supplemental])
+        .await;
+    Ok(())
 }
 
 async fn persist_browser_endpoint(root_dir: &Path, endpoint: &BrowserEndpoint) -> Result<()> {
@@ -691,16 +677,25 @@ async fn load_or_generate_certificate(path: &Path) -> Result<WebRtcCertificate> 
     }
 }
 
-fn advertised_addr(config: &WebRtcDirectConfig, local_addr: SocketAddr) -> Result<SocketAddr> {
+fn advertised_addr(
+    config: &WebRtcDirectConfig,
+    local_addr: SocketAddr,
+    native_addresses: &[(MultiAddr, AddressType)],
+) -> Option<SocketAddr> {
     if let Some(addr) = config.advertised_addr {
-        return Ok(addr);
+        return Some(addr);
     }
-    if local_addr.ip().is_unspecified() {
-        return Err(Error::Config(
-            "webrtc_direct.advertised_addr is required for a wildcard bind".to_string(),
-        ));
+    if !local_addr.ip().is_unspecified() {
+        return Some(local_addr);
     }
-    Ok(local_addr)
+    // The native self-address view already applies observation, scope and
+    // priority policy. Relay sockets belong to the relay, not this listener.
+    native_addresses
+        .iter()
+        .filter(|(_, kind)| *kind != AddressType::Relay)
+        .filter_map(|(address, _)| address.socket_addr())
+        .find(|addr| addr.is_ipv4() == local_addr.is_ipv4())
+        .map(|addr| SocketAddr::new(addr.ip(), local_addr.port()))
 }
 
 #[allow(clippy::significant_drop_tightening)]
@@ -1402,13 +1397,20 @@ async fn process_request(
 }
 
 fn hello_response(request_id: u64, state: &ServerState) -> Response {
+    let Some(endpoint) = state.endpoint.read().clone() else {
+        return Response::error(
+            request_id,
+            "endpoint_unavailable",
+            "address discovery is pending".to_string(),
+        );
+    };
     Response::ok(
         request_id,
         ResponseBody::Hello {
             protocol: BROWSER_PROTOCOL_NAME.to_string(),
             peer_id: state.p2p.peer_id().to_hex(),
             max_chunk_size: MAX_CHUNK_SIZE,
-            endpoint: state.endpoint.clone(),
+            endpoint,
             payment: state.payment.clone(),
             capabilities: vec![
                 "chunk_protocol".into(),
@@ -1897,7 +1899,7 @@ struct ServerState {
     p2p: Arc<P2PNode>,
     ant_protocol: Option<Arc<AntProtocol>>,
     payment: BrowserPaymentNetwork,
-    endpoint: BrowserEndpoint,
+    endpoint: RwLock<Option<BrowserEndpoint>>,
     endpoint_catalog: Option<Arc<BrowserEndpointCatalog>>,
 }
 
@@ -1910,6 +1912,7 @@ struct ServerState {
 )]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
 
     #[test]
     fn default_resource_limits_preserve_headroom_for_other_sources() {
@@ -2220,45 +2223,56 @@ mod tests {
     }
 
     #[test]
-    fn derives_stable_high_port_from_native_port() {
-        assert_eq!(automatic_webrtc_port(10_000), 42_768);
-        assert_eq!(automatic_webrtc_port(10_001), 42_769);
-        assert_eq!(automatic_webrtc_port(32_768), 49_152);
-        assert_ne!(automatic_webrtc_port(40_000), 40_000);
-    }
-
-    #[test]
-    fn resolves_default_public_listener_from_observed_ip() {
+    fn wildcard_publication_waits_for_native_discovery_and_excludes_relays() {
         let config = WebRtcDirectConfig::default();
-        let resolved = resolve_automatic_config(
-            &config,
-            10_000,
-            Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))),
-        );
-
-        assert_eq!(resolved.bind, "0.0.0.0:42768".parse().expect("bind"));
+        let local = "0.0.0.0:43210".parse().expect("bound listener");
+        assert_eq!(advertised_addr(&config, local, &[]), None);
+        let addresses = vec![
+            (
+                MultiAddr::quic("203.0.113.1:1000".parse().expect("relay")),
+                AddressType::Relay,
+            ),
+            (
+                MultiAddr::quic("[2001:db8::1]:1000".parse().expect("IPv6")),
+                AddressType::Direct,
+            ),
+        ];
+        assert_eq!(advertised_addr(&config, local, &addresses), None);
+        let mut addresses = addresses;
+        addresses.push((
+            MultiAddr::quic("198.51.100.2:1000".parse().expect("observed")),
+            AddressType::Unverified,
+        ));
         assert_eq!(
-            resolved.advertised_addr,
-            Some("203.0.113.7:42768".parse().expect("advertised"))
+            advertised_addr(&config, local, &addresses),
+            Some("198.51.100.2:43210".parse().expect("WebRTC"))
+        );
+        addresses[2].0 = MultiAddr::quic("198.51.100.3:2000".parse().expect("new observed"));
+        assert_eq!(
+            advertised_addr(&config, local, &addresses),
+            Some("198.51.100.3:43210".parse().expect("updated WebRTC"))
         );
     }
 
-    #[test]
-    fn explicit_listener_addresses_are_preserved() {
+    #[tokio::test]
+    async fn automatic_port_is_os_assigned_and_explicit_advertisement_is_independent() {
+        let certificate = WebRtcCertificate::generate().expect("certificate");
+        let listener =
+            WebRtcDirectListener::bind("127.0.0.1:0".parse().expect("bind"), certificate)
+                .await
+                .expect("ephemeral listener");
+        let local = listener.local_addr();
+        assert_ne!(local.port(), 0);
+        assert_eq!(
+            advertised_addr(&WebRtcDirectConfig::default(), local, &[]),
+            Some(local)
+        );
         let config = WebRtcDirectConfig {
-            bind: "0.0.0.0:11000".parse().expect("bind"),
             advertised_addr: Some("198.51.100.4:11000".parse().expect("advertised")),
             ..WebRtcDirectConfig::default()
         };
-
-        assert_eq!(
-            resolve_automatic_config(&config, 10_000, None).bind,
-            config.bind
-        );
-        assert_eq!(
-            resolve_automatic_config(&config, 10_000, None).advertised_addr,
-            config.advertised_addr
-        );
+        assert_eq!(advertised_addr(&config, local, &[]), config.advertised_addr);
+        listener.close().await.expect("close listener");
     }
 
     #[test]
@@ -2314,7 +2328,7 @@ mod tests {
     #[test]
     fn derives_ipv6_advertised_address() {
         let config = WebRtcDirectConfig::default();
-        let addr = advertised_addr(&config, "[::1]:23456".parse().expect("socket"))
+        let addr = advertised_addr(&config, "[::1]:23456".parse().expect("socket"), &[])
             .expect("advertised address");
         assert_eq!(addr, "[::1]:23456".parse().expect("socket"));
     }

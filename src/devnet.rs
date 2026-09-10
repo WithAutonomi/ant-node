@@ -1038,7 +1038,7 @@ impl Devnet {
                     node.index
                 ))
             })?;
-            node.browser_endpoint = Some(server.endpoint);
+            node.browser_endpoint = server.endpoint;
             node.webrtc_direct_task = Some(server.task);
         }
 

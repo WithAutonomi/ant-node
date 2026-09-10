@@ -34,14 +34,14 @@ pub struct Cli {
 
     /// Override the default ADR-0009 WebRTC Direct UDP bind address.
     ///
-    /// Port zero selects the stable automatic port derived from `--port`.
+    /// Port zero asks the OS to choose an available UDP port.
     #[arg(long, env = "ANT_WEBRTC_DIRECT_BIND")]
     pub webrtc_direct_bind: Option<SocketAddr>,
 
     /// Override the UDP port used by the WebRTC Direct listener.
     ///
     /// This takes precedence over the port in `--webrtc-direct-bind`. Port zero
-    /// selects the automatic port derived from the native QUIC listener.
+    /// asks the OS to choose an available UDP port.
     #[arg(long, visible_alias = "webrtc-port", env = "ANT_WEBRTC_DIRECT_PORT")]
     pub webrtc_direct_port: Option<u16>,
 
