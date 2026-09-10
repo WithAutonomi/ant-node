@@ -1420,7 +1420,7 @@ fn hello_response(request_id: u64, state: &ServerState) -> Response {
             capabilities: vec![
                 "chunk_protocol".into(),
                 "find_node".into(),
-                saorsa_core::signed_address::ADDRESS_V2_CAPABILITY.into(),
+                ant_protocol::transport::ADDRESS_V2_CAPABILITY.into(),
                 "get_chunk".into(),
                 "quote_chunk".into(),
                 "put_chunk".into(),
