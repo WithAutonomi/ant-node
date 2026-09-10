@@ -156,13 +156,12 @@ pub struct NodeConfig {
 /// It exposes local closest-node lookup, immutable chunk reads, and paid
 /// content-addressed writes through the ordinary payment verifier.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct WebRtcDirectConfig {
     /// Enable the browser listener.
-    #[serde(default)]
     pub enabled: bool,
 
     /// UDP address for the WebRTC Direct listener.
-    #[serde(default = "default_webrtc_direct_bind")]
     pub bind: SocketAddr,
 
     /// Literal public UDP address advertised to browsers.
@@ -170,69 +169,56 @@ pub struct WebRtcDirectConfig {
     /// When omitted, a wildcard listener uses the native transport's observed
     /// external IP (or the host's routed IP) and an automatically assigned,
     /// stable high UDP port.
-    #[serde(default)]
     pub advertised_addr: Option<SocketAddr>,
 
     /// PEM file used to persist the stable DTLS certificate and private key.
     ///
     /// Relative paths are resolved against the node root directory by the
     /// caller. The default is `webrtc-direct.pem` beside the node identity.
-    #[serde(default)]
     pub certificate_path: Option<PathBuf>,
 
     /// Maximum simultaneously accepted browser sessions.
-    #[serde(default = "default_webrtc_direct_max_connections")]
     pub max_connections: usize,
 
     /// Maximum simultaneously accepted browser sessions from one source IP.
     ///
     /// This must be lower than [`Self::max_connections`] so one public source
     /// cannot occupy every listener slot.
-    #[serde(default = "default_webrtc_direct_max_connections_per_ip")]
     pub max_connections_per_ip: usize,
 
     /// Maximum simultaneously active `DataChannels` on one browser session.
-    #[serde(default = "default_webrtc_direct_max_channels_per_connection")]
     pub max_channels_per_connection: usize,
 
     /// Maximum simultaneously active `DataChannels` across the listener.
     ///
     /// Every admitted channel owns one handler task, so this is also the hard
     /// global channel-task bound.
-    #[serde(default = "default_webrtc_direct_max_channels")]
     pub max_channels: usize,
 
     /// Maximum requests being read or processed across the listener.
-    #[serde(default = "default_webrtc_direct_max_concurrent_requests")]
     pub max_concurrent_requests: usize,
 
     /// Token-bucket request rate across the listener, in requests per second.
-    #[serde(default = "default_webrtc_direct_max_requests_per_second")]
     pub max_requests_per_second: usize,
 
     /// Token-bucket request rate for one source IP, in requests per second.
-    #[serde(default = "default_webrtc_direct_max_requests_per_second_per_ip")]
     pub max_requests_per_second_per_ip: usize,
 
     /// Token-bucket request rate for one browser session, in requests per
     /// second.
-    #[serde(default = "default_webrtc_direct_max_requests_per_second_per_connection")]
     pub max_requests_per_second_per_connection: usize,
 
     /// Maximum bytes reserved by frames being assembled, decrypted, or sent
     /// across the listener.
-    #[serde(default = "default_webrtc_direct_max_in_flight_bytes")]
     pub max_in_flight_bytes: usize,
 
     /// Maximum in-flight frame bytes attributable to one source IP.
-    #[serde(default = "default_webrtc_direct_max_in_flight_bytes_per_ip")]
     pub max_in_flight_bytes_per_ip: usize,
 
     /// Maximum JSON request-header size, in bytes.
     ///
     /// Binary PUT content has a separate [`crate::ant_protocol::MAX_CHUNK_SIZE`]
     /// limit and is never JSON/base64 encoded.
-    #[serde(default = "default_webrtc_direct_max_request_bytes")]
     pub max_request_bytes: usize,
 }
 
@@ -777,6 +763,21 @@ mod tests {
         let config = WebRtcDirectConfig::default();
         assert_eq!(config.enabled, cfg!(feature = "webrtc-direct"));
         assert_eq!(config.bind, "0.0.0.0:0".parse().expect("wildcard bind"));
+    }
+
+    #[test]
+    fn partial_webrtc_config_preserves_defaults_and_explicit_disable() {
+        let absent: NodeConfig = toml::from_str("").unwrap();
+        let partial: NodeConfig = toml::from_str("[webrtc_direct]\nmax_connections = 48").unwrap();
+        assert_eq!(partial.webrtc_direct.enabled, absent.webrtc_direct.enabled);
+        assert_eq!(partial.webrtc_direct.bind, absent.webrtc_direct.bind);
+        assert_eq!(
+            partial.webrtc_direct.max_request_bytes,
+            absent.webrtc_direct.max_request_bytes
+        );
+        assert_eq!(partial.webrtc_direct.max_connections, 48);
+        let disabled: NodeConfig = toml::from_str("[webrtc_direct]\nenabled = false").unwrap();
+        assert!(!disabled.webrtc_direct.enabled);
     }
 
     #[test]
