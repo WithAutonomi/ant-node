@@ -9964,9 +9964,12 @@ async fn rebuild_and_rotate_commitment(
     p2p: &Arc<P2PNode>,
     config: &Arc<ReplicationConfig>,
 ) -> Result<()> {
-    // Not `all_keys()`: that is every name the store holds, and what belongs in a commitment
-    // is only what this node is still responsible for. The sentence that used to be here was
-    // cut off mid-way and described the bridge, which no longer exists.
+    // `all_keys()` is what the store can answer for: it already drops a file marked suspect or
+    // known-wrong, so a name that cannot be read is not offered here. It is NOT the commitment
+    // set — that is narrowed to the keys this node is still responsible for, by the filter a
+    // few lines below, and not by this call. The comment that used to be here said "not
+    // `all_keys()`" immediately above the call to it, which is the sort of thing that sends
+    // somebody to change the wrong layer.
     let stored_keys = storage
         .all_keys()
         .await

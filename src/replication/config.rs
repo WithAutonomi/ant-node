@@ -829,7 +829,11 @@ fn apply_and_announce(suspended: bool) {
     }
 }
 
-/// Set whether failing to hold a close-group chunk penalises.
+/// Set whether the close-group unheld-chunk penalty is SUSPENDED.
+///
+/// `true` holds the penalty off; `false` lets it be handed out. The parameter is the
+/// suspension, not the punishment, and reading it the other way round is how a caller meaning
+/// to switch punishing on switches it off.
 ///
 /// Startup applies the release policy through this. Tests that mean to exercise the
 /// penalty itself set it explicitly, so what they assert is not an accident of whichever
@@ -838,7 +842,10 @@ pub fn set_close_group_storage_penalty_suspended(suspended: bool) {
     CLOSE_GROUP_STORAGE_PENALTY_SUSPENDED.store(suspended, Ordering::Relaxed);
 }
 
-/// Whether failing to hold a close-group chunk currently penalises.
+/// Whether the close-group unheld-chunk penalty is currently SUSPENDED.
+///
+/// `true` means this node hands out no such penalty. The name says `suspended` and so does the
+/// value; it is not a report of whether the lane penalises.
 #[must_use]
 pub fn close_group_storage_penalty_suspended() -> bool {
     CLOSE_GROUP_STORAGE_PENALTY_SUSPENDED.load(Ordering::Relaxed)

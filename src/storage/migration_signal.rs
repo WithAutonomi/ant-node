@@ -221,7 +221,7 @@ pub(super) fn classify(dir: &Path) -> Leftover {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(_) => return Leftover::Unreadable,
     }
-    // No mark. A directory with nothing in it holds no chunks, so it cannot be hiding any:
+    // No mark. A directory with nothing in it is hiding nothing, whatever it once held:
     // that is what a cleanup interrupted between emptying a tombstone and removing it
     // leaves behind.
     std::fs::read_dir(dir).map_or(Leftover::Unreadable, |mut entries| {

@@ -3107,6 +3107,26 @@ mod tests {
     }
 
     /// Content plus the address it hashes to.
+    /// Every path under `root`, sorted, so a test can say the disk did not change.
+    fn tree_under(root: &Path) -> Vec<std::path::PathBuf> {
+        let mut found = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    stack.push(path.clone());
+                }
+                found.push(path);
+            }
+        }
+        found.sort();
+        found
+    }
+
     fn addressed(seed: &str) -> (XorName, Vec<u8>) {
         let content = format!("chunk-content-{seed}").into_bytes();
         (crate::client::compute_address(&content), content)
@@ -3143,6 +3163,12 @@ mod tests {
         let content = vec![0xAB; MAX_CHUNK_SIZE + 1];
         let address = crate::client::compute_address(&content);
 
+        // Every path under the store before the call, so "nothing was written" is asserted
+        // about the whole tree and not only about the name this chunk would have had. A
+        // regression that wrote a temporary somewhere else and tidied it up again would pass
+        // the narrower check.
+        let before = tree_under(dir.path());
+
         let err = store
             .put(&address, &content)
             .await
@@ -3161,6 +3187,11 @@ mod tests {
         assert!(
             !store.chunk_path(&address).exists(),
             "nothing may be left on disk: the refusal comes before the write"
+        );
+        assert_eq!(
+            tree_under(dir.path()),
+            before,
+            "the refusal touched the disk; it is supposed to come before anything is written"
         );
 
         // And a restart cannot find one either, which is what says the refusal left no

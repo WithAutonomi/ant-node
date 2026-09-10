@@ -149,7 +149,10 @@ fn why_it_is_kept(dir: &Path) -> &'static str {
     }
 }
 
-/// Delete every directory that provably holds no chunks, one after another.
+/// Delete every directory retirement had already cleared, one after another.
+///
+/// Not "every directory that holds no chunks": a marked one can hold the chunks the node shed,
+/// which retirement proved the close group holds and deliberately did not copy here.
 ///
 /// **One thread, in sequence.** The names this release recognises are the live directory, the
 /// unnumbered tombstone and sixty-four numbered ones, so a root that has been through enough
@@ -199,66 +202,129 @@ fn remove_all(dirs: Vec<PathBuf>) {
     }
 }
 
+/// The most entries this will look at in one leftover.
+///
+/// A retired chunk environment holds `data.mdb`, `lock.mdb` and the mark. Something with
+/// thousands of entries in it is not one, and reading a corrupt or hostile directory's whole
+/// listing into memory is how a cleanup takes the node down with it instead of returning some
+/// disk. Over this, the directory is kept and named, which is what happens to everything else
+/// this cannot make sense of.
+const MAX_ENTRIES: usize = 1024;
+
 /// Empty a directory, then remove its mark, then remove the directory.
 ///
 /// The order is the whole of it. `remove_dir_all` gives no promise about which entry it
 /// unlinks first, and the mark is the only thing that says this directory was finished with:
-/// if it goes before the chunks do and the process stops there, the next start finds an
+/// if it goes before the contents do and the process stops there, the next start finds an
 /// unmarked directory with data in it, decides it might be an unmigrated store, and keeps it
 /// forever. It is not one, but nothing on disk says so any more, and the node then reports
 /// itself as unfinished to the whole network for as long as it lives.
 ///
-/// Done this way there is no such moment. At every point either the mark is still there, and
-/// the next start resumes, or the directory is empty or gone, which is also finished with.
-///
-/// **On Unix nothing here names a path twice.** An earlier version checked
+/// **On Unix the directory is opened once and never named again.** An earlier version checked
 /// `symlink_metadata(dir)` and then re-opened the same path with `read_dir`, which follows a
 /// link. Anything that could replace the directory between the two — a local actor with write
 /// access to the node's data directory — could point it at a target elsewhere on the disk and
 /// have this process delete that target's contents instead. The node can reach more of the
 /// filesystem than such an actor can, so that is not one more way to lose data inside the data
-/// directory: it is a way to reach outside it. The directory is now opened once, `O_NOFOLLOW`
-/// and `O_DIRECTORY`, and every unlink is made against that handle, so the answer that
-/// authorises the deletion and the deletion itself are about the same inode by construction
-/// rather than by hope.
+/// directory: it is a way to reach outside it. One handle, opened `O_NOFOLLOW | O_DIRECTORY`,
+/// carries every gate and every unlink including the mark's, so the answer that authorises the
+/// deletion and the deletion itself are about the same inode by construction. A second open
+/// for the mark was a second window and is gone.
+///
+/// **Subdirectories are refused, not entered.** `O_NOFOLLOW` declines a trailing symlink; it
+/// says nothing about a mount point, and `openat` walks into one happily. A retired chunk
+/// environment is flat — two files and a mark — so a directory inside one is already something
+/// this build does not understand, and descending into it risks emptying a filesystem that has
+/// nothing to do with this node. Refusing also means there is no recursion to bound, no
+/// descriptor chain to exhaust, and no cycle a bind mount could build.
 ///
 /// The directory itself still goes by path, and that is safe on its own terms: `rmdir` refuses
-/// a symlink, so a swapped name fails the call rather than following it.
+/// a symlink, so a swapped name fails the call rather than following it. It does not preserve
+/// identity — a directory swapped for another real directory would be the one removed — but by
+/// then the only thing that can be removed is an empty directory, and removing an empty
+/// directory somebody else just put there costs nothing.
 ///
-/// Off Unix there is no `unlinkat`, so the path-based version stays. Its exposure is the same
-/// as the previous release's deleter had, and it is written down in ADR-0015 rather than
-/// implied.
+/// Off Unix there is no `unlinkat`. That build keeps the path-based version, with the same
+/// refusals and the same re-check, and the window the previous release's deleter also had.
 fn delete_mark_last(dir: &Path) -> std::io::Result<()> {
-    empty_but_for_the_mark(dir)?;
-    // Now, and only now, the thing that said it was safe to do any of the above.
-    remove_the_mark(dir)?;
-    // `rmdir`, not `unlink`: it refuses a symlink outright, so this one path cannot be
-    // followed anywhere even if the name were swapped between the emptying and here.
+    empty_and_unmark(dir)?;
+    // `rmdir`, not `unlink`: it refuses a symlink outright, so this one path cannot be followed
+    // anywhere even if the name were swapped after the emptying.
     std::fs::remove_dir(dir)
 }
 
-/// The gates, and then the contents, all against one directory handle.
+/// The gates, the contents and the mark, all against one directory handle.
 #[cfg(unix)]
-fn empty_but_for_the_mark(dir: &Path) -> std::io::Result<()> {
+fn empty_and_unmark(dir: &Path) -> std::io::Result<()> {
+    use rustix::fs::{AtFlags, FileType};
+
     let dirfd = open_dir_nofollow(dir)?;
 
     // Asked again, here, on the thread that does the deleting, and asked of the handle. The
     // classification that got this path happened on another thread and is already in the past.
-    // Opening with `O_NOFOLLOW | O_DIRECTORY` is what makes the re-ask sound: a link or a
-    // non-directory fails the open rather than being examined and then acted on separately.
+    //
+    // A REGULAR file, and the comparison masks with `S_IFMT` to say so. Testing
+    // `st_mode & S_IFREG == S_IFREG` is not that test: `S_IFLNK` and `S_IFSOCK` both contain
+    // every bit of `S_IFREG`, so a symlink or a socket wearing the mark's name would pass it
+    // and authorise deleting a store nothing had migrated.
     let marked = matches!(
-        rustix::fs::statat(&dirfd, RETIRED_MARKER, rustix::fs::AtFlags::SYMLINK_NOFOLLOW),
-        Ok(stat) if stat.st_mode & rustix::fs::FileType::RegularFile.as_raw_mode()
-            == rustix::fs::FileType::RegularFile.as_raw_mode()
+        rustix::fs::statat(&dirfd, RETIRED_MARKER, AtFlags::SYMLINK_NOFOLLOW),
+        Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile
     );
-    if !marked && !is_empty_but_for_the_mark(&dirfd)? {
+
+    let names = read_names(&dirfd)?;
+    if !marked
+        && names
+            .iter()
+            .any(|name| name.as_bytes() != RETIRED_MARKER.as_bytes())
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "it no longer carries the mark that said it was finished with, and it is not \
              empty either",
         ));
     }
-    empty_at(&dirfd, true)
+
+    for name in &names {
+        if name.as_bytes() == RETIRED_MARKER.as_bytes() {
+            continue;
+        }
+        match rustix::fs::unlinkat(&dirfd, name.as_c_str(), AtFlags::empty()) {
+            // Gone already is the outcome this wanted.
+            Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+            // A directory: EISDIR on Linux, EPERM on the BSDs and macOS. Both answers are
+            // about the inode the handle names, so neither can have been redirected — and
+            // neither is entered.
+            Err(rustix::io::Errno::ISDIR | rustix::io::Errno::PERM) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "it has a directory inside it, which a retired chunk environment never \
+                     has. Whatever it is, this build will not walk into it",
+                ))
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    // Asked once more, on the same handle, before the one irreversible step. `read_names` is a
+    // listing, not a snapshot: anything created while the loop above ran is not in it and is
+    // still here. Removing the mark over it is exactly the state the ordering exists to
+    // prevent — an unmarked directory with something in it, which every later start keeps.
+    if !is_empty_but_for_the_mark(&dirfd)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "something was created in it while it was being emptied, so the mark stays and \
+             the next start looks again",
+        ));
+    }
+
+    // Now, and only now, the thing that said it was safe to do any of the above.
+    match rustix::fs::unlinkat(&dirfd, RETIRED_MARKER, AtFlags::empty()) {
+        // Already gone is success: the directory qualified by being empty, or something else
+        // finished this.
+        Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Open a directory, refusing a link or anything that is not one, on the handle.
@@ -287,57 +353,16 @@ fn open_dir_nofollow(dir: &Path) -> std::io::Result<std::os::fd::OwnedFd> {
 /// Is there anything in here besides the mark?
 #[cfg(unix)]
 fn is_empty_but_for_the_mark(dirfd: &std::os::fd::OwnedFd) -> std::io::Result<bool> {
-    for name in read_names(dirfd)? {
-        if name.as_bytes() != RETIRED_MARKER.as_bytes() {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    Ok(read_names(dirfd)?
+        .iter()
+        .all(|name| name.as_bytes() == RETIRED_MARKER.as_bytes()))
 }
 
-/// Unlink everything under `dirfd`, optionally sparing the mark, recursing on handles.
-#[cfg(unix)]
-fn empty_at(dirfd: &std::os::fd::OwnedFd, spare_the_mark: bool) -> std::io::Result<()> {
-    use rustix::fs::AtFlags;
-
-    for name in read_names(dirfd)? {
-        if spare_the_mark && name.as_bytes() == RETIRED_MARKER.as_bytes() {
-            continue;
-        }
-        // Try the plain unlink first. A directory answers EISDIR (EPERM on some systems), and
-        // that answer is about the inode the handle names, so it cannot be redirected. Doing
-        // it this way round also means the common case — a file — costs one syscall.
-        match rustix::fs::unlinkat(dirfd, name.as_c_str(), AtFlags::empty()) {
-            // Gone already is the outcome this wanted.
-            Ok(()) | Err(rustix::io::Errno::NOENT) => continue,
-            // A directory: EISDIR on Linux, EPERM on the BSDs and macOS. Both answers are
-            // about the inode the handle names, so neither can have been redirected.
-            Err(rustix::io::Errno::ISDIR | rustix::io::Errno::PERM) => {}
-            Err(e) => return Err(e.into()),
-        }
-        // A subdirectory. Opened `O_NOFOLLOW` from this handle, emptied the same way, then
-        // removed by name against the handle that named it.
-        let child = rustix::fs::openat(
-            dirfd,
-            name.as_c_str(),
-            rustix::fs::OFlags::RDONLY
-                | rustix::fs::OFlags::DIRECTORY
-                | rustix::fs::OFlags::NOFOLLOW
-                | rustix::fs::OFlags::CLOEXEC,
-            rustix::fs::Mode::empty(),
-        )?;
-        empty_at(&child, false)?;
-        drop(child);
-        rustix::fs::unlinkat(dirfd, name.as_c_str(), AtFlags::REMOVEDIR)?;
-    }
-    Ok(())
-}
-
-/// Every name in a directory handle, without `.` and `..`.
+/// Every name in a directory handle, without `.` and `..`, and never more than a leftover has.
 ///
-/// Collected rather than streamed: the unlinking below changes what a live iterator would see
-/// next, and reading the whole list first is both simpler to reason about and small — these
-/// directories hold a database file, a lock file and a mark.
+/// Collected rather than streamed, because unlinking while a directory stream is open is not
+/// something any filesystem promises to keep coherent. It is a listing and not a snapshot, so
+/// the caller asks again before the step it cannot take back.
 #[cfg(unix)]
 fn read_names(dirfd: &std::os::fd::OwnedFd) -> std::io::Result<Vec<std::ffi::CString>> {
     let mut names = Vec::new();
@@ -348,14 +373,26 @@ fn read_names(dirfd: &std::os::fd::OwnedFd) -> std::io::Result<Vec<std::ffi::CSt
         if name.to_bytes() == b"." || name.to_bytes() == b".." {
             continue;
         }
+        if names.len() >= MAX_ENTRIES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "it holds more than {MAX_ENTRIES} entries, which a retired chunk \
+                     environment never does"
+                ),
+            ));
+        }
         names.push(name.to_owned());
     }
     Ok(names)
 }
 
 /// The path-based version, for the platforms with no `unlinkat`.
+///
+/// The same refusals and the same re-check, so the two do not drift on anything but the window
+/// between naming a path and acting on it, which is what `unlinkat` closes and this cannot.
 #[cfg(not(unix))]
-fn empty_but_for_the_mark(dir: &Path) -> std::io::Result<()> {
+fn empty_and_unmark(dir: &Path) -> std::io::Result<()> {
     if !matches!(std::fs::symlink_metadata(dir), Ok(meta) if meta.is_dir()) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -366,47 +403,66 @@ fn empty_but_for_the_mark(dir: &Path) -> std::io::Result<()> {
         std::fs::symlink_metadata(dir.join(RETIRED_MARKER)),
         Ok(meta) if meta.is_file()
     );
-    if !marked && std::fs::read_dir(dir)?.next().is_some() {
+    let names = read_names_by_path(dir)?;
+    if !marked && names.iter().any(|name| name != RETIRED_MARKER) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "it no longer carries the mark that said it was finished with, and it is not \
              empty either",
         ));
     }
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        if entry.file_name() == RETIRED_MARKER {
+    for name in &names {
+        if name == RETIRED_MARKER {
             continue;
         }
-        if entry.file_type()?.is_dir() {
-            std::fs::remove_dir_all(entry.path())?;
-        } else {
-            std::fs::remove_file(entry.path())?;
+        let path = dir.join(name);
+        if matches!(std::fs::symlink_metadata(&path), Ok(meta) if meta.is_dir()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "it has a directory inside it, which a retired chunk environment never has. \
+                 Whatever it is, this build will not walk into it",
+            ));
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
         }
     }
-    Ok(())
-}
-
-/// Remove the mark, which is what said any of the above was allowed.
-#[cfg(unix)]
-fn remove_the_mark(dir: &Path) -> std::io::Result<()> {
-    let dirfd = open_dir_nofollow(dir)?;
-    match rustix::fs::unlinkat(&dirfd, RETIRED_MARKER, rustix::fs::AtFlags::empty()) {
-        // Already gone is success: something else finished this, or there was never a mark
-        // because the directory qualified by being empty.
-        Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
-        Err(e) => Err(e.into()),
+    if read_names_by_path(dir)?
+        .iter()
+        .any(|name| name != RETIRED_MARKER)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "something was created in it while it was being emptied, so the mark stays and \
+             the next start looks again",
+        ));
     }
-}
-
-/// Remove the mark, which is what said any of the above was allowed.
-#[cfg(not(unix))]
-fn remove_the_mark(dir: &Path) -> std::io::Result<()> {
     match std::fs::remove_file(dir.join(RETIRED_MARKER)) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+/// Every name in a directory, and never more than a leftover has.
+#[cfg(not(unix))]
+fn read_names_by_path(dir: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        if names.len() >= MAX_ENTRIES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "it holds more than {MAX_ENTRIES} entries, which a retired chunk \
+                     environment never does"
+                ),
+            ));
+        }
+        names.push(entry?.file_name());
+    }
+    Ok(names)
 }
 
 #[cfg(test)]
@@ -436,6 +492,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("data.mdb"), b"chunks").unwrap();
         dir
+    }
+
+    /// A socket at `path`, for the one type test that needs one.
+    #[cfg(unix)]
+    fn bind_socket(path: &Path) {
+        std::os::unix::net::UnixListener::bind(path).expect("bind");
     }
 
     fn mark_retired(dir: &Path) {
@@ -723,6 +785,134 @@ mod tests {
         let not_a_dir = root.path().join("file");
         std::fs::write(&not_a_dir, b"x").unwrap();
         assert!(open_dir_nofollow(&not_a_dir).is_err());
+    }
+
+    /// Only a regular file is the mark. A link wearing its name is not, and neither is a socket.
+    ///
+    /// This is a type test, and the arithmetic is the whole of it. `S_IFLNK` and `S_IFSOCK` each
+    /// contain every bit of `S_IFREG`, so `st_mode & S_IFREG == S_IFREG` is true for all three
+    /// and is not a test for a regular file at all. Masking with `S_IFMT` is.
+    ///
+    /// What it costs to get wrong: the classifier on the main thread can call a leftover
+    /// harmless while it is empty, and between that and the worker opening it, a restore or a
+    /// local actor can fill it with a store nothing migrated and drop a symlink called `RETIRED`
+    /// beside the contents. The worker asks again — that re-ask is the whole reason it exists —
+    /// and a mask that accepts a link answers yes, and the store goes.
+    ///
+    /// Asserted against `delete_mark_last` rather than against the classifier, because the
+    /// classifier is not where the re-ask happens and a test on it cannot see this.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_regular_file_is_the_mark_when_the_deleting_thread_asks() {
+        let root = TempDir::new().unwrap();
+
+        // A link at the mark's name, pointing at a real regular file so that following it
+        // would find one.
+        let linked = env_with_chunks(root.path(), "chunks.mdb.retired.11");
+        let real_file = root.path().join("somewhere-else");
+        std::fs::write(&real_file, b"not the mark").unwrap();
+        std::os::unix::fs::symlink(&real_file, linked.join(RETIRED_MARKER)).unwrap();
+
+        assert!(
+            delete_mark_last(&linked).is_err(),
+            "a symlink was accepted as the mark, which authorises deleting an unmigrated store"
+        );
+        assert!(
+            linked.join("data.mdb").exists(),
+            "and the store it was guarding is gone"
+        );
+
+        // A socket at the mark's name. Same arithmetic, different type.
+        let socketed = env_with_chunks(root.path(), "chunks.mdb.retired.12");
+        bind_socket(&socketed.join(RETIRED_MARKER));
+        assert!(
+            delete_mark_last(&socketed).is_err(),
+            "a socket was accepted as the mark"
+        );
+        assert!(socketed.join("data.mdb").exists());
+
+        // And the real thing still works, or none of the above proves anything.
+        let genuine = env_with_chunks(root.path(), "chunks.mdb.retired.13");
+        mark_retired(&genuine);
+        assert!(delete_mark_last(&genuine).is_ok());
+        assert!(!genuine.exists());
+    }
+
+    /// A directory inside a leftover is refused, never entered.
+    ///
+    /// `O_NOFOLLOW` declines a trailing symlink and says nothing about a mount point, and
+    /// `openat` walks into one without complaint. A retired chunk environment is flat — two
+    /// files and a mark — so a directory inside one is already something this build does not
+    /// understand, and descending into it could empty a filesystem that has nothing to do with
+    /// this node. Refusing also leaves no recursion to bound and no cycle a bind mount could
+    /// build.
+    #[test]
+    fn a_directory_inside_a_leftover_is_refused_rather_than_entered() {
+        let root = TempDir::new().unwrap();
+        let env = env_with_chunks(root.path(), LEGACY_ENV_DIR);
+        mark_retired(&env);
+        let inside = env.join("somewhere");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::write(inside.join("not-ours"), b"another filesystem's problem").unwrap();
+
+        assert!(
+            delete_mark_last(&env).is_err(),
+            "a directory inside a leftover was walked into"
+        );
+        assert!(
+            inside.join("not-ours").exists(),
+            "and its contents were deleted"
+        );
+        assert!(
+            env.join(RETIRED_MARKER).exists(),
+            "the mark has to survive a refusal, or the next start cannot tell what this is"
+        );
+    }
+
+    /// A listing is not a snapshot, so the mark is not removed over something that arrived late.
+    ///
+    /// The names are read once and then unlinked one by one. Anything created after that read
+    /// is not in the list and is still there when the loop finishes. Removing the mark over it
+    /// leaves an unmarked directory with something in it, which is the exact state the ordering
+    /// exists to prevent and which every later start then keeps for good.
+    ///
+    /// The real interleaving needs a write between the read and the mark's removal; staged here
+    /// by leaving an entry the loop was never told about, which is the same state it produces.
+    #[test]
+    fn the_mark_is_not_removed_over_an_entry_that_arrived_late() {
+        let root = TempDir::new().unwrap();
+        let env = env_with_chunks(root.path(), LEGACY_ENV_DIR);
+        mark_retired(&env);
+
+        // A name the loop cannot unlink, so the directory is still non-empty when the re-ask
+        // happens. What matters is the answer to that re-ask, not how the entry got there.
+        let stubborn = env.join("arrived-late");
+        std::fs::create_dir_all(&stubborn).unwrap();
+
+        assert!(delete_mark_last(&env).is_err());
+        assert!(
+            env.join(RETIRED_MARKER).exists(),
+            "the mark went while the directory still had something in it, so the next start \
+             sees an unmigrated store and keeps it for ever"
+        );
+    }
+
+    /// A directory far wider than any leftover is refused rather than read into memory.
+    #[test]
+    fn an_implausibly_wide_leftover_is_refused() {
+        let root = TempDir::new().unwrap();
+        let env = root.path().join(LEGACY_ENV_DIR);
+        std::fs::create_dir_all(&env).unwrap();
+        mark_retired(&env);
+        for n in 0..(MAX_ENTRIES + 8) {
+            std::fs::write(env.join(format!("e{n}")), b"x").unwrap();
+        }
+
+        assert!(
+            delete_mark_last(&env).is_err(),
+            "a directory with more entries than any leftover has was read in full"
+        );
+        assert!(env.join(RETIRED_MARKER).exists());
     }
 
     /// The cleanup removes exactly what the fleet signal calls finished with, and nothing else.

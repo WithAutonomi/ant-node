@@ -136,7 +136,7 @@ and it is the network that holds them afterwards.
 | what is on disk | what the cleanup does | what the node then serves | disk back |
 |---|---|---|---|
 | nothing, or a root that does not exist yet | nothing | whatever it stores from here | n/a |
-| a leftover carrying its `RETIRED` mark | remove it in the background, report the space once it is back | its file store, which is all of it | yes |
+| a leftover carrying its `RETIRED` mark | remove it in the background, report the space once it is back | its file store — everything it kept, and nothing it shed | yes |
 | a leftover with nothing in it | remove it | its file store | yes |
 | a leftover with chunks in it and no mark | **keep it**, name it once | its file store only — **not** what is in that directory | no |
 | a leftover whose contents or mark cannot be established | keep it, name it once | its file store only | no |
@@ -177,7 +177,7 @@ recognises are the live directory, the unnumbered tombstone and sixty-four numbe
 root that has been through enough restore cycles can present sixty-six at once, and a thread
 each would put sixty-six concurrent recursive deletions on the disk that is also serving
 chunks, at the moment a node is starting. Nothing is waiting on them, so doing them in turn
-costs nothing that matters. It deletes in place: there is nothing to get out of the way, because the directory holds no chunks and this
+costs nothing that matters. It deletes in place: there is nothing to get out of the way, because the directory holds nothing this node is answerable for and this
 build has no code that would read it if it did. An earlier draft renamed first and could run
 out of names to rename to, at which point it stopped removing anything at all, permanently.
 The space is only reported as returned once the deletion has actually finished, because a
@@ -233,7 +233,8 @@ in a node that runs, a warning that names the directory, and disk that has not c
 which is a worse place than success and a far better one than a restart loop.
 
 Nothing here can leave a node with no store: the deletion runs only after the store that
-replaced it has opened, and only over directories that provably hold no chunks. A node that
+replaced it has opened, and only over directories retirement had already cleared — everything
+kept copied and re-hashed, everything shed proven held by the close group. A node that
 never opens one, because storage is switched off, deletes nothing at all — it has established
 nothing about where those chunks went, and it has no use for the disk either.
 
@@ -265,10 +266,33 @@ moved the name does, and on many installations runs as root. That is privilege e
 one more way to lose a chunk.
 
 So on Unix the directory is opened once, `O_NOFOLLOW | O_DIRECTORY`, and every unlink is made
-against that handle with `unlinkat`; subdirectories are opened the same way from the same handle
-and emptied the same way. A link cannot produce a handle, so no unlink can be redirected through
-one. The pattern and the reasoning are already in this codebase: `open_regular` refuses a link
-and a FIFO on the handle rather than on the path, for the same class of reason.
+against that handle with `unlinkat` — the mark's included, so the handle is not dropped and the
+path re-opened for the last step, which was a second window and is gone. A link cannot produce a
+handle, so no unlink can be redirected through one. The pattern and the reasoning are already in
+this codebase: `open_regular` refuses a link and a FIFO on the handle rather than on the path,
+for the same class of reason.
+
+**A subdirectory is refused, never entered**, and that is a second decision rather than a detail
+of the first. `O_NOFOLLOW` declines a trailing symlink and says nothing about a mount point,
+which `openat` walks into without complaint; a bind mount can also make a cycle. A retired chunk
+environment is flat — two files and a mark — so a directory inside one is already something this
+build does not understand, and descending into it risks emptying a filesystem that has nothing
+to do with this node. Refusing keeps that shut, and it also leaves no recursion to bound and no
+descriptor chain to exhaust. For the same reason a directory holding more entries than any
+leftover ever has is refused rather than read into memory: a corrupt or hostile one should not
+be able to take the node down through the cleanup that was meant to return it some disk.
+
+**And the mark is not removed on the strength of a stale listing.** The names are read once and
+unlinked one by one, and a listing is not a snapshot: anything created while that loop runs is
+not in it and is still there at the end. So the handle is asked once more, immediately before
+the one irreversible step, and the mark stays if the answer is no. Without that the ordering
+protects nothing in exactly the case it exists for — the mark goes, something is left, and every
+later start reads an unmigrated store.
+
+**The type test on the mark masks with `S_IFMT`.** `S_IFLNK` and `S_IFSOCK` each contain every
+bit of `S_IFREG`, so testing `st_mode & S_IFREG` accepts a symlink or a socket wearing the
+mark's name — and that answer is what authorises deleting a store nothing migrated. This was
+written wrongly first and caught by review; there is a test for both types now.
 
 The directory itself still goes by path, and that is safe on its own terms: `rmdir` refuses a
 symlink, so a swapped name fails the call rather than following it.
@@ -313,7 +337,8 @@ reader does not reopen it from the sidecar's remains.
 first commit, and every released path by which data enters a node from the network enforces it
 before anything is stored: the protocol handler on a paid store, and replication on both the
 receive and the fetch path. **So no value over the ceiling has ever entered this network as a
-chunk.** It does not follow that none can exist on a disk — one can, and the next paragraph says
+chunk through released node code.** Something planted on a disk by hand is a separate matter and
+is refused on read rather than served. It does not follow that none can exist on a disk — one can, and the next paragraph says
 how — only that anything which does is not a chunk: not data with a copy elsewhere, not data
 whose owner is waiting for it, and nothing any peer would accept or serve.
 
@@ -396,7 +421,11 @@ release breaks the fleet, and it outranks the objective that no migration code s
   `FileStoreConfig`, `StoreLayout`, `VerifyReport` and `LEGACY_ENV_DIR` were exported too**,
   and all five are gone from the public API along with the LMDB and migration types. A
   downstream crate importing any of them stops compiling, so they belong in the release
-  notes and not only in this list.
+  notes and not only in this list. Two caveats on how far that narrowing goes. Under the
+  `test-utils` feature `chunk_store` is a public module, so everything `pub` inside it —
+  `StoreLayout`, `CapacityVerdict`, every inherent method — is still importable; the narrowing
+  above is the default build's surface. And `ChunkStore` keeps its public inherent methods,
+  which is a wider surface than the re-export list suggests on its own.
 
 ### Neutral / Operational
 
@@ -564,6 +593,12 @@ Named rather than implied. None is a regression; each is the state before this c
   and returns in the release after. What such a node is exposed to is the commitment-bound
   lane, which every release enforces. The remedy is the operator's, and the warning names the
   directory.
+- **Neither build re-marks or retries the way retirement did.** That release would retry a
+  failed final removal many times and write the mark back if it could not finish. This one makes
+  one attempt per start and leaves the rest to the next start, which is a longer wait on a host
+  where something holds the directory open — antivirus on Windows is the realistic case. What it
+  leaves behind is an empty unmarked directory, which the next start reads as harmless and
+  removes, so the cost is delay rather than a stuck node.
 - **Off Unix the path check and the unlink are not one operation.** They are on Unix, where the
   deletion is made against a handle opened `O_NOFOLLOW`; `std` offers no portable `unlinkat`, so
   the other platforms keep the path-based deleter and the window the previous release's deleter
