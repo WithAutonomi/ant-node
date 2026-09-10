@@ -44,9 +44,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::logging::{info, warn};
-use crate::storage::migration_signal::{
-    classify, legacy_directories, Leftover, Unreadable, RETIRED_MARKER,
-};
+use crate::storage::migration_signal::{classify, legacy_directories, Leftover, RETIRED_MARKER};
 
 /// Remove what the storage migration finished with, and start either way.
 ///
@@ -73,17 +71,14 @@ pub fn clean_up(root_dir: &Path) {
     // to remove nothing and say so: an unlistable root is not evidence that there is nothing
     // to keep. Said out loud because an earlier version returned silently, which left the
     // decision record promising a warning that no code emitted.
-    let leftovers = match legacy_directories(root_dir) {
-        Ok(found) => found,
-        Err(Unreadable) => {
-            warn!(
-                migration_event = "legacy_store_left",
-                "{} could not be listed, so nothing left over from the storage migration was \
-                 removed from it. Any leftover is still costing disk.",
-                root_dir.display()
-            );
-            return;
-        }
+    let Ok(leftovers) = legacy_directories(root_dir) else {
+        warn!(
+            migration_event = "legacy_store_left",
+            "{} could not be listed, so nothing left over from the storage migration was \
+             removed from it. Any leftover is still costing disk.",
+            root_dir.display()
+        );
+        return;
     };
 
     let mut finished_with = Vec::new();
@@ -114,6 +109,12 @@ pub fn clean_up(root_dir: &Path) {
 /// solely to say which of its reasons applied. If the disk changes underneath the two, the
 /// cost is a warning that names the wrong reason, never a directory deleted that should not
 /// have been.
+///
+/// Its only caller is inside a `warn!`, which compiles to nothing without the `logging`
+/// feature, so off that feature this has no caller at all. Same treatment as the signal's own
+/// token helpers rather than a `#[cfg]`, which would take the function out of the build the
+/// tests run in.
+#[cfg_attr(not(feature = "logging"), allow(dead_code))]
 fn why_it_is_kept(dir: &Path) -> &'static str {
     let Ok(meta) = std::fs::symlink_metadata(dir) else {
         return "it cannot be examined";
@@ -525,10 +526,7 @@ mod tests {
             &unmarked_tomb,
             &fake_mark,
         ];
-        let verdicts: Vec<_> = considered
-            .iter()
-            .map(|dir| (*dir, classify(dir)))
-            .collect();
+        let verdicts: Vec<_> = considered.iter().map(|dir| (*dir, classify(dir))).collect();
 
         clean_up(base);
         settle();
