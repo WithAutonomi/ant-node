@@ -45,10 +45,11 @@
 //! ```
 
 // `test-utils` makes this module public so integration tests and downstream harnesses can
-// reach the store directly. Anything `pub` inside it is therefore public in that build, and
-// this list of re-exports below is the API boundary that actually holds — not the item
-// visibilities inside the module. Adding a `pub` item there is not a decision to publish it;
-// flipping this cfg would be.
+// reach the store directly, and that is not a narrow door: with the feature on, every `pub`
+// item inside it — `StoreLayout`, `CapacityVerdict`, every inherent method on `ChunkStore` —
+// is importable from outside the crate. The re-export list below is the boundary for the
+// DEFAULT build only. Anything relying on the wider surface is relying on a test feature, and
+// this comment is here so that is a decision rather than a discovery.
 #[cfg(any(test, feature = "test-utils"))]
 pub mod chunk_store;
 #[cfg(not(any(test, feature = "test-utils")))]

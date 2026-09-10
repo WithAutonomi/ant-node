@@ -1314,7 +1314,11 @@ mod tests {
         let root = dir.path().join("node");
         let env = root.join(LEGACY_ENV_DIR);
         std::fs::create_dir_all(&env).expect("mkdir");
-        std::fs::write(env.join("data.mdb"), b"already copied out").expect("seed");
+        std::fs::write(
+            env.join("data.mdb"),
+            b"bytes retirement had already cleared",
+        )
+        .expect("seed");
         std::fs::write(env.join("RETIRED"), b"retired").expect("mark");
 
         let port = rand::thread_rng().gen_range(TEST_PORT_RANGE);
@@ -1337,7 +1341,11 @@ mod tests {
         let root = dir.path().join("node");
         let env = root.join(LEGACY_ENV_DIR);
         std::fs::create_dir_all(&env).expect("mkdir");
-        std::fs::write(env.join("data.mdb"), b"already copied out").expect("seed");
+        std::fs::write(
+            env.join("data.mdb"),
+            b"bytes retirement had already cleared",
+        )
+        .expect("seed");
         std::fs::write(env.join("RETIRED"), b"retired").expect("mark");
 
         let port = rand::thread_rng().gen_range(TEST_PORT_RANGE);
@@ -1361,7 +1369,11 @@ mod tests {
         let root = dir.path().join("node");
         let env = root.join(LEGACY_ENV_DIR);
         std::fs::create_dir_all(&env).expect("mkdir");
-        std::fs::write(env.join("data.mdb"), b"already copied out").expect("seed");
+        std::fs::write(
+            env.join("data.mdb"),
+            b"bytes retirement had already cleared",
+        )
+        .expect("seed");
         std::fs::write(env.join("RETIRED"), b"retired").expect("mark");
 
         // A file where the chunk directory has to be, so the store cannot create it.
