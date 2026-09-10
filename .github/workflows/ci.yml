@@ -127,7 +127,7 @@ jobs:
           version: ${{ env.FOUNDRY_VERSION }}
       - name: Run persistent-session discovery and transfer test
         run: >-
-          cargo test --test webrtc_direct_devnet
+          cargo test --test webrtc_direct_devnet --features test-utils
           -- --ignored --test-threads=1
 
   security:
