@@ -51,7 +51,7 @@ use crate::logging::{info, warn};
 const REPORT_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 /// The directory the old chunk store lives in.
-pub(crate) const LEGACY_ENV_DIR: &str = "chunks.mdb";
+pub const LEGACY_ENV_DIR: &str = "chunks.mdb";
 
 /// What retirement renames it to before deleting it.
 pub(super) const RETIRED_SUFFIX: &str = ".retired";

@@ -2095,7 +2095,7 @@ fn is_marker_temp_name(name: &str) -> bool {
 /// Best effort throughout. Failing to tidy up is not a reason to refuse to start, and the
 /// caller takes the store lock before this runs, so there is no other process whose live
 /// temporary this could take.
-pub(crate) fn sweep_marker_temps(dir: &Path) {
+pub fn sweep_marker_temps(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
