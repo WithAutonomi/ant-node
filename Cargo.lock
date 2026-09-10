@@ -854,6 +854,7 @@ dependencies = [
  "rand 0.8.8",
  "reqwest",
  "rmp-serde",
+ "rustix",
  "saorsa-core",
  "saorsa-pqc",
  "saorsa-transport",

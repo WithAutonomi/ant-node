@@ -44,6 +44,11 @@
 //! listener.register_protocol(protocol).await?;
 //! ```
 
+// `test-utils` makes this module public so integration tests and downstream harnesses can
+// reach the store directly. Anything `pub` inside it is therefore public in that build, and
+// this list of re-exports below is the API boundary that actually holds — not the item
+// visibilities inside the module. Adding a `pub` item there is not a decision to publish it;
+// flipping this cfg would be.
 #[cfg(any(test, feature = "test-utils"))]
 pub mod chunk_store;
 #[cfg(not(any(test, feature = "test-utils")))]
