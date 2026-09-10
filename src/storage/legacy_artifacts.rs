@@ -29,35 +29,32 @@
 //! Those go, and their disk comes back. Anything else stays exactly where it is, and is
 //! named once so an operator can decide.
 //!
-//! That is the answer the previous release's fleet signal is designed around: it reports
-//! which nodes still have an unfinished store, and this release is published when that count
-//! is clean. The nodes this leaves a directory on are the ones that count missed, and leaving
-//! it is what keeps their data recoverable.
+//! **What may be deleted is decided by [`migration_signal::classify`], not by a second
+//! reading of the same directory.** The previous release put each node's answer on the wire
+//! so a fleet could be seen to have finished, and this release is published on the strength
+//! of that count. If the cleanup had its own notion of which directories are finished with,
+//! the two could drift, and a node could delete a directory it was still reporting as
+//! unfinished, or report `files` while keeping one. They are one function, and the names
+//! they match are one set of constants.
 //!
 //! Two things are never done, both because a name is not evidence of what is behind it. A
 //! link is neither followed nor unlinked: what is behind it is on storage this node does not
 //! own. And only the exact names the previous release created are considered at all.
 
-use crate::logging::{info, warn};
 use std::path::{Path, PathBuf};
 
-/// The directory the old chunk store lived in.
-pub const LEGACY_ENV_DIR: &str = "chunks.mdb";
-
-/// What retirement renamed it to before deleting it.
-pub const RETIRED_SUFFIX: &str = ".retired";
-
-/// The file retirement wrote inside a directory to say it had finished with it.
-const RETIRED_MARKER: &str = "RETIRED";
-
-/// The most tombstones the previous release will ever have created.
-const MAX_TOMBSTONES: u32 = 64;
+use crate::logging::{info, warn};
+use crate::storage::migration_signal::{
+    classify, legacy_directories, Leftover, Unreadable, RETIRED_MARKER,
+};
 
 /// Remove what the storage migration finished with, and start either way.
 ///
-/// Returns nothing and fails at nothing. Every outcome is a node that runs: the worst case
-/// is a directory left where it is, which costs disk, is said out loud, and is a far better
-/// place to be than a node that will not start.
+/// Returns nothing and fails at nothing. **This is what never vetoes a start** — it is not a
+/// claim that every node starts, which is not this module's to make: the file store is built
+/// before this runs and a store that cannot open still stops the node. What is ruled out is
+/// a node kept from running by what it found left over, which is what the first draft of this
+/// release did.
 ///
 /// Called once the file store has opened, and not before. "Finished with" means the chunks
 /// are in the file store, which is only true if the file store is there to hold them: running
@@ -71,166 +68,125 @@ const MAX_TOMBSTONES: u32 = 64;
 /// is exactly what makes it removable and exactly what makes it harmless. The node announces
 /// `files` either way, whether the deletion has finished or not yet started.
 pub fn clean_up(root_dir: &Path) {
-    for dir in leftovers(root_dir) {
+    // A root that cannot be listed hides every tombstone under it. The previous release's
+    // own reporting calls that `unknown` rather than `files`, and the matching answer here is
+    // to remove nothing and say so: an unlistable root is not evidence that there is nothing
+    // to keep. Said out loud because an earlier version returned silently, which left the
+    // decision record promising a warning that no code emitted.
+    let leftovers = match legacy_directories(root_dir) {
+        Ok(found) => found,
+        Err(Unreadable) => {
+            warn!(
+                migration_event = "legacy_store_left",
+                "{} could not be listed, so nothing left over from the storage migration was \
+                 removed from it. Any leftover is still costing disk.",
+                root_dir.display()
+            );
+            return;
+        }
+    };
+
+    let mut finished_with = Vec::new();
+    for dir in leftovers {
         match classify(&dir) {
             // Its chunks are in the file store and the previous release simply did not
             // finish deleting it, or there is nothing in it at all. Either way it holds
             // nothing, so removing it cannot lose anything.
-            Verdict::FinishedWith => remove(dir),
-            Verdict::Keep(reason) => warn!(
+            Leftover::Harmless => finished_with.push(dir),
+            Leftover::Holding | Leftover::Unreadable => warn!(
                 migration_event = "legacy_store_left",
                 "{} is left over from the storage migration and this build will not remove \
-                 it: {reason}. It is costing disk until it is dealt with by hand.",
-                dir.display()
+                 it: {}. It is costing disk until it is dealt with by hand.",
+                dir.display(),
+                why_it_is_kept(&dir)
             ),
         }
     }
+
+    if !finished_with.is_empty() {
+        remove_all(finished_with);
+    }
 }
 
-/// What one leftover directory means.
-enum Verdict {
-    /// It provably holds no chunks, so it is pure cost.
-    FinishedWith,
-    /// It might hold chunks, or nothing here can tell. Left alone, with the reason.
-    Keep(&'static str),
-}
-
-/// Every leftover of the old chunk store under `root_dir`, live name and tombstones alike.
+/// Why one directory is being kept, for the operator who has to decide what to do with it.
 ///
-/// Matched by exact name. Retirement only ever created `chunks.mdb`, `chunks.mdb.retired`,
-/// or `chunks.mdb.retired.<n>` for `n` in `1..=64`, and what this returns is considered for
-/// deletion: a prefix match would also claim a `chunks.mdb.retired-keep-this` that somebody
-/// put there on purpose.
-fn leftovers(root_dir: &Path) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-
-    // `symlink_metadata`, not `try_exists`: the latter follows links, so a dangling or
-    // looping one at the live name would read as nothing being there at all.
-    let live = root_dir.join(LEGACY_ENV_DIR);
-    if !matches!(
-        std::fs::symlink_metadata(&live),
-        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
-    ) {
-        found.push(live);
-    }
-
-    let Ok(entries) = std::fs::read_dir(root_dir) else {
-        // A root that is not there yet holds nothing, and one that cannot be listed is a
-        // problem the store's own constructor reports far better than this can.
-        return found;
+/// Prose only. The decision was already made by `classify`; this re-reads the directory
+/// solely to say which of its reasons applied. If the disk changes underneath the two, the
+/// cost is a warning that names the wrong reason, never a directory deleted that should not
+/// have been.
+fn why_it_is_kept(dir: &Path) -> &'static str {
+    let Ok(meta) = std::fs::symlink_metadata(dir) else {
+        return "it cannot be examined";
     };
-    for entry in entries.flatten() {
-        if entry.file_name().to_str().is_some_and(is_tombstone_name) {
-            found.push(entry.path());
-        }
-    }
-    found
-}
-
-/// Is this a name retirement gave a tombstone?
-///
-/// The bounds are not decoration: retirement only ever counted up to 64, so `.65` and `.007`
-/// are names it cannot have produced, and this decides what gets deleted.
-fn is_tombstone_name(name: &str) -> bool {
-    let base = format!("{LEGACY_ENV_DIR}{RETIRED_SUFFIX}");
-    if name == base {
-        return true;
-    }
-    let Some(suffix) = name.strip_prefix(&format!("{base}.")) else {
-        return false;
-    };
-    // Parsed and written back out, so a leading zero or a plus sign fails to match itself.
-    suffix
-        .parse::<u32>()
-        .is_ok_and(|n| (1..=MAX_TOMBSTONES).contains(&n) && suffix == n.to_string())
-}
-
-/// Decide what one leftover is, erring every way towards keeping it.
-fn classify(dir: &Path) -> Verdict {
-    let meta = match std::fs::symlink_metadata(dir) {
-        Ok(meta) => meta,
-        // Gone between listing and looking. Nothing to do and nothing to say.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Verdict::FinishedWith,
-        Err(_) => return Verdict::Keep("it cannot be examined"),
-    };
-
-    // Behind a link is a directory on storage this node does not own. Following it would
-    // delete somebody else's data; unlinking it would throw away the only record of where
-    // that data went. Neither is this build's decision to make.
     if meta.file_type().is_symlink() {
-        return Verdict::Keep("it is a link to storage this node does not own");
+        return "it is a link to storage this node does not own";
     }
     if !meta.is_dir() {
-        return Verdict::Keep("it is not a directory");
+        return "it is not a directory";
     }
-
-    // The mark the previous release wrote inside the directory before it deleted anything.
-    // It is the only durable evidence there is that the chunks were copied out.
-    //
-    // A regular file, not merely something at that name. Retirement writes it with
-    // `create_new`, so it is always an ordinary file; a directory, a link, a FIFO or anything
-    // else wearing the name proves nothing, and this answer is what authorises deleting every
-    // chunk underneath it.
     match std::fs::symlink_metadata(dir.join(RETIRED_MARKER)) {
-        Ok(meta) if meta.is_file() => return Verdict::FinishedWith,
+        Ok(meta) if meta.is_file() => "it carries the mark that says it was finished with",
         Ok(_) => {
-            return Verdict::Keep(
-                "something that is not the storage migration's mark is using the name the \
-                 mark would have, so this node cannot tell whether it was finished with",
-            )
+            "something that is not the storage migration's mark is using the name the mark \
+             would have, so this node cannot tell whether it was finished with"
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return Verdict::Keep("whether it was finished with cannot be established"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            "it has chunks in it that were never copied into the file store, and this build \
+             cannot read them. Nothing here will delete them, so they are not lost. Whether \
+             this node's close group still needs them is the question to answer before \
+             removing it by hand"
+        }
+        Err(_) => "whether it was finished with cannot be established",
     }
-
-    // No mark. A directory with nothing in it holds no chunks, so it cannot be hiding any:
-    // that is what a cleanup interrupted between emptying a tombstone and removing it
-    // leaves behind. Anything else might be a whole node's chunks, and is kept.
-    std::fs::read_dir(dir).map_or(
-        Verdict::Keep("what is in it cannot be established"),
-        |mut entries| {
-            if entries.next().is_none() {
-                Verdict::FinishedWith
-            } else {
-                Verdict::Keep(
-                    "it has chunks in it that were never copied into the file store, and \
-                     this build cannot read them. Nothing here will delete them, so they \
-                     are not lost. Whether this node's close group still needs them is the \
-                     question to answer before removing it by hand",
-                )
-            }
-        },
-    )
 }
 
-/// Delete a directory that provably holds no chunks.
+/// Delete every directory that provably holds no chunks, one after another.
 ///
-/// In the background and in place. Nothing has to be got out of the way first: this
-/// directory holds nothing, and this build has no code that would read it if it did. Not
+/// **One thread, in sequence.** The names this release recognises are the live directory, the
+/// unnumbered tombstone and sixty-four numbered ones, so a root that has been through enough
+/// restore cycles can present sixty-six at once. A thread each would put sixty-six concurrent
+/// recursive deletions on the disk that is also serving chunks, at the moment a node is
+/// starting up. They are pure disk work with nothing waiting on them, so doing them in turn
+/// costs nothing that matters and bounds what this can do to a node's I/O.
+///
+/// In the background and in place. Nothing has to be got out of the way first: these
+/// directories hold nothing, and this build has no code that would read them if they did. Not
 /// renaming also means no name to allocate, which is what an earlier version of this could
 /// run out of and wedge itself on.
-fn remove(dir: PathBuf) {
+fn remove_all(dirs: Vec<PathBuf>) {
     let spawned = std::thread::Builder::new()
         .name("legacy-store-cleanup".into())
-        .spawn(move || match delete_mark_last(&dir) {
-            // Said only once the deletion has finished. Announcing the space before it is
-            // back is how an operator comes to trust a number that is wrong for the next
-            // several minutes.
-            Ok(()) => info!(
-                migration_event = "space_returned",
-                "Removed {}, which the storage migration had finished with, and returned \
-                 its space.",
-                dir.display()
-            ),
-            Err(e) => warn!(
-                migration_event = "legacy_store_left",
-                "{} was finished with by the storage migration but could not be removed \
-                 ({e}). It is costing disk. The next start tries again.",
-                dir.display()
-            ),
+        .spawn(move || {
+            for dir in dirs {
+                match delete_mark_last(&dir) {
+                    // Said only once the deletion has finished. Announcing the space before
+                    // it is back is how an operator comes to trust a number that is wrong for
+                    // the next several minutes.
+                    Ok(()) => info!(
+                        migration_event = "space_returned",
+                        "Removed {}, which the storage migration had finished with, and \
+                         returned its space.",
+                        dir.display()
+                    ),
+                    Err(e) => warn!(
+                        migration_event = "legacy_store_left",
+                        "{} was finished with by the storage migration but could not be \
+                         removed ({e}). It is costing disk. The next start tries again.",
+                        dir.display()
+                    ),
+                }
+            }
         });
     if let Err(e) = spawned {
-        warn!("Could not start the storage migration's cleanup thread: {e}");
+        // Naming what did not happen, not just that something did not. An earlier version
+        // said only that a thread could not start, which tells an operator nothing about
+        // which disk stayed full.
+        warn!(
+            migration_event = "legacy_store_left",
+            "Could not start the storage migration's cleanup thread ({e}), so nothing it had \
+             finished with was removed. Those directories are still costing disk and the next \
+             start tries again."
+        );
     }
 }
 
@@ -248,11 +204,13 @@ fn remove(dir: PathBuf) {
 ///
 /// What this does NOT close, and does not pretend to: the checks above name a path, and the
 /// unlinking below names it again. Anything that can replace the directory between the two
-/// wins. Closing that properly needs a directory handle held across the whole operation and
-/// `unlinkat` against it, which Rust's standard library does not offer portably. It is
-/// accepted rather than half-fixed, on the ground that whoever can win that race already has
-/// write access to this node's data directory and does not need the race to delete anything
-/// in it.
+/// wins. It cuts both ways, and both are accepted rather than half-fixed. An entry created
+/// inside a directory this found empty is deleted with it; and an entry created after the
+/// mark has gone leaves an unmarked directory with something in it, which every later start
+/// then keeps for good. Closing either properly needs a directory handle held across the
+/// whole operation and `unlinkat` against it, which Rust's standard library does not offer
+/// portably. Whoever can win that race already has write access to this node's data
+/// directory and does not need the race to delete anything in it.
 fn delete_mark_last(dir: &Path) -> std::io::Result<()> {
     // Asked again, here, on the thread that does the deleting. The classification that got
     // this path happened on another thread and is already in the past, and what is at a path
@@ -301,6 +259,7 @@ fn delete_mark_last(dir: &Path) -> std::io::Result<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::storage::migration_signal::{is_tombstone_name, LEGACY_ENV_DIR, MAX_TOMBSTONES};
     use tempfile::TempDir;
 
     /// The deletion runs on its own thread.
@@ -523,6 +482,137 @@ mod tests {
         let unmarked = env_with_chunks(root.path(), "chunks.mdb.retired.9");
         assert!(delete_mark_last(&unmarked).is_err());
         assert!(unmarked.join("data.mdb").exists());
+    }
+
+    /// The cleanup removes exactly what the fleet signal calls finished with, and nothing else.
+    ///
+    /// This is the property that lets the previous release's count authorise this one. That
+    /// count is each node reporting `files` when nothing under its root is `Leftover::Holding`
+    /// or `Leftover::Unreadable`. If this release deleted anything the signal would not have
+    /// called harmless, a node could destroy a directory it was still reporting as unfinished;
+    /// if it kept something the signal called harmless, a node would report `files` and go on
+    /// paying for the disk for ever.
+    ///
+    /// They cannot disagree today because there is one `classify`. This is what fails if
+    /// somebody gives the cleanup its own again: every shape below is checked both ways round,
+    /// so a classifier that is wrong in either direction shows up here rather than on a fleet.
+    #[test]
+    fn the_cleanup_removes_exactly_what_the_signal_calls_finished_with() {
+        let root = TempDir::new().unwrap();
+        let base = root.path();
+
+        // Every shape a real root can present, harmless and not, with the near misses that
+        // are not this release's to touch at all.
+        let marked_live = env_with_chunks(base, LEGACY_ENV_DIR);
+        mark_retired(&marked_live);
+        let marked_tomb = env_with_chunks(base, "chunks.mdb.retired.5");
+        mark_retired(&marked_tomb);
+        let empty_tomb = base.join("chunks.mdb.retired");
+        std::fs::create_dir_all(&empty_tomb).unwrap();
+        let unmarked_tomb = env_with_chunks(base, "chunks.mdb.retired.6");
+        let fake_mark = env_with_chunks(base, "chunks.mdb.retired.7");
+        std::fs::create_dir_all(fake_mark.join(RETIRED_MARKER)).unwrap();
+        let near_miss = env_with_chunks(base, "chunks.mdb.retired.65");
+        mark_retired(&near_miss);
+        let operators = env_with_chunks(base, "chunks.mdb.retired-keep-this");
+        mark_retired(&operators);
+
+        // What the signal says about each, before anything is removed.
+        let considered = [
+            &marked_live,
+            &marked_tomb,
+            &empty_tomb,
+            &unmarked_tomb,
+            &fake_mark,
+        ];
+        let verdicts: Vec<_> = considered
+            .iter()
+            .map(|dir| (*dir, classify(dir)))
+            .collect();
+
+        clean_up(base);
+        settle();
+
+        for (dir, verdict) in verdicts {
+            let gone = !dir.exists();
+            assert_eq!(
+                gone,
+                verdict == Leftover::Harmless,
+                "{} was classified {verdict:?} and {} removed",
+                dir.display(),
+                if gone { "was" } else { "was not" }
+            );
+        }
+
+        // And the names outside the set are not classified at all, so they are never even
+        // considered for deletion.
+        for untouched in [&near_miss, &operators] {
+            assert!(
+                untouched.join("data.mdb").exists(),
+                "{} is not a name retirement can have created",
+                untouched.display()
+            );
+        }
+    }
+
+    /// Sixty-six leftovers are removed one after another, on one thread.
+    ///
+    /// The accepted names are the live directory, the unnumbered tombstone and sixty-four
+    /// numbered ones. A thread each would put sixty-six recursive deletions on the disk that
+    /// is also serving chunks, at the moment the node is starting.
+    #[test]
+    fn every_leftover_a_root_can_hold_is_removed_without_a_thread_each() {
+        let root = TempDir::new().unwrap();
+        let base = root.path();
+
+        let mut staged = vec![env_with_chunks(base, LEGACY_ENV_DIR)];
+        staged.push(env_with_chunks(base, "chunks.mdb.retired"));
+        for n in 1..=MAX_TOMBSTONES {
+            staged.push(env_with_chunks(base, &format!("chunks.mdb.retired.{n}")));
+        }
+        assert_eq!(staged.len(), 66, "the accepted namespace is this big");
+        for dir in &staged {
+            mark_retired(dir);
+        }
+
+        let before = std::thread::available_parallelism().is_ok();
+        clean_up(base);
+        assert!(before, "sanity: the platform reports its parallelism");
+
+        for dir in &staged {
+            assert!(
+                wait_gone(dir),
+                "{} was finished with and is still there",
+                dir.display()
+            );
+        }
+    }
+
+    /// A root that cannot be listed removes nothing, and says so.
+    ///
+    /// An unlistable root hides every tombstone under it, so it is not evidence that there is
+    /// nothing to keep. An earlier version returned silently here, which left the decision
+    /// record promising a warning that no code emitted.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_that_cannot_be_listed_removes_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TempDir::new().unwrap();
+        let base = root.path().join("locked");
+        std::fs::create_dir_all(&base).unwrap();
+        let env = env_with_chunks(&base, LEGACY_ENV_DIR);
+        mark_retired(&env);
+
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o000)).unwrap();
+        clean_up(&base);
+        settle();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            env.join("data.mdb").exists(),
+            "a root that could not be listed had something removed from it anyway"
+        );
     }
 
     /// What a link points at belongs to somebody else, and is never followed or removed.

@@ -29,7 +29,7 @@
 //! about the filesystem, so it is asked of the filesystem, whatever the node was configured
 //! to do with it.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -51,13 +51,13 @@ use crate::logging::{info, warn};
 const REPORT_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 /// The directory the old chunk store lives in.
-const LEGACY_ENV_DIR: &str = "chunks.mdb";
+pub(crate) const LEGACY_ENV_DIR: &str = "chunks.mdb";
 
 /// What retirement renames it to before deleting it.
-const RETIRED_SUFFIX: &str = ".retired";
+pub(super) const RETIRED_SUFFIX: &str = ".retired";
 
 /// The file retirement writes inside a directory to say it has finished with it.
-const RETIRED_MARKER: &str = "RETIRED";
+pub(super) const RETIRED_MARKER: &str = "RETIRED";
 
 /// The token that carries the state, so a reader can find it wherever it sits.
 const SIGNAL_PREFIX: &str = "migration/";
@@ -109,8 +109,12 @@ impl MigrationSignal {
 }
 
 /// What one leftover directory means for the node carrying it.
+///
+/// `legacy_artifacts` decides what it may delete from this same verdict, so that the state a
+/// node reports and the state its cleanup acts on can never be two different readings of one
+/// directory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Leftover {
+pub(super) enum Leftover {
     /// It holds chunks this node has not moved.
     Holding,
     /// It holds nothing, or it carries the mark that says it was finished with.
@@ -128,7 +132,7 @@ enum Leftover {
 ///
 /// An entry that cannot be read is returned rather than skipped, so it becomes `Unknown`
 /// rather than silently becoming `Files`.
-fn legacy_directories(root_dir: &Path) -> Result<Vec<std::path::PathBuf>, Unreadable> {
+pub(super) fn legacy_directories(root_dir: &Path) -> Result<Vec<PathBuf>, Unreadable> {
     let mut found = Vec::new();
 
     // `symlink_metadata`, not `try_exists`: the latter follows links, so a dangling or
@@ -169,10 +173,10 @@ fn legacy_directories(root_dir: &Path) -> Result<Vec<std::path::PathBuf>, Unread
 
 /// There is no answer to give about this root.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Unreadable;
+pub(super) struct Unreadable;
 
 /// The most tombstones one root can hold, matching what retirement will ever create.
-const MAX_TOMBSTONES: u32 = 64;
+pub(super) const MAX_TOMBSTONES: u32 = 64;
 
 /// Is this a name retirement gives a tombstone?
 ///
@@ -180,7 +184,7 @@ const MAX_TOMBSTONES: u32 = 64;
 /// writes it. The bounds are not decoration: retirement only ever counts up to 64, so `.65`
 /// and `.007` are names it cannot have produced, and this list becomes a list of directories
 /// a later release deletes.
-fn is_tombstone_name(name: &str) -> bool {
+pub(super) fn is_tombstone_name(name: &str) -> bool {
     let base = format!("{LEGACY_ENV_DIR}{RETIRED_SUFFIX}");
     if name == base {
         return true;
@@ -197,7 +201,7 @@ fn is_tombstone_name(name: &str) -> bool {
 }
 
 /// What one directory says about itself.
-fn classify(dir: &Path) -> Leftover {
+pub(super) fn classify(dir: &Path) -> Leftover {
     match std::fs::symlink_metadata(dir) {
         // A link is never treated as finished with, whatever it points at: the mark would
         // have been written through it into a directory that is not this node's. It is also
