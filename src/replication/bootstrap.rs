@@ -453,7 +453,7 @@ mod tests {
 
         note_capacity_rejected(&state, source).await;
         assert_eq!(
-            expire_capacity_rejected(&state, Duration::from_secs(3600)).await,
+            expire_capacity_rejected(&state, Duration::from_hours(1)).await,
             0,
             "a fresh rejection must survive expiry with a generous max_age"
         );
@@ -489,7 +489,7 @@ mod tests {
         let queues = ReplicationQueues::new();
         let stale_source = saorsa_core::identity::PeerId::from_bytes([0xC3; 32]);
         let fresh_source = saorsa_core::identity::PeerId::from_bytes([0xC4; 32]);
-        let max_age = Duration::from_secs(60);
+        let max_age = Duration::from_mins(1);
         let stale_rejected_at = Instant::now().checked_sub(max_age * 2).unwrap();
 
         state
@@ -525,7 +525,7 @@ mod tests {
     async fn repeat_capacity_rejection_does_not_refresh_timestamp() {
         let state = Arc::new(RwLock::new(BootstrapState::new()));
         let source = saorsa_core::identity::PeerId::from_bytes([0xC5; 32]);
-        let max_age = Duration::from_secs(60);
+        let max_age = Duration::from_mins(1);
         let first_rejected_at = Instant::now().checked_sub(max_age * 2).unwrap();
 
         state
@@ -565,7 +565,7 @@ mod tests {
         let state = Arc::new(RwLock::new(BootstrapState::new()));
         let queues = ReplicationQueues::new();
         let source = saorsa_core::identity::PeerId::from_bytes([0xC6; 32]);
-        let max_age = Duration::from_secs(60);
+        let max_age = Duration::from_mins(1);
 
         for _ in 0..REJECTION_ROUNDS {
             note_capacity_rejected(&state, source).await;
