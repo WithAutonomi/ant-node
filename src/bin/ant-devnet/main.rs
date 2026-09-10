@@ -95,6 +95,13 @@ async fn main() -> color_eyre::Result<()> {
         ));
     }
 
+    #[cfg(not(feature = "test-utils"))]
+    if cli.public_file.is_some() {
+        return Err(color_eyre::eyre::eyre!(
+            "prepaid public-file seeding requires --features test-utils"
+        ));
+    }
+
     // A non-unicast --host would stamp unreachable bootstrap addresses into the
     // manifest (LAN mode would fail non-obviously), so reject it early.
     if let Some(host) = cli
@@ -129,17 +136,25 @@ async fn main() -> color_eyre::Result<()> {
 
     #[cfg(feature = "webrtc-direct")]
     let browser_manifest = if cli.webrtc_direct {
-        let (name, content_type, content) = load_public_file(cli.public_file.as_deref()).await?;
-        let public_file = devnet
-            .publish_public_file(name, content_type, &content)
-            .await?;
+        #[cfg(feature = "test-utils")]
+        let files = {
+            let (name, content_type, content) =
+                load_public_file(cli.public_file.as_deref()).await?;
+            vec![
+                devnet
+                    .publish_public_file(name, content_type, &content)
+                    .await?,
+            ]
+        };
+        #[cfg(not(feature = "test-utils"))]
+        let files = Vec::new();
         let network_id = format!("local-devnet-{}-{}", devnet.config().base_port, created_at);
         Some(BrowserDevnetManifest::new(
             network_id,
             created_at.clone(),
             devnet.browser_endpoints(),
             devnet.browser_payment_network().await?,
-            vec![public_file],
+            files,
         ))
     } else {
         None
@@ -201,7 +216,7 @@ async fn main() -> color_eyre::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "webrtc-direct")]
+#[cfg(all(feature = "webrtc-direct", feature = "test-utils"))]
 async fn load_public_file(
     path: Option<&std::path::Path>,
 ) -> color_eyre::Result<(String, String, Vec<u8>)> {

@@ -3,18 +3,26 @@
 use ant_node::devnet::{Devnet, DevnetConfig};
 use ant_node::BrowserEndpoint;
 use ant_protocol::MAX_CHUNK_SIZE;
+#[cfg(feature = "test-utils")]
 use bytes::Bytes;
+#[cfg(feature = "test-utils")]
 use evmlib::common::Amount;
+#[cfg(feature = "test-utils")]
 use evmlib::wallet::Wallet;
+#[cfg(feature = "test-utils")]
 use evmlib::EncodedPeerId;
+#[cfg(feature = "test-utils")]
 use evmlib::{PaymentQuote, ProofOfPayment};
 use saorsa_transport::transport::{WebRtcCertificateHash, WebRtcDirectAddr};
+#[cfg(feature = "test-utils")]
+use saorsa_transport::webrtc::BROWSER_PROTOCOL_NAME;
 use saorsa_transport::webrtc::{
     decode_pq_frame, encode_pq_frame, pq_frame_length, PqClientHandshake, PqSession,
-    BROWSER_PROTOCOL_NAME, BROWSER_PROTOCOL_VERSION, PQ_ENCRYPTED_OVERHEAD_BYTES,
-    PQ_SERVER_ACCEPT_BYTES, WEBRTC_DIRECT_DATA_CHANNEL, WEBRTC_WRITE_CHUNK_BYTES,
+    BROWSER_PROTOCOL_VERSION, PQ_ENCRYPTED_OVERHEAD_BYTES, PQ_SERVER_ACCEPT_BYTES,
+    WEBRTC_DIRECT_DATA_CHANNEL, WEBRTC_WRITE_CHUNK_BYTES,
 };
 use saorsa_transport::webrtc_direct::{WebRtcDataChannel, WebRtcDirectClient};
+#[cfg(feature = "test-utils")]
 use self_encryption::{DataMap, EncryptedChunk};
 use serde_json::{json, Value};
 use std::error::Error;
@@ -179,6 +187,7 @@ async fn invalid_chain_identity_fails_without_exposing_provider_response(
     Ok(())
 }
 
+#[cfg(feature = "test-utils")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "starts a five-node local network"]
 #[serial_test::serial]
@@ -469,6 +478,7 @@ impl BrowserRpcClient {
         Ok(result)
     }
 
+    #[cfg(feature = "test-utils")]
     async fn chunk_rpc(
         &mut self,
         request_id: u64,
@@ -484,6 +494,7 @@ impl BrowserRpcClient {
         Ok(response.body)
     }
 
+    #[cfg(feature = "test-utils")]
     const fn requests_sent(&self) -> usize {
         self.requests_sent
     }

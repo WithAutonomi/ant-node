@@ -28,17 +28,17 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-#[cfg(feature = "webrtc-direct")]
+#[cfg(all(feature = "webrtc-direct", feature = "test-utils"))]
 use crate::ant_protocol::{ChunkMessage, ChunkMessageBody, ChunkPutRequest, ChunkPutResponse};
+#[cfg(all(feature = "webrtc-direct", feature = "test-utils"))]
+use crate::browser::BrowserPublicFile;
 #[cfg(feature = "webrtc-direct")]
-use crate::browser::{
-    browser_payment_network, BrowserBootstrapNode, BrowserPaymentNetwork, BrowserPublicFile,
-};
+use crate::browser::{browser_payment_network, BrowserBootstrapNode, BrowserPaymentNetwork};
 #[cfg(feature = "webrtc-direct")]
 use crate::config::WebRtcDirectConfig;
-#[cfg(feature = "webrtc-direct")]
+#[cfg(all(feature = "webrtc-direct", feature = "test-utils"))]
 use bytes::Bytes;
-#[cfg(feature = "webrtc-direct")]
+#[cfg(all(feature = "webrtc-direct", feature = "test-utils"))]
 use std::collections::HashMap;
 
 // =============================================================================
@@ -620,7 +620,7 @@ impl Devnet {
     /// Returns an error when WebRTC Direct is disabled, self-encryption fails,
     /// a generated chunk is too large, no node admits a required record, or
     /// protocol serialization fails.
-    #[cfg(feature = "webrtc-direct")]
+    #[cfg(all(feature = "webrtc-direct", feature = "test-utils"))]
     pub async fn publish_public_file(
         &self,
         name: String,
@@ -727,7 +727,7 @@ impl Devnet {
             .map_err(|error| DevnetError::Config(error.to_string()))
     }
 
-    #[cfg(feature = "webrtc-direct")]
+    #[cfg(all(feature = "webrtc-direct", feature = "test-utils"))]
     async fn publish_browser_record(&self, address: [u8; 32], content: &Bytes) -> Result<usize> {
         let mut replicas = 0usize;
         let mut failures = Vec::new();
