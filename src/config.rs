@@ -180,7 +180,7 @@ pub struct WebRtcDirectConfig {
     /// Maximum simultaneously accepted browser sessions.
     pub max_connections: usize,
 
-    /// Maximum simultaneously accepted browser sessions from one source IP.
+    /// Maximum simultaneously accepted browser sessions from one IPv4 address or IPv6 /64.
     ///
     /// This must be lower than [`Self::max_connections`] so one public source
     /// cannot occupy every listener slot.
@@ -201,7 +201,7 @@ pub struct WebRtcDirectConfig {
     /// Token-bucket request rate across the listener, in requests per second.
     pub max_requests_per_second: usize,
 
-    /// Token-bucket request rate for one source IP, in requests per second.
+    /// Token-bucket request rate for one IPv4 address or IPv6 /64, in requests per second.
     pub max_requests_per_second_per_ip: usize,
 
     /// Token-bucket request rate for one browser session, in requests per
@@ -212,7 +212,7 @@ pub struct WebRtcDirectConfig {
     /// across the listener.
     pub max_in_flight_bytes: usize,
 
-    /// Maximum in-flight frame bytes attributable to one source IP.
+    /// Maximum in-flight frame bytes attributable to one IPv4 address or IPv6 /64.
     pub max_in_flight_bytes_per_ip: usize,
 
     /// Maximum JSON request-header size, in bytes.

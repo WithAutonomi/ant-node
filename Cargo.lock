@@ -856,7 +856,7 @@ dependencies = [
  "rmp-serde",
  "saorsa-core",
  "saorsa-pqc",
- "saorsa-transport",
+ "saorsa-transport 0.36.3 (git+https://github.com/WithAutonomi/saorsa-transport?rev=c079c8aa839feb6684a9a79f0557703a41c6d6b7)",
  "self-replace",
  "self_encryption",
  "semver 1.0.28",
@@ -5339,7 +5339,7 @@ dependencies = [
  "postcard",
  "rand 0.8.8",
  "saorsa-pqc",
- "saorsa-transport",
+ "saorsa-transport 0.36.3 (git+https://github.com/WithAutonomi/saorsa-transport?rev=c6e3ee21d41caf332b3a64dd15d32123e486f8ac)",
  "serde",
  "serde_json",
  "tempfile",
@@ -5390,7 +5390,7 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.36.3"
-source = "git+https://github.com/WithAutonomi/saorsa-transport?rev=c6e3ee21d41caf332b3a64dd15d32123e486f8ac#c6e3ee21d41caf332b3a64dd15d32123e486f8ac"
+source = "git+https://github.com/WithAutonomi/saorsa-transport?rev=c079c8aa839feb6684a9a79f0557703a41c6d6b7#c079c8aa839feb6684a9a79f0557703a41c6d6b7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5450,6 +5450,66 @@ dependencies = [
  "windows",
  "x25519-dalek",
  "x509-parser 0.18.1",
+ "zeroize",
+]
+
+[[package]]
+name = "saorsa-transport"
+version = "0.36.3"
+source = "git+https://github.com/WithAutonomi/saorsa-transport?rev=c6e3ee21d41caf332b3a64dd15d32123e486f8ac#c6e3ee21d41caf332b3a64dd15d32123e486f8ac"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-lc-rs",
+ "base64 0.22.1",
+ "blake3",
+ "bytes",
+ "chrono",
+ "clap",
+ "core-foundation 0.9.4",
+ "dashmap",
+ "dirs",
+ "enum_dispatch",
+ "futures-util",
+ "hex",
+ "igd-next",
+ "indexmap 2.14.1",
+ "keyring",
+ "libc",
+ "lru-slab",
+ "nix 0.31.3",
+ "once_cell",
+ "parking_lot",
+ "pin-project-lite",
+ "quinn-udp 0.6.1",
+ "rand 0.8.8",
+ "rcgen 0.14.10",
+ "regex",
+ "reqwest",
+ "rustc-hash",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pemfile",
+ "rustls-platform-verifier",
+ "rustls-post-quantum",
+ "saorsa-pqc",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "slab",
+ "socket2 0.6.5",
+ "system-configuration",
+ "thiserror 2.0.20",
+ "time",
+ "tinyvec",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "unicode-width",
+ "uuid",
+ "windows",
+ "x25519-dalek",
  "zeroize",
 ]
 

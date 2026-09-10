@@ -203,7 +203,7 @@ saorsa-pqc = { git = "https://github.com/saorsa-labs/saorsa-pqc", rev = "6d57e9d
 evmlib = { git = "https://github.com/WithAutonomi/evmlib", rev = "c80b7c7aee11bb62503b00d8b41e08da1a13039d" }
 ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "7d40a94017264a10c72d20e645205143aab0c1e2" }
 saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core", rev = "68a4a16f813aa78c154bde768c6f749143cfc335" }
-saorsa-transport = { git = "https://github.com/WithAutonomi/saorsa-transport", rev = "c6e3ee21d41caf332b3a64dd15d32123e486f8ac" }
+saorsa-transport = { git = "https://github.com/WithAutonomi/saorsa-transport", rev = "c079c8aa839feb6684a9a79f0557703a41c6d6b7" }
 
 [profile.release]
 lto = true
