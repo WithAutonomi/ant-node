@@ -581,6 +581,8 @@ mod tests {
         // What the signal says about each, before anything is removed. Every classification
         // the enum can produce is represented: Harmless three ways, Holding two, Unreadable
         // two.
+        // The `mut` is used only where the link below exists, which is not everywhere.
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut considered = vec![
             &marked_live,
             &marked_tomb,
