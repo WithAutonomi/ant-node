@@ -10447,7 +10447,7 @@ mod tests {
     #[tokio::test]
     async fn subtree_round1_limiter_cooldown_and_single_use_session() {
         let limiter = SubtreeRound1Limiter::new(
-            Duration::from_secs(3600),
+            Duration::from_hours(1),
             config::MAX_CONCURRENT_SUBTREE_ROUND1,
         );
         let peer = test_peer(1);
@@ -13248,7 +13248,7 @@ mod tests {
 
     #[test]
     fn no_longer_responsible_is_terminal_and_releases_the_retry_slot() {
-        const RETRY_AFTER: Duration = Duration::from_secs(60);
+        const RETRY_AFTER: Duration = Duration::from_mins(1);
 
         let mut q = ReplicationQueues::new();
         let key = test_key(0xAB);
@@ -13281,7 +13281,7 @@ mod tests {
 
     #[test]
     fn no_longer_responsible_shares_the_stored_terminal_path() {
-        const RETRY_AFTER: Duration = Duration::from_secs(60);
+        const RETRY_AFTER: Duration = Duration::from_mins(1);
 
         // Both variants must walk the identical terminal gate so the
         // battle-tested Stored accounting (retry-slot release + bootstrap
@@ -13301,7 +13301,7 @@ mod tests {
 
     #[test]
     fn source_failure_walks_alternate_sources_then_requeues_for_verification() {
-        const RETRY_AFTER: Duration = Duration::from_secs(60);
+        const RETRY_AFTER: Duration = Duration::from_mins(1);
 
         let mut q = ReplicationQueues::new();
         let key = test_key(0xEF);
@@ -13333,7 +13333,7 @@ mod tests {
 
     #[test]
     fn source_failure_without_retry_metadata_is_terminal() {
-        const RETRY_AFTER: Duration = Duration::from_secs(60);
+        const RETRY_AFTER: Duration = Duration::from_mins(1);
 
         // Direct enqueue (no pending entry) models a fetch with no
         // verification retry reservation to restore.
@@ -13352,7 +13352,7 @@ mod tests {
 
     #[test]
     fn already_held_key_leaves_the_pipeline_terminally() {
-        const RETRY_AFTER: Duration = Duration::from_secs(60);
+        const RETRY_AFTER: Duration = Duration::from_mins(1);
 
         let mut q = ReplicationQueues::new();
         let key = test_key(0x4C);
@@ -13379,7 +13379,7 @@ mod tests {
 
     #[test]
     fn local_write_failure_does_not_conscript_the_remaining_sources() {
-        const RETRY_AFTER: Duration = Duration::from_secs(60);
+        const RETRY_AFTER: Duration = Duration::from_mins(1);
 
         let mut q = ReplicationQueues::new();
         let key = test_key(0x2A);
@@ -13410,7 +13410,7 @@ mod tests {
 
     #[test]
     fn local_write_failure_without_retry_metadata_is_terminal() {
-        const RETRY_AFTER: Duration = Duration::from_secs(60);
+        const RETRY_AFTER: Duration = Duration::from_mins(1);
 
         // No pending entry to restore, so the only way not to strand the key
         // in `in_flight_fetch` forever — which would also stall bootstrap

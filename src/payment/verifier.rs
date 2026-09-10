@@ -4835,7 +4835,7 @@ mod tests {
         let verifier = floor_test_verifier(true);
         let xorname = [0xD5u8; 32];
         let stale_age = crate::replication::commitment_state::GOSSIP_ANSWERABILITY_TTL
-            + std::time::Duration::from_secs(60);
+            + std::time::Duration::from_mins(1);
         let neighbours = attach_group_commitments(&verifier, &GROUP_TEST_KEY_COUNTS, stale_age);
 
         let proof_bytes = group_floor_proof(
@@ -4876,7 +4876,7 @@ mod tests {
         let verifier = floor_test_verifier(true);
         let xorname = [0xDEu8; 32];
         let stale_age = crate::replication::commitment_state::GOSSIP_ANSWERABILITY_TTL
-            + std::time::Duration::from_secs(60);
+            + std::time::Duration::from_mins(1);
 
         // Fresh: the full fixture, exactly on the gate.
         let fresh =

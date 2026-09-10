@@ -1674,7 +1674,7 @@ mod tests {
         let family = peek_variant_index(&encoded).and_then(family_of_variant);
         assert_eq!(family, Some(BodyFamily::SubtreeAudit));
         assert!(
-            family.map_or(true, BodyFamily::is_audit),
+            family.is_none_or(BodyFamily::is_audit),
             "an audit body must take the audit ceiling regardless of the id it rode"
         );
     }

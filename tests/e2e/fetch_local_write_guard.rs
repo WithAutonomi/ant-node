@@ -75,7 +75,7 @@ const CONTROL_INDEX: usize = 7;
 /// A delay no ordinary requeue reaches, so the check identifies the capacity
 /// backoff rather than just "something deferred it". Every other requeue in this
 /// path waits `verification_request_timeout`, which is 15 s.
-const CAPACITY_BACKOFF_FLOOR: Duration = Duration::from_secs(60);
+const CAPACITY_BACKOFF_FLOOR: Duration = Duration::from_mins(1);
 
 /// Put `key` into `engine`'s pending-verification queue, tolerating a hint that
 /// arrived first.

@@ -1660,7 +1660,7 @@ mod tests {
             config.capacity_rejected_max_age(),
             full_cycle + config.neighbor_sync_interval_max,
         );
-        assert!(config.capacity_rejected_max_age() > Duration::from_secs(70 * 60));
+        assert!(config.capacity_rejected_max_age() > Duration::from_mins(70));
     }
 
     #[test]

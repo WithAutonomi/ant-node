@@ -1869,7 +1869,7 @@ mod tests {
         let source_a = peer_id_from_byte(1);
         let source_b = peer_id_from_byte(2);
         let mut first = test_entry(1);
-        first.next_verify_at = Instant::now() + Duration::from_secs(60);
+        first.next_verify_at = Instant::now() + Duration::from_mins(1);
         assert!(queues.add_pending_verify(key, first).admitted());
         assert!(queues.ready_pending_keys(Instant::now()).is_empty());
         assert!(!queues.add_pending_verify(key, test_entry(2)).admitted());
@@ -2594,7 +2594,7 @@ mod tests {
         queues.add_pending_verify(key, test_entry(1));
 
         for _ in 0..10 {
-            assert!(queues.defer_pending(&key, Duration::from_secs(300)));
+            assert!(queues.defer_pending(&key, Duration::from_mins(5)));
         }
 
         let outcome = queues
@@ -2651,7 +2651,7 @@ mod tests {
     fn backoff_never_retries_faster_than_the_caller_base() {
         // A base above the cap (an unusual config, but representable) must not
         // be shortened into a tighter retry loop than the caller asked for.
-        let long_base = VERIFICATION_RETRY_BACKOFF_MAX + Duration::from_secs(60);
+        let long_base = VERIFICATION_RETRY_BACKOFF_MAX + Duration::from_mins(1);
         assert_eq!(backoff_delay(long_base, 1), long_base);
         assert_eq!(backoff_delay(long_base, 9), long_base);
     }

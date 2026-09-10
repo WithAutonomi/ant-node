@@ -131,14 +131,14 @@ mod tests {
                     std::mem::discriminant(&decoded.body),
                     std::mem::discriminant(&original.body)
                 );
-                let sanitized = match &decoded.body {
-                    ChunkMessageBody::GetResponse(ChunkGetResponse::Error(e))
-                    | ChunkMessageBody::PutResponse(ChunkPutResponse::Error(e))
-                    | ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(e))
-                    | ChunkMessageBody::MerkleCandidateQuoteResponse(
-                        MerkleCandidateQuoteResponse::Error(e),
-                    ) => e,
-                    _ => unreachable!(),
+                let (ChunkMessageBody::GetResponse(ChunkGetResponse::Error(sanitized))
+                | ChunkMessageBody::PutResponse(ChunkPutResponse::Error(sanitized))
+                | ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(sanitized))
+                | ChunkMessageBody::MerkleCandidateQuoteResponse(
+                    MerkleCandidateQuoteResponse::Error(sanitized),
+                )) = &decoded.body
+                else {
+                    unreachable!();
                 };
                 assert_eq!(
                     std::mem::discriminant(sanitized),
