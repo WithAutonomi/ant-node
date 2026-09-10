@@ -22,7 +22,7 @@ use saorsa_core::identity::NodeIdentity;
 use saorsa_core::{DHTNode, MultiAddr, P2PNode, PeerId};
 use saorsa_transport::webrtc::{
     accept_pq_session, decode_pq_frame, encode_response_frame, parse_request_header,
-    pq_frame_length, transfer_timeout, BrowserCommitmentArtifact, BrowserNode,
+    pq_frame_length, source_ip_bucket, transfer_timeout, BrowserCommitmentArtifact, BrowserNode,
     BrowserQuoteArtifact, BrowserRequest as Request, BrowserRequestBody as RequestBody,
     BrowserResponse as Response, BrowserResponseBody as ResponseBody,
     BrowserResponseStatus as ResponseStatus, PqSession, BROWSER_PROTOCOL_NAME,
@@ -368,7 +368,7 @@ impl ListenerResources {
         let global = Arc::clone(&self.connection_limit)
             .try_acquire_owned()
             .map_err(|_| CONNECTION_CAPACITY_ERROR.to_string())?;
-        let ip = canonical_source_ip(remote_addr.ip());
+        let ip = source_ip_bucket(remote_addr.ip());
         let source = {
             let mut state = self.source_state.lock();
             if !state.sources.contains_key(&ip) && state.sources.len() >= self.max_tracked_sources {
@@ -469,13 +469,6 @@ struct ConnectionAdmission {
 impl Drop for ConnectionAdmission {
     fn drop(&mut self) {
         self.listener.release_connection(self.ip);
-    }
-}
-
-fn canonical_source_ip(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or(IpAddr::V6(ip), IpAddr::V4),
-        IpAddr::V4(ip) => IpAddr::V4(ip),
     }
 }
 
@@ -2044,6 +2037,40 @@ mod tests {
             resources.try_admit_connection(mapped).err().as_deref(),
             Some(SOURCE_CONNECTION_CAPACITY_ERROR)
         );
+    }
+
+    #[test]
+    fn ipv6_hosts_share_connection_rate_and_byte_budgets_by_prefix() {
+        let config = WebRtcDirectConfig::default();
+        let resources = ListenerResources::new(&config);
+        let mut admissions = Vec::new();
+        for host in 1..=config.max_connections_per_ip {
+            let addr = format!("[2001:db8:1234:5678::{host:x}]:1000")
+                .parse()
+                .expect("IPv6 host");
+            admissions.push(resources.try_admit_connection(addr).expect("prefix share"));
+        }
+        assert!(Arc::ptr_eq(
+            &admissions[0].context.source,
+            &admissions[1].context.source
+        ));
+        let same_prefix = "[2001:db8:1234:5678::ffff]:2000"
+            .parse()
+            .expect("same prefix");
+        assert_eq!(
+            resources.try_admit_connection(same_prefix).err().as_deref(),
+            Some(SOURCE_CONNECTION_CAPACITY_ERROR)
+        );
+        let other_prefix = "[2001:db8:1234:5679::1]:2000"
+            .parse()
+            .expect("other prefix");
+        resources
+            .try_admit_connection(other_prefix)
+            .expect("independent prefix");
+        drop(admissions.pop());
+        resources
+            .try_admit_connection(same_prefix)
+            .expect("released prefix slot");
     }
 
     #[test]
