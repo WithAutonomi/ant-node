@@ -367,6 +367,19 @@ rather than less. They are back as `tests/chunk_store_crash_safety.rs` and run i
 property, that engine shutdown waits for a detached store write, is named under the gaps
 below.
 
+**The hardening release's two tests, one deleted and one that must keep passing.** The release
+that hardened the migration added exactly two, and this release does something different with
+each, so both are named rather than left to be noticed in a diff.
+`a_store_left_midway_by_the_previous_release_keeps_its_place` proved that an upgrade picks a
+half-finished migration up where it left off instead of restarting its clock — it drives
+`copy_batch`, `migration_phase`, `legacy_only_keys` and `migration_state`, all of which this
+release deletes. It goes with its subject: there is no migration left for an upgrade to
+continue, and a test of one cannot be rewritten against a release that has none.
+`retiring_keeps_a_pinned_root_answerable_and_clearing_does_not` is the opposite case. It is why
+the commitment rotation has no emptiness branch, it touches nothing this release removes, and it
+still passes here. **It must go on passing**, because the branch it rules out is exactly the one
+an earlier draft of this release was going to reinstate.
+
 That leaves the loopback filesystem job with nothing to run, and deleting it would quietly
 drop ext4, XFS and btrfs coverage of the store itself. It now runs the storage unit tests
 against each mounted filesystem instead, which is what still has something to say there:
