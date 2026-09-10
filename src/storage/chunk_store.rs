@@ -2082,7 +2082,7 @@ fn is_marker_temp_name(name: &str) -> bool {
 
 /// Remove marker temporaries a previous run left beside `path`.
 ///
-/// [`write_file_atomic`] writes its temporary next to its target. For the layout marker
+/// `write_file_atomic` writes its temporary next to its target. For the layout marker
 /// that is inside `chunks/`, which the startup scan sweeps; for the migration marker it is
 /// the node root, which nothing sweeps, so a crash between the write and the rename leaves
 /// one there for the life of the node. Each is a few hundred bytes, so this is inodes
