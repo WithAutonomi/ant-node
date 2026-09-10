@@ -3112,6 +3112,71 @@ mod tests {
         (crate::client::compute_address(&content), content)
     }
 
+    /// A value over the ceiling is not a chunk, and this build will not hold one anywhere.
+    ///
+    /// The 4 MB ceiling is what makes a chunk a chunk, and every released ingress enforces it
+    /// before anything is stored: the protocol handler on a paid store, and replication on
+    /// both the receive and the fetch path. So no over-ceiling value ever entered this network
+    /// as a chunk, and one found on a disk is not data to be preserved — it is not a chunk at
+    /// all.
+    ///
+    /// There was exactly one way to get one onto a disk, and it was ours, not the network's.
+    /// The bridge's `put` wrote to the legacy environment FIRST — LMDB has no size ceiling —
+    /// and only then offered the same bytes to the file store, which refused them. It then
+    /// recorded the key as legacy-only so the copier would retry it, and the copier's own
+    /// size arm deleted it. A local caller of the public `ChunkStore::put` was the whole of
+    /// the exposure.
+    ///
+    /// That path is gone with the bridge. There is one store, its `put` refuses over the
+    /// ceiling, and it refuses BEFORE it writes anything, so there is no half-written state
+    /// to reason about and nothing for a later pass to find and have to decide about. This is
+    /// why the release preserves no such value and grows no sidecar to put one in: there is
+    /// no valid chunk to lose, and building a place to keep invalid ones would be building
+    /// for a case this release makes unreachable.
+    #[tokio::test]
+    async fn a_value_over_the_ceiling_is_refused_before_anything_is_written() {
+        let (store, dir) = test_store().await;
+
+        // Addressed to its own bytes, so the content-address arm passes and the refusal is
+        // the size one. Checking the wrong arm would pass this test while the ceiling was
+        // gone.
+        let content = vec![0xAB; MAX_CHUNK_SIZE + 1];
+        let address = crate::client::compute_address(&content);
+
+        let err = store
+            .put(&address, &content)
+            .await
+            .expect_err("a value over the ceiling is not a chunk and must be refused");
+        let message = format!("{err}");
+        assert!(
+            message.contains("byte maximum"),
+            "refused for the wrong reason, so this proves nothing about the ceiling: {message}"
+        );
+
+        assert!(
+            !store.exists(&address).expect("exists"),
+            "the node must not claim a value it refused"
+        );
+        assert!(!store.all_keys().await.expect("keys").contains(&address));
+        assert!(
+            !store.chunk_path(&address).exists(),
+            "nothing may be left on disk: the refusal comes before the write"
+        );
+
+        // And a restart cannot find one either, which is what says the refusal left no
+        // partial file for a startup scan to index by name. The store holds its directory
+        // lock for as long as it lives, so it goes first: two of them on one root is refused,
+        // which is a different failure and would prove nothing about the ceiling.
+        drop(store);
+        let reopened = reopen(&dir).await;
+        assert!(!reopened.exists(&address).expect("exists"));
+        assert_eq!(
+            reopened.current_chunks().expect("count"),
+            0,
+            "a refused value must not survive as a name the scan believes"
+        );
+    }
+
     #[tokio::test]
     async fn put_then_get_returns_the_same_bytes() {
         let (store, _dir) = test_store().await;

@@ -259,6 +259,47 @@ That the cleanup does not touch these today is a property of the exact-name matc
 accident, and it is stated here because a future widening of that match would be a silent
 data loss rather than an obvious one.
 
+### Values over the size ceiling are not chunks, and none is preserved
+
+This was argued both ways across the three releases, and one of the earlier answers — preserve
+them to a sidecar rather than destroy them — was wrong. It is settled here so that a later
+reader does not reopen it from the sidecar's remains.
+
+**A chunk is at most 4 MB.** `MAX_CHUNK_SIZE` has been `4 * 1024 * 1024` since ant-protocol's
+first commit, and every released path by which data enters a node from the network enforces it
+before anything is stored: the protocol handler on a paid store, and replication on both the
+receive and the fetch path. **So no value over the ceiling has ever entered this network as a
+chunk.** One found in a legacy environment is not data with a copy elsewhere and it is not data
+whose owner is waiting for it. It is not a chunk at all.
+
+**The one way such a value could reach a disk was ours.** Not the network's. The bridge's
+public `ChunkStore::put` wrote to the legacy environment *first* — `LmdbStorage::put` has no
+size ceiling, deliberately, because the store it wrote to was being abandoned and its verdict
+was not allowed to refuse chunks the file store had room for — and only then offered the same
+bytes to the file store, which refused them for size. The bridge then recorded the key as
+legacy-only so the copier would retry it, and the copier's own size arm deleted it. Every
+oversized value that can exist on any node came through a local caller of that method during
+the bridge period, and through nothing else.
+
+**This release removes the bridge, so it removes the hole.** There is one store; its `put`
+refuses anything over the ceiling, and refuses *before* it writes, so there is no partial state
+for a later pass to find and no key recorded anywhere. There is no `LmdbStorage::put` left to
+take an unbounded value in the first place. The read path and the repair path refuse over the
+ceiling too, so a file planted by hand is refused rather than served.
+
+**Nothing is preserved and no sidecar is built.** An earlier draft added one, on the reasoning
+that no peer can hold a copy of an over-ceiling value and no repair can fetch one, so deleting
+it destroys the only copy. Both halves of that are true and the conclusion still does not
+follow: there is no valid chunk there to be the only copy *of*. Building somewhere to keep
+invalid values would be building for a case this release makes unreachable, and the cost of
+doing it was measured — the sidecar was written, and adversarial review found two real defects
+inside it, in code that existed only to serve a case that cannot arise. It was cut before it
+shipped, and it is not coming back here.
+
+A legacy directory that happens to contain such a value is kept if it is unmarked and removed if
+it carries the mark, exactly like every other directory, and for exactly the same reasons. This
+release never looks inside one, so its contents are not a factor in either verdict.
+
 ### The penalty is restored by the release after this one, not by this one
 
 The original plan had this release delete the old store and restore the close-group storage
@@ -337,8 +378,15 @@ a subdirectory made unremovable, the attempt fails and the mark has to still be 
 that is what lets the next start recognise the directory rather than treat it as unmigrated
 forever.
 
-Three properties are pinned that the earlier draft had no test for, because it had no code for
-them either. **The correspondence with the fleet signal**: every shape a root can present is
+A value over the ceiling is refused by `put`, and refused *before* anything is written: the
+store does not claim it, no file is left under its name, and a restart onto the same directory
+finds nothing to index. Addressed to its own bytes on purpose, so the refusal is the size arm
+and not the content-address arm — checking the wrong arm would pass while the ceiling was gone.
+Mutation-checked: with the size branch deleted the test fails, which is what says it is testing
+the ceiling rather than testing that something went wrong.
+
+Three further properties are pinned that the earlier draft had no test for, because it had no
+code for them either. **The correspondence with the fleet signal**: every shape a root can present is
 staged at once, each is classified before anything is removed, and afterwards each is asserted
 gone exactly when it was called harmless and still there exactly when it was not — both
 directions, so a classifier that drifts either way fails here. **Sixty-six leftovers**, the
@@ -413,6 +461,17 @@ which is why the count needs a denominator and not just a numerator.
 That gate cannot be made airtight, and it is worth being honest about which part is soft.
 Nodes that are offline for the whole window are in nobody's count and come back afterwards;
 that is the population this decision knowingly cleans up rather than the one it waits for.
+
+**Where that gate stands as this is written, which is nowhere yet.** The signal first shipped in
+`v0.19.0-beta.1`, published 2026-09-09, so there is under a day of it against a gate that asks
+for several consecutive days. More to the point, the beta's own lines do not mean yet what the
+gate needs them to mean: the staged migrations have not started, so a node reporting `files`
+today is reporting that it has nothing to move rather than that it has finished moving it, and
+those two are indistinguishable in the tally. And the population the gate exists for — the
+community nodes, and the NTFS hosts where the store's case-folding and directory-entry
+behaviour differ from ours — is not reporting to us at all. **No count taken before the staged
+migrations run should be read as progress towards this gate**, and this release is not published
+on the strength of one.
 
 ## What this release does not fix
 
