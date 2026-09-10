@@ -49,18 +49,22 @@ pub mod chunk_store;
 #[cfg(not(any(test, feature = "test-utils")))]
 pub(crate) mod chunk_store;
 mod handler;
-pub mod legacy_artifacts;
+// Both are this crate's own business. The cleanup is called once, from the node builder, and
+// the signal was `pub(crate)` in the release that added it; exporting either would publish a
+// migration this release exists to finish.
+pub(crate) mod legacy_artifacts;
 // Carried forward from the release before this one. Without it a node on this release reads
 // to its peers as one that never reported at all, and the fleet gate that authorised this
 // release could never come back clean again.
-pub mod migration_signal;
+pub(crate) mod migration_signal;
 
 pub use crate::ant_protocol::XorName;
-pub use chunk_store::{CapacityVerdict, ChunkStore, ChunkStoreConfig, StoreLayout};
+pub use chunk_store::{ChunkStore, ChunkStoreConfig};
+// Crate-private, as it was before the two stores became one: `CapacityVerdict` was
+// `pub(crate)` on the old store and has no caller outside this crate.
+pub(crate) use chunk_store::CapacityVerdict;
 pub use handler::AntProtocol;
 pub(crate) use handler::ChunkRequestContext;
-pub use legacy_artifacts::LEGACY_ENV_DIR;
-pub use migration_signal::{peer_state, MigrationSignal, PeerMigrationState};
 
 /// Bytes in one MiB.
 pub const MIB: u64 = 1024 * 1024;
