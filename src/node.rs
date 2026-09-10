@@ -1176,6 +1176,8 @@ mod tests {
     use rand::Rng;
     use tempfile::TempDir;
 
+    use crate::storage::migration_signal::LEGACY_ENV_DIR;
+
     /// The e2e port range, so a test bind never lands on a production or dev instance.
     const TEST_PORT_RANGE: std::ops::Range<u16> = 20000..60000;
 
@@ -1275,7 +1277,7 @@ mod tests {
         for storage_enabled in [true, false] {
             let dir = TempDir::new().expect("temp dir");
             let root = dir.path().join("node");
-            let env = root.join(crate::storage::LEGACY_ENV_DIR);
+            let env = root.join(LEGACY_ENV_DIR);
             std::fs::create_dir_all(&env).expect("mkdir");
             std::fs::write(env.join("data.mdb"), b"chunks that were never copied out")
                 .expect("seed");
@@ -1310,7 +1312,7 @@ mod tests {
     async fn a_node_with_storage_disabled_deletes_nothing() {
         let dir = TempDir::new().expect("temp dir");
         let root = dir.path().join("node");
-        let env = root.join(crate::storage::LEGACY_ENV_DIR);
+        let env = root.join(LEGACY_ENV_DIR);
         std::fs::create_dir_all(&env).expect("mkdir");
         std::fs::write(env.join("data.mdb"), b"already copied out").expect("seed");
         std::fs::write(env.join("RETIRED"), b"retired").expect("mark");
@@ -1333,7 +1335,7 @@ mod tests {
     async fn a_finished_store_is_removed_once_the_replacement_opens() {
         let dir = TempDir::new().expect("temp dir");
         let root = dir.path().join("node");
-        let env = root.join(crate::storage::LEGACY_ENV_DIR);
+        let env = root.join(LEGACY_ENV_DIR);
         std::fs::create_dir_all(&env).expect("mkdir");
         std::fs::write(env.join("data.mdb"), b"already copied out").expect("seed");
         std::fs::write(env.join("RETIRED"), b"retired").expect("mark");
@@ -1357,7 +1359,7 @@ mod tests {
     async fn a_finished_store_survives_a_file_store_that_will_not_open() {
         let dir = TempDir::new().expect("temp dir");
         let root = dir.path().join("node");
-        let env = root.join(crate::storage::LEGACY_ENV_DIR);
+        let env = root.join(LEGACY_ENV_DIR);
         std::fs::create_dir_all(&env).expect("mkdir");
         std::fs::write(env.join("data.mdb"), b"already copied out").expect("seed");
         std::fs::write(env.join("RETIRED"), b"retired").expect("mark");
