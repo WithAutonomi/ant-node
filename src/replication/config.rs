@@ -693,7 +693,11 @@ pub(crate) const CAPACITY_BLOCKED_RETRY: Duration =
 /// Trust event weight for confirmed audit failures.
 pub const AUDIT_FAILURE_TRUST_WEIGHT: f64 = 5.0;
 
-/// Whether this build penalises a peer for not holding a chunk it was supposed to hold.
+/// Whether this build HOLDS OFF the penalty for not holding a chunk it was supposed to hold.
+///
+/// `true` suspends the penalty. The name says `SUSPEND`; read it that way, because a reader who
+/// takes it as "does this build penalise" gets the answer backwards, which is how a comment
+/// three lines down came to claim the opposite of what ships.
 ///
 /// **Still `true`, and deliberately not flipped by this release.** It was raised while the
 /// fleet moved off the legacy LMDB chunk store, because a node that has to give up chunks
@@ -731,10 +735,13 @@ pub const RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY: bool = true;
 /// be needed. It suspends only the penalties this node hands out, so an emergency suspension
 /// has to go to the fleet, not to the node being penalised.
 ///
-/// The one-way guard the previous release added is kept and is now inert by construction: it
-/// refuses to un-suspend only while the release constant says to hold the penalty off, and
-/// this release says the opposite. Deleting it would be a silent change of meaning if the
-/// constant ever went back, so it stays and costs nothing.
+/// The one-way guard the previous release added is kept, and in this release it is ACTIVE: it
+/// refuses to un-suspend while the release constant says to hold the penalty off, and this
+/// release says exactly that. So the override can suspend and cannot un-suspend, and a host
+/// setting it to `0` is told so and ignored — which is the point, because one host penalising
+/// its close group for behaving as the release asked would slash all of them. It becomes inert
+/// in the release that restores the penalty, and it stays there rather than being deleted so
+/// that the meaning does not silently change if the constant ever goes back.
 pub const SUSPEND_CLOSE_GROUP_STORAGE_PENALTY_ENV: &str = "ANT_SUSPEND_UNHELD_CHUNK_PENALTY";
 
 /// The live switch.

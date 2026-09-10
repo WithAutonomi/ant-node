@@ -171,8 +171,11 @@ async fn a_process_killed_mid_publish_leaves_no_chunk_it_cannot_serve() {
 /// file under its final name and flushes it, deliberately, since a rename there is not
 /// documented to be durable. So there is no temporary file to sweep and the equivalent
 /// hazard is different: a real chunk name over bytes that are short or wrong. That one is
-/// covered by the store's own tests, which run on every platform, and by the
-/// re-hash-everything pass the retirement does before it deletes anything.
+/// covered by the store's own tests, which run on every platform: a read verifies the bytes
+/// against the name and refuses a file that does not match. There used to be a second answer
+/// here, the re-hash-everything pass retirement ran before deleting, and this release deletes
+/// retirement, so it is no longer one. Forced power loss on a real filesystem remains an open
+/// gate, named in ADR-0015.
 #[cfg(unix)]
 #[tokio::test]
 async fn the_leftovers_of_a_killed_publish_are_swept() {

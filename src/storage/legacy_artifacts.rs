@@ -24,10 +24,18 @@
 //!
 //! So: **start, and remove only what is provably finished with.** The previous release wrote
 //! a `RETIRED` mark inside the directory before it deleted anything, so a directory carrying
-//! that mark has already had its contents copied out and is pure cost. So is an empty one,
+//! that mark is one whose retirement gates were all met and is pure cost. So is an empty one,
 //! which is what a cleanup interrupted between emptying a tombstone and removing it leaves.
 //! Those go, and their disk comes back. Anything else stays exactly where it is, and is
 //! named once so an operator can decide.
+//!
+//! "Gates were met" is not "its contents are in the file store", and the difference is load
+//! bearing. Retirement cleared a directory on two grounds: every chunk the node KEPT was copied
+//! into the file store and re-hashed there, and every chunk it SHED was proven held by its close
+//! group — all but one answering a possession challenge — and then deliberately not copied. So a
+//! marked directory can legitimately hold bytes that are in no file store on this node. Removing
+//! them is finishing what the previous release had already started; the safety argument for them
+//! is the close group's proofs, not a local copy.
 //!
 //! **What may be deleted is decided by [`migration_signal::classify`], not by a second
 //! reading of the same directory.** The previous release put each node's answer on the wire
@@ -337,12 +345,48 @@ mod tests {
         assert!(wait_gone(&tomb));
     }
 
+    /// A marked directory goes even though its bytes are in no file store on this node.
+    ///
+    /// This is the case the record used to describe wrongly, and the tests used to conceal by
+    /// never staging a file store at all: they showed that a mark triggers deletion, which
+    /// leaves a reader free to assume the deleted bytes had been copied somewhere first.
+    ///
+    /// They need not have been. Retirement cleared a directory on two grounds, and only one is
+    /// a local copy: chunks the node KEPT were copied into the file store and re-hashed there,
+    /// and chunks it SHED were proven held by its close group and then deliberately not copied
+    /// — the pre-retirement pass skips exactly those keys. So the state staged here, a marked
+    /// directory beside an empty file store, is one the previous release produces on purpose on
+    /// any node that was short of disk, and it is reachable through its own kill point between
+    /// writing the mark and finishing the delete.
+    ///
+    /// Removing it is right: the previous release was about to. What this pins is that the
+    /// deletion does NOT depend on a local copy existing, so nobody later "fixes" it by adding
+    /// a file-store check that would strand every shedding node's directory for ever.
+    #[test]
+    fn a_marked_store_goes_even_when_nothing_was_copied_into_this_node() {
+        let root = TempDir::new().unwrap();
+        let env = env_with_chunks(root.path(), LEGACY_ENV_DIR);
+        mark_retired(&env);
+
+        // No file store, and nothing in one. A node that shed everything it held looks exactly
+        // like this.
+        assert!(!root.path().join("chunks").exists());
+
+        clean_up(root.path());
+        assert!(
+            wait_gone(&env),
+            "a marked directory must go whether or not this node kept a copy: the close \
+             group's possession proofs are what cleared it, not a local file"
+        );
+    }
+
     /// The one that would be data loss.
     ///
     /// A node that missed the previous release entirely arrives here with every chunk it
     /// owns in that directory and nothing in the file store, and the upgrade monitor picks
     /// the newest release rather than the next one, so this build is genuinely reachable
-    /// from that state.
+    /// from that state. Unmarked is the whole difference from the test above: nothing
+    /// cleared this directory, so nothing here may remove it.
     #[test]
     fn a_store_that_was_never_migrated_is_left_exactly_where_it_is() {
         let root = TempDir::new().unwrap();
@@ -351,7 +395,7 @@ mod tests {
         settle();
         assert!(
             env.join("data.mdb").exists(),
-            "chunks that were never copied out were deleted"
+            "an unmarked store passed no retirement gate, and was deleted anyway"
         );
     }
 
@@ -518,14 +562,35 @@ mod tests {
         let operators = env_with_chunks(base, "chunks.mdb.retired-keep-this");
         mark_retired(&operators);
 
-        // What the signal says about each, before anything is removed.
-        let considered = [
+        // Not a directory at all, wearing a name in the set. The marker probe cannot even be
+        // asked of it, so it classifies unreadable and must be kept.
+        let not_a_dir = base.join("chunks.mdb.retired.8");
+        std::fs::write(&not_a_dir, b"not a store").unwrap();
+
+        // A link wearing a name in the set. What is behind it is somebody else's, and neither
+        // following it nor unlinking it is this build's decision.
+        #[cfg(unix)]
+        let linked = {
+            let elsewhere = env_with_chunks(base, "elsewhere-for-the-link");
+            mark_retired(&elsewhere);
+            let link = base.join("chunks.mdb.retired.9");
+            std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+            (link, elsewhere)
+        };
+
+        // What the signal says about each, before anything is removed. Every classification
+        // the enum can produce is represented: Harmless three ways, Holding two, Unreadable
+        // two.
+        let mut considered = vec![
             &marked_live,
             &marked_tomb,
             &empty_tomb,
             &unmarked_tomb,
             &fake_mark,
+            &not_a_dir,
         ];
+        #[cfg(unix)]
+        considered.push(&linked.0);
         let verdicts: Vec<_> = considered.iter().map(|dir| (*dir, classify(dir))).collect();
 
         clean_up(base);
@@ -549,6 +614,22 @@ mod tests {
                 untouched.join("data.mdb").exists(),
                 "{} is not a name retirement can have created",
                 untouched.display()
+            );
+        }
+
+        // A link is kept as a link, and what it points at keeps its data: following it would
+        // delete storage this node does not own, unlinking it would throw away the only record
+        // of where that data went.
+        #[cfg(unix)]
+        {
+            let (link, elsewhere) = &linked;
+            assert!(
+                std::fs::symlink_metadata(link).is_ok(),
+                "the link was removed"
+            );
+            assert!(
+                elsewhere.join("data.mdb").exists(),
+                "the link was followed and somebody else's data was deleted"
             );
         }
     }

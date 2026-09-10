@@ -6998,9 +6998,12 @@ fn request_is_stale(received_at: Instant, timeout: Duration) -> bool {
 enum FetchFault {
     /// The peer does not hold a chunk it was expected to hold.
     ///
-    /// This was the lane the migration releases withheld, because a node part-way through
-    /// moving off the old store answered exactly this way about chunks it had legitimately
-    /// given up. That is over, and it is penalised again.
+    /// This is the lane the migration releases withhold, because a node part-way through
+    /// moving off the old store answers exactly this way about chunks it had legitimately
+    /// given up. It is STILL withheld here: this release deletes the old store, and a node
+    /// that was away while the migration ran arrives holding one it cannot read, so
+    /// accusing it in the release that stranded it would slash it for a state it had no
+    /// chance to leave. The release after this one restores it.
     UnheldChunk,
     /// The peer's own storage failed, or served bytes that no longer hash to their
     /// address.
@@ -9961,7 +9964,9 @@ async fn rebuild_and_rotate_commitment(
     p2p: &Arc<P2PNode>,
     config: &Arc<ReplicationConfig>,
 ) -> Result<()> {
-    // Not `all_keys()`. While the node is bridging off the legacy store these are the
+    // Not `all_keys()`: that is every name the store holds, and what belongs in a commitment
+    // is only what this node is still responsible for. The sentence that used to be here was
+    // cut off mid-way and described the bridge, which no longer exists.
     let stored_keys = storage
         .all_keys()
         .await
