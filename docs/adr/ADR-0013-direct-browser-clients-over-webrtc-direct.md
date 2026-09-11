@@ -558,8 +558,8 @@ rejected.
 ### Browser protocol and DataChannel framing
 
 The public protocol is not the private Saorsa `WireMessage` or native Postcard
-DHT protocol. The application protocol name is `autonomi.web.poc.v6`, its
-DataChannel label is `autonomi.web.v6`, and the embedded post-quantum session
+DHT protocol. The application protocol name is `autonomi.web.poc.v5`, its
+DataChannel label is `autonomi.web.v5`, and the embedded post-quantum session
 has its own independently checked wire version 1. The initial methods are:
 
 - `HELLO`: return and validate protocol, peer, endpoint, capability, chunk-size,
@@ -592,7 +592,7 @@ and both contracts. This schema change requires protocol v5 on both sides.
 
 WebRTC DataChannels are messages, not byte streams. One persistent reliable
 ordered DataChannel carries a sequence of RPC request/response frames for one
-association. Protocol v6 has two framing layers:
+association. The unreleased browser protocol has two framing layers:
 
 1. The plaintext inner frame is a versioned JSON object immediately followed
    by the declared raw binary body, with no JSON-header length prefix. The JSON
@@ -600,7 +600,8 @@ association. Protocol v6 has two framing layers:
    is limited before JSON parsing, and parser input is capped at a fixed 64 KiB
    header limit shared with the client. This accommodates paid upload quotes
    with full signed commitments; operators cannot lower it. Chunk bytes are
-   never JSON/base64. This framing change requires protocol v6 on both sides.
+   never JSON/base64. This revises the unreleased format in place, retaining
+   the existing v5 protocol identifiers.
 2. The shared post-quantum session seals the complete inner frame as one record.
    The record contains a type tag, a 64-bit sequence number, and
    ChaCha20-Poly1305 ciphertext and authentication tag. A four-byte encrypted
