@@ -2255,7 +2255,7 @@ mod tests {
     #[test]
     fn parses_versioned_requests() {
         let request: Request = serde_json::from_str(
-            r#"{"version":6,"request_id":7,"content_length":0,"type":"find_node","target":"0000000000000000000000000000000000000000000000000000000000000000","count":20}"#,
+            r#"{"version":5,"request_id":7,"content_length":0,"type":"find_node","target":"0000000000000000000000000000000000000000000000000000000000000000","count":20}"#,
         )
         .expect("valid request");
 

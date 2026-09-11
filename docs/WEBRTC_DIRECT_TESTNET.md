@@ -59,7 +59,7 @@ manifest contain only `chain_id`, `payment_token_address`, and
 `payment_vault_address`. Local Anvil uses chain ID 31337. Neither the verification
 RPC URL nor the funded key is included in browser metadata.
 
-Browser protocol v6 and browser manifest v6 require matching node, Rust/WASM
+Browser protocol v5 and browser manifest v6 require matching node, Rust/WASM
 client, and SDK versions. The application or wallet owns its payment provider;
 no browser RPC setting is needed on the node. For a custom EVM network, the node
 privately resolves `eth_chainId` from its verification RPC when starting the
