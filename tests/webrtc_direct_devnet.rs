@@ -422,6 +422,35 @@ async fn seeded_public_file_downloads_and_paid_uploads_over_direct_node_endpoint
     assert!(
         matches!(response, ant_protocol::ChunkMessageBody::GetResponse(ant_protocol::ChunkGetResponse::Success { address, content }) if address == upload_address && content == upload_content)
     );
+    let diagnostics = devnet.browser_listener_diagnostics();
+    assert_eq!(diagnostics.len(), 5);
+    assert!(diagnostics.iter().all(|listener| listener.running));
+    assert!(
+        diagnostics
+            .iter()
+            .map(|listener| listener.transport.successful_connections)
+            .sum::<u64>()
+            >= 2
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .map(|listener| listener.transport.bytes_received)
+            .sum::<u64>()
+            > 0
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .map(|listener| listener.transport.bytes_sent)
+            .sum::<u64>()
+            > 0
+    );
+    assert!(diagnostics
+        .iter()
+        .flat_map(|listener| &listener.transport.connections)
+        .any(|connection| connection.connected_at.is_some() && connection.last_activity.is_some()));
+
     assert!(seed_client.requests_sent() >= 2);
     assert!(download_client.requests_sent() >= 6);
 
@@ -429,6 +458,14 @@ async fn seeded_public_file_downloads_and_paid_uploads_over_direct_node_endpoint
     seed_client.close().await?;
 
     devnet.shutdown().await?;
+    for listener in devnet.browser_listener_diagnostics() {
+        assert!(!listener.running);
+        assert_eq!(listener.active_connections, 0);
+        assert_eq!(listener.active_channels, 0);
+        assert_eq!(listener.active_requests, 0);
+        assert_eq!(listener.in_flight_bytes, 0);
+        assert!(listener.transport.connections.is_empty());
+    }
     Ok(())
 }
 
