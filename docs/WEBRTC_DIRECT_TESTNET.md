@@ -59,7 +59,7 @@ manifest contain only `chain_id`, `payment_token_address`, and
 `payment_vault_address`. Local Anvil uses chain ID 31337. Neither the verification
 RPC URL nor the funded key is included in browser metadata.
 
-Browser protocol v5 and browser manifest v6 require matching node, Rust/WASM
+Browser protocol v6 and browser manifest v6 require matching node, Rust/WASM
 client, and SDK versions. The application or wallet owns its payment provider;
 no browser RPC setting is needed on the node. For a custom EVM network, the node
 privately resolves `eth_chainId` from its verification RPC when starting the
@@ -198,7 +198,11 @@ limits are not shared with browser traffic. The defaults are:
 | `max_requests_per_second_per_connection` | 16 | association work token bucket |
 | `max_in_flight_bytes` | 64 MiB | listener frame memory |
 | `max_in_flight_bytes_per_ip` | 16 MiB | source-prefix frame memory |
-| `max_request_bytes` | 64 KiB | JSON request header |
+
+JSON request headers have a fixed 64 KiB protocol limit shared with the browser
+client; it accommodates paid quotes with full signed commitments and is not
+configurable. Complete plaintext frames are limited to 5 MiB + 64 KiB before
+JSON parsing. The JSON object is followed directly by raw binary content.
 
 The per-IP ceilings must remain strictly below their corresponding global
 ceilings. The product of the per-IP connection and per-connection channel

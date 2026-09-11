@@ -214,12 +214,6 @@ pub struct WebRtcDirectConfig {
 
     /// Maximum in-flight frame bytes attributable to one IPv4 address or IPv6 /64.
     pub max_in_flight_bytes_per_ip: usize,
-
-    /// Maximum JSON request-header size, in bytes.
-    ///
-    /// Binary PUT content has a separate [`crate::ant_protocol::MAX_CHUNK_SIZE`]
-    /// limit and is never JSON/base64 encoded.
-    pub max_request_bytes: usize,
 }
 
 impl Default for WebRtcDirectConfig {
@@ -240,7 +234,6 @@ impl Default for WebRtcDirectConfig {
                 default_webrtc_direct_max_requests_per_second_per_connection(),
             max_in_flight_bytes: default_webrtc_direct_max_in_flight_bytes(),
             max_in_flight_bytes_per_ip: default_webrtc_direct_max_in_flight_bytes_per_ip(),
-            max_request_bytes: default_webrtc_direct_max_request_bytes(),
         }
     }
 }
@@ -287,10 +280,6 @@ const fn default_webrtc_direct_max_in_flight_bytes() -> usize {
 
 const fn default_webrtc_direct_max_in_flight_bytes_per_ip() -> usize {
     16 * 1024 * 1024
-}
-
-const fn default_webrtc_direct_max_request_bytes() -> usize {
-    64 * 1024
 }
 
 /// Auto-upgrade configuration.
@@ -771,10 +760,6 @@ mod tests {
         let partial: NodeConfig = toml::from_str("[webrtc_direct]\nmax_connections = 48").unwrap();
         assert_eq!(partial.webrtc_direct.enabled, absent.webrtc_direct.enabled);
         assert_eq!(partial.webrtc_direct.bind, absent.webrtc_direct.bind);
-        assert_eq!(
-            partial.webrtc_direct.max_request_bytes,
-            absent.webrtc_direct.max_request_bytes
-        );
         assert_eq!(partial.webrtc_direct.max_connections, 48);
         let disabled: NodeConfig = toml::from_str("[webrtc_direct]\nenabled = false").unwrap();
         assert!(!disabled.webrtc_direct.enabled);

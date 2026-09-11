@@ -29,9 +29,9 @@ use saorsa_transport::webrtc::{
     BrowserQuoteArtifact, BrowserRequest as Request, BrowserRequestBody as RequestBody,
     BrowserResponse as Response, BrowserResponseBody as ResponseBody,
     BrowserResponseStatus as ResponseStatus, PqSession, BROWSER_PROTOCOL_NAME,
-    BROWSER_PROTOCOL_VERSION, MAX_BROWSER_HEADER_BYTES, PQ_CLIENT_HELLO_BYTES,
-    PQ_ENCRYPTED_OVERHEAD_BYTES, PQ_FRAME_PREFIX_BYTES, WEBRTC_DIRECT_DATA_CHANNEL,
-    WEBRTC_WRITE_CHUNK_BYTES,
+    BROWSER_PROTOCOL_VERSION, MAX_BROWSER_FRAME_BYTES, MAX_BROWSER_HEADER_BYTES,
+    PQ_CLIENT_HELLO_BYTES, PQ_ENCRYPTED_OVERHEAD_BYTES, PQ_FRAME_PREFIX_BYTES,
+    WEBRTC_DIRECT_DATA_CHANNEL, WEBRTC_WRITE_CHUNK_BYTES,
 };
 use saorsa_transport::webrtc_direct::{
     WebRtcAdmissionLimits, WebRtcCertificate, WebRtcDataChannel, WebRtcDirectConnection,
@@ -632,11 +632,6 @@ fn validate_webrtc_config(config: &WebRtcDirectConfig) -> Result<()> {
                 .to_string(),
         ));
     }
-    if config.max_request_bytes == 0 || config.max_request_bytes > MAX_BROWSER_HEADER_BYTES {
-        return Err(Error::Config(format!(
-            "webrtc_direct.max_request_bytes must be between 1 and {MAX_BROWSER_HEADER_BYTES}"
-        )));
-    }
     if config.advertised_addr.is_some_and(|addr| addr.port() == 0) {
         return Err(Error::Config(
             "webrtc_direct.advertised_addr must not use port zero".to_string(),
@@ -669,11 +664,6 @@ async fn load_or_generate_certificate(path: &Path) -> Result<WebRtcCertificate> 
                 Error::Startup(format!("failed to generate WebRTC certificate: {error}"))
             })?;
             tokio::fs::write(path, certificate.serialize_pem()).await?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
-            }
             Ok(certificate)
         }
         Err(error) => Err(error.into()),
@@ -953,7 +943,6 @@ async fn handle_webrtc_channel(
             () = shutdown.cancelled() => return Ok(()),
             result = read_webrtc_request(
                 channel,
-                state.config.max_request_bytes,
                 &mut pq_session,
                 &resources,
             ) => result,
@@ -1103,7 +1092,6 @@ struct AdmittedRequest {
 
 async fn read_webrtc_request(
     channel: &WebRtcDataChannel,
-    max_header_bytes: usize,
     pq_session: &mut PqSession,
     resources: &ConnectionResources,
 ) -> ServerResult<AdmittedRequest> {
@@ -1111,7 +1099,7 @@ async fn read_webrtc_request(
     // Admission happens as soon as a client starts a frame. Idle persistent
     // channels consume neither request-rate tokens nor request worker slots.
     let request_permit = resources.try_admit_request()?;
-    let max_plaintext_bytes = 4 + max_header_bytes + ant_protocol::MAX_WIRE_MESSAGE_SIZE;
+    let max_plaintext_bytes = MAX_BROWSER_FRAME_BYTES;
     let mut encrypted = read_pq_payload_after_first(
         first_message,
         channel,
@@ -1135,7 +1123,7 @@ async fn read_webrtc_request(
     reservation.resize(frame.len())?;
 
     let (request, content_offset) =
-        parse_request_header(&frame, max_header_bytes).map_err(|error| error.to_string())?;
+        parse_request_header(&frame).map_err(|error| error.to_string())?;
     let content_len = frame.len() - content_offset;
     let accounted_request_bytes = frame.len();
     // serde owns the parsed header and the body copy below owns the content.
@@ -2267,7 +2255,7 @@ mod tests {
     #[test]
     fn parses_versioned_requests() {
         let request: Request = serde_json::from_str(
-            r#"{"version":5,"request_id":7,"content_length":0,"type":"find_node","target":"0000000000000000000000000000000000000000000000000000000000000000","count":20}"#,
+            r#"{"version":6,"request_id":7,"content_length":0,"type":"find_node","target":"0000000000000000000000000000000000000000000000000000000000000000","count":20}"#,
         )
         .expect("valid request");
 
@@ -2293,6 +2281,56 @@ mod tests {
         assert_eq!(
             hex::encode(evmlib::cryptography::hash([0_u8, 1, 2, 3])),
             "d98f2e8134922f73748703c8e7084d42f13d2fa1439936ef5a3abcf5646fe83f"
+        );
+    }
+
+    #[test]
+    fn largest_paid_upload_header_fits_fixed_protocol_limit() {
+        // 0xff maximizes MessagePack's integer-array encoding. Exercise the
+        // actual native commitment serializer, including the JSON duplication
+        // of the commitment's public key and signature.
+        let commitment = ::ant_protocol::payment::commitment::StorageCommitment {
+            root: [0xff; 32],
+            key_count: u32::MAX,
+            sender_peer_id: [0xff; 32],
+            sender_public_key: vec![0xff; 1952],
+            signature: vec![0xff; 3309],
+        };
+        let encoded = rmp_serde::to_vec(&commitment).expect("serialize commitment");
+        let quote = BrowserQuoteArtifact {
+            peer_id: "ff".repeat(32),
+            content: "ff".repeat(32),
+            timestamp_secs: u64::MAX,
+            price: "9".repeat(78), // decimal U256 width
+            rewards_address: format!("0x{}", "ff".repeat(20)),
+            public_key: "ff".repeat(1952),
+            signature: "ff".repeat(3309),
+            committed_key_count: u32::MAX,
+            commitment_pin: Some("ff".repeat(32)),
+            quote_hash: "ff".repeat(32),
+            commitment: Some(browser_commitment_from_bytes(&encoded).expect("commitment artifact")),
+        };
+        let request = Request::new(
+            u64::MAX,
+            RequestBody::PutChunk {
+                address: "ff".repeat(32),
+                quote: Box::new(quote),
+                transaction_hash: format!("0x{}", "ff".repeat(32)),
+            },
+            MAX_CHUNK_SIZE,
+        );
+        let header = serde_json::to_vec(&request).expect("serialize paid request");
+        assert!(
+            header.len() < MAX_BROWSER_HEADER_BYTES,
+            "{} bytes",
+            header.len()
+        );
+        let content = vec![0xff; MAX_CHUNK_SIZE];
+        let frame = saorsa_transport::webrtc::encode_request_frame(&request, &content)
+            .expect("largest paid upload fits");
+        assert_eq!(
+            parse_request_header(&frame).expect("parse upload").0,
+            request
         );
     }
 
