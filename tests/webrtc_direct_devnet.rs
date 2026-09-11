@@ -2,7 +2,6 @@
 
 use ant_node::devnet::{Devnet, DevnetConfig};
 use ant_node::BrowserEndpoint;
-use ant_protocol::MAX_CHUNK_SIZE;
 #[cfg(feature = "test-utils")]
 use bytes::Bytes;
 #[cfg(feature = "test-utils")]
@@ -513,9 +512,7 @@ async fn rpc_stream(
 ) -> Result<(Value, Vec<u8>), Box<dyn Error>> {
     request["content_length"] = json!(content.len());
     let request_header = serde_json::to_vec(&request)?;
-    let request_header_len = u32::try_from(request_header.len())?;
-    let mut request_frame = Vec::with_capacity(4 + request_header.len() + content.len());
-    request_frame.extend_from_slice(&request_header_len.to_be_bytes());
+    let mut request_frame = Vec::with_capacity(request_header.len() + content.len());
     request_frame.extend_from_slice(&request_header);
     request_frame.extend_from_slice(content);
     let encrypted = pq_session.seal(&request_frame)?;
@@ -523,23 +520,13 @@ async fn rpc_stream(
 
     let encrypted = read_pq_payload(
         channel,
-        4 + 64 * 1024 + MAX_CHUNK_SIZE + PQ_ENCRYPTED_OVERHEAD_BYTES,
+        saorsa_transport::webrtc::MAX_BROWSER_FRAME_BYTES + PQ_ENCRYPTED_OVERHEAD_BYTES,
     )
     .await?;
     let frame = pq_session.open(&encrypted)?;
-    if frame.len() < 4 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "response is truncated").into());
-    }
-    let header_len = u32::from_be_bytes(frame[0..4].try_into()?) as usize;
-    let content_offset = 4usize
-        .checked_add(header_len)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "header length overflow"))?;
-    if frame.len() < content_offset {
-        return Err(
-            io::Error::new(io::ErrorKind::InvalidData, "response header is truncated").into(),
-        );
-    }
-    let header: Value = serde_json::from_slice(&frame[4..content_offset])?;
+    let parsed = saorsa_transport::webrtc::parse_response_frame(&frame)?;
+    let header = serde_json::to_value(parsed.header)?;
+    let content_offset = frame.len() - parsed.content.len();
     let content_length = header["content_length"]
         .as_u64()
         .and_then(|length| usize::try_from(length).ok())
