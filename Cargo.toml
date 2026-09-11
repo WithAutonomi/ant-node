@@ -129,6 +129,8 @@ tokio-test = "0.4"
 proptest = "1"
 alloy = { version = "1", features = ["node-bindings"] }
 serial_test = "3"
+# Exercise connected peers that never announce a DataChannel to the listener.
+webrtc-stack = { package = "webrtc", version = "0.14" }
 
 # Proves the migration returns disk to the filesystem, which is the claim the whole
 # change exists to make good. Needs the test-only migration-state accessor.

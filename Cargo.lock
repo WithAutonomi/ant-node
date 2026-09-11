@@ -874,6 +874,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "webrtc",
  "xor_name",
  "zip",
 ]
