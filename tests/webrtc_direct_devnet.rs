@@ -91,6 +91,146 @@ impl Drop for MockChainRpc {
     }
 }
 
+/// Connect ICE/DTLS using an externally negotiated channel, which sends no DCEP OPEN.
+async fn connect_without_remote_channel(
+    endpoint: &BrowserEndpoint,
+) -> Result<webrtc_stack::peer_connection::RTCPeerConnection, Box<dyn Error>> {
+    use webrtc_stack::api::{setting_engine::SettingEngine, APIBuilder};
+    use webrtc_stack::data_channel::data_channel_init::RTCDataChannelInit;
+    use webrtc_stack::ice::{mdns::MulticastDnsMode, network_type::NetworkType};
+    use webrtc_stack::peer_connection::{
+        configuration::RTCConfiguration, sdp::session_description::RTCSessionDescription,
+    };
+
+    let password = "stalledBrowserPassword0123456789";
+    let mut settings = SettingEngine::default();
+    settings.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
+    settings.set_ice_credentials("stalledBrowser".to_string(), password.to_string());
+    settings.set_network_types(vec![NetworkType::Udp4]);
+    settings.set_include_loopback_candidate(true);
+    settings.set_ip_filter(Box::new(|ip| ip.is_loopback()));
+    let peer = APIBuilder::new()
+        .with_setting_engine(settings)
+        .build()
+        .new_peer_connection(RTCConfiguration::default())
+        .await?;
+    peer.create_data_channel(
+        WEBRTC_DIRECT_DATA_CHANNEL,
+        Some(RTCDataChannelInit {
+            negotiated: Some(0),
+            ..Default::default()
+        }),
+    )
+    .await?;
+    let offer = peer.create_offer(None).await?;
+    peer.set_local_description(offer).await?;
+    let parsed = endpoint.parse().map_err(io::Error::other)?;
+    let answer = saorsa_transport::webrtc::server_answer_sdp(
+        &parsed,
+        &format!("saorsa+webrtc+v2/{password}"),
+    )?;
+    peer.set_remote_description(RTCSessionDescription::answer(answer)?)
+        .await?;
+    Ok(peer)
+}
+
+// Exercise the production 15-second first-channel timeout over real UDP/ICE.
+// Complete ICE/DTLS without announcing a remote DataChannel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn stalled_connection_times_out_and_allows_a_new_client() -> Result<(), Box<dyn Error>> {
+    use std::time::Duration;
+
+    let rpc =
+        MockChainRpc::new(json!({"jsonrpc":"2.0", "id":1, "result":"0x7a69"}).to_string()).await?;
+    let temp = tempfile::tempdir()?;
+    let mut config = DevnetConfig::minimal();
+    config.node_count = 2;
+    config.bootstrap_count = 1;
+    config.base_port = 0;
+    config.webrtc_direct = true;
+    config.data_dir = temp.path().join("stalled-connection-devnet");
+    config.spawn_delay = Duration::from_millis(20);
+    config.evm_network = Some(rpc.network());
+    let mut devnet = Devnet::new(config).await?;
+    devnet.start().await?;
+    let endpoint = devnet.browser_endpoints().remove(0).endpoint;
+    let parsed = endpoint.parse().map_err(io::Error::other)?;
+    let server_addr = parsed.socket_addr().map_err(io::Error::other)?;
+    let stalled_peer = connect_without_remote_channel(&endpoint).await?;
+
+    // Shut down the devnet even when a bounded wait returns an error.
+    let result: Result<(), Box<dyn Error>> = async {
+        let snapshot = || {
+            devnet
+                .browser_listener_diagnostics()
+                .into_iter()
+                .find(|snapshot| snapshot.local_addr == server_addr)
+                .ok_or_else(|| io::Error::other("missing listener diagnostics"))
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while snapshot()?.active_connections != 1
+                || snapshot()?.transport.successful_connections != 1
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok::<(), io::Error>(())
+        })
+        .await??;
+        let stalled = snapshot()?;
+        assert_eq!(stalled.active_channels, 0);
+        assert_eq!(stalled.transport.connections.len(), 1);
+        assert_eq!(stalled.connection_errors, 0);
+        let created = stalled.transport.connections[0].created_at;
+
+        // Do not close the association from the test: the real handler must do it.
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while snapshot()?.active_connections != 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Ok::<(), io::Error>(())
+        })
+        .await??;
+        assert!(
+            created.elapsed() >= Duration::from_secs(15),
+            "connection ended before its first-channel timeout"
+        );
+        let cleaned = snapshot()?;
+        assert!(cleaned.running);
+        assert_eq!(cleaned.connection_errors, 1);
+        assert_eq!(cleaned.transport.closed_connections, 1);
+        assert!(cleaned.transport.connections.is_empty());
+        assert_eq!(cleaned.active_channels, 0);
+        assert_eq!(cleaned.active_requests, 0);
+        assert_eq!(cleaned.in_flight_bytes, 0);
+        assert_eq!(cleaned.task_failures, 0);
+
+        // Use the same loopback source IP as the stalled association.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut client = BrowserRpcClient::connect(&endpoint).await?;
+            let (hello, content) = client
+                .rpc(
+                    json!({
+                        "version": BROWSER_PROTOCOL_VERSION, "request_id": 1, "type": "hello",
+                    }),
+                    &[],
+                )
+                .await?;
+            client.close().await?;
+            assert_eq!(hello["status"], "ok");
+            assert!(content.is_empty());
+            Ok::<(), Box<dyn Error>>(())
+        })
+        .await??;
+        assert_eq!(snapshot()?.transport.successful_connections, 2);
+        Ok(())
+    }
+    .await;
+    stalled_peer.close().await?;
+    devnet.shutdown().await?;
+    result
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]
 async fn encrypted_hello_and_manifest_never_disclose_verification_rpc() -> Result<(), Box<dyn Error>>

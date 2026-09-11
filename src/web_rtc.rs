@@ -2182,7 +2182,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_data_channel_timeout_releases_connection_admission() {
+    async fn first_data_channel_wait_times_out_and_scoped_admission_is_released() {
         let config = WebRtcDirectConfig::default();
         let resources = ListenerResources::new(&config);
         let remote_addr: SocketAddr = "198.51.100.1:1000".parse().expect("remote address");
