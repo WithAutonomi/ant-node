@@ -83,6 +83,7 @@ impl NodeBuilder {
     /// # Errors
     ///
     /// Returns an error if the node fails to start.
+    #[allow(clippy::too_many_lines)]
     pub async fn build(mut self) -> Result<RunningNode> {
         info!("Building ant-node with config: {:?}", self.config);
 
@@ -224,6 +225,8 @@ impl NodeBuilder {
             protocol_task: None,
             #[cfg(feature = "webrtc-direct")]
             webrtc_direct_task: None,
+            #[cfg(feature = "webrtc-direct")]
+            webrtc_diagnostics: tokio::sync::watch::channel(None).0,
             upgrade_exit_code: Arc::new(AtomicI32::new(-1)),
         };
 
@@ -486,11 +489,23 @@ pub struct RunningNode {
     /// ADR-0013 browser listener task.
     #[cfg(feature = "webrtc-direct")]
     webrtc_direct_task: Option<JoinHandle<()>>,
+    #[cfg(feature = "webrtc-direct")]
+    webrtc_diagnostics: tokio::sync::watch::Sender<Option<crate::web_rtc::WebRtcServerDiagnostics>>,
     /// Exit code requested by a successful upgrade (-1 = no upgrade exit pending).
     upgrade_exit_code: Arc<AtomicI32>,
 }
 
 impl RunningNode {
+    /// Subscribe before `run()` to receive the browser diagnostics handle after startup.
+    /// The handle can be sampled at any time and retains counters after shutdown.
+    #[cfg(feature = "webrtc-direct")]
+    #[must_use]
+    pub fn subscribe_webrtc_diagnostics(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<crate::web_rtc::WebRtcServerDiagnostics>> {
+        self.webrtc_diagnostics.subscribe()
+    }
+
     /// Get the node's root directory.
     #[must_use]
     pub fn root_dir(&self) -> &PathBuf {
@@ -560,7 +575,12 @@ impl RunningNode {
             )
             .await
             {
-                Ok(server) => self.webrtc_direct_task = Some(server.task),
+                Ok(server) => {
+                    let _ = self
+                        .webrtc_diagnostics
+                        .send_replace(Some(server.diagnostics));
+                    self.webrtc_direct_task = Some(server.task);
+                }
                 Err(error) => {
                     if let Err(shutdown_error) = self.p2p_node.shutdown().await {
                         warn!("P2P shutdown after WebRtcDirect startup failure failed: {shutdown_error}");

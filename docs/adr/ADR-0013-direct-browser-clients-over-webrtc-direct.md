@@ -305,6 +305,27 @@ size. Outbound frames send the four-byte prefix and bounded payload fragments
 without allocating another full-frame copy. Every reservation is released on
 success, rejection, cancellation, task abort, or protocol error.
 
+### Internal listener diagnostics
+
+`WebRtcDirectServer::diagnostics` exposes a cloneable snapshot handle.
+`RunningNode::subscribe_webrtc_diagnostics()` can be called before `run()` to
+receive that handle once startup completes. Devnets expose the same snapshots
+through `browser_listener_diagnostics()`.
+
+Snapshots include accept-loop and UDP-driver liveness; ICE/DTLS connection
+attempts, successes, failures and closures; per-connection DataChannel payload
+traffic and last activity; live application connections, channels, requests and
+reserved frame bytes against their configured capacities; and cumulative
+connection/channel/request/rate/memory rejection and handler-error counts.
+Counters survive shutdown; live connection entries are removed on close or owner drop.
+Unexpected UDP-driver termination wakes accept and ends the accept loop rather
+than repeatedly logging errors while reporting a live listener.
+
+These are internal diagnostics, without a new HTTP endpoint or relay/reachability
+probes. A running listener is not proof of external connectivity. Traffic counts
+exclude UDP/DTLS/SCTP overhead. RTT and packet loss are unavailable (`None`),
+because the upstream DataChannel stack does not supply usable measurements.
+
 ### Stable addresses and transport certificates
 
 The canonical direct address form is:

@@ -34,15 +34,15 @@ use saorsa_transport::webrtc::{
     WEBRTC_DIRECT_DATA_CHANNEL, WEBRTC_WRITE_CHUNK_BYTES,
 };
 use saorsa_transport::webrtc_direct::{
-    WebRtcAdmissionLimits, WebRtcCertificate, WebRtcDataChannel, WebRtcDirectConnection,
-    WebRtcDirectListener,
+    WebRtcAdmissionLimits, WebRtcCertificate, WebRtcDataChannel, WebRtcDiagnostics,
+    WebRtcDiagnosticsSnapshot, WebRtcDirectConnection, WebRtcDirectListener,
 };
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -134,13 +134,15 @@ impl RequestRateBucket {
 /// incrementally and the accounting must resize without queueing an unbounded
 /// number of waiters.
 struct ByteBudget {
+    rejections: Arc<AtomicU64>,
     limit: usize,
     in_use: AtomicUsize,
 }
 
 impl ByteBudget {
-    fn new(limit: usize) -> Self {
+    fn with_rejections(limit: usize, rejections: Arc<AtomicU64>) -> Self {
         Self {
+            rejections,
             limit,
             in_use: AtomicUsize::new(0),
         }
@@ -157,7 +159,10 @@ impl ByteBudget {
                     .checked_add(amount)
                     .filter(|next| *next <= self.limit)
             })
-            .map_err(|_| error.to_string())?;
+            .map_err(|_| {
+                self.rejections.fetch_add(1, Ordering::Relaxed);
+                error.to_string()
+            })?;
         Ok(ByteReservation {
             budget: Arc::clone(self),
             amount,
@@ -186,7 +191,10 @@ impl ByteReservation {
                     .checked_add(amount)
                     .filter(|next| *next <= self.budget.limit)
             })
-            .map_err(|_| self.error.to_string())?;
+            .map_err(|_| {
+                self.budget.rejections.fetch_add(1, Ordering::Relaxed);
+                self.error.to_string()
+            })?;
         self.amount += amount;
         Ok(())
     }
@@ -264,6 +272,16 @@ struct SourceAdmissionState {
 
 /// Admission and accounting shared by every association on one listener.
 struct ListenerResources {
+    running: AtomicBool,
+    connection_rejections: AtomicU64,
+    channel_rejections: AtomicU64,
+    request_rejections: AtomicU64,
+    rate_rejections: AtomicU64,
+    byte_rejections: Arc<AtomicU64>,
+    listener_errors: AtomicU64,
+    connection_errors: AtomicU64,
+    channel_errors: AtomicU64,
+    task_failures: AtomicU64,
     connection_limit: Arc<Semaphore>,
     channel_limit: Arc<Semaphore>,
     request_limit: Arc<Semaphore>,
@@ -279,12 +297,26 @@ struct ListenerResources {
 
 impl ListenerResources {
     fn new(config: &WebRtcDirectConfig) -> Arc<Self> {
+        let byte_rejections = Arc::new(AtomicU64::new(0));
         Arc::new(Self {
+            running: AtomicBool::new(false),
+            connection_rejections: AtomicU64::new(0),
+            channel_rejections: AtomicU64::new(0),
+            request_rejections: AtomicU64::new(0),
+            rate_rejections: AtomicU64::new(0),
+            listener_errors: AtomicU64::new(0),
+            connection_errors: AtomicU64::new(0),
+            channel_errors: AtomicU64::new(0),
+            task_failures: AtomicU64::new(0),
+            byte_rejections: Arc::clone(&byte_rejections),
             connection_limit: Arc::new(Semaphore::new(config.max_connections)),
             channel_limit: Arc::new(Semaphore::new(config.max_channels)),
             request_limit: Arc::new(Semaphore::new(config.max_concurrent_requests)),
             global_request_rate: Mutex::new(RequestRateBucket::new(config.max_requests_per_second)),
-            global_bytes: Arc::new(ByteBudget::new(config.max_in_flight_bytes)),
+            global_bytes: Arc::new(ByteBudget::with_rejections(
+                config.max_in_flight_bytes,
+                byte_rejections,
+            )),
             source_state: Mutex::new(SourceAdmissionState::default()),
             max_connections_per_ip: config.max_connections_per_ip,
             max_requests_per_second_per_ip: config.max_requests_per_second_per_ip,
@@ -298,6 +330,15 @@ impl ListenerResources {
     }
 
     fn try_admit_connection(
+        self: &Arc<Self>,
+        remote_addr: SocketAddr,
+    ) -> ServerResult<ConnectionAdmission> {
+        self.admit_connection(remote_addr).inspect_err(|_| {
+            self.connection_rejections.fetch_add(1, Ordering::Relaxed);
+        })
+    }
+
+    fn admit_connection(
         self: &Arc<Self>,
         remote_addr: SocketAddr,
     ) -> ServerResult<ConnectionAdmission> {
@@ -327,7 +368,10 @@ impl ListenerResources {
                     request_rate: Mutex::new(RequestRateBucket::new(
                         self.max_requests_per_second_per_ip,
                     )),
-                    bytes: Arc::new(ByteBudget::new(self.max_in_flight_bytes_per_ip)),
+                    bytes: Arc::new(ByteBudget::with_rejections(
+                        self.max_in_flight_bytes_per_ip,
+                        Arc::clone(&self.byte_rejections),
+                    )),
                 }),
             });
             if entry.active_connections >= self.max_connections_per_ip {
@@ -371,12 +415,20 @@ impl ConnectionResources {
     fn try_admit_request(&self) -> ServerResult<OwnedSemaphorePermit> {
         let permit = Arc::clone(&self.listener.request_limit)
             .try_acquire_owned()
-            .map_err(|_| REQUEST_CAPACITY_ERROR.to_string())?;
+            .map_err(|_| {
+                self.listener
+                    .request_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                REQUEST_CAPACITY_ERROR.to_string()
+            })?;
         let now = Instant::now();
         if !self.source.request_rate.lock().allow(now)
             || !self.request_rate.lock().allow(now)
             || !self.listener.global_request_rate.lock().allow(now)
         {
+            self.listener
+                .rate_rejections
+                .fetch_add(1, Ordering::Relaxed);
             return Err(REQUEST_RATE_ERROR.to_string());
         }
         Ok(permit)
@@ -408,8 +460,111 @@ impl Drop for ConnectionAdmission {
     }
 }
 
+/// Internal browser-listener diagnostics, sampled without network I/O.
+#[derive(Clone, Debug)]
+pub struct WebRtcServerSnapshot {
+    /// Bound local UDP socket.
+    pub local_addr: SocketAddr,
+    /// Both accept loop and UDP driver are alive; no external probe is implied.
+    pub running: bool,
+    /// Transport connection lifecycle and `DataChannel` traffic counters.
+    pub transport: WebRtcDiagnosticsSnapshot,
+    /// Application connection slots currently held, including setup.
+    pub active_connections: usize,
+    /// Configured application connection capacity.
+    pub max_connections: usize,
+    /// `DataChannel` handler slots currently held.
+    pub active_channels: usize,
+    /// Configured `DataChannel` handler capacity.
+    pub max_channels: usize,
+    /// Request permits currently held, including frame assembly.
+    pub active_requests: usize,
+    /// Configured concurrent request capacity.
+    pub max_concurrent_requests: usize,
+    /// Frame bytes currently reserved by handlers.
+    pub in_flight_bytes: usize,
+    /// Configured frame-memory capacity.
+    pub max_in_flight_bytes: usize,
+    /// Application connection admissions denied by capacity policy.
+    pub connection_rejections: u64,
+    /// `DataChannels` rejected by global or per-connection capacity policy.
+    pub channel_rejections: u64,
+    /// Requests rejected because all worker permits are in use.
+    pub request_rejections: u64,
+    /// Requests rejected by a global, source, or association rate limit.
+    pub rate_rejections: u64,
+    /// Failed frame-memory reservations, including buffer growth.
+    pub byte_rejections: u64,
+    /// Transport accept errors observed by the application listener.
+    pub listener_errors: u64,
+    /// Connection handlers that returned an error.
+    pub connection_errors: u64,
+    /// `DataChannel` handlers that returned an error, including PQ setup failures.
+    pub channel_errors: u64,
+    /// Connection or `DataChannel` tasks that panicked or were unexpectedly cancelled.
+    pub task_failures: u64,
+}
+
+/// Cloneable diagnostics handle for a running or stopped browser listener.
+#[derive(Clone)]
+pub struct WebRtcServerDiagnostics {
+    local_addr: SocketAddr,
+    transport: WebRtcDiagnostics,
+    resources: Arc<ListenerResources>,
+    config: WebRtcDirectConfig,
+}
+
+impl WebRtcServerDiagnostics {
+    /// Sample listener state, lifecycle counts, traffic, and resource pressure.
+    pub fn snapshot(&self) -> WebRtcServerSnapshot {
+        let resources = &self.resources;
+        let transport = self.transport.snapshot();
+        WebRtcServerSnapshot {
+            local_addr: self.local_addr,
+            running: resources.running.load(Ordering::Acquire) && transport.running,
+            transport,
+            active_connections: self
+                .config
+                .max_connections
+                .saturating_sub(resources.connection_limit.available_permits()),
+            max_connections: self.config.max_connections,
+            active_channels: self
+                .config
+                .max_channels
+                .saturating_sub(resources.channel_limit.available_permits()),
+            max_channels: self.config.max_channels,
+            active_requests: self
+                .config
+                .max_concurrent_requests
+                .saturating_sub(resources.request_limit.available_permits()),
+            max_concurrent_requests: self.config.max_concurrent_requests,
+            in_flight_bytes: resources.global_bytes.in_use.load(Ordering::Acquire),
+            max_in_flight_bytes: self.config.max_in_flight_bytes,
+            connection_rejections: resources.connection_rejections.load(Ordering::Relaxed),
+            channel_rejections: resources.channel_rejections.load(Ordering::Relaxed),
+            request_rejections: resources.request_rejections.load(Ordering::Relaxed),
+            rate_rejections: resources.rate_rejections.load(Ordering::Relaxed),
+            byte_rejections: resources.byte_rejections.load(Ordering::Relaxed),
+            listener_errors: resources.listener_errors.load(Ordering::Relaxed),
+            connection_errors: resources.connection_errors.load(Ordering::Relaxed),
+            channel_errors: resources.channel_errors.load(Ordering::Relaxed),
+            task_failures: resources.task_failures.load(Ordering::Relaxed),
+        }
+    }
+}
+
+struct ListenerRunGuard(Arc<ListenerResources>);
+
+impl Drop for ListenerRunGuard {
+    fn drop(&mut self) {
+        self.0.running.store(false, Ordering::Release);
+    }
+}
+
 /// A running browser listener and the endpoint clients use to reach it.
 pub struct WebRtcDirectServer {
+    /// Local health, traffic, lifecycle, and admission diagnostics.
+    pub diagnostics: WebRtcServerDiagnostics,
     /// Initial endpoint, absent until native address discovery yields a usable IP.
     /// Later updates are published through the DHT and the endpoint file.
     pub endpoint: Option<BrowserEndpoint>,
@@ -467,6 +622,14 @@ pub async fn spawn(
         }
     }
     let resources = ListenerResources::new(config);
+    let diagnostics = WebRtcServerDiagnostics {
+        local_addr,
+        transport: listener.diagnostics(),
+        resources: Arc::clone(&resources),
+        config: config.clone(),
+    };
+    resources.running.store(true, Ordering::Release);
+    let run_guard = ListenerRunGuard(Arc::clone(&resources));
     info!(bind = %local_addr, certificate = %certificate_path.display(),
         "ADR-0013 WebRTC Direct listening");
     let root_dir = root_dir.to_path_buf();
@@ -474,7 +637,13 @@ pub async fn spawn(
         // Both futures are owned by the listener task. Address publication cannot
         // block accepting sessions, and shutdown cancels a pending publication.
         tokio::join!(
-            serve_webrtc(listener, Arc::clone(&state), resources, shutdown.clone()),
+            serve_webrtc(
+                listener,
+                Arc::clone(&state),
+                resources,
+                shutdown.clone(),
+                run_guard
+            ),
             async {
                 let refresh = async {
                     let mut interval = tokio::time::interval(ADDRESS_REFRESH_INTERVAL);
@@ -500,6 +669,7 @@ pub async fn spawn(
         );
     });
     Ok(WebRtcDirectServer {
+        diagnostics,
         endpoint: browser_endpoint,
         task,
     })
@@ -697,6 +867,7 @@ async fn serve_webrtc(
     state: Arc<ServerState>,
     resources: Arc<ListenerResources>,
     shutdown: CancellationToken,
+    _run_guard: ListenerRunGuard,
 ) {
     let mut connection_tasks = JoinSet::new();
     loop {
@@ -705,6 +876,7 @@ async fn serve_webrtc(
             () = shutdown.cancelled() => break,
             completed = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
                 if let Some(Err(error)) = completed {
+                    resources.task_failures.fetch_add(1, Ordering::Relaxed);
                     warn!(%error, "WebRTC Direct connection task failed");
                 }
                 continue;
@@ -731,6 +903,7 @@ async fn serve_webrtc(
                 let connection_resources = Arc::clone(&admission.context);
                 let connection_state = Arc::clone(&state);
                 let connection_shutdown = shutdown.clone();
+                let diagnostic_resources = Arc::clone(&resources);
                 connection_tasks.spawn(async move {
                     let _admission = admission;
                     if let Err(error) = handle_connection(
@@ -741,12 +914,22 @@ async fn serve_webrtc(
                     )
                     .await
                     {
+                        diagnostic_resources
+                            .connection_errors
+                            .fetch_add(1, Ordering::Relaxed);
                         debug!(remote = %remote_addr, "WebRTC Direct connection ended: {error}");
                     }
                 });
             }
             Err(error) => {
+                resources.listener_errors.fetch_add(1, Ordering::Relaxed);
                 warn!("WebRTC Direct listener error: {error}");
+                if matches!(
+                    error,
+                    saorsa_transport::webrtc_direct::WebRtcDirectError::Closed
+                ) {
+                    break;
+                }
             }
         }
     }
@@ -812,6 +995,7 @@ async fn handle_connection(
                 () = shutdown.cancelled() => break Ok(()),
                 completed = channel_tasks.join_next(), if !channel_tasks.is_empty() => {
                     if let Some(Err(error)) = completed {
+                        resources.listener.task_failures.fetch_add(1, Ordering::Relaxed);
                         debug!(remote = %remote_addr, %error, "WebRTC Direct DataChannel task failed");
                     }
                     // The v4 protocol uses persistent channels; it has no channel
@@ -883,6 +1067,10 @@ async fn start_data_channel_task(
     remote_addr: SocketAddr,
 ) -> ServerResult<()> {
     if channel_tasks.len() >= state.config.max_channels_per_connection {
+        resources
+            .listener
+            .channel_rejections
+            .fetch_add(1, Ordering::Relaxed);
         if let Err(error) = channel.close().await {
             debug!(remote = %remote_addr, %error, "Failed to close excess DataChannel");
         }
@@ -890,6 +1078,10 @@ async fn start_data_channel_task(
     }
     let Ok(channel_permit) = Arc::clone(&resources.listener.channel_limit).try_acquire_owned()
     else {
+        resources
+            .listener
+            .channel_rejections
+            .fetch_add(1, Ordering::Relaxed);
         if let Err(error) = channel.close().await {
             debug!(remote = %remote_addr, %error, "Failed to close excess DataChannel");
         }
@@ -898,6 +1090,7 @@ async fn start_data_channel_task(
     let channel_state = Arc::clone(state);
     let channel_resources = Arc::clone(resources);
     let handler_shutdown = channel_shutdown.clone();
+    let diagnostic_resources = Arc::clone(&resources.listener);
     channel_tasks.spawn(async move {
         let _channel_permit = channel_permit;
         if let Err(error) = handle_webrtc_channel(
@@ -908,6 +1101,7 @@ async fn start_data_channel_task(
         )
         .await
         {
+            diagnostic_resources.channel_errors.fetch_add(1, Ordering::Relaxed);
             debug!(remote = %remote_addr, channel = channel.id(), "WebRTC Direct DataChannel ended: {error}");
         }
         if let Err(error) = channel.close().await {
@@ -1890,6 +2084,73 @@ struct ServerState {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn diagnostics_report_capacity_rate_and_byte_pressure_without_leaking_slots() {
+        let config = WebRtcDirectConfig {
+            max_connections: 2,
+            max_connections_per_ip: 1,
+            max_concurrent_requests: 1,
+            max_requests_per_second_per_connection: 1,
+            max_in_flight_bytes: 8,
+            max_in_flight_bytes_per_ip: 8,
+            ..WebRtcDirectConfig::default()
+        };
+        let resources = ListenerResources::new(&config);
+        let diagnostics = WebRtcServerDiagnostics {
+            local_addr: "127.0.0.1:1234".parse().unwrap(),
+            transport: WebRtcDiagnostics::default(),
+            resources: Arc::clone(&resources),
+            config,
+        };
+        let first = resources
+            .try_admit_connection("192.0.2.1:1000".parse().unwrap())
+            .unwrap();
+        assert!(resources
+            .try_admit_connection("192.0.2.1:1001".parse().unwrap())
+            .is_err());
+        let second = resources
+            .try_admit_connection("192.0.2.2:1000".parse().unwrap())
+            .unwrap();
+        assert!(resources
+            .try_admit_connection("192.0.2.3:1000".parse().unwrap())
+            .is_err());
+        let permit = first.context.try_admit_request().unwrap();
+        assert!(second.context.try_admit_request().is_err());
+        assert_eq!(diagnostics.snapshot().active_requests, 1);
+        drop(permit);
+        assert!(first.context.try_admit_request().is_err());
+        let mut bytes = first.context.try_reserve_bytes(6).unwrap();
+        assert!(second.context.try_reserve_bytes(3).is_err());
+        assert!(bytes.try_grow(3).is_err());
+        let busy = diagnostics.snapshot();
+        assert_eq!(busy.active_connections, 2);
+        assert_eq!(busy.connection_rejections, 2);
+        assert_eq!(busy.request_rejections, 1);
+        assert_eq!(busy.rate_rejections, 1);
+        assert_eq!(busy.byte_rejections, 2);
+        assert_eq!(busy.in_flight_bytes, 6);
+        assert_eq!(busy.active_requests, 0);
+        drop((bytes, first, second));
+        let idle = diagnostics.snapshot();
+        assert_eq!(idle.in_flight_bytes, 0);
+        assert_eq!(idle.active_connections, 0);
+        assert_eq!(idle.byte_rejections, 2);
+    }
+
+    #[tokio::test]
+    async fn aborting_listener_task_clears_running_status() {
+        let resources = ListenerResources::new(&WebRtcDirectConfig::default());
+        resources.running.store(true, Ordering::Release);
+        let guard = ListenerRunGuard(Arc::clone(&resources));
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(!resources.running.load(Ordering::Acquire));
+    }
 
     #[test]
     fn default_resource_limits_preserve_headroom_for_other_sources() {

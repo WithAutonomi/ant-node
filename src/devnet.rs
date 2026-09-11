@@ -344,6 +344,8 @@ pub struct DevnetNode {
     #[cfg(feature = "webrtc-direct")]
     webrtc_direct_task: Option<JoinHandle<()>>,
     #[cfg(feature = "webrtc-direct")]
+    webrtc_diagnostics: Option<crate::web_rtc::WebRtcServerDiagnostics>,
+    #[cfg(feature = "webrtc-direct")]
     browser_endpoint: Option<crate::browser::BrowserEndpoint>,
 }
 
@@ -589,6 +591,20 @@ impl Devnet {
                     self.config.advertise_ip.unwrap_or(Ipv4Addr::LOCALHOST),
                     n.port,
                 )))
+            })
+            .collect()
+    }
+
+    /// Snapshot every browser listener, including counters retained after shutdown.
+    #[cfg(feature = "webrtc-direct")]
+    #[must_use]
+    pub fn browser_listener_diagnostics(&self) -> Vec<crate::web_rtc::WebRtcServerSnapshot> {
+        self.nodes
+            .iter()
+            .filter_map(|node| {
+                node.webrtc_diagnostics
+                    .as_ref()
+                    .map(crate::web_rtc::WebRtcServerDiagnostics::snapshot)
             })
             .collect()
     }
@@ -896,6 +912,8 @@ impl Devnet {
             #[cfg(feature = "webrtc-direct")]
             webrtc_direct_task: None,
             #[cfg(feature = "webrtc-direct")]
+            webrtc_diagnostics: None,
+            #[cfg(feature = "webrtc-direct")]
             browser_endpoint: None,
         })
     }
@@ -1039,6 +1057,7 @@ impl Devnet {
                 ))
             })?;
             node.browser_endpoint = server.endpoint;
+            node.webrtc_diagnostics = Some(server.diagnostics);
             node.webrtc_direct_task = Some(server.task);
         }
 
