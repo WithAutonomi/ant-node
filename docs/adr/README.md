@@ -32,5 +32,6 @@ See [`TOOLING.md`](./TOOLING.md) for `adrs`, `adr-kit`, and AI harness setup.
 - [ADR-0010: Restrict the beta upgrade channel to `-beta.*` pre-releases](./ADR-0010-beta-upgrade-channel-semantics.md)
 - [ADR-0011: Capacity-gated source discovery in the replication verification cycle](./ADR-0011-capacity-gated-source-discovery.md)
 - [ADR-0012: Back off and report once when a verification round finds no holder](./ADR-0012-unresolved-verification-retry-backoff.md)
-- [ADR-0013: Direct browser clients over WebRTC Direct](./ADR-0013-direct-browser-clients-over-webrtc-direct.md)
 - [ADR-0014: One File Per Chunk, and Retiring LMDB Without Losing Data](./ADR-0014-file-based-chunk-store-and-lmdb-retirement.md)
+- [ADR-0013: Settlement version and pre-payment compatibility](./ADR-0013-settlement-version-and-pre-payment-compatibility.md)
+- [ADR-0015: Direct browser clients over WebRTC Direct](./ADR-0015-direct-browser-clients-over-webrtc-direct.md)

@@ -1,4 +1,4 @@
-# ADR-0013: Direct browser clients over WebRTC Direct
+# ADR-0015: Direct browser clients over WebRTC Direct
 
 - **Status:** Proposed
 - **Date:** 2026-08-03

@@ -1149,4 +1149,4 @@ messages may be at most 5 MiB; stored records still have the native 4 MiB limit.
 `cargo test --test webrtc_direct_devnet --features test-utils seeded_public_file_downloads_and_paid_uploads_over_direct_node_endpoints -- --ignored`
 exercises this path over real local WebRTC endpoints and an Anvil payment chain.
 
-Browser transport decisions and startup policy: [ADR-0013](docs/adr/ADR-0013-direct-browser-clients-over-webrtc-direct.md).
+Browser transport decisions and startup policy: [ADR-0015](docs/adr/ADR-0015-direct-browser-clients-over-webrtc-direct.md).

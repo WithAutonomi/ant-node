@@ -611,7 +611,7 @@ pub struct RunningNode {
     /// a chunk read that outlives the loop keeps the legacy store busy exactly while the
     /// migration is trying to drain it.
     protocol_children: TaskTracker,
-    /// ADR-0013 browser listener task.
+    /// ADR-0015 browser listener task.
     #[cfg(feature = "webrtc-direct")]
     webrtc_direct_task: Option<JoinHandle<()>>,
     #[cfg(feature = "webrtc-direct")]
@@ -915,6 +915,7 @@ impl RunningNode {
         // Run the main event loop with signal handling
         self.run_event_loop().await?;
 
+        self.shutdown.cancel();
         // The shared token closes the WebRtcDirect accept loop and active
         // browser sessions before storage and native P2P are torn down.
         #[cfg(feature = "webrtc-direct")]
