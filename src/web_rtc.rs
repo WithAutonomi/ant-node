@@ -25,10 +25,10 @@ use saorsa_core::identity::NodeIdentity;
 use saorsa_core::{AddressType, DHTNode, MultiAddr, P2PNode, PeerId};
 use saorsa_transport::webrtc::{
     accept_pq_session, decode_pq_frame, encode_response_frame, parse_request_header,
-    pq_frame_length, source_ip_bucket, transfer_timeout, BrowserCommitmentArtifact, BrowserNode,
+    pq_frame_length, source_ip_bucket, BrowserCommitmentArtifact, BrowserNode,
     BrowserQuoteArtifact, BrowserRequest as Request, BrowserRequestBody as RequestBody,
     BrowserResponse as Response, BrowserResponseBody as ResponseBody,
-    BrowserResponseStatus as ResponseStatus, PqSession, BROWSER_PROTOCOL_NAME,
+    BrowserResponseStatus as ResponseStatus, PqSession, TransferDeadline, BROWSER_PROTOCOL_NAME,
     BROWSER_PROTOCOL_VERSION, MAX_BROWSER_FRAME_BYTES, MAX_BROWSER_HEADER_BYTES,
     PQ_CLIENT_HELLO_BYTES, PQ_ENCRYPTED_OVERHEAD_BYTES, PQ_FRAME_PREFIX_BYTES,
     WEBRTC_DIRECT_DATA_CHANNEL, WEBRTC_WRITE_CHUNK_BYTES,
@@ -1356,8 +1356,7 @@ async fn read_pq_payload_after_first(
     frame_timeout_message: &str,
     resources: &ConnectionResources,
 ) -> ServerResult<TrackedBytes> {
-    let frame_started = tokio::time::Instant::now();
-    let mut frame_deadline = frame_started + transfer_timeout(PQ_FRAME_PREFIX_BYTES);
+    let mut frame_deadline = TransferDeadline::for_frame(PQ_FRAME_PREFIX_BYTES);
     let mut frame = TrackedBytes {
         reservation: resources.try_reserve_bytes(first_message.len())?,
         bytes: first_message,
@@ -1384,7 +1383,7 @@ async fn read_pq_payload_after_first(
                 // body. A sender cannot make many partial 4 MiB frames consume
                 // unaccounted memory during their transfer windows.
                 frame.reserve_length(length)?;
-                frame_deadline = frame_started + transfer_timeout(length);
+                frame_deadline.extend_for_frame(length);
             }
         }
 
@@ -1407,7 +1406,10 @@ async fn read_pq_payload_after_first(
             }
         }
 
-        let message = tokio::time::timeout_at(frame_deadline, channel.receive())
+        if frame_deadline.remaining().is_zero() {
+            return Err(frame_timeout_message.to_string());
+        }
+        let message = tokio::time::timeout(frame_deadline.remaining(), channel.receive())
             .await
             .map_err(|_| frame_timeout_message.to_string())?
             .map_err(|error| format!("DataChannel message read failed: {error}"))?;
@@ -1477,13 +1479,19 @@ async fn write_framed_pq_payload(channel: &WebRtcDataChannel, payload: &[u8]) ->
     let framed_len = PQ_FRAME_PREFIX_BYTES
         .checked_add(payload.len())
         .ok_or_else(|| "PQ response frame length overflow".to_string())?;
-    let deadline = tokio::time::Instant::now() + transfer_timeout(framed_len);
-    tokio::time::timeout_at(deadline, channel.send(&payload_len.to_be_bytes()))
-        .await
-        .map_err(|_| "response frame timed out".to_string())?
-        .map_err(|error| format!("response message write failed: {error}"))?;
+    let deadline = TransferDeadline::for_frame(framed_len);
+    tokio::time::timeout(
+        deadline.remaining(),
+        channel.send(&payload_len.to_be_bytes()),
+    )
+    .await
+    .map_err(|_| "response frame timed out".to_string())?
+    .map_err(|error| format!("response message write failed: {error}"))?;
     for chunk in payload.chunks(WEBRTC_WRITE_CHUNK_BYTES) {
-        tokio::time::timeout_at(deadline, channel.send(chunk))
+        if deadline.remaining().is_zero() {
+            return Err("response frame timed out".to_string());
+        }
+        tokio::time::timeout(deadline.remaining(), channel.send(chunk))
             .await
             .map_err(|_| "response frame timed out".to_string())?
             .map_err(|error| format!("response message write failed: {error}"))?;
