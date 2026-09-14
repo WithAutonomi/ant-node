@@ -9,6 +9,8 @@ mod cli;
 mod platform;
 
 use ant_node::config::BootstrapSource;
+#[cfg(feature = "logging")]
+use ant_node::logging::WithBuildInfo;
 use ant_node::NodeBuilder;
 use clap::Parser;
 use cli::Cli;
@@ -18,6 +20,15 @@ use cli::CliLogFormat;
 use tracing_subscriber::prelude::*;
 #[cfg(feature = "logging")]
 use tracing_subscriber::{fmt, EnvFilter, Layer};
+
+/// JSON event format shared by the stdout and file sinks: flattened event
+/// fields, stamped with the running build's `node_version` / `node_commit`
+/// on every line so telemetry can attribute each document to the binary
+/// that wrote it (see `ant_node::logging::WithBuildInfo`).
+#[cfg(feature = "logging")]
+fn json_event_format() -> WithBuildInfo<fmt::format::Format<fmt::format::Json>> {
+    WithBuildInfo(fmt::format().json().flatten_event(true))
+}
 
 /// Initialize the tracing subscriber when the `logging` feature is active
 /// **and** the user passed `--enable-logging`.
@@ -48,7 +59,7 @@ fn init_logging(
         }
         (CliLogFormat::Json, None) => {
             guard = None;
-            Box::new(fmt::layer().json().flatten_event(true))
+            Box::new(fmt::layer().json().event_format(json_event_format()))
         }
         (CliLogFormat::Text, Some(dir)) => {
             let file_appender = tracing_appender::rolling::Builder::new()
@@ -73,7 +84,7 @@ fn init_logging(
             Box::new(
                 fmt::layer()
                     .json()
-                    .flatten_event(true)
+                    .event_format(json_event_format())
                     .with_writer(non_blocking)
                     .with_ansi(false),
             )
