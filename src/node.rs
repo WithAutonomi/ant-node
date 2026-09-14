@@ -655,8 +655,24 @@ impl RunningNode {
     /// # Errors
     ///
     /// Returns an error if the node encounters a fatal error.
-    #[allow(clippy::too_many_lines)]
     pub async fn run(&mut self) -> Result<()> {
+        let result = self.run_until_shutdown().await;
+        self.cleanup().await;
+        // If an upgrade triggered the shutdown, exit with the requested code.
+        // This happens *after* all cleanup (P2P shutdown, log flush, etc.) so
+        // that destructors and async resources are properly torn down.
+        let exit_code = self.upgrade_exit_code.load(Ordering::SeqCst);
+        if result.is_ok() && exit_code >= 0 {
+            info!("Exiting with code {} for upgrade restart", exit_code);
+            std::process::exit(exit_code);
+        }
+
+        result
+    }
+
+    /// Start serving and wait for shutdown; the caller owns cleanup on every exit.
+    #[allow(clippy::too_many_lines)]
+    async fn run_until_shutdown(&mut self) -> Result<()> {
         info!("Node runtime loop starting");
 
         // Subscribe to DHT events BEFORE starting the P2P node so the
@@ -707,9 +723,6 @@ impl RunningNode {
                     self.webrtc_direct_task = Some(server.task);
                 }
                 Err(error) => {
-                    if let Err(shutdown_error) = self.p2p_node.shutdown().await {
-                        warn!("P2P shutdown after WebRtcDirect startup failure failed: {shutdown_error}");
-                    }
                     return Err(error);
                 }
             }
@@ -913,8 +926,11 @@ impl RunningNode {
         info!("Node running, waiting for shutdown signal");
 
         // Run the main event loop with signal handling
-        self.run_event_loop().await?;
+        self.run_event_loop().await
+    }
 
+    /// Drain dependent work before shutting down native networking.
+    async fn cleanup(&mut self) {
         self.shutdown.cancel();
         // The shared token closes the WebRtcDirect accept loop and active
         // browser sessions before storage and native P2P are torn down.
@@ -990,17 +1006,6 @@ impl RunningNode {
             warn!("Failed to send ShuttingDown event: {e}");
         }
         info!("Node shutdown complete");
-
-        // If an upgrade triggered the shutdown, exit with the requested code.
-        // This happens *after* all cleanup (P2P shutdown, log flush, etc.) so
-        // that destructors and async resources are properly torn down.
-        let exit_code = self.upgrade_exit_code.load(Ordering::SeqCst);
-        if exit_code >= 0 {
-            info!("Exiting with code {} for upgrade restart", exit_code);
-            std::process::exit(exit_code);
-        }
-
-        Ok(())
     }
 
     /// Run the main event loop, handling shutdown and signals.
@@ -1300,6 +1305,34 @@ mod tests {
             },
             ..NodeConfig::default()
         }
+    }
+
+    #[cfg(feature = "webrtc-direct")]
+    #[tokio::test]
+    async fn browser_startup_failure_drains_existing_migration() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("node");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        seed_legacy_store(&root).await;
+        let occupied = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let mut config = local_node_config(&root, 0);
+        config.webrtc_direct.enabled = true;
+        config.webrtc_direct.bind = occupied.local_addr().expect("address");
+        let mut node = NodeBuilder::new(config).build().await.expect("build");
+        assert!(node.migration_task.is_some());
+        let cancelled = node.shutdown.clone();
+        let result = node.run().await;
+        assert!(result.is_err(), "occupied browser port must fail startup");
+        assert!(cancelled.is_cancelled());
+        assert!(
+            node.migration_task.is_none(),
+            "migration must be joined before returning"
+        );
+        assert!(node.protocol_children.is_empty());
+        // The test runtime remains alive: cleanup must not rely on process exit.
+        tokio::task::yield_now().await;
     }
 
     /// A real, fully built node with a legacy store is actually migrating it.
