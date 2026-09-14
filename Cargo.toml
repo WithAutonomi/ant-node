@@ -230,10 +230,10 @@ webrtc-direct = [
 
 [patch.crates-io]
 saorsa-pqc = { git = "https://github.com/saorsa-labs/saorsa-pqc", rev = "6d57e9dd73d537182fe85b0050e809a224f21154" }
-evmlib = { git = "https://github.com/WithAutonomi/evmlib", rev = "c80b7c7aee11bb62503b00d8b41e08da1a13039d" }
-ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "c6bbf1768e2a62d4f58a4618a86eec840e16cb47" }
-saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core", rev = "e1680b7b759ad337674d84920c0d283b1d99dab8" }
-saorsa-transport = { git = "https://github.com/WithAutonomi/saorsa-transport", rev = "f583dd053dab331fb424b67da8600c4259b2c9dc" }
+evmlib = { git = "https://github.com/WithAutonomi/evmlib", rev = "a5f3d6179a9be86f78874030d1514df6cf62fef9" }
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "56e273810f72f2ab91a5892c412345d5513d24a3" }
+saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core", rev = "45c2f8545bc5bae9ace976f5c0f88a3868ec91c4" }
+saorsa-transport = { git = "https://github.com/WithAutonomi/saorsa-transport", rev = "539ac0354f5d4054fdd4156988864d6d98b757ec" }
 
 [profile.release]
 lto = true
