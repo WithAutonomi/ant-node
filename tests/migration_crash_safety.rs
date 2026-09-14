@@ -85,7 +85,7 @@ fn kill_child_at_failpoint(role: &str, root: &Path, failpoint: &str, let_through
 
     // Generous, but not unbounded. Without a deadline a failpoint that stopped working
     // would hang the job rather than fail it, and a hang says nothing about the code.
-    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let deadline = std::time::Instant::now() + Duration::from_mins(2);
     while !marker.exists() {
         if let Ok(Some(status)) = child.try_wait() {
             panic!("the child exited before reaching the failpoint: {status}");

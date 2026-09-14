@@ -64,7 +64,7 @@ const RETIRED_DELETE_ATTEMPTS: u32 = 60;
 const RETIRED_DELETE_BACKOFF: Duration = Duration::from_secs(10);
 
 /// The longest the reaper waits between attempts.
-const RETIRED_DELETE_BACKOFF_MAX: Duration = Duration::from_secs(30 * 60);
+const RETIRED_DELETE_BACKOFF_MAX: Duration = Duration::from_mins(30);
 
 /// How many retired directories may be waiting to be deleted before the node stops
 /// finding new names for them. Far more than a node should ever accumulate.

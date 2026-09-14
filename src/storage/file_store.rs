@@ -442,7 +442,7 @@ pub(crate) fn halt_here_if_asked(variable: &str, reached: &Path) {
         return;
     }
     loop {
-        std::thread::sleep(Duration::from_secs(3600));
+        std::thread::sleep(Duration::from_hours(1));
     }
 }
 

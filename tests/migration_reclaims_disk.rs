@@ -331,7 +331,7 @@ async fn retiring_the_legacy_environment_returns_its_bytes_to_the_filesystem() {
 /// Returns whatever it last saw when the deadline passes, so the caller's assertion is
 /// what fails rather than this helper, and the number in the failure is a real reading.
 async fn wait_for_space(path: &Path, wanted: u64) -> u64 {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
     loop {
         let free = free_space(path);
         if free >= wanted || std::time::Instant::now() > deadline {
