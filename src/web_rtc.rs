@@ -2605,7 +2605,7 @@ mod tests {
             }),
             ChunkMessageBody::MerkleCandidateQuoteResponse(MerkleCandidateQuoteResponse::Success {
                 candidate_node: rmp_serde::to_vec(&candidate).expect("candidate"),
-                commitment: Some(commitment.clone()),
+                commitment: Some(commitment),
             }),
         ] {
             let message = ChunkMessage {
