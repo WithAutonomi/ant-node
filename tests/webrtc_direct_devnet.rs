@@ -33,6 +33,120 @@ struct MockChainRpc {
     task: tokio::task::JoinHandle<io::Result<()>>,
 }
 
+/// Keep an actual disk PUT blocked across disconnect and listener shutdown.
+/// Test prepayment isolates storage lifetime from external chain verification.
+#[cfg(feature = "test-utils")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+#[allow(clippy::await_holding_lock)] // Deliberately stall a blocking disk write across awaits.
+async fn disconnected_put_retains_admission_and_allows_small_binary_quotes(
+) -> Result<(), Box<dyn Error>> {
+    use std::time::Duration;
+
+    let rpc =
+        MockChainRpc::new(json!({"jsonrpc":"2.0", "id":1, "result":"0x7a69"}).to_string()).await?;
+    let temp = tempfile::tempdir()?;
+    let mut config = DevnetConfig::minimal();
+    config.node_count = 2;
+    config.bootstrap_count = 1;
+    config.base_port = 0;
+    config.webrtc_direct = true;
+    config.cleanup_data_dir = false;
+    config.data_dir = temp.path().join("stalled-put-devnet");
+    config.spawn_delay = Duration::from_millis(20);
+    config.evm_network = Some(rpc.network());
+    let mut devnet = Devnet::new(config).await?;
+    devnet.start().await?;
+    let endpoint = devnet.browser_endpoints().remove(0).endpoint;
+    let (protocol, diagnostics) = devnet.test_browser_node(0).ok_or("missing browser node")?;
+    let storage = protocol.storage();
+    let gate = storage.test_put_gate();
+    let blocked = gate.write();
+    let address = *blake3::hash(&vec![7; ant_protocol::MAX_CHUNK_SIZE]).as_bytes();
+    let result: Result<(), Box<dyn Error>> = async {
+        protocol.payment_verifier_arc().cache_insert(address);
+        let mut client = BrowserRpcClient::connect(&endpoint).await?;
+        client.rpc(json!({"version":BROWSER_PROTOCOL_VERSION,"request_id":1,"type":"hello"}), &[]).await?;
+        let message = ant_protocol::ChunkMessage {
+            request_id: 2,
+            body: ant_protocol::ChunkMessageBody::PutRequest(ant_protocol::ChunkPutRequest::new(
+                address, Bytes::from(vec![7; ant_protocol::MAX_CHUNK_SIZE]),
+            )),
+        }.encode()?;
+        let mut frame = serde_json::to_vec(&json!({
+            "version":BROWSER_PROTOCOL_VERSION,"request_id":2,"type":"chunk_protocol","content_length":message.len()
+        }))?;
+        frame.extend_from_slice(&message);
+        send_pq_payload(client.client.data_channel(), &client.pq_session.seal(&frame)?).await?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while storage.test_file_tasks_in_flight() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await?;
+
+        // Under the old fixed 10 MiB allowance, this second client's QUOTE
+        // closed its channel even though both operations fit the source budget.
+        let mut other = BrowserRpcClient::connect(&endpoint).await?;
+        other.rpc(json!({"version":BROWSER_PROTOCOL_VERSION,"request_id":1,"type":"hello"}), &[]).await?;
+        let quote = other.chunk_rpc(2, ant_protocol::ChunkMessageBody::QuoteRequestV2(
+            ant_protocol::ChunkQuoteRequestV2::new([9; 32], 1024),
+        )).await?;
+        assert!(matches!(quote, ant_protocol::ChunkMessageBody::QuoteResponse(ant_protocol::ChunkQuoteResponse::Success { .. })));
+
+        // Check the actual adapter and shared version gate, not only the
+        // sanitizer in isolation. Both public refusal variants must survive.
+        for version in [0, 2] {
+            let mut request = ant_protocol::ChunkQuoteRequestV2::new([9; 32], 1024);
+            request.settlement_version = version;
+            let response = other.chunk_rpc(3, ant_protocol::ChunkMessageBody::QuoteRequestV2(request)).await?;
+            let expected = if version == 0 {
+                ant_protocol::ProtocolError::ClientUpdateRequired { client_settlement_version: 0, min_settlement_version: 1 }
+            } else {
+                ant_protocol::ProtocolError::StorerUpdateRequired { client_settlement_version: 2, node_settlement_version: 1 }
+            };
+            assert!(matches!(response, ant_protocol::ChunkMessageBody::QuoteResponse(ant_protocol::ChunkQuoteResponse::Error(ref error)) if *error == expected));
+        }
+        client.close().await?;
+        other.close().await?;
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while diagnostics.snapshot().active_connections != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await?;
+        let snapshot = diagnostics.snapshot();
+        assert_eq!(snapshot.active_requests, 1, "disconnected PUT still owns its worker slot");
+        assert!(snapshot.in_flight_bytes >= ant_protocol::MAX_CHUNK_SIZE);
+        assert_eq!(storage.test_file_tasks_in_flight(), 1);
+        Ok(())
+    }.await;
+
+    // Poll shutdown past its connection-drain deadline while the real disk
+    // operation remains blocked, then release it even if an assertion fails.
+    let shutdown = devnet.shutdown();
+    tokio::pin!(shutdown);
+    let early_shutdown = tokio::time::timeout(Duration::from_secs(6), &mut shutdown).await;
+    let during_shutdown = diagnostics.snapshot();
+    drop(blocked);
+    if early_shutdown.is_err() {
+        tokio::time::timeout(Duration::from_secs(20), &mut shutdown).await??;
+    }
+    storage.wait_idle().await;
+    result?;
+    assert!(
+        early_shutdown.is_err(),
+        "listener returned while a started PUT still owned disk work"
+    );
+    assert_eq!(during_shutdown.active_requests, 1);
+    assert!(during_shutdown.in_flight_bytes >= ant_protocol::MAX_CHUNK_SIZE);
+    assert_eq!(diagnostics.snapshot().active_requests, 0);
+    assert_eq!(diagnostics.snapshot().in_flight_bytes, 0);
+    assert!(
+        storage.get(&address).await?.is_some(),
+        "started PUT completed after disconnect"
+    );
+    Ok(())
+}
+
 impl MockChainRpc {
     async fn new(body: String) -> io::Result<Self> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;

@@ -1078,6 +1078,13 @@ impl ChunkStore {
         self.files.test_put_gate()
     }
 
+    /// Test-only count of running or queued file-store blocking operations.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn test_file_tasks_in_flight(&self) -> usize {
+        self.files.tasks_in_flight()
+    }
+
     /// Test-only: adjust the persisted migration marker directly.
     ///
     /// Real transitions go through [`Self::commit_to_files`] and

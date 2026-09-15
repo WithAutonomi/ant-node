@@ -5,6 +5,7 @@
 //! in `saorsa_transport::webrtc` uses ML-KEM-768, ML-DSA-65, and ChaCha20-Poly1305 to bind
 //! the node identity and protect every browser RPC without libp2p or Noise.
 
+mod certificate;
 mod errors;
 
 use crate::ant_protocol::{
@@ -17,7 +18,8 @@ use crate::error::{Error, Result};
 use crate::logging::{debug, info, warn};
 use crate::payment::{serialize_single_node_proof, PaymentProof};
 use crate::storage::AntProtocol;
-use errors::{decode_response, error_response, public_error, sanitize_response};
+use certificate::load_or_generate_certificate;
+use errors::{error_response, public_error, sanitize_response};
 use evmlib::common::{Amount, TxHash};
 use evmlib::{EncodedPeerId, PaymentQuote, ProofOfPayment, RewardsAddress};
 use parking_lot::{Mutex, RwLock};
@@ -34,8 +36,8 @@ use saorsa_transport::webrtc::{
     WEBRTC_DIRECT_DATA_CHANNEL, WEBRTC_WRITE_CHUNK_BYTES,
 };
 use saorsa_transport::webrtc_direct::{
-    WebRtcAdmissionLimits, WebRtcCertificate, WebRtcDataChannel, WebRtcDiagnostics,
-    WebRtcDiagnosticsSnapshot, WebRtcDirectConnection, WebRtcDirectListener,
+    WebRtcAdmissionLimits, WebRtcDataChannel, WebRtcDiagnostics, WebRtcDiagnosticsSnapshot,
+    WebRtcDirectConnection, WebRtcDirectListener,
 };
 use std::collections::HashMap;
 use std::future::Future;
@@ -48,6 +50,7 @@ use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 const MAX_FIND_NODE_RESULTS: usize = 20;
 // Browser dials use a 10-second channel-open timeout. Give successful clients
@@ -285,6 +288,7 @@ struct ListenerResources {
     connection_limit: Arc<Semaphore>,
     channel_limit: Arc<Semaphore>,
     request_limit: Arc<Semaphore>,
+    request_tasks: Mutex<TaskTracker>,
     global_request_rate: Mutex<RequestRateBucket>,
     global_bytes: Arc<ByteBudget>,
     source_state: Mutex<SourceAdmissionState>,
@@ -312,6 +316,7 @@ impl ListenerResources {
             connection_limit: Arc::new(Semaphore::new(config.max_connections)),
             channel_limit: Arc::new(Semaphore::new(config.max_channels)),
             request_limit: Arc::new(Semaphore::new(config.max_concurrent_requests)),
+            request_tasks: Mutex::new(TaskTracker::new()),
             global_request_rate: Mutex::new(RequestRateBucket::new(config.max_requests_per_second)),
             global_bytes: Arc::new(ByteBudget::with_rejections(
                 config.max_in_flight_bytes,
@@ -352,7 +357,11 @@ impl ListenerResources {
                 let eviction = state
                     .sources
                     .iter()
-                    .filter(|(_, entry)| entry.active_connections == 0)
+                    .filter(|(_, entry)| {
+                        entry.active_connections == 0
+                            && Arc::strong_count(&entry.quota) == 1
+                            && entry.quota.bytes.in_use.load(Ordering::Acquire) == 0
+                    })
                     .min_by_key(|(_, entry)| entry.last_seen)
                     .map(|(ip, _)| *ip);
                 let Some(eviction) = eviction else {
@@ -402,6 +411,30 @@ impl ListenerResources {
             entry.active_connections = entry.active_connections.saturating_sub(1);
             entry.last_seen = Instant::now();
         }
+    }
+
+    fn spawn_request<F>(&self, work: F) -> ServerResult<JoinHandle<F::Output>>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        // TaskTracker::close alone does not prevent spawning. Serialize these
+        // steps so a channel still unwinding after abort cannot register work
+        // after shutdown observed an empty tracker and returned.
+        let tracker = self.request_tasks.lock();
+        if tracker.is_closed() {
+            return Err("browser listener is shutting down".to_string());
+        }
+        Ok(tracker.spawn(work))
+    }
+
+    async fn drain_requests(&self) {
+        let tracker = {
+            let tracker = self.request_tasks.lock();
+            tracker.close();
+            tracker.clone()
+        };
+        tracker.wait().await;
     }
 }
 
@@ -477,11 +510,12 @@ pub struct WebRtcServerSnapshot {
     pub active_channels: usize,
     /// Configured `DataChannel` handler capacity.
     pub max_channels: usize,
-    /// Request permits currently held, including frame assembly.
+    /// Request permits held during frame assembly, processing and response sends.
+    /// Includes started requests whose browser has disconnected.
     pub active_requests: usize,
     /// Configured concurrent request capacity.
     pub max_concurrent_requests: usize,
-    /// Frame bytes currently reserved by handlers.
+    /// Request and response bytes reserved, including disconnected disk work.
     pub in_flight_bytes: usize,
     /// Configured frame-memory capacity.
     pub max_in_flight_bytes: usize,
@@ -818,28 +852,6 @@ fn certificate_path(config: &WebRtcDirectConfig, root_dir: &Path) -> PathBuf {
     }
 }
 
-async fn load_or_generate_certificate(path: &Path) -> Result<WebRtcCertificate> {
-    match tokio::fs::read_to_string(path).await {
-        Ok(pem) => WebRtcCertificate::from_pem(&pem).map_err(|error| {
-            Error::Startup(format!(
-                "failed to load WebRTC certificate {}: {error}",
-                path.display()
-            ))
-        }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if let Some(parent) = path.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-            let certificate = WebRtcCertificate::generate().map_err(|error| {
-                Error::Startup(format!("failed to generate WebRTC certificate: {error}"))
-            })?;
-            tokio::fs::write(path, certificate.serialize_pem()).await?;
-            Ok(certificate)
-        }
-        Err(error) => Err(error.into()),
-    }
-}
-
 fn advertised_addr(
     config: &WebRtcDirectConfig,
     local_addr: SocketAddr,
@@ -949,6 +961,10 @@ async fn serve_webrtc(
         connection_tasks.abort_all();
         while connection_tasks.join_next().await.is_some() {}
     }
+    // Connection tasks may be cancelled, but started requests own their permits
+    // until the storage/payment handler returns. Never abort these workers: a
+    // blocking disk operation can outlive its async caller.
+    resources.drain_requests().await;
     info!("ADR-0015 WebRTC Direct stopped");
 }
 
@@ -998,7 +1014,7 @@ async fn handle_connection(
                         resources.listener.task_failures.fetch_add(1, Ordering::Relaxed);
                         debug!(remote = %remote_addr, %error, "WebRTC Direct DataChannel task failed");
                     }
-                    // The v4 protocol uses persistent channels; it has no channel
+                    // The browser protocol uses persistent channels; it has no channel
                     // reopen/continuation handshake. Once the last channel ends,
                     // close the association promptly instead of retaining a stale
                     // per-IP connection slot while waiting for another channel.
@@ -1028,9 +1044,9 @@ async fn handle_connection(
         }
     };
 
-    // Stop every handler before returning its storage/P2P state. Closing the
-    // association alone is not a sufficient wake-up guarantee for work that
-    // is currently inside an application request.
+    // Stop channel I/O promptly. Started application requests are owned by the
+    // listener's request tracker and keep their storage state and admission
+    // until processing finishes, independently of this connection.
     channel_shutdown.cancel();
     if let Err(error) = connection.close().await {
         debug!(remote = %remote_addr, %error, "Failed to close WebRTC Direct connection");
@@ -1160,12 +1176,7 @@ async fn handle_webrtc_channel(
                 return Ok(());
             }
         };
-        let AdmittedRequest {
-            request,
-            content,
-            _request_permit,
-            _in_flight_bytes,
-        } = admitted;
+        let request = &admitted.request;
         if request.version != BROWSER_PROTOCOL_VERSION {
             let response = Response::error(
                 request.request_id,
@@ -1210,10 +1221,16 @@ async fn handle_webrtc_channel(
             continue;
         }
 
-        let (response, content) = tokio::select! {
+        let CompletedRequest {
+            response,
+            content,
+            _request_permit,
+            _in_flight_bytes,
+            _resources,
+        } = tokio::select! {
             biased;
             () = shutdown.cancelled() => return Ok(()),
-            result = process_request(request, content, &state, &resources) => result?,
+            result = start_request(admitted, Arc::clone(&state), Arc::clone(&resources)) => result?,
         };
         if is_hello && matches!(&response.status, ResponseStatus::Ok) {
             hello_completed = true;
@@ -1282,6 +1299,43 @@ struct AdmittedRequest {
     content: Vec<u8>,
     _request_permit: OwnedSemaphorePermit,
     _in_flight_bytes: InFlightByteReservation,
+}
+
+struct CompletedRequest {
+    response: Response,
+    content: Option<TrackedBytes>,
+    _request_permit: OwnedSemaphorePermit,
+    _in_flight_bytes: InFlightByteReservation,
+    // Prevent source eviction until the response and all its charges are gone.
+    _resources: Arc<ConnectionResources>,
+}
+
+async fn start_request(
+    admitted: AdmittedRequest,
+    state: Arc<ServerState>,
+    resources: Arc<ConnectionResources>,
+) -> ServerResult<CompletedRequest> {
+    let listener = Arc::clone(&resources.listener);
+    let worker = listener.spawn_request(async move {
+        let AdmittedRequest {
+            request,
+            content,
+            _request_permit: request_permit,
+            _in_flight_bytes: in_flight_bytes,
+        } = admitted;
+        let (response, content) = process_request(request, content, &state, &resources).await?;
+        Ok(CompletedRequest {
+            response,
+            content,
+            _request_permit: request_permit,
+            _in_flight_bytes: in_flight_bytes,
+            _resources: resources,
+        })
+    })?;
+    worker.await.map_err(|error| {
+        listener.task_failures.fetch_add(1, Ordering::Relaxed);
+        public_error("request_failed", error)
+    })?
 }
 
 async fn read_webrtc_request(
@@ -1531,22 +1585,17 @@ async fn process_request(
                     None,
                 ));
             };
-            // Charge the response before the shared handler can allocate it.
-            // Requests retain the existing connection/rate/byte admission limits.
-            let mut reservation =
-                resources.try_reserve_bytes(2 * ant_protocol::MAX_WIRE_MESSAGE_SIZE)?;
-            let response = protocol
-                .try_handle_request(&content)
-                .await
-                .map_err(|error| public_error("chunk_protocol_failed", error))?
-                .ok_or_else(|| "chunk protocol handler returned no response".to_string())?;
-            if response.len() > ant_protocol::MAX_WIRE_MESSAGE_SIZE {
-                return Err("chunk protocol response exceeds wire limit".to_string());
-            }
-            let response = decode_response(response)?;
-            let bytes = response
-                .encode()
-                .map_err(|error| public_error("invalid_response", error))?;
+            // The admitted frame remains charged for the whole request. Charge
+            // decoding before it copies the input, then retain that allowance
+            // for the PUT handler's disk buffer after dropping the wire buffer.
+            let mut reservation = resources.try_reserve_bytes(content.len())?;
+            let message = ChunkMessage::decode(&content)
+                .map_err(|error| public_error("invalid_request", error))?;
+            drop(content);
+            let response_limit = binary_response_limit(&message.body)?;
+            reservation.resize(reservation.source.amount.max(2 * response_limit))?;
+            let response = handle_ant_message(protocol, message).await?;
+            let bytes = encode_binary_response(&response, response_limit)?;
             drop(response);
             reservation.resize(bytes.len())?;
             Ok((
@@ -1590,6 +1639,37 @@ async fn process_request(
         )
         .await),
     }
+}
+
+// PUT acknowledgements and signed quotes contain no chunk payload. 64 KiB
+// covers the ML-DSA public key/signature, quote and signed commitment, including
+// worst-case MessagePack integer encoding. GET alone needs a full wire buffer.
+const SMALL_BINARY_RESPONSE_BYTES: usize = 64 * 1024;
+
+fn binary_response_limit(body: &ChunkMessageBody) -> ServerResult<usize> {
+    match body {
+        ChunkMessageBody::GetRequest(_) => Ok(ant_protocol::MAX_WIRE_MESSAGE_SIZE),
+        ChunkMessageBody::PutRequest(_)
+        | ChunkMessageBody::QuoteRequest(_)
+        | ChunkMessageBody::QuoteRequestV2(_)
+        | ChunkMessageBody::MerkleCandidateQuoteRequest(_)
+        | ChunkMessageBody::MerkleCandidateQuoteRequestV2(_) => Ok(SMALL_BINARY_RESPONSE_BYTES),
+        _ => Err("unsupported chunk protocol request".to_string()),
+    }
+}
+
+fn encode_binary_response(message: &ChunkMessage, limit: usize) -> ServerResult<Vec<u8>> {
+    // Size without allocating, then encode into exactly the charged space.
+    // This also prevents Vec growth from retaining an oversized capacity.
+    let length = postcard::experimental::serialized_size(message)
+        .map_err(|error| public_error("invalid_response", error))?;
+    if length > limit {
+        return Err("chunk protocol response exceeds operation limit".to_string());
+    }
+    let mut bytes = vec![0; length];
+    postcard::to_slice(message, &mut bytes)
+        .map_err(|error| public_error("invalid_response", error))?;
+    Ok(bytes)
 }
 
 fn hello_response(request_id: u64, state: &ServerState) -> Response {
@@ -2402,6 +2482,164 @@ mod tests {
     }
 
     #[test]
+    fn source_churn_cannot_evict_disconnected_work_or_reset_its_budget() {
+        let resources = ListenerResources::new(&WebRtcDirectConfig::default());
+        let address = "192.0.2.1:1000".parse().expect("source");
+        let connection = resources.try_admit_connection(address).expect("connection");
+        let worker_resources = Arc::clone(&connection.context);
+        let reservation = worker_resources
+            .try_reserve_bytes(resources.max_in_flight_bytes_per_ip)
+            .expect("budget");
+        drop(connection);
+        for index in 0..resources.max_tracked_sources + 10 {
+            let third = u8::try_from(index / 254).expect("third octet");
+            let host = u8::try_from(index % 254 + 1).expect("host octet");
+            let other = SocketAddr::from((Ipv4Addr::new(198, 51, third, host), 1000));
+            drop(resources.try_admit_connection(other).expect("source churn"));
+        }
+        let reconnect = resources.try_admit_connection(address).expect("reconnect");
+        assert!(Arc::ptr_eq(
+            &worker_resources.source,
+            &reconnect.context.source
+        ));
+        assert_eq!(
+            reconnect.context.try_reserve_bytes(1).err().as_deref(),
+            Some(SOURCE_BYTE_CAPACITY_ERROR)
+        );
+        drop(reservation);
+        assert!(reconnect.context.try_reserve_bytes(1).is_ok());
+    }
+
+    #[tokio::test]
+    async fn request_drain_keeps_started_work_and_rejects_late_registration() {
+        let config = WebRtcDirectConfig::default();
+        let resources = ListenerResources::new(&config);
+        let connection = resources
+            .try_admit_connection("192.0.2.1:1000".parse().expect("source"))
+            .expect("connection");
+        let request_permit = connection
+            .context
+            .try_admit_request()
+            .expect("request slot");
+        let bytes = connection.context.try_reserve_bytes(1024).expect("bytes");
+        let (finish, finished) = tokio::sync::oneshot::channel::<()>();
+        // Dropping the awaiter's handle must leave the actual work charged.
+        drop(
+            resources
+                .spawn_request(async move {
+                    let _request_permit = request_permit;
+                    let _bytes = bytes;
+                    finished.await.expect("finish signal");
+                })
+                .expect("started request"),
+        );
+        drop(connection);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), resources.drain_requests())
+                .await
+                .is_err()
+        );
+        assert_eq!(resources.global_bytes.in_use(), 1024);
+        assert_eq!(
+            resources.request_limit.available_permits(),
+            config.max_concurrent_requests - 1
+        );
+        assert!(
+            resources.spawn_request(async {}).is_err(),
+            "closed admission rejects a late channel"
+        );
+        finish.send(()).expect("finish work");
+        tokio::time::timeout(Duration::from_secs(1), resources.drain_requests())
+            .await
+            .expect("drained");
+        assert_eq!(resources.global_bytes.in_use(), 0);
+        assert_eq!(
+            resources.request_limit.available_permits(),
+            config.max_concurrent_requests
+        );
+    }
+
+    #[test]
+    fn signed_quotes_and_commitments_fit_the_small_binary_response_bound() {
+        use ant_protocol::payment::commitment::StorageCommitment;
+        use ant_protocol::MerkleCandidateQuoteResponse;
+        use evmlib::merkle_payments::MerklePaymentCandidateNode;
+        use saorsa_pqc::api::sig::MlDsaVariant;
+
+        // 0xff maximizes MessagePack's integer-array encoding. Use the actual
+        // signature profile so an upstream size change exercises this bound.
+        let public_key = vec![0xff; MlDsaVariant::MlDsa65.public_key_size()];
+        let signature = vec![0xff; MlDsaVariant::MlDsa65.signature_size()];
+        let commitment = rmp_serde::to_vec(&StorageCommitment {
+            root: [0xff; 32],
+            key_count: u32::MAX,
+            sender_peer_id: [0xff; 32],
+            sender_public_key: public_key.clone(),
+            signature: signature.clone(),
+        })
+        .expect("commitment");
+        let quote = PaymentQuote {
+            content: xor_name::XorName([0xff; 32]),
+            timestamp: SystemTime::UNIX_EPOCH + Duration::from_secs(u32::MAX.into()),
+            price: Amount::MAX,
+            rewards_address: RewardsAddress::new([0xff; 20]),
+            pub_key: public_key.clone(),
+            signature: signature.clone(),
+            committed_key_count: u32::MAX,
+            commitment_pin: Some([0xff; 32]),
+        };
+        let candidate = MerklePaymentCandidateNode {
+            pub_key: public_key,
+            price: Amount::MAX,
+            reward_address: RewardsAddress::new([0xff; 20]),
+            merkle_payment_timestamp: u64::MAX,
+            signature,
+            committed_key_count: u32::MAX,
+            commitment_pin: Some([0xff; 32]),
+        };
+        for body in [
+            ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success {
+                quote: rmp_serde::to_vec(&quote).expect("quote"),
+                already_stored: false,
+                commitment: Some(commitment.clone()),
+            }),
+            ChunkMessageBody::MerkleCandidateQuoteResponse(MerkleCandidateQuoteResponse::Success {
+                candidate_node: rmp_serde::to_vec(&candidate).expect("candidate"),
+                commitment: Some(commitment.clone()),
+            }),
+        ] {
+            let message = ChunkMessage {
+                request_id: u64::MAX,
+                body,
+            };
+            let bytes = encode_binary_response(&message, SMALL_BINARY_RESPONSE_BYTES)
+                .expect("bounded quote");
+            assert_eq!(bytes, message.encode().expect("shared wire encoding"));
+            assert_eq!(bytes.capacity(), bytes.len());
+        }
+    }
+
+    #[test]
+    fn maximum_binary_get_fits_and_oversized_responses_are_rejected() {
+        let request = ChunkMessageBody::GetRequest(ant_protocol::ChunkGetRequest::new([0xff; 32]));
+        let response = ChunkMessage {
+            request_id: u64::MAX,
+            body: ChunkMessageBody::GetResponse(ant_protocol::ChunkGetResponse::Success {
+                address: [0xff; 32],
+                content: vec![0xff; MAX_CHUNK_SIZE],
+            }),
+        };
+        let bytes = encode_binary_response(
+            &response,
+            binary_response_limit(&request).expect("GET bound"),
+        )
+        .expect("maximum GET");
+        assert_eq!(bytes, response.encode().expect("shared wire encoding"));
+        assert!(encode_binary_response(&response, SMALL_BINARY_RESPONSE_BYTES).is_err());
+        assert!(binary_response_limit(&response.body).is_err());
+    }
+
+    #[test]
     fn byte_reservations_are_per_source_global_and_raii_released() {
         let config = WebRtcDirectConfig {
             max_in_flight_bytes: 256,
@@ -2499,6 +2737,7 @@ mod tests {
 
     #[tokio::test]
     async fn automatic_port_is_os_assigned_and_explicit_advertisement_is_independent() {
+        use saorsa_transport::webrtc_direct::WebRtcCertificate;
         let certificate = WebRtcCertificate::generate().expect("certificate");
         let listener =
             WebRtcDirectListener::bind("127.0.0.1:0".parse().expect("bind"), certificate)

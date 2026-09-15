@@ -609,6 +609,20 @@ impl Devnet {
             .collect()
     }
 
+    /// Test-only handles for exercising browser admission during stalled storage.
+    #[cfg(all(feature = "webrtc-direct", feature = "test-utils"))]
+    #[must_use]
+    pub fn test_browser_node(
+        &self,
+        index: usize,
+    ) -> Option<(Arc<AntProtocol>, crate::web_rtc::WebRtcServerDiagnostics)> {
+        let node = self.nodes.get(index)?;
+        Some((
+            Arc::clone(node.ant_protocol.as_ref()?),
+            node.webrtc_diagnostics.clone()?,
+        ))
+    }
+
     /// Get every direct browser endpoint in this devnet.
     #[cfg(feature = "webrtc-direct")]
     #[must_use]

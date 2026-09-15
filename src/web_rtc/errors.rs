@@ -29,7 +29,8 @@ pub(super) fn error_response(request_id: u64, code: &str, detail: impl Display) 
 
 /// Consume the encoded buffer before callers re-encode the decoded message, so
 /// sanitization retains at most two response-sized allocations at a time.
-pub(super) fn decode_response(response: bytes::Bytes) -> ServerResult<ChunkMessage> {
+#[cfg(test)]
+fn decode_response(response: bytes::Bytes) -> ServerResult<ChunkMessage> {
     let mut message =
         ChunkMessage::decode(&response).map_err(|error| public_error("invalid_response", error))?;
     drop(response);
@@ -82,7 +83,9 @@ fn sanitize_protocol_error(error: &mut ProtocolError) {
         ProtocolError::Internal(detail) => (detail, "node could not process the request"),
         ProtocolError::MessageTooLarge { .. }
         | ProtocolError::ChunkTooLarge { .. }
-        | ProtocolError::AddressMismatch { .. } => return,
+        | ProtocolError::AddressMismatch { .. }
+        | ProtocolError::ClientUpdateRequired { .. }
+        | ProtocolError::StorerUpdateRequired { .. } => return,
         _ => {
             warn!(detail = %error, "Unrecognized browser protocol error");
             *error = ProtocolError::Internal("node could not process the request".to_string());
@@ -204,6 +207,36 @@ mod tests {
             .expect("encode");
             let decoded = decode_response(original.clone().into()).expect("decode");
             assert_eq!(decoded.encode().expect("encode"), original);
+        }
+    }
+
+    #[test]
+    fn settlement_refusals_survive_sanitization_and_wire_round_trip() {
+        for error in [
+            ProtocolError::ClientUpdateRequired {
+                client_settlement_version: 0,
+                min_settlement_version: 1,
+            },
+            ProtocolError::StorerUpdateRequired {
+                client_settlement_version: 2,
+                node_settlement_version: 1,
+            },
+        ] {
+            for body in [
+                ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(error.clone())),
+                ChunkMessageBody::MerkleCandidateQuoteResponse(
+                    MerkleCandidateQuoteResponse::Error(error.clone()),
+                ),
+            ] {
+                let original = ChunkMessage {
+                    request_id: 42,
+                    body,
+                }
+                .encode()
+                .expect("encode");
+                let decoded = decode_response(original.clone().into()).expect("sanitize");
+                assert_eq!(decoded.encode().expect("re-encode"), original);
+            }
         }
     }
 }
