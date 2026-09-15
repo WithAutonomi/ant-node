@@ -332,10 +332,14 @@ pub async fn tally_peers(p2p: &Arc<P2PNode>) -> PeerTally {
     let transport = p2p.transport();
     let observer = p2p.peer_id().to_hex();
     for peer in transport.connected_peers().await {
-        // No agent recorded is not the same as a peer that reported nothing, but it is
-        // just as far from evidence of completion, so it lands in the same bucket rather
-        // than being skipped.
         let agent = transport.peer_user_agent(&peer).await;
+        // A peer that disconnected after the list above was taken has no agent any more. It is
+        // not a peer this node can see, so it is skipped: counting it put a departing client in
+        // the unreported bucket on a testnet. A peer still connected with no agent recorded is
+        // not evidence of completion either, so that one stays in the unreported bucket.
+        if agent.is_none() && !transport.is_peer_connected(&peer).await {
+            continue;
+        }
         let state = agent
             .as_deref()
             .map_or(PeerMigrationState::Unreported, peer_state);
