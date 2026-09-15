@@ -237,3 +237,42 @@ connectivity evidence, not v5 or cross-browser acceptance evidence. Nodes
 behind the testnet's deliberate inbound-NAT rules remain unreachable without
 relayed WebRTC, so their 10-second DataChannel timeouts currently make this
 smoke path slower than an all-public fleet.
+
+## crates.io release dependency order
+
+The web-support branches use exact Git revisions for development. Cargo removes
+`[patch.crates-io]` overrides from a packaged crate and replaces versioned Git
+dependencies with registry dependencies. A successful branch build therefore
+does not establish that the crate can be published.
+
+Before releasing ant-node with WebRTC, merge and publish the dependency changes
+in this order (the first two can be released independently):
+
+1. [saorsa-pqc](https://github.com/saorsa-labs/saorsa-pqc/pull/7)
+2. [evmlib](https://github.com/WithAutonomi/evmlib/pull/17)
+3. [saorsa-transport](https://github.com/WithAutonomi/saorsa-transport/pull/160)
+4. [saorsa-core](https://github.com/WithAutonomi/saorsa-core/pull/158)
+5. [ant-protocol](https://github.com/WithAutonomi/ant-protocol/pull/29)
+6. [ant-node](https://github.com/WithAutonomi/ant-node/pull/220)
+7. [ant-client](https://github.com/WithAutonomi/ant-client/pull/186)
+
+For each release, choose a new version through the normal release process.
+Raise downstream dependency minimum versions to the releases that contain the
+required APIs and features, including version fields on Git dependencies. Remove
+the corresponding development Git pins and registry patches once those releases
+are available, then regenerate the lockfile and run `cargo publish --dry-run`
+with normal compilation verification. Repeat in dependency order.
+
+In particular, published transport 0.36.3 does not contain `webrtc` or
+`webrtc-direct`; core 0.27.3 and protocol 2.3.5 also precede the web-support
+changes. Their existing version requirements must not be treated as the minimum
+compatible web-support releases. Merely removing the patches or adding a new
+version number locally cannot supply the missing registry code.
+
+The node Release workflow now runs package verification for stable-version dry
+runs as well as real releases. Dry runs never upload a crate. This check must
+pass against crates.io before tagging the node release; `cargo package --list`
+and builds using local patches are not substitutes. Prereleases retain the
+existing binary-only release behavior.
+
+Tracked under [V2-803](https://linear.app/autonominetwork/issue/V2-803/investigate-webrtcwebtransport-support-for-browser-access-to-the).
