@@ -754,6 +754,13 @@ impl ChunkStore {
     /// `content` must already hash to `address`; the caller checks that before this is
     /// reached, and a repair from bytes that do not would be worse than the damage.
     ///
+    /// A chunk the file store names but whose file has gone is not written back here. If
+    /// the legacy environment still holds exactly these bytes the node does hold it, and the
+    /// key goes back on the copier's list the way [`Self::get`] puts it back. Otherwise the
+    /// answer is `false`, including when the legacy environment cannot be read. The handler
+    /// sends `AlreadyExists` on a `true` without checking payment or closeness, and those
+    /// checks are what decide whether this node takes on a chunk it did not have.
+    ///
     /// # Errors
     ///
     /// Never fails. An unreadable chunk answers `false`, so the offered copy is stored
@@ -803,7 +810,27 @@ impl ChunkStore {
                 self.files.note_bytes_proven_good(address);
                 true
             }
-            Ok(_) => {
+            // Nothing behind the name, and the read drops the index entry if the file is
+            // still missing. On Unix a repair would put the offer there anyway and answer
+            // `AlreadyExists` for bytes that were not on disk, on an offer whose payment
+            // nothing has checked yet. So nothing is written here, and the answer is whether
+            // the legacy environment still holds these exact bytes: a copied chunk normally
+            // stays there until it is deleted or the environment is retired, and a read that
+            // falls back to it puts the key back on the copier's list. Anything else goes
+            // through the ordinary path, which checks payment and closeness first.
+            Ok(None) => {
+                let Some(legacy) = self.legacy() else {
+                    return false;
+                };
+                let held = matches!(legacy.lmdb.get_raw(address).await, Ok(Some(bytes)) if bytes == content);
+                // Only if the file is still gone, as in `serve_from_legacy`: the legacy-only
+                // set is for keys the file store does not have.
+                if held && !self.files.is_indexed(address) {
+                    legacy.only.write().insert(*address);
+                }
+                held
+            }
+            Ok(Some(_)) => {
                 warn!(
                     "Chunk {} is on disk but its contents are wrong; replacing it with the \
                      copy just offered",
@@ -3444,6 +3471,160 @@ mod tests {
         let store = open(&dir).await;
         let (addr, content) = addressed("never-stored");
         assert!(!store.holds_verified(&addr, &content).await);
+    }
+
+    /// Where a chunk's file lives in the file store.
+    fn chunk_file(store: &ChunkStore, addr: &XorName) -> PathBuf {
+        store
+            .files
+            .chunks_dir()
+            .join(format!("{:02x}", addr.last().copied().unwrap_or(0)))
+            .join(hex::encode(addr))
+    }
+
+    /// A chunk whose file has gone is not written back on the strength of an offer.
+    ///
+    /// The index still names it, which is exactly the state a check has to see through: the
+    /// name outlived the bytes. On Unix, writing the offered copy here would create a chunk
+    /// this node did not have and report it as already held, and the handler acts on that
+    /// answer before it checks payment or closeness. Refusing it here does not lose the
+    /// offer: the ordinary write path can still take it, as the end of this test shows.
+    #[tokio::test]
+    async fn a_chunk_whose_file_has_gone_is_not_written_back_by_the_check() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = open(&dir).await;
+        assert!(
+            !store.has_legacy(),
+            "no legacy environment, or this is not the state under test"
+        );
+        let (addr, content) = addressed("gone-before-the-offer");
+        store.put(&addr, &content).await.expect("put");
+
+        let path = chunk_file(&store, &addr);
+        std::fs::remove_file(&path).expect("remove behind the store's back");
+        assert!(
+            store.files.is_indexed(&addr),
+            "the index must still name the chunk, or this is not the state under test"
+        );
+
+        assert!(
+            !store.holds_verified(&addr, &content).await,
+            "a chunk with nothing behind its name is not held"
+        );
+        assert!(
+            !path.exists(),
+            "the check must not write the offered copy back"
+        );
+        assert!(!store.files.is_indexed(&addr));
+        assert!(!store.exists(&addr).expect("exists"));
+
+        assert!(
+            store.put(&addr, &content).await.expect("put again"),
+            "the ordinary path must be able to take the offer and publish it as new"
+        );
+        assert!(store.holds_verified(&addr, &content).await);
+    }
+
+    /// A chunk whose file has gone is still held while the legacy environment has it.
+    ///
+    /// A copied chunk normally stays in the legacy environment until it is deleted or the
+    /// environment is retired, so losing the file does not mean losing the chunk. Here it
+    /// is still there, and the check answers that it is held, writes nothing,
+    /// and puts the key back on the copier's list, as a read falling back to the legacy
+    /// environment would.
+    #[tokio::test]
+    async fn a_chunk_whose_file_has_gone_is_still_held_while_the_legacy_environment_has_it() {
+        let dir = TempDir::new().expect("temp dir");
+        let keys = seed_legacy(&dir, &["copied-then-file-lost"]).await;
+        let key = *keys.first().expect("one key");
+        let content = format!("chunk-content-{}", "copied-then-file-lost").into_bytes();
+        let store = open(&dir).await;
+        assert!(store.legacy_only_keys().contains(&key));
+
+        // Copied: the file store takes it, and it leaves the legacy-only set, while the
+        // legacy environment keeps its own copy.
+        store.put(&key, &content).await.expect("copy into files");
+        assert!(store.files.is_indexed(&key));
+        assert!(!store.legacy_only_keys().contains(&key));
+        let legacy = store.legacy().expect("legacy");
+        assert_eq!(
+            legacy.lmdb.get_raw(&key).await.expect("legacy read"),
+            Some(content.clone()),
+            "the legacy environment must still hold it, or this is not the state under test"
+        );
+
+        let path = chunk_file(&store, &key);
+        std::fs::remove_file(&path).expect("remove behind the store's back");
+
+        assert!(
+            store.holds_verified(&key, &content).await,
+            "the legacy environment still holds exactly these bytes"
+        );
+        assert!(
+            !path.exists(),
+            "the check must not write the offered copy to the file store"
+        );
+        assert!(
+            store.legacy_only_keys().contains(&key),
+            "the key must go back on the copier's list"
+        );
+        assert!(store.exists(&key).expect("exists"));
+    }
+
+    /// A chunk whose file has gone is not held on the strength of wrong legacy bytes.
+    ///
+    /// The legacy environment answers for the chunk only with exactly the offered bytes. A
+    /// record under the same key with anything else in it is not this chunk, so the check
+    /// answers `false`, writes nothing, and does not put the key on the copier's list.
+    #[tokio::test]
+    async fn a_chunk_whose_file_has_gone_is_not_held_on_wrong_legacy_bytes() {
+        let dir = TempDir::new().expect("temp dir");
+        let (key, content) = addressed("copied-then-rotted");
+        let rotted = vec![b'x'; content.len()];
+        assert_ne!(rotted, content);
+        {
+            let lmdb = LmdbStorage::new(LmdbStorageConfig {
+                root_dir: dir.path().to_path_buf(),
+                verify_on_read: false,
+                max_map_size: 0,
+                disk_reserve: 0,
+            })
+            .await
+            .expect("open legacy");
+            // The chunk's key over bytes that are not the chunk: a record that rotted in
+            // place.
+            lmdb.put_unchecked(&key, &rotted)
+                .await
+                .expect("plant wrong legacy bytes");
+            lmdb.wait_idle().await;
+        }
+        let store = open(&dir).await;
+        assert!(store.legacy_only_keys().contains(&key));
+
+        // Copied: the file store takes the real chunk and the key leaves the legacy-only
+        // set, while the legacy record under it keeps its wrong bytes.
+        store.put(&key, &content).await.expect("copy into files");
+        assert!(store.files.is_indexed(&key));
+        assert!(!store.legacy_only_keys().contains(&key));
+        let legacy = store.legacy().expect("legacy");
+        assert_eq!(
+            legacy.lmdb.get_raw(&key).await.expect("legacy read"),
+            Some(rotted),
+            "the legacy record must hold the wrong bytes, or this is not the state under test"
+        );
+
+        let path = chunk_file(&store, &key);
+        std::fs::remove_file(&path).expect("remove behind the store's back");
+
+        assert!(
+            !store.holds_verified(&key, &content).await,
+            "wrong legacy bytes are not this chunk"
+        );
+        assert!(!path.exists(), "the check must not write the offered copy");
+        assert!(
+            !store.legacy_only_keys().contains(&key),
+            "and must not put the key on the copier's list"
+        );
     }
 
     /// An environment is never deleted because it failed to open.

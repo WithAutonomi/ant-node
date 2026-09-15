@@ -1422,6 +1422,57 @@ mod tests {
         }
     }
 
+    /// A PUT for a chunk whose file has gone is not answered `AlreadyExists`.
+    ///
+    /// That answer is sent before payment and closeness are checked, so it may only mean the
+    /// node had the chunk, intact or damaged. The index still names this one, but nothing is
+    /// behind the name and there is no legacy environment to hold it, and an offer that
+    /// carries no payment must not put it back.
+    #[tokio::test]
+    async fn test_put_for_a_chunk_whose_file_has_gone_is_not_already_exists() {
+        let (protocol, _temp) = create_test_protocol().await;
+
+        let content = b"stored once, then lost from the disk";
+        let address = ChunkStore::compute_address(content);
+        protocol
+            .put_local(&address, content)
+            .await
+            .expect("put local");
+
+        let path = protocol
+            .storage()
+            .root_dir()
+            .join("chunks")
+            .join(format!("{:02x}", address.last().copied().unwrap_or(0)))
+            .join(hex::encode(address));
+        std::fs::remove_file(&path).expect("remove behind the store's back");
+
+        // No payment proof, and nothing in the payment cache, so a PUT that reaches
+        // `verify_payment` is refused there.
+        let put_request = ChunkPutRequest::new(address, Bytes::copy_from_slice(content));
+        let put_msg = ChunkMessage {
+            request_id: 41,
+            body: ChunkMessageBody::PutRequest(put_request),
+        };
+        let put_bytes = put_msg.encode().expect("encode put");
+        let response_bytes = protocol
+            .try_handle_request(&put_bytes)
+            .await
+            .expect("handle put")
+            .expect("expected response");
+        let response = ChunkMessage::decode(&response_bytes).expect("decode response");
+
+        match response.body {
+            ChunkMessageBody::PutResponse(
+                ChunkPutResponse::PaymentRequired { .. }
+                | ChunkPutResponse::Error(ProtocolError::PaymentFailed(_)),
+            ) => {}
+            other => panic!("expected the payment check to refuse the PUT, got: {other:?}"),
+        }
+        assert!(!path.exists(), "an unpaid offer must not be written");
+        assert!(!protocol.exists(&address).expect("exists check"));
+    }
+
     #[tokio::test]
     async fn test_protocol_id() {
         let (protocol, _temp) = create_test_protocol().await;
