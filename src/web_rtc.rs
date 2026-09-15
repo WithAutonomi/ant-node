@@ -17,7 +17,7 @@ use crate::error::{Error, Result};
 use crate::logging::{debug, info, warn};
 use crate::payment::{serialize_single_node_proof, PaymentProof};
 use crate::storage::AntProtocol;
-use errors::{decode_response, error_response, public_error};
+use errors::{decode_response, error_response, public_error, sanitize_response};
 use evmlib::common::{Amount, TxHash};
 use evmlib::{EncodedPeerId, PaymentQuote, ProofOfPayment, RewardsAddress};
 use parking_lot::{Mutex, RwLock};
@@ -1803,7 +1803,7 @@ async fn process_quote_chunk(
         request_id,
         body: ChunkMessageBody::QuoteRequest(ChunkQuoteRequest::new(address_bytes, size)),
     };
-    let response = match handle_ant_message(ant_protocol, &message).await {
+    let response = match handle_ant_message(ant_protocol, message).await {
         Ok(response) => response,
         Err(error) => return (error_response(request_id, "quote_failed", error), None),
     };
@@ -1893,7 +1893,7 @@ async fn process_put_chunk(
             proof,
         )),
     };
-    let response = match handle_ant_message(ant_protocol, &message).await {
+    let response = match handle_ant_message(ant_protocol, message).await {
         Ok(response) => response,
         Err(error) => return (error_response(request_id, "put_failed", error), None),
     };
@@ -1961,17 +1961,14 @@ fn build_payment_proof(
 
 async fn handle_ant_message(
     ant_protocol: &AntProtocol,
-    message: &ChunkMessage,
+    message: ChunkMessage,
 ) -> ServerResult<ChunkMessage> {
-    let encoded = message
-        .encode()
-        .map_err(|error| format!("storage request encoding failed: {error}"))?;
-    let response = ant_protocol
-        .try_handle_request(&encoded)
+    let mut response = ant_protocol
+        .try_handle_message(message)
         .await
-        .map_err(|error| format!("storage request failed: {error}"))?
         .ok_or_else(|| "storage handler returned no response".to_string())?;
-    decode_response(response)
+    sanitize_response(&mut response)?;
+    Ok(response)
 }
 
 fn decode_32_byte_hex(value: &str) -> ServerResult<[u8; 32]> {

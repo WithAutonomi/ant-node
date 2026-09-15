@@ -37,7 +37,7 @@ pub(super) fn decode_response(response: bytes::Bytes) -> ServerResult<ChunkMessa
     Ok(message)
 }
 
-fn sanitize_response(message: &mut ChunkMessage) -> ServerResult<()> {
+pub(super) fn sanitize_response(message: &mut ChunkMessage) -> ServerResult<()> {
     match &mut message.body {
         ChunkMessageBody::PutResponse(ChunkPutResponse::Error(error))
         | ChunkMessageBody::GetResponse(ChunkGetResponse::Error(error))
