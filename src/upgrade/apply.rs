@@ -10,6 +10,7 @@
 use crate::error::{Error, Result};
 use crate::logging::{debug, error, info, warn};
 use crate::upgrade::binary_cache::BinaryCache;
+use crate::upgrade::traffic::{self, UpgradeFetch};
 use crate::upgrade::{signature, UpgradeInfo, UpgradeResult};
 use flate2::read::GzDecoder;
 use semver::Version;
@@ -283,9 +284,35 @@ impl AutoApplyUpgrader {
     }
 
     /// Download a file to the specified path.
-    async fn download(&self, url: &str, dest: &Path) -> Result<()> {
+    async fn download(&self, url: &str, dest: &Path, kind: UpgradeFetch) -> Result<()> {
         debug!("Downloading: {}", url);
 
+        // V2-834: count the body once fully read; anything short of that is
+        // an error for this fetch kind.
+        let bytes = match self.fetch_body(url).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                traffic::record_error(kind);
+                return Err(e);
+            }
+        };
+        traffic::record_rx(kind, bytes.len());
+
+        if bytes.len() > MAX_ARCHIVE_SIZE_BYTES {
+            return Err(Error::Upgrade(format!(
+                "Downloaded file too large: {} bytes (max {})",
+                bytes.len(),
+                MAX_ARCHIVE_SIZE_BYTES
+            )));
+        }
+
+        fs::write(dest, &bytes)?;
+        debug!("Downloaded {} bytes to {}", bytes.len(), dest.display());
+        Ok(())
+    }
+
+    /// GET `url` and read the whole body.
+    async fn fetch_body(&self, url: &str) -> Result<bytes::Bytes> {
         let response = self
             .client
             .get(url)
@@ -300,22 +327,10 @@ impl AutoApplyUpgrader {
             )));
         }
 
-        let bytes = response
+        response
             .bytes()
             .await
-            .map_err(|e| Error::Network(format!("Failed to read response: {e}")))?;
-
-        if bytes.len() > MAX_ARCHIVE_SIZE_BYTES {
-            return Err(Error::Upgrade(format!(
-                "Downloaded file too large: {} bytes (max {})",
-                bytes.len(),
-                MAX_ARCHIVE_SIZE_BYTES
-            )));
-        }
-
-        fs::write(dest, &bytes)?;
-        debug!("Downloaded {} bytes to {}", bytes.len(), dest.display());
-        Ok(())
+            .map_err(|e| Error::Network(format!("Failed to read response: {e}")))
     }
 
     /// Resolve the upgrade binary, checking the cache first and falling back
@@ -405,11 +420,13 @@ impl AutoApplyUpgrader {
 
         // Step 1: Download archive
         info!("Downloading ant-node binary...");
-        self.download(&info.download_url, &archive_path).await?;
+        self.download(&info.download_url, &archive_path, UpgradeFetch::Archive)
+            .await?;
 
         // Step 2: Download signature
         info!("Downloading signature...");
-        self.download(&info.signature_url, &sig_path).await?;
+        self.download(&info.signature_url, &sig_path, UpgradeFetch::Signature)
+            .await?;
 
         // Step 3: Verify signature on archive BEFORE extraction
         info!("Verifying ML-DSA signature on archive...");

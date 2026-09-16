@@ -43,6 +43,7 @@ use crate::payment::{PaymentVerifier, QuoteGenerator, VerificationContext};
 use crate::replication::admission;
 use crate::replication::config::K_BUCKET_SIZE;
 use crate::replication::fresh::FreshWriteEvent;
+use crate::storage::traffic::{self, ChunkRequestKind, ChunkResponseKey};
 use crate::storage::ChunkStore;
 use bytes::Bytes;
 use parking_lot::RwLock;
@@ -97,6 +98,9 @@ impl ChunkRequestContext {
 pub struct HandledChunkRequest {
     pub(crate) response: Result<Option<Bytes>>,
     pub(crate) get_telemetry: Option<GetRequestTelemetry>,
+    /// Kind × outcome of the encoded response, so the router can attribute
+    /// the bytes once the send is confirmed (V2-834).
+    pub(crate) traffic_key: Option<ChunkResponseKey>,
 }
 
 /// Bounded stage timings for one decoded chunk GET.
@@ -461,25 +465,35 @@ impl AntProtocol {
         let message = match ChunkMessage::decode(data) {
             Ok(message) => message,
             Err(e) => {
+                traffic::record_rx(ChunkRequestKind::DecodeError, data.len());
                 return HandledChunkRequest {
                     response: Err(Error::Protocol(format!("Failed to decode message: {e}"))),
                     get_telemetry: None,
+                    traffic_key: None,
                 };
             }
         };
 
+        // V2-834: attribute inbound bytes by request kind at the decode
+        // choke point.
+        traffic::record_rx(ChunkRequestKind::of(&message.body), data.len());
+
         let request_id = message.request_id;
         let mut get_telemetry = None;
 
-        let response_body = match message.body {
+        // Each arm yields the response body and its V2-834 traffic key.
+        let (response_body, traffic_key) = match message.body {
             ChunkMessageBody::PutRequest(req) => {
-                ChunkMessageBody::PutResponse(self.handle_put(req).await)
+                let response = self.handle_put(req).await;
+                let key = ChunkResponseKey::of_put(&response);
+                (ChunkMessageBody::PutResponse(response), key)
             }
             ChunkMessageBody::GetRequest(req) => {
                 let chunk_address = hex::encode(req.address);
                 let storage_started = Instant::now();
                 let response = self.handle_get_inner(req).await;
                 let storage_read_ms = duration_ms(storage_started.elapsed());
+                let key = ChunkResponseKey::of_get(&response);
                 if let Some(context) = context {
                     get_telemetry = Some(GetRequestTelemetry::from_response(
                         context,
@@ -489,26 +503,34 @@ impl AntProtocol {
                         &response,
                     ));
                 }
-                ChunkMessageBody::GetResponse(response)
+                (ChunkMessageBody::GetResponse(response), key)
             }
             ChunkMessageBody::QuoteRequest(ref req) => {
                 Self::note_unversioned_quote("single_node");
-                ChunkMessageBody::QuoteResponse(self.handle_quote(req))
+                (
+                    ChunkMessageBody::QuoteResponse(self.handle_quote(req)),
+                    ChunkResponseKey::Quote,
+                )
             }
             ChunkMessageBody::MerkleCandidateQuoteRequest(ref req) => {
                 Self::note_unversioned_quote("merkle");
-                ChunkMessageBody::MerkleCandidateQuoteResponse(
-                    self.handle_merkle_candidate_quote(req),
+                (
+                    ChunkMessageBody::MerkleCandidateQuoteResponse(
+                        self.handle_merkle_candidate_quote(req),
+                    ),
+                    ChunkResponseKey::MerkleQuote,
                 )
             }
-            ChunkMessageBody::QuoteRequestV2(ref req) => {
-                ChunkMessageBody::QuoteResponse(self.handle_quote_v2(req))
-            }
-            ChunkMessageBody::MerkleCandidateQuoteRequestV2(ref req) => {
+            ChunkMessageBody::QuoteRequestV2(ref req) => (
+                ChunkMessageBody::QuoteResponse(self.handle_quote_v2(req)),
+                ChunkResponseKey::QuoteV2,
+            ),
+            ChunkMessageBody::MerkleCandidateQuoteRequestV2(ref req) => (
                 ChunkMessageBody::MerkleCandidateQuoteResponse(
                     self.handle_merkle_candidate_quote_v2(req),
-                )
-            }
+                ),
+                ChunkResponseKey::MerkleQuoteV2,
+            ),
             // Anything else — response messages are handled by client
             // subscribers (e.g. send_and_await_chunk_response), not by the
             // protocol handler. Returning None prevents the caller from
@@ -524,6 +546,7 @@ impl AntProtocol {
                 return HandledChunkRequest {
                     response: Ok(None),
                     get_telemetry: None,
+                    traffic_key: None,
                 };
             }
         };
@@ -544,6 +567,7 @@ impl AntProtocol {
         HandledChunkRequest {
             response: encoded,
             get_telemetry,
+            traffic_key: Some(traffic_key),
         }
     }
 

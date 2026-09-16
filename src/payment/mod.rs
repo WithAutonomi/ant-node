@@ -44,6 +44,7 @@ pub mod pricing;
 pub mod proof;
 pub mod quote;
 pub mod single_node;
+pub(crate) mod traffic;
 mod verifier;
 pub mod wallet;
 
