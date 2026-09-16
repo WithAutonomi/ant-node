@@ -883,7 +883,7 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "2.3.5"
-source = "git+https://github.com/WithAutonomi/ant-protocol?rev=cdae7d19f004bbd384e9a6cc91f4df253b416044#cdae7d19f004bbd384e9a6cc91f4df253b416044"
+source = "git+https://github.com/WithAutonomi/ant-protocol?rev=f6e86dd16d5b9e86e7e1df44d6c3b72b933135d4#f6e86dd16d5b9e86e7e1df44d6c3b72b933135d4"
 dependencies = [
  "blake3",
  "bytes",
@@ -2599,7 +2599,7 @@ dependencies = [
 [[package]]
 name = "evmlib"
 version = "0.9.1"
-source = "git+https://github.com/WithAutonomi/evmlib?rev=cf424c0447c9f1ca1313b43ce07df65a227e340c#cf424c0447c9f1ca1313b43ce07df65a227e340c"
+source = "git+https://github.com/WithAutonomi/evmlib?rev=ccd65f18bf3750af8b8c3cfe07548bc77e3c368d#ccd65f18bf3750af8b8c3cfe07548bc77e3c368d"
 dependencies = [
  "alloy",
  "ant-merkle",
@@ -6169,7 +6169,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -7121,7 +7121,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
