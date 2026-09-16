@@ -1,6 +1,6 @@
 [package]
 name = "ant-node"
-version = "0.19.0-beta.2"
+version = "0.19.0"
 edition = "2021"
 authors = ["David Irvine <david.irvine@maidsafe.net>"]
 description = "Pure quantum-proof network node for the Autonomi decentralized network"
@@ -42,10 +42,10 @@ mimalloc = "0.1"
 # Pinned to the ant-protocol main commit that merged the settlement wire
 # types (WithAutonomi/ant-protocol#25). Swap back to a published version pin
 # once the release train publishes them.
-ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", branch = "rc-2026.9.2" }
+ant-protocol = "2.4.0"
 
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
-saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core", branch = "rc-2026.9.2" }
+saorsa-core = "0.27.4"
 saorsa-pqc = "0.5"
 
 # Payment verification - autonomi network lookup + EVM payment
