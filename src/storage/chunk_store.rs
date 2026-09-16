@@ -292,6 +292,7 @@ impl ChunkStore {
             MigrationPhase::FilesOnly
         };
         let mut state = MigrationState::load_or_create(&config.root_dir, phase);
+        let legacy_only = Self::legacy_only_count(legacy.as_ref());
 
         // The filesystem is the authority on whether a legacy environment exists; the
         // marker only records decisions. Reconcile rather than trust.
@@ -315,6 +316,32 @@ impl ChunkStore {
                  holds {}. Restarting the migration from the copying stage.",
                 state.kept_key_count,
                 files.current_chunks().unwrap_or(0)
+            );
+            state.phase = MigrationPhase::Bridging;
+            state.committed_at_unix = None;
+            state.rebuilds_since_commit = 0;
+            if let Err(e) = state.save(&config.root_dir) {
+                warn!("Could not persist the migration marker: {e}");
+            }
+        } else if state.phase == MigrationPhase::Committed && legacy_only > state.shed_key_count {
+            // Once committed, the copier only moves keys the rank check refuses to shed.
+            // A chunk that turns up in the legacy environment after that, and that this
+            // node never agreed to give up, is never copied and never proven to be held
+            // elsewhere, so nothing frees it from the environment and the environment is
+            // never retired. Free disk does not change that; only the phase does.
+            //
+            // The count, not emptiness, is the test. A node that legitimately shed keeps
+            // exactly the keys it is giving up in the legacy environment until they stop
+            // being answerable, and sending it back to the bridge on every restart would
+            // reset its retention clock each time.
+            warn!(
+                migration_event = "back_to_bridging",
+                legacy_only,
+                shed = state.shed_key_count,
+                "The migration marker says this node committed after agreeing to shed {} \
+                 chunk(s), but {legacy_only} are still only in the legacy environment. \
+                 Restarting the migration from the copying stage so they are copied.",
+                state.shed_key_count
             );
             state.phase = MigrationPhase::Bridging;
             state.committed_at_unix = None;
@@ -414,6 +441,11 @@ impl ChunkStore {
             .filter(|key| !files.is_indexed(key))
             .copied()
             .collect()
+    }
+
+    /// How many keys only the legacy environment holds; zero once it is gone.
+    fn legacy_only_count(legacy: Option<&Legacy>) -> u64 {
+        legacy.map_or(0, |l| l.only.read().len().try_into().unwrap_or(u64::MAX))
     }
 
     /// Take the critical section for one key.
@@ -3172,6 +3204,67 @@ mod tests {
         assert!(!store.exists(&target).expect("exists"));
     }
 
+    /// A store left partway through by the release that shipped is picked up, not restarted.
+    ///
+    /// This release lands on nodes that are already migrating under the one before it, so what
+    /// matters is not what it does to a fresh store but what it does to a half-finished one.
+    /// It must re-read that state and change nothing: the phase, the first-start time the
+    /// waves are measured from, what the node committed to giving up, and the keys still only
+    /// in the legacy store all have to survive, or a node restarts a clock it had nearly run
+    /// down, or re-copies what it already copied.
+    ///
+    /// Nothing in this release writes migration state, and this is what says so.
+    #[tokio::test]
+    async fn a_store_left_midway_by_the_previous_release_keeps_its_place() {
+        let dir = TempDir::new().expect("temp dir");
+        let keys = seed_legacy(&dir, &["k1", "k2", "k3"]).await;
+
+        let started_at = {
+            let store = open(&dir).await;
+            // Partway: one copied, two still only in the legacy store, which is where a node
+            // that ran out of disk under the previous release sits.
+            store
+                .copy_batch(&keys[..1], 0, 0, &never_cancelled())
+                .await
+                .expect("copy");
+            store.commit_to_files().expect("commit");
+            assert_eq!(store.migration_phase(), MigrationPhase::Committed);
+            assert_eq!(store.legacy_only_keys().len(), 2);
+            store.migration_state().first_start_unix
+        };
+
+        // The upgrade: a new process opening the same directory.
+        let store = open(&dir).await;
+        assert_eq!(
+            store.migration_phase(),
+            MigrationPhase::Committed,
+            "an upgrade must not put a committed node back to bridging"
+        );
+        assert_eq!(
+            store.migration_state().first_start_unix,
+            started_at,
+            "the waves are measured from this, so restarting it restarts the schedule"
+        );
+        assert_eq!(
+            store.migration_state().shed_key_count,
+            2,
+            "what the node committed to giving up must survive the upgrade"
+        );
+        assert_eq!(
+            store.legacy_only_keys().len(),
+            2,
+            "the keys still to copy must not be recounted from scratch"
+        );
+
+        // And everything is still servable, out of whichever store holds it.
+        for key in &keys {
+            assert!(
+                store.get(key).await.expect("get").is_some(),
+                "a chunk stopped being servable across the upgrade"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn committing_narrows_the_commitment_but_not_what_is_served() {
         let dir = TempDir::new().expect("temp dir");
@@ -4605,6 +4698,99 @@ mod tests {
             "the filesystem must win over the marker"
         );
         assert_eq!(store.legacy_only_keys().len(), 3);
+    }
+
+    /// V2-1232. Once committed, the copier moves only the keys the rank check refuses to
+    /// shed, so a chunk that is found in the legacy environment after the commitment,
+    /// and that this node never agreed to give up, is never copied, never provable
+    /// elsewhere, and keeps the environment from ever being retired. Free disk does not
+    /// help and neither does a restart. Reopening has to notice and reopen the bridge.
+    #[tokio::test]
+    async fn a_node_that_committed_with_nothing_to_shed_resumes_the_copy_for_chunks_only_it_holds()
+    {
+        let dir = TempDir::new().expect("temp dir");
+        let keys = seed_legacy(&dir, &["c1", "c2"]).await;
+        let store = open(&dir).await;
+        store
+            .copy_batch(&keys, 0, 0, &never_cancelled())
+            .await
+            .expect("copy");
+        store.commit_to_files().expect("commit");
+        store.note_commitment_rebuilt();
+        let state = store.migration_state();
+        assert_eq!(state.shed_key_count, 0, "nothing had to be shed");
+        assert!(state.committed_at_unix.is_some());
+        assert_eq!(state.rebuilds_since_commit, 1);
+        store.wait_idle().await;
+        drop(store);
+
+        // A chunk in the legacy environment that the file store has no record of, found
+        // after the node committed. The file store is untouched, so the kept-count rule
+        // has nothing to say about this.
+        let late = seed_legacy(&dir, &["c3"]).await;
+
+        let store = open(&dir).await;
+        let state = store.migration_state();
+        assert_eq!(
+            state.phase,
+            MigrationPhase::Bridging,
+            "a chunk the node never agreed to shed must reopen the bridge"
+        );
+        assert!(
+            state.committed_at_unix.is_none(),
+            "the retirement clock must not carry over from the abandoned commitment"
+        );
+        assert_eq!(state.rebuilds_since_commit, 0);
+        assert_eq!(store.legacy_only_keys(), late);
+
+        // And the copier, which the phase change lets run again, moves it.
+        store
+            .copy_batch(&late, 0, 0, &never_cancelled())
+            .await
+            .expect("copy");
+        assert!(store.legacy_only_keys().is_empty());
+        assert_eq!(
+            store
+                .get(late.first().expect("a key"))
+                .await
+                .expect("get")
+                .expect("present"),
+            addressed("c3").1
+        );
+    }
+
+    /// The counterpart of the test above, and it matters as much. A node that shed keeps
+    /// exactly the keys it is giving up in the legacy environment until they stop being
+    /// answerable, so a non-empty legacy-only set is its normal state. Sending it back
+    /// to the bridge on every restart would reset its retention clock each time, and a
+    /// node restarted regularly would never retire.
+    #[tokio::test]
+    async fn a_node_that_shed_stays_committed_across_a_restart() {
+        let dir = TempDir::new().expect("temp dir");
+        let keys = seed_legacy(&dir, &["k1", "k2"]).await;
+        let store = open(&dir).await;
+        store
+            .copy_batch(&keys[..1], 0, 0, &never_cancelled())
+            .await
+            .expect("copy");
+        store.commit_to_files().expect("commit");
+        store.note_commitment_rebuilt();
+        let before = store.migration_state();
+        assert_eq!(before.shed_key_count, 1);
+        assert_eq!(store.legacy_only_keys().len(), 1);
+        store.wait_idle().await;
+        drop(store);
+
+        let store = open(&dir).await;
+        let after = store.migration_state();
+        assert_eq!(
+            after.phase,
+            MigrationPhase::Committed,
+            "the keys it is giving up are not a reason to reopen the bridge"
+        );
+        assert_eq!(after.committed_at_unix, before.committed_at_unix);
+        assert_eq!(after.rebuilds_since_commit, before.rebuilds_since_commit);
+        assert_eq!(store.legacy_only_keys().len(), 1);
     }
 
     #[tokio::test]

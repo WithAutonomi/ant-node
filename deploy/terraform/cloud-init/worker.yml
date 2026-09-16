@@ -79,7 +79,14 @@ write_files:
       Type=simple
       User=ant
       Group=ant
-      ExecStart=$${BINARY_PATH} --root-dir $${NODE_DIR} --port 0 --metrics-port $${METRICS_PORT} $${BOOTSTRAP_ARGS}
+      # --enable-logging is not optional here, whatever it looks like. Without it the
+      # binary installs no tracing subscriber and emits nothing at all, so a node on this
+      # unit is silent: no migration progress, no warnings, and nothing said about whether
+      # it still has an old chunk store. That last one does not make the fleet's state
+      # decidable, and nothing does; it is what lets a node on this unit surface itself as
+      # unfinished at all. JSON because what reads these lines is a query, and the fields
+      # that matter are structured.
+      ExecStart=$${BINARY_PATH} --root-dir $${NODE_DIR} --port 0 --metrics-port $${METRICS_PORT} --enable-logging --log-format json $${BOOTSTRAP_ARGS}
       Restart=always
       RestartSec=10
       MemoryMax=350M

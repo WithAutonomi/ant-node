@@ -9980,7 +9980,6 @@ async fn rebuild_and_rotate_commitment(
     // this filter the pruner's reprieve would keep re-committing stale keys
     // forever (the rebuild reads all_keys, so a retained-on-disk key would be
     // re-committed and re-gossiped every rotation — a permanent pin).
-    let storage_empty = stored_keys.is_empty();
     let self_id = *p2p.peer_id();
     let mut keys = Vec::with_capacity(stored_keys.len());
     for k in stored_keys {
@@ -9990,20 +9989,30 @@ async fn rebuild_and_rotate_commitment(
     }
 
     if keys.is_empty() {
-        if storage_empty {
-            // Storage is genuinely empty — there is nothing to answer for, so
-            // drop the previously advertised commitment immediately. Keeping it
-            // would leave remote auditors pinning a hash we can never satisfy
-            // again (the bytes are gone).
-            if state.retained_slot_count() > 0 {
-                debug!("Commitment rotation: storage empty, clearing retained slots");
-                state.clear_all();
-            }
-            storage.note_commitment_rebuilt();
-            return Ok(());
-        }
-        // Bytes are still on disk but no key is currently in range. We must NOT
-        // clear retention here: a peer may still be pinning a root we gossiped
+        // There used to be a second branch here that dropped every retained root outright
+        // when the node looked empty. It is gone, and the reason is worth keeping.
+        //
+        // "Empty" was decided from key counts, and every version of that test was wrong in
+        // the same direction. It read the committable set, which narrows to the file-backed
+        // keys once the migration settles, so a node whose disk filled before it could copy
+        // anything looked empty with a full legacy store beside it. Adding the raw file index
+        // still missed a file dropped from the index by a failed read while its legacy copy
+        // was being put back. Adding the legacy environment still missed a files-only node
+        // that had published bytes to disk but not yet indexed them, because a file is
+        // published before it is indexed. Each fix closed one window and left another.
+        //
+        // The asymmetry is what settles it. Clearing wrongly repudiates a root a peer is
+        // pinning, and `UnknownCommitment` is a confirmed failure on the commitment-bound
+        // lane, which is enforced in every release and is not the lane the migration holds
+        // off — so a node that still holds the bytes is slashed for holding them. Retiring
+        // wrongly costs a root that stops being advertised now and ages out by its gossip TTL
+        // instead of vanishing now. Both set `has_current = false`; they differ only in
+        // whether the node goes on being answerable in the meantime. A genuinely empty node
+        // cannot answer either way, so retiring costs it nothing it had.
+        //
+        // So there is one branch, and no emptiness question to get wrong.
+        //
+        // A peer may still be pinning a root we gossiped
         // moments ago and could demand its bytes in a round-2 challenge, which
         // we can still answer (the bytes are present). But we must STOP
         // advertising the stale commitment: retire it so `current()` returns
