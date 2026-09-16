@@ -139,7 +139,7 @@ const BUILD_INFO_TAIL: &str = concat!(
 /// formatter has no hook for constant fields and span fields do not survive
 /// `tokio::spawn`, so this wraps the formatter instead: the inner output is
 /// rendered into a thread-local buffer, its closing brace is replaced with
-/// [`BUILD_INFO_TAIL`], and the result is copied to the real writer. Cost is
+/// `BUILD_INFO_TAIL`, and the result is copied to the real writer. Cost is
 /// one memcpy per line on top of the serialisation the inner formatter
 /// already does.
 ///
