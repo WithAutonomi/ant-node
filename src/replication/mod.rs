@@ -3468,6 +3468,11 @@ impl ReplicationEngine {
                         protocol::log_served_peers_summary();
                         protocol::log_audit_outcome_summary();
                         audit_metrics::log_responder_admission_summary();
+                        // V2-834 Part D: chunk RPC, upgrade and EVM RPC attribution
+                        // ride the same cadence.
+                        crate::storage::traffic::log_chunk_rpc_traffic_summary();
+                        crate::upgrade::traffic::log_upgrade_traffic_summary();
+                        crate::payment::traffic::log_evm_rpc_summary();
                     }
                 }
             }
