@@ -468,6 +468,39 @@ impl AntProtocol {
             }
         };
 
+        let (response, mut get_telemetry) =
+            self.handle_message_with_context(message, context).await;
+        let encode_started = Instant::now();
+        let encoded = response
+            .map(|response| {
+                response
+                    .encode()
+                    .map(Bytes::from)
+                    .map_err(|e| Error::Protocol(format!("Failed to encode response: {e}")))
+            })
+            .transpose();
+        if let Some(telemetry) = &mut get_telemetry {
+            telemetry.set_response_encode_ms(encode_started.elapsed());
+        }
+
+        HandledChunkRequest {
+            response: encoded,
+            get_telemetry,
+        }
+    }
+
+    /// Dispatch an already decoded request without copying its chunk buffer.
+    /// The wire adapter and browser adapter share all storage and payment checks.
+    #[cfg(any(feature = "webrtc-direct", test))]
+    pub(crate) async fn try_handle_message(&self, message: ChunkMessage) -> Option<ChunkMessage> {
+        self.handle_message_with_context(message, None).await.0
+    }
+
+    async fn handle_message_with_context(
+        &self,
+        message: ChunkMessage,
+        context: Option<ChunkRequestContext>,
+    ) -> (Option<ChunkMessage>, Option<GetRequestTelemetry>) {
         let request_id = message.request_id;
         let mut get_telemetry = None;
 
@@ -521,30 +554,17 @@ impl AntProtocol {
             // select handshake version-gates peers, so this arm should
             // only be reached by a misconfigured peer.
             _ => {
-                return HandledChunkRequest {
-                    response: Ok(None),
-                    get_telemetry: None,
-                };
+                return (None, None);
             }
         };
 
-        let response = ChunkMessage {
-            request_id,
-            body: response_body,
-        };
-        let encode_started = Instant::now();
-        let encoded = response
-            .encode()
-            .map(|b| Some(Bytes::from(b)))
-            .map_err(|e| Error::Protocol(format!("Failed to encode response: {e}")));
-        if let Some(telemetry) = &mut get_telemetry {
-            telemetry.set_response_encode_ms(encode_started.elapsed());
-        }
-
-        HandledChunkRequest {
-            response: encoded,
+        (
+            Some(ChunkMessage {
+                request_id,
+                body: response_body,
+            }),
             get_telemetry,
-        }
+        )
     }
 
     /// Handle a PUT request.
@@ -1181,6 +1201,75 @@ mod tests {
             panic!("expected GetResponse::Success");
         }
         telemetry.finish_send(Duration::from_millis(2), true);
+    }
+
+    #[tokio::test]
+    async fn typed_put_preserves_native_validation_and_storage() {
+        let (protocol, _temp) = create_test_protocol().await;
+        let content = Bytes::from(vec![0x5a; MAX_CHUNK_SIZE]);
+        let address = ChunkStore::compute_address(&content);
+
+        // Typed callers still encounter content, size, and payment admission.
+        for (request_id, request) in [
+            (1, ChunkPutRequest::new([0; 32], content.clone())),
+            (
+                2,
+                ChunkPutRequest::new(address, Bytes::from(vec![0; MAX_CHUNK_SIZE + 1])),
+            ),
+            (3, ChunkPutRequest::new(address, content.clone())),
+        ] {
+            let message = ChunkMessage {
+                request_id,
+                body: ChunkMessageBody::PutRequest(request),
+            };
+            let wire = message.encode().expect("encode request");
+            let typed = protocol
+                .try_handle_message(message)
+                .await
+                .expect("response");
+            let native = protocol
+                .try_handle_request(&wire)
+                .await
+                .expect("native request")
+                .expect("native response");
+            assert_eq!(typed.encode().expect("encode response"), native.as_ref());
+            assert!(matches!(
+                typed.body,
+                ChunkMessageBody::PutResponse(
+                    ChunkPutResponse::Error(_) | ChunkPutResponse::PaymentRequired { .. }
+                )
+            ));
+        }
+        assert!(protocol
+            .storage()
+            .get(&address)
+            .await
+            .expect("read")
+            .is_none());
+
+        protocol.payment_verifier().cache_insert(address);
+        let response = protocol
+            .try_handle_message(ChunkMessage {
+                request_id: 4,
+                body: ChunkMessageBody::PutRequest(ChunkPutRequest::new(address, content.clone())),
+            })
+            .await
+            .expect("paid response");
+        assert_eq!(response.request_id, 4);
+        assert!(matches!(
+            response.body,
+            ChunkMessageBody::PutResponse(ChunkPutResponse::Success { .. })
+        ));
+        assert_eq!(
+            protocol
+                .storage()
+                .get(&address)
+                .await
+                .expect("read")
+                .expect("stored"),
+            content.as_ref()
+        );
+        assert!(protocol.try_handle_message(response).await.is_none());
     }
 
     #[tokio::test]

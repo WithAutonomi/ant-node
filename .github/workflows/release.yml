@@ -349,7 +349,8 @@ jobs:
     name: Publish to crates.io
     needs: [validate]
     runs-on: ubuntu-latest
-    if: github.event.inputs.dry_run != 'true' && needs.validate.outputs.is_prerelease != 'true'
+    # Dry runs must exercise registry dependency resolution and package verification.
+    if: needs.validate.outputs.is_prerelease != 'true'
     steps:
       - uses: actions/checkout@v4
 
@@ -362,6 +363,7 @@ jobs:
         run: cargo publish --dry-run --allow-dirty
 
       - name: Publish to crates.io
+        if: github.event.inputs.dry_run != 'true'
         run: cargo publish --no-verify --allow-dirty
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}

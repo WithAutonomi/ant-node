@@ -74,7 +74,7 @@ pub const MIN_RETIRE_DELAY_HOURS: u64 = 4;
 ///
 /// Each attempt scans every key in it, so retrying on every tick would spend a large store
 /// entirely on failing to open it.
-const HANDLE_RECOVERY_INTERVAL: Duration = Duration::from_secs(300);
+const HANDLE_RECOVERY_INTERVAL: Duration = Duration::from_mins(5);
 
 /// The longest one node may hold the volume migration lock before giving others a turn.
 ///
@@ -83,13 +83,13 @@ const HANDLE_RECOVERY_INTERVAL: Duration = Duration::from_secs(300);
 /// that never resolves stops every other node sharing the disk from ever starting, for the
 /// whole release. Longer than a copy pass and a verification take, so it never interrupts
 /// a node that is genuinely working.
-const MAX_VOLUME_LOCK_HOLD: Duration = Duration::from_secs(6 * 3600);
+const MAX_VOLUME_LOCK_HOLD: Duration = Duration::from_hours(6);
 
 /// How long a node stands back after the cap takes the volume lock off it.
 ///
 /// Long enough that another node waiting on the lock actually gets it, rather than losing
 /// the race to the node that has just been holding it for six hours.
-const VOLUME_LOCK_COOLDOWN: Duration = Duration::from_secs(120);
+const VOLUME_LOCK_COOLDOWN: Duration = Duration::from_mins(2);
 
 /// How many commitment rebuilds must be observed after the node commits to its
 /// file-backed set before the legacy environment may be retired.
@@ -949,7 +949,7 @@ const REFUSAL_SAMPLE: usize = 4;
 /// second is exactly what a node in the middle of its own migration looks like, and
 /// counting it as a holder is how two migrating nodes could each conclude the other was
 /// covering the chunk.
-const COMMITMENT_FRESHNESS: Duration = Duration::from_secs(2 * 3600);
+const COMMITMENT_FRESHNESS: Duration = Duration::from_hours(2);
 
 /// How many keys one possession round asks about.
 ///
@@ -958,7 +958,7 @@ const COMMITMENT_FRESHNESS: Duration = Duration::from_secs(2 * 3600);
 const POSSESSION_BATCH_KEYS: usize = 256;
 
 /// How long to wait before re-evaluating a shed decision that was refused.
-const SHED_REEVALUATION_INTERVAL: Duration = Duration::from_secs(600);
+const SHED_REEVALUATION_INTERVAL: Duration = Duration::from_mins(10);
 
 /// How many copied chunks between operator-facing progress lines.
 const PROGRESS_LOG_EVERY: usize = 500;
@@ -968,7 +968,7 @@ const PROGRESS_LOG_EVERY: usize = 500;
 /// Chunks written since the pass were content-checked on the way in and flushed, so the
 /// only thing the window exposes is bit rot in the last half hour, which is the ordinary
 /// risk of any file and is caught on read.
-const VERIFICATION_REUSE_WINDOW: Duration = Duration::from_secs(1800);
+const VERIFICATION_REUSE_WINDOW: Duration = Duration::from_mins(30);
 
 /// The network facts the driver needs, kept behind one type so the store itself stays
 /// free of any knowledge of routing or commitments.
@@ -1582,9 +1582,8 @@ impl LockHold {
 
     /// May this node ask for the lock yet?
     fn may_ask(&self) -> bool {
-        !self
-            .cooldown_until
-            .is_some_and(|until| Instant::now() < until)
+        self.cooldown_until
+            .is_none_or(|until| Instant::now() >= until)
     }
 }
 
@@ -2008,7 +2007,7 @@ enum RetireOutcome {
 static LAST_OPERATOR_WARNING: parking_lot::Mutex<Option<Instant>> = parking_lot::Mutex::new(None);
 
 /// How often to repeat it. Often enough to be noticed, rarely enough not to drown the log.
-const OPERATOR_WARNING_INTERVAL: Duration = Duration::from_secs(3600);
+const OPERATOR_WARNING_INTERVAL: Duration = Duration::from_hours(1);
 
 /// Should the "this needs a person" warning be repeated now?
 ///
@@ -2561,7 +2560,7 @@ mod tests {
     /// deadline sized for the work rather than for the contention turns a slow build into
     /// a failing test. The work itself is two ticks.
     async fn wait_for(store: &Arc<crate::storage::ChunkStore>, phase: MigrationPhase, what: &str) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(180);
+        let deadline = std::time::Instant::now() + Duration::from_mins(3);
         while std::time::Instant::now() < deadline {
             if store.migration_phase() == phase {
                 return;

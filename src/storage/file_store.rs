@@ -442,7 +442,7 @@ pub(crate) fn halt_here_if_asked(variable: &str, reached: &Path) {
         return;
     }
     loop {
-        std::thread::sleep(Duration::from_secs(3600));
+        std::thread::sleep(Duration::from_hours(1));
     }
 }
 
@@ -1565,7 +1565,7 @@ impl FileStore {
     /// Lets a test wait for work to have actually started rather than guessing at a
     /// delay, which is the difference between a test that proves something and one that
     /// passes because the machine was quick.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     #[must_use]
     pub(crate) fn tasks_in_flight(&self) -> usize {
         self.blocking_tracker.len()

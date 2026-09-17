@@ -617,6 +617,10 @@ let harness = TestHarness::setup_with_evm().await?;
 assert!(harness.anvil().is_healthy().await);
 ```
 
+For the direct-browser testnet, where every node exposes WebRTC Direct and a
+default immutable file is published at startup, see
+[Browser-enabled local testnet](docs/WEBRTC_DIRECT_TESTNET.md).
+
 ### Roadmap
 
 | Phase | Target | Status |
@@ -858,7 +862,7 @@ ant-node
 
 ### Prerequisites
 
-- Rust 1.75+ (for building from source)
+- Rust 1.91+ (for building from source)
 - Linux, macOS, or Windows
 
 ### Build from Source
@@ -1132,3 +1136,17 @@ cargo fmt
 ---
 
 **ant-node**: Securing the future of decentralized data, one quantum-proof node at a time.
+
+### Shared browser application protocol
+
+WebRTC Direct HELLO advertises `chunk_protocol`. A request with this type carries
+an encoded `ant_protocol::ChunkMessage` in its binary body; the response uses the
+same type and native encoding. Requests use the existing ANT storage handler,
+including quote signing, payment proofs, commitment validation and chunk checks.
+The authenticated session and per-source resource limits apply as usual. Encoded
+messages may be at most 5 MiB; stored records still have the native 4 MiB limit.
+
+`cargo test --test webrtc_direct_devnet --features test-utils seeded_public_file_downloads_and_paid_uploads_over_direct_node_endpoints -- --ignored`
+exercises this path over real local WebRTC endpoints and an Anvil payment chain.
+
+Browser transport decisions and startup policy: [ADR-0015](docs/adr/ADR-0015-direct-browser-clients-over-webrtc-direct.md).
