@@ -48,7 +48,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -1168,7 +1168,13 @@ async fn handle_webrtc_channel(
     let mut hello_completed = false;
     let mut ids = HashSet::new();
     let mut pending = FuturesUnordered::new();
-    let mut reading = Box::pin(read_webrtc_request(channel, &session, &resources));
+    let (activity, active_requests) = watch::channel(0usize);
+    let mut reading = Box::pin(read_webrtc_request(
+        channel,
+        &session,
+        &resources,
+        &active_requests,
+    ));
     let mut writing = None;
     let mut ready = VecDeque::<CompletedRequest>::new();
     loop {
@@ -1203,6 +1209,7 @@ async fn handle_webrtc_channel(
             () = shutdown.cancelled() => return Ok(()),
             result = async { match writing.as_mut() { Some(writer) => writer.await, None => std::future::pending().await } }, if writing.is_some() => {
                 ids.remove(&result?);
+                activity.send_replace(ids.len());
                 writing = None;
             }
             result = &mut reading => {
@@ -1225,6 +1232,7 @@ async fn handle_webrtc_channel(
                 if ids.len() >= MAX_CHANNEL_REQUESTS || !ids.insert(request.request_id) {
                     return Err("duplicate request ID or per-channel RPC capacity exhausted".into());
                 }
+                activity.send_replace(ids.len());
                 let error = if request.version != BROWSER_PROTOCOL_VERSION {
                     Some(Response::error(request.request_id, "unsupported_version",
                         format!("protocol version {} is unsupported; expected {BROWSER_PROTOCOL_VERSION}", request.version)))
@@ -1249,7 +1257,7 @@ async fn handle_webrtc_channel(
                         None => start_request(admitted, request_state, request_resources).await,
                     }
                 });
-                reading = Box::pin(read_webrtc_request(channel, &session, &resources));
+                reading = Box::pin(read_webrtc_request(channel, &session, &resources, &active_requests));
             }
             completed = pending.next(), if !pending.is_empty() => {
                 let Some(completed) = completed else { continue };
@@ -1387,8 +1395,18 @@ async fn read_webrtc_request(
     channel: &WebRtcDataChannel,
     pq_session: &Mutex<PqSession>,
     resources: &ConnectionResources,
+    active_requests: &watch::Receiver<usize>,
 ) -> ServerResult<AdmittedRequest> {
-    let first_message = receive_first_message(channel, "request idle timeout").await?;
+    let first_message = receive_while_active(
+        channel.receive(),
+        active_requests.clone(),
+        REQUEST_IDLE_TIMEOUT,
+    )
+    .await?
+    .map_err(|error| format!("DataChannel message read failed: {error}"))?;
+    if first_message.is_empty() {
+        return Err("DataChannel closed".into());
+    }
     // Admission happens as soon as a client starts a frame. Idle persistent
     // channels consume neither request-rate tokens nor request worker slots.
     let request_permit = resources.try_admit_request()?;
@@ -1433,6 +1451,29 @@ async fn read_webrtc_request(
         _request_permit: request_permit,
         _in_flight_bytes: reservation,
     })
+}
+
+// Observe resets even while work is pending. Only an idle channel spends the
+// inactivity budget; a slow disk operation or permitted bulk transfer must not
+// be interrupted by the request-idle timer. Keep the receive future pinned so
+// activity changes never discard a partially polled transport read.
+async fn receive_while_active<T>(
+    receive: impl Future<Output = T>,
+    mut activity: watch::Receiver<usize>,
+    idle_timeout: Duration,
+) -> ServerResult<T> {
+    tokio::pin!(receive);
+    loop {
+        let idle = *activity.borrow_and_update() == 0;
+        tokio::select! {
+            biased;
+            result = &mut receive => return Ok(result),
+            changed = activity.changed() => {
+                changed.map_err(|_| "channel activity closed".to_string())?;
+            }
+            () = tokio::time::sleep(idle_timeout), if idle => return Err("request idle timeout".into()),
+        }
+    }
 }
 
 async fn receive_first_message(
@@ -2445,6 +2486,43 @@ mod tests {
         resources
             .try_admit_connection(same_prefix)
             .expect("released prefix slot");
+    }
+
+    #[tokio::test]
+    async fn active_requests_suspend_idle_timeout_but_not_channel_closure() {
+        let (activity, receiver) = watch::channel(1usize);
+        let (closed, receive) = tokio::sync::oneshot::channel::<()>();
+        let mut waiting = Box::pin(receive_while_active(
+            receive,
+            receiver,
+            Duration::from_millis(15),
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), &mut waiting)
+                .await
+                .is_err()
+        );
+        closed.send(()).unwrap();
+        assert!(waiting.await.unwrap().is_ok());
+        drop(activity);
+    }
+
+    #[tokio::test]
+    async fn idle_budget_starts_after_the_last_active_response() {
+        let (activity, receiver) = watch::channel(1usize);
+        let waiting = receive_while_active(
+            std::future::pending::<()>(),
+            receiver,
+            Duration::from_millis(15),
+        );
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut waiting)
+                .await
+                .is_err()
+        );
+        activity.send_replace(0);
+        assert_eq!(waiting.await.unwrap_err(), "request idle timeout");
     }
 
     #[test]
