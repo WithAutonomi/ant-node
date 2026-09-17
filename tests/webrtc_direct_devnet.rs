@@ -41,6 +41,23 @@ struct MockChainRpc {
 #[allow(clippy::await_holding_lock)] // Deliberately stall a blocking disk write across awaits.
 async fn disconnected_put_retains_admission_and_allows_small_binary_quotes(
 ) -> Result<(), Box<dyn Error>> {
+    blocked_put_lifecycle(false).await
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn multiplexed_get_completes_before_blocked_put() -> Result<(), Box<dyn Error>> {
+    blocked_put_lifecycle(true).await
+}
+
+#[cfg(feature = "test-utils")]
+#[allow(
+    clippy::await_holding_lock,
+    clippy::future_not_send,
+    clippy::too_many_lines
+)]
+async fn blocked_put_lifecycle(probe_multiplex: bool) -> Result<(), Box<dyn Error>> {
     use std::time::Duration;
 
     let rpc =
@@ -84,6 +101,15 @@ async fn disconnected_put_retains_admission_and_allows_small_binary_quotes(
             }
         }).await?;
 
+        // This GET must finish on the same authenticated channel while the
+        // earlier PUT is blocked. Replies are correlated by ID, not send order.
+        if probe_multiplex {
+        let (reply, _) = tokio::time::timeout(Duration::from_secs(2), client.rpc(
+            json!({"version":BROWSER_PROTOCOL_VERSION,"request_id":99,"type":"get_chunk","address":hex::encode([9;32])}), &[]
+        )).await??;
+        assert_eq!(reply["request_id"], 99);
+        }
+
         // Under the old fixed 10 MiB allowance, this second client's QUOTE
         // closed its channel even though both operations fit the source budget.
         let mut other = BrowserRpcClient::connect(&endpoint).await?;
@@ -106,6 +132,15 @@ async fn disconnected_put_retains_admission_and_allows_small_binary_quotes(
             };
             assert!(matches!(response, ant_protocol::ChunkMessageBody::QuoteResponse(ant_protocol::ChunkQuoteResponse::Error(ref error)) if *error == expected));
         }
+        // Reset only the busy stream, leaving the association itself alive.
+        // Its handler slot must retire before the blocked application work.
+        client.client.data_channel().close().await?;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while diagnostics.snapshot().active_channels > 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await?;
+        assert_eq!(diagnostics.snapshot().active_requests, 1);
         client.close().await?;
         other.close().await?;
         tokio::time::timeout(Duration::from_secs(20), async {
@@ -144,6 +179,86 @@ async fn disconnected_put_retains_admission_and_allows_small_binary_quotes(
         storage.get(&address).await?.is_some(),
         "started PUT completed after disconnect"
     );
+    Ok(())
+}
+
+/// Four full GETs must queue within the default 16 MiB source budget, retain
+/// authenticated frame order, and return every independent request correctly.
+#[cfg(feature = "test-utils")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn multiplexed_full_chunks_respect_source_budget() -> Result<(), Box<dyn Error>> {
+    use std::time::Duration;
+    let rpc =
+        MockChainRpc::new(json!({"jsonrpc":"2.0", "id":1, "result":"0x7a69"}).to_string()).await?;
+    let temp = tempfile::tempdir()?;
+    let mut config = DevnetConfig::minimal();
+    config.node_count = 2;
+    config.bootstrap_count = 1;
+    config.base_port = 0;
+    config.webrtc_direct = true;
+    config.data_dir = temp.path().join("bulk-devnet");
+    config.spawn_delay = Duration::from_millis(20);
+    config.evm_network = Some(rpc.network());
+    let mut devnet = Devnet::new(config).await?;
+    devnet.start().await?;
+    let (protocol, diagnostics) = devnet.test_browser_node(0).ok_or("missing node")?;
+    let bytes = vec![42; ant_protocol::MAX_CHUNK_SIZE];
+    let address = *blake3::hash(&bytes).as_bytes();
+    protocol.storage().put(&address, &bytes).await?;
+    let mut client = BrowserRpcClient::connect(&devnet.browser_endpoints()[0].endpoint).await?;
+    let (hello, _) = client
+        .rpc(
+            json!({"version":BROWSER_PROTOCOL_VERSION,"request_id":1,"type":"hello"}),
+            &[],
+        )
+        .await?;
+    assert!(hello["capabilities"]
+        .as_array()
+        .ok_or("capabilities")?
+        .contains(&json!("rpc-multiplex-4")));
+    for id in 2..6 {
+        let message = ant_protocol::ChunkMessage {
+            request_id: id,
+            body: ant_protocol::ChunkMessageBody::GetRequest(ant_protocol::ChunkGetRequest::new(
+                address,
+            )),
+        }
+        .encode()?;
+        let mut frame = serde_json::to_vec(
+            &json!({"version":BROWSER_PROTOCOL_VERSION,"request_id":id,"type":"chunk_protocol","content_length":message.len()}),
+        )?;
+        frame.extend_from_slice(&message);
+        send_pq_payload(
+            client.client.data_channel(),
+            &client.pq_session.seal(&frame)?,
+        )
+        .await?;
+    }
+    let mut ids = std::collections::HashSet::new();
+    for _ in 0..4 {
+        let encrypted = tokio::time::timeout(
+            Duration::from_secs(10),
+            read_pq_payload(
+                client.client.data_channel(),
+                saorsa_transport::webrtc::MAX_BROWSER_FRAME_BYTES + PQ_ENCRYPTED_OVERHEAD_BYTES,
+            ),
+        )
+        .await??;
+        let plaintext = client.pq_session.open(&encrypted)?;
+        let frame = saorsa_transport::webrtc::parse_response_frame(&plaintext)?;
+        assert!(ids.insert(frame.header.request_id));
+        let response = ant_protocol::ChunkMessage::decode(&frame.content)?;
+        assert_eq!(response.request_id, frame.header.request_id);
+        assert!(
+            matches!(response.body, ant_protocol::ChunkMessageBody::GetResponse(
+            ant_protocol::ChunkGetResponse::Success { content, .. }) if content.as_slice() == bytes.as_slice())
+        );
+    }
+    assert_eq!(ids, (2..6).collect());
+    assert_eq!(diagnostics.snapshot().byte_rejections, 0);
+    client.close().await?;
+    devnet.shutdown().await?;
     Ok(())
 }
 

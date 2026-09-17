@@ -22,6 +22,7 @@ use certificate::load_or_generate_certificate;
 use errors::{error_response, public_error, sanitize_response};
 use evmlib::common::{Amount, TxHash};
 use evmlib::{EncodedPeerId, PaymentQuote, ProofOfPayment, RewardsAddress};
+use futures::{stream::FuturesUnordered, StreamExt};
 use parking_lot::{Mutex, RwLock};
 use saorsa_core::identity::NodeIdentity;
 use saorsa_core::{AddressType, DHTNode, MultiAddr, P2PNode, PeerId};
@@ -39,7 +40,7 @@ use saorsa_transport::webrtc_direct::{
     WebRtcAdmissionLimits, WebRtcDataChannel, WebRtcDiagnostics, WebRtcDiagnosticsSnapshot,
     WebRtcDirectConnection, WebRtcDirectListener,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -53,6 +54,10 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 const MAX_FIND_NODE_RESULTS: usize = 20;
+// Advertised by HELLO. This is a protocol resource ceiling, not a throughput
+// target; clients still obey their global memory/CPU admission budgets.
+const MAX_CHANNEL_REQUESTS: usize = 4;
+const RPC_MULTIPLEX_CAPABILITY: &str = "rpc-multiplex-4";
 // Browser dials use a 10-second channel-open timeout. Give successful clients
 // modest server-side headroom while bounding associations that never open one.
 const FIRST_DATA_CHANNEL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -258,6 +263,7 @@ impl TrackedBytes {
 }
 
 struct SourceQuota {
+    bulk_responses: Arc<Semaphore>,
     request_rate: Mutex<RequestRateBucket>,
     bytes: Arc<ByteBudget>,
 }
@@ -288,6 +294,7 @@ struct ListenerResources {
     connection_limit: Arc<Semaphore>,
     channel_limit: Arc<Semaphore>,
     request_limit: Arc<Semaphore>,
+    bulk_responses: Arc<Semaphore>,
     request_tasks: Mutex<TaskTracker>,
     global_request_rate: Mutex<RequestRateBucket>,
     global_bytes: Arc<ByteBudget>,
@@ -316,6 +323,9 @@ impl ListenerResources {
             connection_limit: Arc::new(Semaphore::new(config.max_connections)),
             channel_limit: Arc::new(Semaphore::new(config.max_channels)),
             request_limit: Arc::new(Semaphore::new(config.max_concurrent_requests)),
+            bulk_responses: Arc::new(Semaphore::new(bulk_response_slots(
+                config.max_in_flight_bytes,
+            ))),
             request_tasks: Mutex::new(TaskTracker::new()),
             global_request_rate: Mutex::new(RequestRateBucket::new(config.max_requests_per_second)),
             global_bytes: Arc::new(ByteBudget::with_rejections(
@@ -374,6 +384,9 @@ impl ListenerResources {
                 active_connections: 0,
                 last_seen: Instant::now(),
                 quota: Arc::new(SourceQuota {
+                    bulk_responses: Arc::new(Semaphore::new(bulk_response_slots(
+                        self.max_in_flight_bytes_per_ip,
+                    ))),
                     request_rate: Mutex::new(RequestRateBucket::new(
                         self.max_requests_per_second_per_ip,
                     )),
@@ -1090,7 +1103,9 @@ async fn start_data_channel_task(
         if let Err(error) = channel.close().await {
             debug!(remote = %remote_addr, %error, "Failed to close excess DataChannel");
         }
-        return Err("per-connection DataChannel capacity exhausted".to_string());
+        // A reset channel's handler may still be scheduled for retirement.
+        // Reject only this excess stream, never its healthy sibling association.
+        return Ok(());
     }
     let Ok(channel_permit) = Arc::clone(&resources.listener.channel_limit).try_acquire_owned()
     else {
@@ -1141,110 +1156,106 @@ async fn handle_webrtc_channel(
         ));
     }
 
-    let mut pq_session = tokio::select! {
+    let pq_session = tokio::select! {
         biased;
         () = shutdown.cancelled() => return Ok(()),
         result = establish_pq_session(channel, &state, &resources) => result?,
     };
+    // Receiving stays live while application work or response writes are pending.
+    // In particular, a channel reset releases its handler slot immediately; the
+    // listener's separately tracked storage/payment work retains its charges.
+    let session = Mutex::new(pq_session);
     let mut hello_completed = false;
+    let mut ids = HashSet::new();
+    let mut pending = FuturesUnordered::new();
+    let mut reading = Box::pin(read_webrtc_request(channel, &session, &resources));
+    let mut writing = None;
+    let mut ready = VecDeque::<CompletedRequest>::new();
     loop {
-        let admitted_result = tokio::select! {
-            biased;
-            () = shutdown.cancelled() => return Ok(()),
-            result = read_webrtc_request(
-                channel,
-                &mut pq_session,
-                &resources,
-            ) => result,
-        };
-        let admitted = match admitted_result {
-            Ok(request) => request,
-            Err(error) if is_quiet_channel_close(&error) => return Ok(()),
-            Err(error) => {
-                let response = Response::error(0, "invalid_request", error);
-                tokio::select! {
-                    biased;
-                    () = shutdown.cancelled() => return Ok(()),
-                    result = write_webrtc_response(
-                        channel,
-                        &mut pq_session,
-                        &response,
-                        None,
-                        &resources,
-                    ) => result?,
+        if writing.is_none() {
+            if let Some(completed) = ready.pop_front() {
+                let id = completed.response.request_id;
+                if matches!(completed.response.body, ResponseBody::Hello { .. })
+                    && completed.response.status == ResponseStatus::Ok
+                {
+                    hello_completed = true;
                 }
-                return Ok(());
+                let session = &session;
+                let resources = &resources;
+                // Only one complete encrypted frame is written at a time. AEAD
+                // sequence numbers follow wire order, not request completion order.
+                writing = Some(Box::pin(async move {
+                    write_webrtc_response(
+                        channel,
+                        session,
+                        &completed.response,
+                        completed.content.as_ref(),
+                        resources,
+                    )
+                    .await?;
+                    drop(completed);
+                    Ok::<_, String>(id)
+                }));
             }
-        };
-        let request = &admitted.request;
-        if request.version != BROWSER_PROTOCOL_VERSION {
-            let response = Response::error(
-                request.request_id,
-                "unsupported_version",
-                format!(
-                    "protocol version {} is unsupported; expected {BROWSER_PROTOCOL_VERSION}",
-                    request.version
-                ),
-            );
-            tokio::select! {
-                biased;
-                () = shutdown.cancelled() => return Ok(()),
-                result = write_webrtc_response(
-                    channel,
-                    &mut pq_session,
-                    &response,
-                    None,
-                    &resources,
-                ) => result?,
-            }
-            continue;
-        }
-
-        let is_hello = matches!(&request.body, RequestBody::Hello);
-        if !is_hello && !hello_completed {
-            let response = Response::error(
-                request.request_id,
-                "authentication_required",
-                "HELLO must initialize this encrypted WebRTC session first".to_string(),
-            );
-            tokio::select! {
-                biased;
-                () = shutdown.cancelled() => return Ok(()),
-                result = write_webrtc_response(
-                    channel,
-                    &mut pq_session,
-                    &response,
-                    None,
-                    &resources,
-                ) => result?,
-            }
-            continue;
-        }
-
-        let CompletedRequest {
-            response,
-            content,
-            _request_permit,
-            _in_flight_bytes,
-            _resources,
-        } = tokio::select! {
-            biased;
-            () = shutdown.cancelled() => return Ok(()),
-            result = start_request(admitted, Arc::clone(&state), Arc::clone(&resources)) => result?,
-        };
-        if is_hello && matches!(&response.status, ResponseStatus::Ok) {
-            hello_completed = true;
         }
         tokio::select! {
             biased;
             () = shutdown.cancelled() => return Ok(()),
-            result = write_webrtc_response(
-                channel,
-                &mut pq_session,
-                &response,
-                content.as_ref(),
-                &resources,
-            ) => result?,
+            result = async { match writing.as_mut() { Some(writer) => writer.await, None => std::future::pending().await } }, if writing.is_some() => {
+                ids.remove(&result?);
+                writing = None;
+            }
+            result = &mut reading => {
+                let admitted = match result {
+                    Ok(request) => request,
+                    Err(error) if is_quiet_channel_close(&error) => return Ok(()),
+                    Err(error) => {
+                        if ids.is_empty() {
+                            let response = Response::error(0, "invalid_request", error);
+                            tokio::select! {
+                                () = shutdown.cancelled() => return Ok(()),
+                                result = write_webrtc_response(channel, &session, &response, None, &resources) => result?,
+                            }
+                            return Ok(());
+                        }
+                        return Err(error);
+                    },
+                };
+                let request = &admitted.request;
+                if ids.len() >= MAX_CHANNEL_REQUESTS || !ids.insert(request.request_id) {
+                    return Err("duplicate request ID or per-channel RPC capacity exhausted".into());
+                }
+                let error = if request.version != BROWSER_PROTOCOL_VERSION {
+                    Some(Response::error(request.request_id, "unsupported_version",
+                        format!("protocol version {} is unsupported; expected {BROWSER_PROTOCOL_VERSION}", request.version)))
+                } else if !hello_completed && !matches!(request.body, RequestBody::Hello) {
+                    Some(Response::error(request.request_id, "authentication_required",
+                        "HELLO must initialize this encrypted WebRTC session first"))
+                } else { None };
+                let request_state = Arc::clone(&state);
+                let request_resources = Arc::clone(&resources);
+                pending.push(async move {
+                    match error {
+                        Some(response) => {
+                            let AdmittedRequest { _request_permit: request_permit, _in_flight_bytes: in_flight_bytes, .. } = admitted;
+                            Ok(CompletedRequest {
+                                _bulk_permits: None,
+                                response, content: None,
+                                _request_permit: request_permit,
+                                _in_flight_bytes: in_flight_bytes,
+                                _resources: request_resources,
+                            })
+                        },
+                        None => start_request(admitted, request_state, request_resources).await,
+                    }
+                });
+                reading = Box::pin(read_webrtc_request(channel, &session, &resources));
+            }
+            completed = pending.next(), if !pending.is_empty() => {
+                let Some(completed) = completed else { continue };
+                let completed = completed?;
+                ready.push_back(completed);
+            }
         }
     }
 }
@@ -1302,12 +1313,29 @@ struct AdmittedRequest {
 }
 
 struct CompletedRequest {
+    // Retain preparation capacity until the response is written or discarded.
+    _bulk_permits: Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)>,
     response: Response,
     content: Option<TrackedBytes>,
     _request_permit: OwnedSemaphorePermit,
     _in_flight_bytes: InFlightByteReservation,
     // Prevent source eviction until the response and all its charges are gone.
     _resources: Arc<ConnectionResources>,
+}
+
+// A GET may hold record bytes, encoded plaintext and ciphertext together.
+// This queue complements exact byte accounting; it never raises those limits.
+fn bulk_response_slots(bytes: usize) -> usize {
+    (bytes / (3 * ant_protocol::MAX_WIRE_MESSAGE_SIZE + 2 * MAX_BROWSER_HEADER_BYTES)).max(1)
+}
+
+fn request_is_get(request: &Request, content: &[u8]) -> bool {
+    matches!(request.body, RequestBody::GetChunk { .. })
+        || (matches!(request.body, RequestBody::ChunkProtocol)
+            // A canonical binary GET is small. Avoid decoding/copying PUTs just
+            // to classify scheduling; the ordinary decoder still validates all.
+            && content.len() <= 128
+            && ChunkMessage::decode(content).is_ok_and(|message| matches!(message.body, ChunkMessageBody::GetRequest(_))))
 }
 
 async fn start_request(
@@ -1323,8 +1351,25 @@ async fn start_request(
             _request_permit: request_permit,
             _in_flight_bytes: in_flight_bytes,
         } = admitted;
+        // Reserve enough preparation capacity for one complete response to
+        // make progress under the existing byte limits. Acquire source first:
+        // queued work from one source cannot occupy every global bulk slot.
+        let bulk_permits = if request_is_get(&request, &content) {
+            let source = Arc::clone(&resources.source.bulk_responses)
+                .acquire_owned()
+                .await
+                .map_err(|_| "bulk response admission closed".to_string())?;
+            let global = Arc::clone(&resources.listener.bulk_responses)
+                .acquire_owned()
+                .await
+                .map_err(|_| "bulk response admission closed".to_string())?;
+            Some((source, global))
+        } else {
+            None
+        };
         let (response, content) = process_request(request, content, &state, &resources).await?;
         Ok(CompletedRequest {
+            _bulk_permits: bulk_permits,
             response,
             content,
             _request_permit: request_permit,
@@ -1340,7 +1385,7 @@ async fn start_request(
 
 async fn read_webrtc_request(
     channel: &WebRtcDataChannel,
-    pq_session: &mut PqSession,
+    pq_session: &Mutex<PqSession>,
     resources: &ConnectionResources,
 ) -> ServerResult<AdmittedRequest> {
     let first_message = receive_first_message(channel, "request idle timeout").await?;
@@ -1361,6 +1406,7 @@ async fn read_webrtc_request(
     // second buffer before asking the cryptographic layer to allocate it.
     encrypted.reservation.try_grow(encrypted_len)?;
     let frame = pq_session
+        .lock()
         .open(&encrypted.bytes)
         .map_err(|error| format!("PQ session: {error}"))?;
     let TrackedBytes {
@@ -1489,7 +1535,7 @@ async fn read_pq_payload_after_first(
 
 async fn write_webrtc_response(
     channel: &WebRtcDataChannel,
-    pq_session: &mut PqSession,
+    pq_session: &Mutex<PqSession>,
     response: &Response,
     content: Option<&TrackedBytes>,
     resources: &ConnectionResources,
@@ -1511,6 +1557,7 @@ async fn write_webrtc_response(
         .ok_or_else(|| "encrypted response length overflow".to_string())?;
     reservation.try_grow(encrypted_len)?;
     let encrypted = pq_session
+        .lock()
         .seal(&plaintext)
         .map_err(|error| format!("PQ session: {error}"))?;
     drop(plaintext);
@@ -1690,6 +1737,7 @@ fn hello_response(request_id: u64, state: &ServerState) -> Response {
             payment: state.payment.clone(),
             capabilities: vec![
                 "chunk_protocol".into(),
+                RPC_MULTIPLEX_CAPABILITY.into(),
                 "find_node".into(),
                 ant_protocol::transport::ADDRESS_V2_CAPABILITY.into(),
                 "get_chunk".into(),
