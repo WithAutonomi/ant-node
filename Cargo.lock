@@ -863,7 +863,7 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "2.5.0"
-source = "git+https://github.com/WithAutonomi/ant-protocol?branch=feat/pointers-immutable-owner#a9f9a27a42d516bcda29dfdb0c081b93d6bf2648"
+source = "git+https://github.com/WithAutonomi/ant-protocol?branch=feat/pointers-immutable-owner#c0fb5272be0d7c8de2f07d83b87f029b562afd4e"
 dependencies = [
  "blake3",
  "bytes",

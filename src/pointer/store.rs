@@ -133,8 +133,6 @@ struct IndexEntry {
     rank: MergeRank,
     /// The held record's counter, for the paid-increment check.
     counter: u64,
-    /// `BLAKE3` over the exact stored bytes, which a storage commitment binds.
-    bytes_hash: XorName,
     /// Which insertion this entry is.
     ///
     /// Monotonic for the life of this store, so an entry can be told apart
@@ -154,7 +152,6 @@ impl IndexEntry {
             state_id: record.state_id(),
             rank: record.state().rank(),
             counter: record.counter(),
-            bytes_hash: record.bytes_hash(),
             generation,
         }
     }
@@ -421,15 +418,6 @@ impl PointerStore {
         self.snapshot(address).map(|e| e.state_id)
     }
 
-    /// `BLAKE3` over the exact bytes held at `address`, if any.
-    ///
-    /// What a storage commitment binds for this record. Per-storer by design:
-    /// each node commits and is audited against the encoding it actually holds.
-    #[must_use]
-    pub fn bytes_hash(&self, address: &XorName) -> Option<XorName> {
-        self.snapshot(address).map(|e| e.bytes_hash)
-    }
-
     /// Whether `state` is the paid successor of what is held.
     ///
     /// One payment buys one increment: a new pointer starts at counter 0, and
@@ -452,59 +440,6 @@ impl PointerStore {
     #[must_use]
     pub fn contains(&self, address: &XorName) -> bool {
         self.snapshot(address).is_some()
-    }
-
-    /// Whether the record held at `address` is already this exact state.
-    ///
-    /// The question a fetch decision asks: holding *the key* is not enough for
-    /// a mutable record, holding *the state* is.
-    #[must_use]
-    pub fn holds_state(&self, address: &XorName, state_id: &XorName) -> bool {
-        self.snapshot(address)
-            .is_some_and(|e| e.state_id == *state_id)
-    }
-
-    /// Every address the store holds.
-    #[must_use]
-    pub fn all_keys(&self) -> Vec<XorName> {
-        self.inner.index.lock().keys().copied().collect()
-    }
-
-    /// Every address with the state identifier and committed bytes hash held
-    /// for it.
-    ///
-    /// The input a commitment build or a sync round needs in one pass, which is
-    /// why the index exists rather than each of those re-reading every file.
-    #[must_use]
-    pub fn all_states(&self) -> Vec<(XorName, XorName, XorName)> {
-        self.inner
-            .index
-            .lock()
-            .iter()
-            .map(|(address, entry)| (*address, entry.state_id, entry.bytes_hash))
-            .collect()
-    }
-
-    /// Which of `wanted` this node does not already hold at the given state.
-    ///
-    /// The fetch decision a mutable record needs. The chunk path asks "do I
-    /// hold this key?" and stops, which for a pointer means a replica on
-    /// version N never fetches N+1 and the two diverge permanently. This asks
-    /// "do I hold this *state*?" instead.
-    #[must_use]
-    pub fn missing_states(&self, wanted: &[(XorName, XorName)]) -> Vec<(XorName, XorName)> {
-        let index = self.inner.index.lock();
-        wanted
-            .iter()
-            .filter(|(address, state_id)| {
-                // `map_or` rather than `is_none_or`: the latter is stable only
-                // from 1.82 and this crate's MSRV is 1.75.
-                index
-                    .get(address)
-                    .map_or(true, |entry| entry.state_id != *state_id)
-            })
-            .copied()
-            .collect()
     }
 
     /// How many records the store holds.
@@ -880,12 +815,7 @@ mod tests {
             .expect("present");
         assert_eq!(read.to_bytes(), record.to_bytes());
         assert_eq!(store.state_id(&record.address()), Some(record.state_id()));
-        assert_eq!(
-            store.bytes_hash(&record.address()),
-            Some(record.bytes_hash())
-        );
         assert!(store.contains(&record.address()));
-        assert!(store.holds_state(&record.address(), &record.state_id()));
         assert_eq!(store.len(), 1);
     }
 
@@ -947,7 +877,6 @@ mod tests {
             held_bytes,
             "not one of the 16 re-signatures reached the disk"
         );
-        assert_eq!(store.bytes_hash(&first.address()), Some(first.bytes_hash()));
     }
 
     #[tokio::test]
@@ -1150,7 +1079,6 @@ mod tests {
         let after = reopened.get(&address).await.expect("get").expect("present");
         assert_eq!(after.to_bytes(), before.to_bytes());
         assert_eq!(reopened.state_id(&address), Some(before.state_id()));
-        assert_eq!(reopened.bytes_hash(&address), Some(before.bytes_hash()));
     }
 
     #[tokio::test]
@@ -1179,8 +1107,6 @@ mod tests {
         store.put_bytes(&first.to_bytes()).await.expect("put");
         store.put_bytes(&second.to_bytes()).await.expect("put");
         assert_eq!(store.len(), 2);
-        assert_eq!(store.all_keys().len(), 2);
-        assert_eq!(store.all_states().len(), 2);
     }
 
     #[tokio::test]
@@ -1266,7 +1192,6 @@ mod tests {
         let held = store.get(&address).await.expect("get").expect("present");
         assert_eq!(held.counter(), 12, "the highest counter must win");
         assert_eq!(store.state_id(&address), Some(held.state_id()));
-        assert_eq!(store.bytes_hash(&address), Some(held.bytes_hash()));
         assert_eq!(store.len(), 1);
 
         // No temporary file survived the race.
@@ -1334,8 +1259,6 @@ mod tests {
         let (store, _dir) = store().await;
         assert!(store.is_empty());
         assert_eq!(store.state_id(&[0u8; 32]), None);
-        assert_eq!(store.bytes_hash(&[0u8; 32]), None);
-        assert!(!store.holds_state(&[0u8; 32], &[0u8; 32]));
         assert!(store.get(&[0u8; 32]).await.expect("get").is_none());
     }
 
@@ -1448,10 +1371,5 @@ mod tests {
         store.put_bytes(&old.to_bytes()).await.expect("put");
 
         assert!(store.contains(&new.address()));
-        assert!(store.holds_state(&old.address(), &old.state_id()));
-        assert!(
-            !store.holds_state(&new.address(), &new.state_id()),
-            "the newer state is absent even though the key is held"
-        );
     }
 }

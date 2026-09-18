@@ -282,28 +282,6 @@ impl PointerService {
 
     /// Handle a pointer GET.
     pub async fn handle_get(&self, request: PointerGetRequest) -> PointerGetResponse {
-        // A replica asking "anything newer than this?" gets a cheap index
-        // lookup first, but the answer is confirmed against the file before it
-        // is sent: an index entry for a record whose file has since gone or
-        // stopped validating would otherwise answer "unchanged" forever, and
-        // the peer would never fetch the copy that would repair it. `get`
-        // re-validates and drops such an entry, so the confirmation costs a
-        // read exactly once, on the way to telling the truth.
-        let known = request.known_state_id;
-        if known.is_some_and(|known| self.store.holds_state(&request.address, &known)) {
-            match self.store.get(&request.address).await {
-                Ok(Some(record)) if Some(record.state_id()) == known => {
-                    return PointerGetResponse::Unchanged {
-                        state_id: record.state_id(),
-                    };
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    return PointerGetResponse::Error(ProtocolError::StorageFailed(e.to_string()));
-                }
-            }
-        }
-
         match self.store.get(&request.address).await {
             Ok(Some(record)) => PointerGetResponse::Success {
                 record: Bytes::from(record.to_bytes()),
@@ -472,35 +450,6 @@ mod tests {
                 assert_eq!(state_id, record.state_id());
             }
             other => panic!("expected Unchanged, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn a_conditional_get_skips_the_transfer_when_nothing_changed() {
-        let (service, _dir) = service().await;
-        let record = signed(1, 0, 3);
-        service.handle_put(put(&record)).await;
-
-        match service
-            .handle_get(PointerGetRequest::if_changed(
-                record.address(),
-                record.state_id(),
-            ))
-            .await
-        {
-            PointerGetResponse::Unchanged { state_id } => {
-                assert_eq!(state_id, record.state_id());
-            }
-            other => panic!("expected Unchanged, got {other:?}"),
-        }
-
-        // A stale known state still gets the bytes.
-        match service
-            .handle_get(PointerGetRequest::if_changed(record.address(), [0u8; 32]))
-            .await
-        {
-            PointerGetResponse::Success { .. } => {}
-            other => panic!("expected Success, got {other:?}"),
         }
     }
 

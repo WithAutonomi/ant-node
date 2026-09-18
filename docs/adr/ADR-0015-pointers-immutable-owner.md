@@ -42,12 +42,11 @@ The key is carried because it has to be: ML-DSA has no key recovery and a
 is 5,303 bytes rather than ~3,350, and the price of validating one with no
 fetch.
 
-### Three identities
+### Two identities
 
 ```text
-A          = BLAKE3("autonomi.pointer.address.v1" || owner)   routes
-state_id   = BLAKE3("autonomi.pointer.state.v1"   || body)    authorizes payment
-bytes_hash = BLAKE3(record)                                   this node's commitment
+A        = BLAKE3("autonomi.pointer.address.v1" || owner)   routes
+state_id = BLAKE3("autonomi.pointer.state.v1"   || body)    authorizes payment
 ```
 
 **Public-key addressed and self-verifying.** `A` is a pure function of the owner
