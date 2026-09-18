@@ -632,7 +632,7 @@ impl Inner {
         let temp = self
             .dir
             .join(format!("{TEMP_PREFIX}{}-{seq}", hex::encode(address)));
-        stage(&temp, record.as_bytes())?;
+        stage(&temp, &record.to_bytes())?;
 
         let outcome = {
             let mut index = self.index.lock();
@@ -872,7 +872,7 @@ mod tests {
     /// A record with its signature destroyed: the body still parses, the
     /// record does not verify.
     fn forged(record: &Pointer) -> Vec<u8> {
-        let mut bytes = record.as_bytes().to_vec();
+        let mut bytes = record.to_bytes().to_vec();
         if let Some(byte) = bytes.get_mut(POINTER_BODY_LEN + 3) {
             *byte ^= 0xff;
         }
@@ -894,7 +894,7 @@ mod tests {
         let (store, _dir) = store().await;
         let record = signed(1, 1, 1);
         assert_eq!(
-            store.put_bytes(record.as_bytes()).await.expect("put"),
+            store.put_bytes(&record.to_bytes()).await.expect("put"),
             PutOutcome::Stored
         );
 
@@ -903,7 +903,7 @@ mod tests {
             .await
             .expect("get")
             .expect("present");
-        assert_eq!(read.as_bytes(), record.as_bytes());
+        assert_eq!(read.to_bytes(), record.to_bytes());
         assert_eq!(store.state_id(&record.address()), Some(record.state_id()));
         assert_eq!(
             store.bytes_hash(&record.address()),
@@ -920,15 +920,15 @@ mod tests {
         let first = signed(1, 1, 1);
         let second = signed(1, 2, 1);
         assert_eq!(
-            store.put_bytes(first.as_bytes()).await.expect("put"),
+            store.put_bytes(&first.to_bytes()).await.expect("put"),
             PutOutcome::Stored
         );
         assert_eq!(
-            store.put_bytes(second.as_bytes()).await.expect("put"),
+            store.put_bytes(&second.to_bytes()).await.expect("put"),
             PutOutcome::Replaced
         );
         assert_eq!(
-            store.put_bytes(first.as_bytes()).await.expect("put"),
+            store.put_bytes(&first.to_bytes()).await.expect("put"),
             PutOutcome::Stale
         );
 
@@ -948,7 +948,7 @@ mod tests {
         // for once.
         let (store, _dir) = store().await;
         let first = signed(1, 5, 5);
-        store.put_bytes(first.as_bytes()).await.expect("put");
+        store.put_bytes(&first.to_bytes()).await.expect("put");
 
         let path = store.dir().join(hex::encode(first.address()));
         let held_bytes = std::fs::read(&path).expect("read");
@@ -956,13 +956,13 @@ mod tests {
         for _ in 0..16 {
             let variant = signed(1, 5, 5);
             assert_ne!(
-                variant.as_bytes(),
-                first.as_bytes(),
+                variant.to_bytes(),
+                first.to_bytes(),
                 "signing is randomized"
             );
             assert_eq!(variant.state_id(), first.state_id());
             assert_eq!(
-                store.put_bytes(variant.as_bytes()).await.expect("put"),
+                store.put_bytes(&variant.to_bytes()).await.expect("put"),
                 PutOutcome::Unchanged
             );
         }
@@ -983,7 +983,7 @@ mod tests {
         // had it run, this would have been an error rather than Unchanged.
         let (store, _dir) = store().await;
         let held = signed(1, 4, 4);
-        store.put_bytes(held.as_bytes()).await.expect("put");
+        store.put_bytes(&held.to_bytes()).await.expect("put");
 
         assert_eq!(
             store.put_bytes(&forged(&held)).await.expect("put"),
@@ -995,14 +995,14 @@ mod tests {
             .await
             .expect("get")
             .expect("present");
-        assert_eq!(after.as_bytes(), held.as_bytes(), "nothing was written");
+        assert_eq!(after.to_bytes(), held.to_bytes(), "nothing was written");
     }
 
     #[tokio::test]
     async fn a_stale_arrival_is_refused_before_its_signature_is_checked() {
         let (store, _dir) = store().await;
         store
-            .put_bytes(signed(1, 9, 1).as_bytes())
+            .put_bytes(&signed(1, 9, 1).to_bytes())
             .await
             .expect("put");
 
@@ -1020,7 +1020,7 @@ mod tests {
         // Losing records skip verification; a record that would win never does.
         let (store, _dir) = store().await;
         store
-            .put_bytes(signed(1, 1, 1).as_bytes())
+            .put_bytes(&signed(1, 1, 1).to_bytes())
             .await
             .expect("put");
 
@@ -1039,14 +1039,14 @@ mod tests {
     async fn prepare_reports_a_no_op_without_a_candidate() {
         let (store, _dir) = store().await;
         let held = signed(1, 6, 6);
-        store.put_bytes(held.as_bytes()).await.expect("put");
+        store.put_bytes(&held.to_bytes()).await.expect("put");
 
-        match store.prepare(held.as_bytes()).await.expect("prepare") {
+        match store.prepare(&held.to_bytes()).await.expect("prepare") {
             Prepared::Noop(outcome) => assert_eq!(outcome, PutOutcome::Unchanged),
             Prepared::Candidate(_) => panic!("an identical state is not a candidate"),
         }
         match store
-            .prepare(signed(1, 1, 6).as_bytes())
+            .prepare(&signed(1, 1, 6).to_bytes())
             .await
             .expect("prepare")
         {
@@ -1059,11 +1059,11 @@ mod tests {
     async fn a_candidate_exposes_what_a_payment_check_needs() {
         let (store, _dir) = store().await;
         let record = signed(1, 2, 2);
-        match store.prepare(record.as_bytes()).await.expect("prepare") {
+        match store.prepare(&record.to_bytes()).await.expect("prepare") {
             Prepared::Candidate(prepared) => {
                 assert_eq!(prepared.address(), record.address());
                 assert_eq!(prepared.state_id(), record.state_id());
-                assert_eq!(prepared.record().as_bytes(), record.as_bytes());
+                assert_eq!(prepared.record().to_bytes(), record.to_bytes());
                 assert_eq!(
                     store.commit(prepared).await.expect("commit"),
                     PutOutcome::Stored
@@ -1080,7 +1080,7 @@ mod tests {
         // that check is in flight, and must not then be overwritten.
         let (store, _dir) = store().await;
         let slow = match store
-            .prepare(signed(1, 2, 1).as_bytes())
+            .prepare(&signed(1, 2, 1).to_bytes())
             .await
             .expect("prepare")
         {
@@ -1090,7 +1090,7 @@ mod tests {
 
         // Someone else's newer state arrives while the payment is being checked.
         store
-            .put_bytes(signed(1, 7, 1).as_bytes())
+            .put_bytes(&signed(1, 7, 1).to_bytes())
             .await
             .expect("put");
 
@@ -1132,7 +1132,7 @@ mod tests {
             for offset in 0..records.len() {
                 let index = (rotation + offset) % records.len();
                 let record = records.get(index).expect("in range");
-                store.put_bytes(record.as_bytes()).await.expect("put");
+                store.put_bytes(&record.to_bytes()).await.expect("put");
             }
             let held = store.get(&address).await.expect("get").expect("present");
             winners.push(held.state_id());
@@ -1155,7 +1155,7 @@ mod tests {
         {
             let store = PointerStore::new(dir.path()).await.expect("open");
             for record in [signed(1, 1, 1), signed(1, 4, 2), signed(1, 2, 3)] {
-                store.put_bytes(record.as_bytes()).await.expect("put");
+                store.put_bytes(&record.to_bytes()).await.expect("put");
             }
             address = signed(1, 1, 1).address();
             before = store.get(&address).await.expect("get").expect("present");
@@ -1166,7 +1166,7 @@ mod tests {
         let reopened = PointerStore::new(dir.path()).await.expect("reopen");
         assert_eq!(reopened.len(), 1);
         let after = reopened.get(&address).await.expect("get").expect("present");
-        assert_eq!(after.as_bytes(), before.as_bytes());
+        assert_eq!(after.to_bytes(), before.to_bytes());
         assert_eq!(reopened.state_id(&address), Some(before.state_id()));
         assert_eq!(reopened.bytes_hash(&address), Some(before.bytes_hash()));
     }
@@ -1194,8 +1194,8 @@ mod tests {
         let first = signed(1, 1, 1);
         let second = signed(2, 1, 1);
         assert_ne!(first.address(), second.address());
-        store.put_bytes(first.as_bytes()).await.expect("put");
-        store.put_bytes(second.as_bytes()).await.expect("put");
+        store.put_bytes(&first.to_bytes()).await.expect("put");
+        store.put_bytes(&second.to_bytes()).await.expect("put");
         assert_eq!(store.len(), 2);
         assert_eq!(store.all_keys().len(), 2);
         assert_eq!(store.all_states().len(), 2);
@@ -1205,7 +1205,7 @@ mod tests {
     async fn a_corrupt_file_is_forgotten_so_the_record_can_be_repaired() {
         let (store, _dir) = store().await;
         let record = signed(1, 1, 1);
-        store.put_bytes(record.as_bytes()).await.expect("put");
+        store.put_bytes(&record.to_bytes()).await.expect("put");
 
         let path = store.dir().join(hex::encode(record.address()));
         let mut bytes = std::fs::read(&path).expect("read back");
@@ -1224,7 +1224,7 @@ mod tests {
         // The repair a peer would send is accepted rather than dismissed as
         // "unchanged", which is the whole point of forgetting it.
         assert_eq!(
-            store.put_bytes(record.as_bytes()).await.expect("put"),
+            store.put_bytes(&record.to_bytes()).await.expect("put"),
             PutOutcome::Stored
         );
         assert!(store.get(&record.address()).await.expect("get").is_some());
@@ -1234,7 +1234,7 @@ mod tests {
     async fn a_deleted_file_is_forgotten_too() {
         let (store, _dir) = store().await;
         let record = signed(1, 1, 1);
-        store.put_bytes(record.as_bytes()).await.expect("put");
+        store.put_bytes(&record.to_bytes()).await.expect("put");
 
         std::fs::remove_file(store.dir().join(hex::encode(record.address()))).expect("remove");
         assert!(store.get(&record.address()).await.expect("get").is_none());
@@ -1247,7 +1247,7 @@ mod tests {
         let record = signed(1, 1, 1);
         {
             let store = PointerStore::new(dir.path()).await.expect("open");
-            store.put_bytes(record.as_bytes()).await.expect("put");
+            store.put_bytes(&record.to_bytes()).await.expect("put");
 
             // Junk under a plausible name, an oversized file, and a partial write.
             std::fs::write(store.dir().join(hex::encode([9u8; 32])), b"not a pointer")
@@ -1274,7 +1274,7 @@ mod tests {
         let mut tasks = Vec::new();
         for counter in 1..=12u64 {
             let store = store.clone();
-            let bytes = signed(1, counter, 1).as_bytes().to_vec();
+            let bytes = signed(1, counter, 1).to_bytes().to_vec();
             tasks.push(tokio::spawn(async move { store.put_bytes(&bytes).await }));
         }
         for task in tasks {
@@ -1302,7 +1302,7 @@ mod tests {
         // the write and the index update both happened, or neither did.
         let (store, _dir) = store().await;
         let record = signed(1, 3, 3);
-        let prepared = match store.prepare(record.as_bytes()).await.expect("prepare") {
+        let prepared = match store.prepare(&record.to_bytes()).await.expect("prepare") {
             Prepared::Candidate(prepared) => prepared,
             Prepared::Noop(_) => panic!("expected a candidate"),
         };
@@ -1364,14 +1364,14 @@ mod tests {
         // node ends up holding a record it never announces or commits to.
         let (store, _dir) = store().await;
         let old = signed(1, 1, 1);
-        store.put_bytes(old.as_bytes()).await.expect("put");
+        store.put_bytes(&old.to_bytes()).await.expect("put");
 
         // Simulate the interleaving: the read observed the old entry, then a
         // newer state was committed, and only then does the read disown what
         // it saw.
         let observed = store.snapshot(&old.address()).map(|entry| entry.generation);
         let new = signed(1, 2, 1);
-        store.put_bytes(new.as_bytes()).await.expect("put");
+        store.put_bytes(&new.to_bytes()).await.expect("put");
 
         store.forget_if_unchanged(&old.address(), observed);
         assert_eq!(
@@ -1394,7 +1394,7 @@ mod tests {
         // the repaired entry from the corrupt one it replaced.
         let (store, _dir) = store().await;
         let record = signed(1, 1, 1);
-        store.put_bytes(record.as_bytes()).await.expect("put");
+        store.put_bytes(&record.to_bytes()).await.expect("put");
 
         let first_reader = store
             .snapshot(&record.address())
@@ -1407,7 +1407,7 @@ mod tests {
 
         // A peer repairs it with the very same state.
         assert_eq!(
-            store.put_bytes(record.as_bytes()).await.expect("put"),
+            store.put_bytes(&record.to_bytes()).await.expect("put"),
             PutOutcome::Stored
         );
 
@@ -1437,7 +1437,7 @@ mod tests {
 
         let reopened = PointerStore::new(dir.path()).await.expect("reopen");
         assert_eq!(
-            reopened.put_bytes(record.as_bytes()).await.expect("put"),
+            reopened.put_bytes(&record.to_bytes()).await.expect("put"),
             PutOutcome::Stored,
             "a swept leftover must not block the first write to its address"
         );
@@ -1447,7 +1447,7 @@ mod tests {
     async fn a_healthy_store_does_not_report_degraded_durability() {
         let (store, _dir) = store().await;
         store
-            .put_bytes(signed(1, 1, 1).as_bytes())
+            .put_bytes(&signed(1, 1, 1).to_bytes())
             .await
             .expect("put");
         assert!(
@@ -1463,7 +1463,7 @@ mod tests {
         let (store, _dir) = store().await;
         let old = signed(1, 1, 1);
         let new = signed(1, 2, 1);
-        store.put_bytes(old.as_bytes()).await.expect("put");
+        store.put_bytes(&old.to_bytes()).await.expect("put");
 
         assert!(store.contains(&new.address()));
         assert!(store.holds_state(&old.address(), &old.state_id()));
