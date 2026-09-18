@@ -204,11 +204,14 @@ impl PointerService {
     ) -> Option<PointerPutResponse> {
         let address = state.address;
 
-        // One payment buys one increment. A create is counter 0 and an update
-        // is exactly one past what this node holds; anything else would let an
-        // owner pay once and jump the counter, skipping every intermediate
-        // payment. Replication does not come through here — it merges on the
-        // counter order, so a replica behind a gap can still catch up.
+        // One payment buys one state and at most one increment. A create is
+        // counter 0; an update is one past what this node holds, or the
+        // tie-break winner at that same counter, which two concurrent updates
+        // must both be able to land on or the group stays split. What is
+        // refused is a jump, which would let an owner pay once and skip every
+        // intermediate payment. Replication does not come through here — it
+        // merges on the counter order, so a replica behind a gap can still
+        // catch up.
         if !self.store.accepts_as_paid_update(state) {
             debug!(
                 "Rejecting pointer PUT for {}: counter {} is not the paid successor",

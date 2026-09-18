@@ -70,8 +70,13 @@ would make every update after the first free.
 
 ### Pay to create, pay to update
 
-Creation is `counter = 0`. Each update is `counter + 1`. Both are paid against
-their own `state_id`, so **one payment buys exactly one increment**.
+Creation is `counter = 0`. An update is `counter + 1`, or the same counter with
+a smaller target — the merge rule's tie-break, which two concurrent updates must
+both be able to land on or they leave the group split. Every one of them is paid
+against its own `state_id`, so **one payment buys one state and at most one
+increment**. A tie-break moves the pointer without advancing the counter, but it
+must strictly descend in target bytes and each step is bought separately, so it
+buys nothing an ordinary update would not.
 
 The client path enforces `+1`. Replication accepts any strictly greater counter,
 because a replica that missed an update must be able to catch up; refusing the
