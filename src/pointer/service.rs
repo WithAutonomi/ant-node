@@ -299,10 +299,10 @@ impl PointerService {
 /// Decide whether a chunk already at `address` blocks this pointer.
 ///
 /// Separated from the handler because the branch cannot be reached in a test
-/// any other way: a pointer address is `BLAKE3(domain || owner)` and a chunk
-/// address is `BLAKE3(content)`, so occupying both with real data would take an
-/// actual hash collision. The decision is what matters, so the decision is what
-/// is tested.
+/// any other way: a pointer address comes out of BLAKE3's derive-key mode and a
+/// chunk address out of a plain hash, so occupying both with real data would
+/// take a collision across the two. The decision is what matters, so the
+/// decision is what is tested.
 ///
 /// `Some(response)` means refuse. Refusing is the only safe answer: whichever
 /// kind were chosen, the other's data would be destroyed, and the node cannot
