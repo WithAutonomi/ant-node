@@ -22,16 +22,25 @@ a pre-buy. Declining transfer is what lets this design be small enough to trust.
 One record. No genesis object, no certificates, no lineage.
 
 ```rust
-pub struct Pointer {              // 5,303 bytes
-    format_version: u8,
-    owner: MlDsa65PublicKey,      // 1,952 — the pointer's identity
-    counter: u64,
-    target: PointerTarget,        // 1-byte kind tag + 32-byte address
-    signature: MlDsa65Signature,  // 3,309, over everything above
+pub struct Pointer {          // 5,303 bytes
+    version: u8,              //     1
+    owner: MlDsa65PublicKey,  // 1,952 — the identity; the address derives from it
+    counter: u64,             //     8 — 0 to create, +1 per paid update
+    target: PointerTarget,    //    33 — kind tag + address; opaque to a node
+    sig: MlDsa65Signature,    // 3,309 — over every field above
 }
 ```
 
-Fixed-width, big-endian, hand-encoded; no serde in the signed bytes.
+Five fields and nothing else — no cached bytes, no cached identifiers. Encoding
+is fixed-width, big-endian and hand-rolled with no serde, so there is exactly
+one byte sequence for a record and re-encoding is always identical to what was
+signed. The address and `state_id` are hashes of fields already present, so they
+are computed rather than stored.
+
+The key is carried because it has to be: ML-DSA has no key recovery and a
+1,952-byte key cannot be a 32-byte address. That is the whole reason a pointer
+is 5,303 bytes rather than ~3,350, and the price of validating one with no
+fetch.
 
 ### Three identities
 
@@ -95,7 +104,7 @@ re-checks under its lock, because a newer state can land while payment verifies.
 | Pay once, jump the counter | Client updates must be `+1` |
 | Pay for a chunk to fund a pointer | Paid cache keyed by a typed `Chunk` vs `PointerState`, never by a raw 32-byte value a crafted chunk could occupy |
 | Merkle proof with no issuer check | Refused for pointers; single-node proofs only |
-| Downgrade the format | `format_version` is signed and inside `state_id`; unknown versions are refused |
+| Downgrade the format | `version` is signed and inside `state_id`; unknown versions are refused |
 | Unknown target kind | Carried, never interpreted — a node stores 33 opaque bytes |
 | Collide a pointer and a chunk address | Refused in both directions rather than resolved |
 | Mint an audit leaf for someone's key | Pointer leaves are refused at round 1 (see below) |
@@ -142,7 +151,7 @@ pointer leaves are refused rather than trusted.
 - A resubmission and a stale arrival are both refused before any signature check.
 - Creation is counter 0; an update is `+1`; every jump — including to `u64::MAX`
   and a wrap back to 0 — is refused as a non-successor.
-- All 256 `format_version` values give distinct paid identifiers.
+- All 256 `version` values give distinct paid identifiers.
 - Golden vectors pin the encoding, both identities and the signing context.
 - A relabelled audit leaf fails structural verification; a chunk-only commitment
   root is bit-identical to before.

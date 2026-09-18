@@ -300,7 +300,7 @@ impl PointerService {
 
         match self.store.get(&request.address).await {
             Ok(Some(record)) => PointerGetResponse::Success {
-                record: Bytes::copy_from_slice(record.as_bytes()),
+                record: Bytes::from(record.to_bytes()),
             },
             Ok(None) => PointerGetResponse::NotFound {
                 address: request.address,
@@ -402,7 +402,7 @@ mod tests {
     }
 
     fn put(record: &Pointer) -> PointerPutRequest {
-        PointerPutRequest::new(Bytes::copy_from_slice(record.as_bytes()))
+        PointerPutRequest::new(Bytes::from(record.to_bytes()))
     }
 
     #[tokio::test]
@@ -423,7 +423,7 @@ mod tests {
             .await
         {
             PointerGetResponse::Success { record: bytes } => {
-                assert_eq!(bytes.as_ref(), record.as_bytes());
+                assert_eq!(bytes.as_ref(), record.to_bytes());
             }
             other => panic!("expected Success, got {other:?}"),
         }
@@ -459,7 +459,7 @@ mod tests {
         service.handle_put(put(&record)).await;
 
         let variant = signed(1, 0, 4);
-        assert_ne!(variant.as_bytes(), record.as_bytes());
+        assert_ne!(variant.to_bytes(), record.to_bytes());
         match service.handle_put(put(&variant)).await {
             PointerPutResponse::Unchanged { address, state_id } => {
                 assert_eq!(address, record.address());
@@ -523,7 +523,7 @@ mod tests {
     async fn a_forged_signature_is_refused() {
         let (service, _dir) = service().await;
         let record = signed(1, 0, 1);
-        let mut bytes = record.as_bytes().to_vec();
+        let mut bytes = record.to_bytes().to_vec();
         if let Some(byte) = bytes.get_mut(ant_protocol::pointer::POINTER_BODY_LEN + 3) {
             *byte ^= 0xff;
         }

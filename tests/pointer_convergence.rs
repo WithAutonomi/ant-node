@@ -143,7 +143,7 @@ proptest! {
             .map(|_| signed(1, counter, target, PointerTargetKind::Chunk))
             .collect();
 
-        let encodings: BTreeSet<&[u8]> = records.iter().map(Pointer::as_bytes).collect();
+        let encodings: BTreeSet<Vec<u8>> = records.iter().map(Pointer::to_bytes).collect();
         prop_assert_eq!(encodings.len(), variants, "ML-DSA signing is randomized");
 
         let states: BTreeSet<_> = records.iter().map(Pointer::state_id).collect();
@@ -209,7 +209,7 @@ proptest! {
         prop_assert_ne!(record.address(), signed(4, 0, 0, PointerTargetKind::Chunk).address());
 
         // An unknown tag round-trips untouched; the node never interprets it.
-        let parsed = Pointer::from_bytes(record.as_bytes()).expect("parse");
+        let parsed = Pointer::from_bytes(&record.to_bytes()).expect("parse");
         prop_assert_eq!(parsed.target().kind_tag(), tag);
         prop_assert_eq!(parsed.target().address, target_bytes);
     }
@@ -253,7 +253,7 @@ proptest! {
         mask in 1u8..255,
     ) {
         let record = signed(5, 11, 22, PointerTargetKind::Chunk);
-        let mut bytes = record.as_bytes().to_vec();
+        let mut bytes = record.to_bytes().to_vec();
         let Some(byte) = bytes.get_mut(index) else {
             return Ok(());
         };
@@ -280,7 +280,7 @@ fn sixty_four_signatures_over_one_state_yield_one_winner() {
         .map(|_| signed(7, 9, 9, PointerTargetKind::Chunk))
         .collect();
 
-    let encodings: BTreeSet<&[u8]> = records.iter().map(Pointer::as_bytes).collect();
+    let encodings: BTreeSet<Vec<u8>> = records.iter().map(Pointer::to_bytes).collect();
     assert_eq!(encodings.len(), 64, "64 distinct valid encodings");
 
     let states: BTreeSet<_> = records.iter().map(Pointer::state_id).collect();
@@ -289,7 +289,7 @@ fn sixty_four_signatures_over_one_state_yield_one_winner() {
     // Sorted worst-first is the submission order that would have made every
     // record win under a byte-ordering tie-break.
     let mut sorted: Vec<&Pointer> = records.iter().collect();
-    sorted.sort_by_key(|record| record.as_bytes().to_vec());
+    sorted.sort_by_key(|record| record.to_bytes().to_vec());
 
     let first = sorted.first().copied().expect("non-empty");
     for candidate in &sorted {
@@ -323,7 +323,7 @@ fn the_wire_format_is_what_the_adr_says() {
         PointerTarget::from_raw_tag(0x5A, target_address),
     )
     .expect("sign");
-    let bytes = record.as_bytes();
+    let bytes = record.to_bytes();
 
     // Layout.
     assert_eq!(bytes.len(), 5303, "1 + 1952 + 8 + 33 + 3309");
@@ -384,7 +384,7 @@ fn the_wire_format_is_what_the_adr_says() {
 
     assert_eq!(
         record.bytes_hash(),
-        *blake3::hash(bytes).as_bytes(),
+        *blake3::hash(&bytes).as_bytes(),
         "bytes_hash is over the whole record"
     );
 
@@ -441,7 +441,7 @@ async fn sixty_four_signatures_buy_exactly_one_write() {
 
     let first = signed(7, 9, 9, PointerTargetKind::Chunk);
     assert_eq!(
-        store.put_bytes(first.as_bytes()).await.expect("put"),
+        store.put_bytes(&first.to_bytes()).await.expect("put"),
         PutOutcome::Stored
     );
 
@@ -451,12 +451,12 @@ async fn sixty_four_signatures_buy_exactly_one_write() {
     for _ in 0..63 {
         let variant = signed(7, 9, 9, PointerTargetKind::Chunk);
         assert_ne!(
-            variant.as_bytes(),
-            first.as_bytes(),
+            variant.to_bytes(),
+            first.to_bytes(),
             "signing is randomized"
         );
         assert_eq!(
-            store.put_bytes(variant.as_bytes()).await.expect("put"),
+            store.put_bytes(&variant.to_bytes()).await.expect("put"),
             PutOutcome::Unchanged
         );
     }
@@ -493,7 +493,7 @@ fn a_version_only_change_cannot_reuse_a_paid_state_identifier() {
 
     let record = signed(11, 9, 9, PointerTargetKind::Chunk);
     let mut body = record
-        .as_bytes()
+        .to_bytes()
         .get(..POINTER_BODY_LEN)
         .expect("body")
         .to_vec();
@@ -536,7 +536,7 @@ fn an_unknown_version_is_refused_rather_than_accepted_at_its_own_price() {
     let record = signed(12, 1, 1, PointerTargetKind::Chunk);
     for version in [0u8, 2, 7, u8::MAX] {
         assert_ne!(version, POINTER_FORMAT_VERSION);
-        let mut bytes = record.as_bytes().to_vec();
+        let mut bytes = record.to_bytes().to_vec();
         if let Some(byte) = bytes.first_mut() {
             *byte = version;
         }
@@ -607,7 +607,7 @@ async fn migration_must_happen_before_the_terminal_update() {
     );
     assert!(!penultimate.is_terminal());
     assert_eq!(
-        store.put_bytes(penultimate.as_bytes()).await.expect("put"),
+        store.put_bytes(&penultimate.to_bytes()).await.expect("put"),
         PutOutcome::Stored
     );
 
@@ -618,7 +618,7 @@ async fn migration_must_happen_before_the_terminal_update() {
         PointerTarget::new(PointerTargetKind::Pointer, [0x80u8; 32]),
     );
     assert_eq!(
-        store.put_bytes(migration.as_bytes()).await.expect("put"),
+        store.put_bytes(&migration.to_bytes()).await.expect("put"),
         PutOutcome::Replaced
     );
     assert!(migration.is_terminal());
@@ -631,12 +631,12 @@ async fn migration_must_happen_before_the_terminal_update() {
         PointerTarget::new(PointerTargetKind::Chunk, [0x01u8; 32]),
     );
     assert!(
-        smaller_target.as_bytes() != migration.as_bytes(),
+        smaller_target.to_bytes() != migration.to_bytes(),
         "a genuinely different state"
     );
     assert_eq!(
         store
-            .put_bytes(smaller_target.as_bytes())
+            .put_bytes(&smaller_target.to_bytes())
             .await
             .expect("put"),
         PutOutcome::Replaced,
@@ -645,7 +645,7 @@ async fn migration_must_happen_before_the_terminal_update() {
 
     // Larger target bytes cannot claw it back: the move is one-way.
     assert_eq!(
-        store.put_bytes(migration.as_bytes()).await.expect("put"),
+        store.put_bytes(&migration.to_bytes()).await.expect("put"),
         PutOutcome::Stale,
         "and the displaced migration can never be restored"
     );
