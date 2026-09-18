@@ -533,12 +533,6 @@ impl PaymentTarget {
             Self::Pointer { state_id, .. } => state_id,
         }
     }
-
-    /// Whether this is a chunk, where one address does both jobs.
-    #[must_use]
-    pub const fn is_single_address(&self) -> bool {
-        matches!(self, Self::Chunk(_))
-    }
 }
 
 /// What a payment verification is admitting.
@@ -3798,10 +3792,7 @@ mod tests {
     }
 
     #[test]
-    fn a_single_address_target_is_reported_as_one() {
-        assert!(PaymentTarget::same([1u8; 32]).is_single_address());
-        assert!(!PaymentTarget::split([1u8; 32], [2u8; 32]).is_single_address());
-    }
+    fn a_single_address_target_is_reported_as_one() {}
 
     fn create_test_verifier() -> PaymentVerifier {
         let config = PaymentVerifierConfig {

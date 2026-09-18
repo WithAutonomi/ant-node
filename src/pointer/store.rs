@@ -42,7 +42,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use fs2::FileExt;
@@ -69,8 +69,7 @@ pub enum PutOutcome {
     /// The record was written: either nothing was held, or it won the merge.
     ///
     /// One outcome rather than two, because nothing downstream treats "stored"
-    /// differently from "replaced" — both mean the node now holds this state
-    /// and both are what `changed()` reports.
+    /// differently from "replaced": both mean the node now holds this state.
     Changed,
     /// The held record is the same authenticated state. Nothing was written.
     ///
@@ -80,17 +79,6 @@ pub enum PutOutcome {
     Unchanged,
     /// The incoming record lost under the merge rule. Nothing was written.
     Stale,
-}
-
-impl PutOutcome {
-    /// Whether this outcome changed what the node holds.
-    ///
-    /// Only a change is worth announcing to replication or counting towards a
-    /// commitment rebuild.
-    #[must_use]
-    pub const fn changed(self) -> bool {
-        matches!(self, Self::Changed)
-    }
 }
 
 /// The result of [`PointerStore::inspect`]: what an arrival claims, before any
@@ -118,6 +106,15 @@ struct IndexEntry {
     /// store applies — merge order, the paid increment — is the protocol's own
     /// rule applied to the held state, and cannot drift from it.
     state: PointerState,
+    /// Whether the file behind `state` is still there and still that record.
+    ///
+    /// A read that finds it gone or different clears this rather than dropping
+    /// the entry. The node stops serving the record, because it does not have
+    /// it — but it still knows what it had, and that is what lets the state be
+    /// restored. Dropping the entry would leave the address looking untouched,
+    /// where only a counter 0 record is admissible, so a pointer that had ever
+    /// been updated could never be repaired.
+    on_disk: bool,
     /// Which insertion this entry is.
     ///
     /// Monotonic for the life of this store, so an entry can be told apart
@@ -135,6 +132,7 @@ impl IndexEntry {
     fn of(record: &Pointer, generation: u64) -> Self {
         Self {
             state: record.state(),
+            on_disk: true,
             generation,
         }
     }
@@ -163,12 +161,6 @@ struct Inner {
     write_seq: AtomicU64,
     /// Source of index generations, monotonic for this store's lifetime.
     generation: AtomicU64,
-    /// Set if a directory sync ever failed after a commit.
-    ///
-    /// Those writes are stored and visible; what is uncertain is whether they
-    /// survive a power loss. Reporting them as failures would be wrong, and
-    /// saying nothing would overstate the guarantee, so the store records it.
-    durability_degraded: AtomicBool,
     /// Held for the store's lifetime; releasing it releases the directory.
     _lock_file: File,
 }
@@ -219,7 +211,6 @@ impl PointerStore {
                 index: Mutex::new(index),
                 write_seq: AtomicU64::new(0),
                 generation: AtomicU64::new(next_generation),
-                durability_degraded: AtomicBool::new(false),
                 _lock_file: lock_file,
             }),
         })
@@ -241,26 +232,33 @@ impl PointerStore {
     /// # Errors
     ///
     /// Returns [`Error::Protocol`] if the bytes are not a well-formed record.
-    pub fn inspect(&self, bytes: &[u8]) -> Result<Inspected> {
+    pub async fn inspect(&self, bytes: &[u8]) -> Result<Inspected> {
+        // Off the executor: deciding this reads the held record back off the
+        // disk, and a flood of arrivals must not put a blocking read on a
+        // runtime worker for each one.
+        let store = self.clone();
+        let bytes = bytes.to_vec();
+        spawn_blocking(move || store.inspect_blocking(&bytes))
+            .await
+            .map_err(|e| Error::Storage(format!("pointer inspection panicked: {e}")))?
+    }
+
+    /// The body of [`Self::inspect`], on a blocking thread.
+    fn inspect_blocking(&self, bytes: &[u8]) -> Result<Inspected> {
         // Parsing decodes the owner key once; `verify` reuses that parse rather
         // than decoding again. The bytes travel with it, so the two cannot be
         // mismatched.
         let parsed = ParsedPointer::parse(bytes.to_vec())?;
         let state = *parsed.state();
 
-        // The index is only a claim about a file. Both early answers below
-        // assert that this node holds something at least as good as what
-        // arrived, so neither may be given on a claim alone: if the file has
-        // gone or stopped validating, `reread` disowns the entry and the
-        // submission falls through as the repair it should be.
-        if let Some(entry) = self
-            .snapshot(&state.address)
-            .filter(|_| self.reread(&state.address))
-        {
-            if entry.state.state_id == state.state_id {
+        // Both early answers below assert that this node holds something at
+        // least as good as what arrived, so neither may be given on the index's
+        // word alone.
+        if let Some(held) = self.held_state(&state.address) {
+            if held.state_id == state.state_id {
                 return Ok(Inspected::Unchanged(state));
             }
-            if !state.replaces(&entry.state) {
+            if !state.replaces(&held) {
                 return Ok(Inspected::Stale(state));
             }
         }
@@ -312,7 +310,7 @@ impl PointerStore {
     ///
     /// As [`Self::inspect`], [`Self::verify`] and [`Self::commit`].
     pub async fn put_bytes(&self, bytes: &[u8]) -> Result<PutOutcome> {
-        match self.inspect(bytes)? {
+        match self.inspect(bytes).await? {
             Inspected::Unchanged(_) => Ok(PutOutcome::Unchanged),
             Inspected::Stale(_) => Ok(PutOutcome::Stale),
             Inspected::Candidate(parsed) => {
@@ -351,7 +349,7 @@ impl PointerStore {
         let validated = match read {
             Ok(Some(validated)) => validated,
             Ok(None) => {
-                self.forget_if_unchanged(address, claimed);
+                self.disown_if_unchanged(address, claimed);
                 return Ok(None);
             }
             Err(e) => return Err(e),
@@ -365,7 +363,7 @@ impl PointerStore {
                      from the index",
                     hex::encode(address)
                 );
-                self.forget_if_unchanged(address, claimed);
+                self.disown_if_unchanged(address, claimed);
                 Ok(None)
             }
             Err(e) => {
@@ -373,7 +371,7 @@ impl PointerStore {
                     "Pointer file at {} does not validate ({e}); dropping it from the index",
                     hex::encode(address)
                 );
-                self.forget_if_unchanged(address, claimed);
+                self.disown_if_unchanged(address, claimed);
                 Ok(None)
             }
         }
@@ -386,7 +384,9 @@ impl PointerStore {
     /// under different signatures agree and do not refetch each other forever.
     #[must_use]
     pub fn state_id(&self, address: &XorName) -> Option<XorName> {
-        self.snapshot(address).map(|e| e.state.state_id)
+        self.snapshot(address)
+            .filter(|entry| entry.on_disk)
+            .map(|entry| entry.state.state_id)
     }
 
     /// Whether `state` is the paid successor of what is held.
@@ -399,24 +399,43 @@ impl PointerStore {
     /// Only the client path asks this. Replication uses the merge rule instead,
     /// so a replica that missed an update can still catch up rather than being
     /// stuck behind a gap it can never fill.
+    ///
+    /// A record this node knew and lost takes that same merge rule: anything at
+    /// least as good as the lost state restores it. The increment rule exists to
+    /// stop an owner buying one state and skipping to it, and a repair skips
+    /// nothing — the state it carries was paid for and the rest of the group
+    /// already serves it. Holding a lost address to the increment rule would
+    /// make every loss above counter 0 permanent, because only a counter 0
+    /// record is admissible at an address nothing is known about.
     #[must_use]
     pub fn accepts_as_paid_update(&self, state: &PointerState) -> bool {
         self.snapshot(&state.address).map_or_else(
             || state.is_genesis(),
-            |entry| state.is_successor_of(&entry.state),
+            |entry| {
+                if entry.on_disk {
+                    state.is_successor_of(&entry.state)
+                } else {
+                    state.state_id == entry.state.state_id || state.replaces(&entry.state)
+                }
+            },
         )
     }
 
     /// Whether a record is held at `address`.
     #[must_use]
     pub fn contains(&self, address: &XorName) -> bool {
-        self.snapshot(address).is_some()
+        self.snapshot(address).is_some_and(|entry| entry.on_disk)
     }
 
     /// How many records the store holds.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.inner.index.lock().len()
+        self.inner
+            .index
+            .lock()
+            .values()
+            .filter(|entry| entry.on_disk)
+            .count()
     }
 
     /// Whether the store holds nothing.
@@ -425,41 +444,39 @@ impl PointerStore {
         self.len() == 0
     }
 
-    /// Whether any committed write could not have its directory entry flushed.
-    ///
-    /// Those records are stored and readable now; what is uncertain is whether
-    /// they survive a power loss. A put still reports success, because the
-    /// write did happen — this is how an operator learns the filesystem is not
-    /// giving the store what it asks for.
-    #[must_use]
-    pub fn durability_degraded(&self) -> bool {
-        self.inner.durability_degraded.load(Ordering::Relaxed)
-    }
-
     /// Directory holding the records.
     #[must_use]
     pub fn dir(&self) -> &Path {
         &self.inner.dir
     }
 
-    /// Whether the file behind `address` still reads back as a valid record.
+    /// The state this node can actually serve at `address`, having read it
+    /// back.
     ///
-    /// Guards the two early answers in `inspect`, both of which claim this
-    /// node already holds something at least as good as what arrived. A failed
-    /// read disowns the entry, exactly as `get` does.
-    fn reread(&self, address: &XorName) -> bool {
-        let claimed = self.snapshot(address).map(|entry| entry.generation);
-        let valid = matches!(
+    /// The index is a claim about a file; this is that claim checked. The file
+    /// must still be there and must still be the record the index names —
+    /// comparing the state, not merely the address, because the disk and the
+    /// index are updated under one lock and an answer taken between the two
+    /// would otherwise describe a record that is no longer the one held.
+    ///
+    /// Only the structure is parsed: these bytes verified when they were
+    /// committed, and the question here is what is held, not whether it is
+    /// authentic. A failed check disowns the entry, so the arrival that found
+    /// it becomes a repair.
+    fn held_state(&self, address: &XorName) -> Option<PointerState> {
+        let entry = self.snapshot(address).filter(|entry| entry.on_disk)?;
+        let serves = matches!(
             read_record_file(&self.path_for(address)),
             Ok(Some(ref bytes)) if matches!(
-                Pointer::from_bytes(bytes),
-                Ok(ref record) if record.address() == *address
+                PointerState::parse(bytes),
+                Ok(ref state) if *state == entry.state
             )
         );
-        if !valid {
-            self.forget_if_unchanged(address, claimed);
+        if !serves {
+            self.disown_if_unchanged(address, Some(entry.generation));
+            return None;
         }
-        valid
+        Some(entry.state)
     }
 
     /// Copy out what is held for `address`, releasing the index lock at once.
@@ -467,8 +484,11 @@ impl PointerStore {
         self.inner.index.lock().get(address).copied()
     }
 
-    /// Drop the index entry for `address`, but only if it is still the exact
-    /// entry the caller found unreadable.
+    /// Stop serving `address`, but only if the entry is still the exact one
+    /// the caller found unreadable.
+    ///
+    /// The entry stays, marked as no longer on disk: what was lost is what says
+    /// which states can restore it.
     ///
     /// A read is not atomic with a write. Removing unconditionally would let a
     /// slow read of a corrupt file erase the entry for a record committed while
@@ -477,15 +497,17 @@ impl PointerStore {
     /// rather than the state identifier also covers the case where the record
     /// written meanwhile is a *repair of the same state*, which a state
     /// comparison could not tell apart from the entry being disowned.
-    fn forget_if_unchanged(&self, address: &XorName, claimed: Option<u64>) {
+    fn disown_if_unchanged(&self, address: &XorName, claimed: Option<u64>) {
         let Some(claimed) = claimed else {
             // Nothing was claimed when the read began, so there is nothing this
-            // read is entitled to remove.
+            // read is entitled to disown.
             return;
         };
         let mut index = self.inner.index.lock();
-        if index.get(address).map(|entry| entry.generation) == Some(claimed) {
-            index.remove(address);
+        if let Some(entry) = index.get_mut(address) {
+            if entry.generation == claimed {
+                entry.on_disk = false;
+            }
         }
     }
 
@@ -516,7 +538,7 @@ impl Inner {
         // A cheap look before doing any work. The authoritative check is the
         // one under the lock below; this only avoids staging a file for an
         // arrival that is already obviously a no-op.
-        if let Some(entry) = self.index.lock().get(&address) {
+        if let Some(entry) = self.index.lock().get(&address).filter(|e| e.on_disk) {
             if entry.state.state_id == record.state_id() {
                 return Ok(PutOutcome::Unchanged);
             }
@@ -541,12 +563,14 @@ impl Inner {
             // Re-check: staging is not instantaneous and a newer state may
             // have committed while it ran.
             let outcome = match index.get(&address) {
-                None => PutOutcome::Changed,
+                // Nothing held, or a record this node lost: either way the
+                // write must happen, whatever state it carries.
+                None | Some(IndexEntry { on_disk: false, .. }) => PutOutcome::Changed,
                 Some(entry) if entry.state.state_id == record.state_id() => PutOutcome::Unchanged,
                 Some(entry) if record.state().replaces(&entry.state) => PutOutcome::Changed,
                 Some(_) => PutOutcome::Stale,
             };
-            if !outcome.changed() {
+            if outcome != PutOutcome::Changed {
                 let _ = std::fs::remove_file(&temp);
                 return Ok(outcome);
             }
@@ -568,10 +592,10 @@ impl Inner {
 
         // Durability of the directory entry, after the commit and outside the
         // lock. The record is already stored and indexed, so a failure here
-        // cannot be reported as "nothing happened"; it is recorded instead, and
-        // `durability_degraded` reports it.
+        // cannot be reported as "nothing happened"; it is logged instead, which
+        // is how an operator learns the filesystem is not giving the store what
+        // it asks for.
         if let Err(e) = sync_directory(&self.dir) {
-            self.durability_degraded.store(true, Ordering::Relaxed);
             warn!(
                 "{} is stored and indexed, but {} could not be synced: {e}. It is \
                  visible now; its survival across a power loss depends on the \
@@ -763,9 +787,9 @@ fn sync_directory(dir: &Path) -> Result<()> {
 )]
 mod tests {
     use super::*;
-    use std::future::Future;
     use ant_protocol::pointer::{PointerTarget, PointerTargetKind, POINTER_BODY_LEN};
     use saorsa_pqc::api::sig::{ml_dsa_65, MlDsaPublicKey, MlDsaSecretKey};
+    use std::future::Future;
 
     fn keypair(seed: u8) -> (MlDsaPublicKey, MlDsaSecretKey) {
         ml_dsa_65().generate_keypair_from_seed(&[seed; 32])
@@ -943,11 +967,15 @@ mod tests {
         let held = signed(1, 6, 6);
         store.put_bytes(&held.to_bytes()).await.expect("put");
 
-        match store.inspect(&held.to_bytes()).expect("inspect") {
+        match store.inspect(&held.to_bytes()).await.expect("inspect") {
             Inspected::Unchanged(_) => (),
             other => panic!("an identical state is not a candidate, got {other:?}"),
         }
-        match store.inspect(&signed(1, 1, 6).to_bytes()).expect("inspect") {
+        match store
+            .inspect(&signed(1, 1, 6).to_bytes())
+            .await
+            .expect("inspect")
+        {
             Inspected::Stale(_) => (),
             other => panic!("a stale record is not a candidate, got {other:?}"),
         }
@@ -1119,7 +1147,7 @@ mod tests {
     /// Run the production sequence as far as the payment gate: inspect, then
     /// verify the candidate it yields.
     async fn verified(store: &PointerStore, record: &Pointer) -> Pointer {
-        match store.inspect(&record.to_bytes()).expect("inspect") {
+        match store.inspect(&record.to_bytes()).await.expect("inspect") {
             Inspected::Candidate(parsed) => store.verify(parsed).await.expect("verify"),
             other => panic!("expected a candidate, got {other:?}"),
         }
@@ -1148,6 +1176,81 @@ mod tests {
             "a resubmission must repair a record the disk lost"
         );
         assert!(store.get(&record.address()).await.expect("get").is_some());
+    }
+
+    #[tokio::test]
+    async fn a_lost_record_above_counter_zero_is_still_repairable() {
+        // The admission rule alone would make this impossible: an address the
+        // node knows nothing about admits only a counter 0 record, so an entry
+        // that was *forgotten* on a failed read could never be restored above
+        // genesis, and every loss would be permanent.
+        let (store, _dir) = store().await;
+        for counter in 0..=3u64 {
+            store
+                .put_bytes(&signed(1, counter, 1).to_bytes())
+                .await
+                .expect("put");
+        }
+        let held = signed(1, 3, 1);
+
+        std::fs::remove_file(store.dir().join(hex::encode(held.address()))).expect("remove");
+        // A read notices the loss and stops the node answering for it.
+        assert!(store.get(&held.address()).await.expect("get").is_none());
+        assert!(!store.contains(&held.address()), "it is not served");
+        assert_eq!(store.state_id(&held.address()), None);
+
+        // What it lost is what it will take back, and so is anything newer.
+        assert!(
+            store.accepts_as_paid_update(&held.state()),
+            "the state this node lost must be admissible again"
+        );
+        assert!(
+            store.accepts_as_paid_update(&signed(1, 9, 1).state()),
+            "so must a newer state the rest of the group has moved on to"
+        );
+        assert!(
+            !store.accepts_as_paid_update(&signed(1, 2, 1).state()),
+            "but not one that loses to what was lost"
+        );
+
+        assert_eq!(
+            store.put_bytes(&held.to_bytes()).await.expect("put"),
+            PutOutcome::Changed,
+            "the repair must write, not be answered as unchanged"
+        );
+        let back = store
+            .get(&held.address())
+            .await
+            .expect("get")
+            .expect("present");
+        assert_eq!(back.counter(), 3);
+        assert_eq!(back.state_id(), held.state_id());
+
+        // And the increment rule is back in force now that it holds one.
+        assert!(store.accepts_as_paid_update(&signed(1, 4, 1).state()));
+        assert!(!store.accepts_as_paid_update(&signed(1, 6, 1).state()));
+    }
+
+    #[tokio::test]
+    async fn a_file_swapped_for_another_valid_record_is_not_answered_for() {
+        // The index names one state; the disk holds a different, perfectly
+        // valid one. Answering from the index would acknowledge a state this
+        // node cannot serve.
+        let (store, _dir) = store().await;
+        let indexed = signed(1, 4, 1);
+        store.put_bytes(&indexed.to_bytes()).await.expect("put");
+
+        let other = signed(1, 9, 1);
+        std::fs::write(
+            store.dir().join(hex::encode(indexed.address())),
+            other.to_bytes(),
+        )
+        .expect("swap the file");
+
+        match store.inspect(&indexed.to_bytes()).await.expect("inspect") {
+            Inspected::Candidate(_) => (),
+            other => panic!("a state the node cannot serve must not be answered for: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1286,7 +1389,7 @@ mod tests {
         let new = signed(1, 2, 1);
         store.put_bytes(&new.to_bytes()).await.expect("put");
 
-        store.forget_if_unchanged(&old.address(), observed);
+        store.disown_if_unchanged(&old.address(), observed);
         assert_eq!(
             store.state_id(&new.address()),
             Some(new.state_id()),
@@ -1295,7 +1398,7 @@ mod tests {
 
         // And the ordinary case still works: disowning what is actually there.
         let current = store.snapshot(&new.address()).map(|entry| entry.generation);
-        store.forget_if_unchanged(&new.address(), current);
+        store.disown_if_unchanged(&new.address(), current);
         assert!(!store.contains(&new.address()));
     }
 
@@ -1315,7 +1418,7 @@ mod tests {
         let second_reader = first_reader;
 
         // Reader one finds the file unreadable and disowns what it saw.
-        store.forget_if_unchanged(&record.address(), first_reader);
+        store.disown_if_unchanged(&record.address(), first_reader);
         assert!(!store.contains(&record.address()));
 
         // A peer repairs it with the very same state.
@@ -1325,7 +1428,7 @@ mod tests {
         );
 
         // Reader two, still holding its stale observation, must not erase it.
-        store.forget_if_unchanged(&record.address(), second_reader);
+        store.disown_if_unchanged(&record.address(), second_reader);
         assert!(
             store.contains(&record.address()),
             "the repair must survive a second reader disowning the old entry"
@@ -1353,19 +1456,6 @@ mod tests {
             reopened.put_bytes(&record.to_bytes()).await.expect("put"),
             PutOutcome::Changed,
             "a swept leftover must not block the first write to its address"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_healthy_store_does_not_report_degraded_durability() {
-        let (store, _dir) = store().await;
-        store
-            .put_bytes(&signed(1, 1, 1).to_bytes())
-            .await
-            .expect("put");
-        assert!(
-            !store.durability_degraded(),
-            "an ordinary write on a working filesystem is fully durable"
         );
     }
 
