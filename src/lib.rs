@@ -17,8 +17,10 @@
 //!
 //! ## Data Types
 //!
-//! Currently supports a single data type:
+//! Two data types:
 //! - **Chunk**: Immutable content-addressed data (hash(value) == key)
+//! - **Pointer**: A paid mutable reference signed by an immutable owner, stored
+//!   at an address derived from the owner key (see [`mod@pointer`] and ADR-0015)
 //!
 //! ## Example
 //!
@@ -51,6 +53,7 @@ pub mod event;
 pub mod logging;
 pub mod node;
 pub mod payment;
+pub mod pointer;
 pub mod replication;
 pub mod storage;
 pub mod upgrade;
@@ -70,6 +73,9 @@ pub use error::{Error, Result};
 pub use event::{NodeEvent, NodeEventsChannel};
 pub use node::{NodeBuilder, RunningNode};
 pub use payment::{PaymentStatus, PaymentVerifier, PaymentVerifierConfig};
+pub use pointer::{
+    Inspected, Pointer, PointerState, PointerStore, PointerTarget, PointerTargetKind, PutOutcome,
+};
 pub use replication::{config::ReplicationConfig, ReplicationEngine};
 pub use storage::{AntProtocol, ChunkStore, ChunkStoreConfig, LmdbStorage, LmdbStorageConfig};
 
