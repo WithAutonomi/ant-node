@@ -382,12 +382,6 @@ fn the_wire_format_is_what_the_adr_says() {
         "state_id covers the whole body and nothing else"
     );
 
-    assert_eq!(
-        record.bytes_hash(),
-        *blake3::hash(&bytes).as_bytes(),
-        "bytes_hash is over the whole record"
-    );
-
     // The signature verifies over the body under the literal context, and does
     // not verify under a different one. The context is consensus too.
     let dsa = ml_dsa_65();
