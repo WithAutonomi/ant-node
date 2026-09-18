@@ -6,7 +6,7 @@
 use crate::ant_protocol::CLOSE_GROUP_SIZE;
 use crate::error::{Error, Result};
 use crate::logging::{debug, info, warn};
-use crate::payment::cache::{CacheStats, VerifiedCache, XorName};
+use crate::payment::cache::{CacheStats, PaidKey, VerifiedCache, XorName};
 use crate::payment::pricing::{calculate_price, derive_records_stored_from_price};
 use crate::payment::proof::{
     deserialize_merkle_proof, deserialize_single_node_proof, detect_proof_type, ProofType,
@@ -479,6 +479,64 @@ pub struct PaymentVerifierConfig {
 /// does not call this verifier. It authorizes repair from network evidence:
 /// majority storage among the configured close group, or majority paid-list
 /// membership among the closest K.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaymentTarget {
+    /// The address whose close group is responsible, and whose members' quotes
+    /// therefore count. For a chunk this is its content address; for a pointer
+    /// it is the pointer's address, which never changes.
+    pub routing: XorName,
+    /// What the quote must actually name. For a chunk this equals
+    /// [`Self::routing`]; for a pointer it is the record's `state_id`, so each
+    /// update is paid for separately rather than riding the first payment.
+    pub content: XorName,
+}
+
+impl PaymentTarget {
+    /// A target where one address does both jobs, as every chunk does.
+    #[must_use]
+    pub const fn same(address: XorName) -> Self {
+        Self {
+            routing: address,
+            content: address,
+        }
+    }
+
+    /// A target that routes at one address and is paid at another.
+    #[must_use]
+    pub const fn split(routing: XorName, content: XorName) -> Self {
+        Self { routing, content }
+    }
+
+    /// Whether this target's two jobs fall to one address, as a chunk's do.
+    #[must_use]
+    pub fn is_single_address(&self) -> bool {
+        self.routing == self.content
+    }
+
+    /// The key this target's "already paid" entry is filed under.
+    ///
+    /// A **typed** key, not a hashed one. Hashing the two halves back into 32
+    /// bytes would not separate the namespaces: a chunk's address is
+    /// `BLAKE3(content)`, so a client could store a chunk whose *content* is
+    /// exactly that preimage and land on the same key. Paying for that chunk
+    /// would then file an entry the pointer path reads as its own — buying a
+    /// pointer update at chunk prices and skipping the issuer-proximity,
+    /// price-floor and proof-shape checks along with it. Distinct enum variants
+    /// cannot collide however the bytes are chosen.
+    #[must_use]
+    pub fn cache_key(&self) -> PaidKey {
+        if self.is_single_address() {
+            PaidKey::Chunk(self.content)
+        } else {
+            PaidKey::PointerState {
+                routing: self.routing,
+                state_id: self.content,
+            }
+        }
+    }
+}
+
+/// What a payment verification is admitting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerificationContext {
     /// The node is admitting a chunk store from a direct client PUT, with
@@ -1045,11 +1103,29 @@ impl PaymentVerifier {
         xorname: &XorName,
         context: VerificationContext,
     ) -> PaymentStatus {
+        self.check_payment_required_keyed(PaidKey::Chunk(*xorname), context)
+    }
+
+    /// As [`Self::check_payment_required`], for an already-typed cache key.
+    ///
+    /// A pointer's entry is filed under both its routing address and the state
+    /// paid for, so it can never be satisfied by a chunk that happens to sit at
+    /// either value.
+    #[must_use]
+    pub fn check_payment_required_keyed(
+        &self,
+        key: PaidKey,
+        context: VerificationContext,
+    ) -> PaymentStatus {
+        let xorname = match &key {
+            PaidKey::Chunk(address) => address,
+            PaidKey::PointerState { state_id, .. } => state_id,
+        };
         // Check LRU cache (fast path)
         let cached = if context.is_store_admission() {
-            self.cache.contains_client_put_verified(xorname)
+            self.cache.contains_client_put_verified_key(&key)
         } else {
-            self.cache.contains_paid_list_verified(xorname)
+            self.cache.contains_paid_list_verified_key(&key)
         };
         if cached {
             if crate::logging::enabled!(crate::logging::Level::DEBUG) {
@@ -1099,7 +1175,7 @@ impl PaymentVerifier {
         let proof_type = payment_proof_type_label(payment_proof);
         let proof_bytes = payment_proof.map_or(0, <[u8]>::len);
         let result = self
-            .verify_payment_inner(xorname, payment_proof, context)
+            .verify_payment_inner(&PaymentTarget::same(*xorname), payment_proof, context)
             .await;
         let elapsed_ms = started.elapsed().as_millis();
 
@@ -1135,12 +1211,19 @@ impl PaymentVerifier {
 
     async fn verify_payment_inner(
         &self,
-        xorname: &XorName,
+        target: &PaymentTarget,
         payment_proof: Option<&[u8]>,
         context: VerificationContext,
     ) -> Result<PaymentStatus> {
+        // What the proof must name: for a chunk its address, for a pointer the
+        // state being paid for. Caching under the *address* would mark every
+        // future update of a pointer as already paid — the 1.0 free-update
+        // defect — so the cache is keyed separately, and never shares a key
+        // with the chunk whose address happens to equal this state.
+        let xorname = &target.content;
+        let cache_key = target.cache_key();
         // First check if payment is required
-        let status = self.check_payment_required(xorname, context);
+        let status = self.check_payment_required_keyed(cache_key, context);
 
         match status {
             PaymentStatus::CachedAsVerified => {
@@ -1165,7 +1248,7 @@ impl PaymentVerifier {
                     // Detect proof type from version tag byte
                     match detect_proof_type(proof) {
                         Some(ProofType::Merkle) => {
-                            self.verify_merkle_payment(xorname, proof, context).await?;
+                            self.verify_merkle_payment(target, proof, context).await?;
                         }
                         Some(ProofType::SingleNode) => {
                             let parsed = deserialize_single_node_proof(proof).map_err(|e| {
@@ -1180,7 +1263,7 @@ impl PaymentVerifier {
                             }
 
                             self.verify_evm_payment(
-                                xorname,
+                                target,
                                 &parsed.proof_of_payment,
                                 &parsed.commitment_sidecars,
                                 context,
@@ -1208,9 +1291,9 @@ impl PaymentVerifier {
                     // strength. Stronger entries satisfy weaker future lookups,
                     // but not the reverse.
                     if context.is_store_admission() {
-                        self.cache.insert(*xorname);
+                        self.cache.insert_key(cache_key);
                     } else {
-                        self.cache.insert_paid_list_verified(*xorname);
+                        self.cache.insert_paid_list_verified_key(cache_key);
                     }
 
                     Ok(PaymentStatus::PaymentVerified)
@@ -1225,6 +1308,39 @@ impl PaymentVerifier {
             PaymentStatus::PaymentVerified => Err(Error::Payment(
                 "Unexpected PaymentVerified status from check_payment_required".to_string(),
             )),
+        }
+    }
+
+    /// Verify that a pointer state was paid for.
+    ///
+    /// `routing_address` is the pointer's address: it selects the close group
+    /// whose quotes count, and it never changes for the life of the pointer.
+    /// `paid_content` is the record's `state_id`: it is what the quote must
+    /// name, and it changes with every update. Passing one address for both —
+    /// which is all the chunk path can express — would either check the wrong
+    /// close group or mark every future update of the pointer as already paid.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Payment`] if the proof is missing, malformed, names a
+    /// different state, was issued by a peer outside the routing address's
+    /// close group, or did not settle on chain.
+    pub async fn verify_pointer_payment(
+        &self,
+        routing_address: &XorName,
+        paid_content: &XorName,
+        payment_proof: &[u8],
+    ) -> Result<()> {
+        let target = PaymentTarget::split(*routing_address, *paid_content);
+        match self
+            .verify_payment_inner(&target, Some(payment_proof), VerificationContext::ClientPut)
+            .await?
+        {
+            PaymentStatus::CachedAsVerified | PaymentStatus::PaymentVerified => Ok(()),
+            PaymentStatus::PaymentRequired => Err(Error::Payment(format!(
+                "no settled payment for pointer state {}",
+                hex::encode(paid_content)
+            ))),
         }
     }
 
@@ -1279,11 +1395,15 @@ impl PaymentVerifier {
     /// was paid 3x.
     async fn verify_evm_payment(
         &self,
-        xorname: &XorName,
+        target: &PaymentTarget,
         payment: &ProofOfPayment,
         commitment_sidecars: &[Vec<u8>],
         context: VerificationContext,
     ) -> Result<()> {
+        // `content` is what a quote must name; `routing` is whose close group
+        // may issue it. For a chunk they are one address, for a pointer they
+        // are not.
+        let xorname = &target.content;
         if crate::logging::enabled!(crate::logging::Level::DEBUG) {
             let xorname_hex = hex::encode(xorname);
             let quote_count = payment.peer_quotes.len();
@@ -1320,10 +1440,7 @@ impl PaymentVerifier {
         for candidate in candidates {
             let paid_price = candidate.quote.price;
             let candidate_peer = *candidate.encoded_peer_id.as_bytes();
-            match self
-                .verify_legacy_median_candidate(xorname, candidate)
-                .await
-            {
+            match self.verify_legacy_median_candidate(target, candidate).await {
                 Ok(settled_amount) => {
                     verified_paid_quote = Some((paid_price, settled_amount));
                     // First settlement-verified median candidate wins the paid
@@ -1356,7 +1473,11 @@ impl PaymentVerifier {
         // unauthenticated bundles can never poison floor telemetry. Shadow
         // mode logs; enforcement rejects — an economic admission decision
         // only, never trust/misbehaviour evidence.
-        self.enforce_price_floor(xorname, paid_price, settled_amount, context)
+        // The floor compares against the median commitment price of the close
+        // group that is RESPONSIBLE for the data, so it takes the routing
+        // address. For a chunk that is the same value; for a pointer the paid
+        // content is its state, which names no close group at all.
+        self.enforce_price_floor(&target.routing, paid_price, settled_amount, context)
             .await?;
 
         // ADR-0004 observe-only telemetry: log off-curve quotes only AFTER the
@@ -1433,14 +1554,17 @@ impl PaymentVerifier {
     /// honest client may overpay a cheap quote to clear stricter receivers).
     async fn verify_legacy_median_candidate(
         &self,
-        xorname: &XorName,
+        target: &PaymentTarget,
         candidate: LegacyMedianCandidate<'_>,
     ) -> Result<Amount> {
-        Self::validate_paid_quote_content(xorname, candidate)?;
+        // The two checks take different addresses. The quote must name what was
+        // paid for; the issuer must be close to what the network routes. A
+        // chunk supplies one address for both, a pointer two.
+        Self::validate_paid_quote_content(&target.content, candidate)?;
         let issuer_peer_id =
             Self::validate_paid_quote_peer_binding(candidate.encoded_peer_id, candidate.quote)?;
 
-        self.validate_paid_quote_issuer_k_closest(xorname, &issuer_peer_id)
+        self.validate_paid_quote_issuer_k_closest(&target.routing, &issuer_peer_id)
             .await?;
 
         Self::validate_paid_quote_signature(candidate).await?;
@@ -3171,10 +3295,28 @@ impl PaymentVerifier {
     #[allow(clippy::too_many_lines)]
     async fn verify_merkle_payment(
         &self,
-        xorname: &XorName,
+        target: &PaymentTarget,
         proof_bytes: &[u8],
         context: VerificationContext,
     ) -> Result<()> {
+        // The proof names what was paid for, which for a pointer is its state
+        // rather than its address.
+        let xorname = &target.content;
+
+        // A merkle proof binds the paid address but carries no issuer-proximity
+        // check, so it cannot express "paid at the state, quoted by the group
+        // around the address". Accepting one for a pointer would check the
+        // close group of a state identifier, which names no group at all.
+        // Single-node proofs do carry that check, so pointers use those until
+        // the merkle proof shape can say which group issued it.
+        if target.routing != target.content {
+            return Err(Error::Payment(format!(
+                "a pointer update must be paid with a single-node proof: a merkle \
+                 proof cannot bind the issuing close group of {} to the paid state {}",
+                hex::encode(target.routing),
+                hex::encode(target.content)
+            )));
+        }
         if crate::logging::enabled!(crate::logging::Level::DEBUG) {
             debug!(
                 "Verifying merkle payment for {} ({context:?})",
@@ -3576,6 +3718,70 @@ mod tests {
 
     /// Create a verifier for unit tests. EVM is always on, but tests can
     /// pre-populate the cache to bypass on-chain verification.
+    /// A chunk whose address equals a pointer's `state_id` must not be able to
+    /// pay for that pointer's update.
+    ///
+    /// `state_id` is `BLAKE3(domain || body)`, so a client can store a chunk
+    /// whose *content* is exactly `domain || body`; that chunk's address is the
+    /// pointer's state identifier. If both filed their "already paid" entry
+    /// under that one value, paying chunk price for the chunk would buy the
+    /// pointer update — and skip issuer proximity, the price floor and the
+    /// proof-shape rule with it.
+    #[test]
+    fn a_chunk_cannot_pay_for_a_pointer_that_shares_its_address() {
+        let state_id: XorName = [0x5Au8; 32];
+        let pointer_address: XorName = [0xA5u8; 32];
+
+        let chunk = PaymentTarget::same(state_id);
+        let pointer = PaymentTarget::split(pointer_address, state_id);
+
+        assert_eq!(
+            chunk.cache_key(),
+            PaidKey::Chunk(state_id),
+            "a chunk keeps its bare address, so existing entries are untouched"
+        );
+        assert_ne!(
+            pointer.cache_key(),
+            chunk.cache_key(),
+            "the pointer must not read the chunk's paid entry as its own"
+        );
+
+        // And two different pointers sharing a state cannot borrow either.
+        let other = PaymentTarget::split([0x11u8; 32], state_id);
+        assert_ne!(pointer.cache_key(), other.cache_key());
+
+        // The key is typed, not hashed: there is no 32-byte preimage a client
+        // could put in a chunk's *content* to land on the pointer's entry,
+        // because no chunk key is ever a `PointerState` variant.
+        let cache = VerifiedCache::with_capacity(8);
+        cache.insert_key(chunk.cache_key());
+        assert!(
+            cache.contains_key(&chunk.cache_key()),
+            "the chunk's own entry is there"
+        );
+        assert!(
+            !cache.contains_key(&pointer.cache_key()),
+            "and it does not satisfy the pointer"
+        );
+        for crafted in [state_id, pointer_address, [0u8; 32], [0xFFu8; 32]] {
+            assert!(
+                !cache.contains_key(&PaymentTarget::split(pointer_address, state_id).cache_key()),
+                "no chunk address {crafted:?} can stand in for the pointer's entry"
+            );
+            cache.insert_key(PaidKey::Chunk(crafted));
+        }
+        assert!(
+            !cache.contains_key(&pointer.cache_key()),
+            "still no chunk address satisfies the pointer's typed entry"
+        );
+    }
+
+    #[test]
+    fn a_single_address_target_is_reported_as_one() {
+        assert!(PaymentTarget::same([1u8; 32]).is_single_address());
+        assert!(!PaymentTarget::split([1u8; 32], [2u8; 32]).is_single_address());
+    }
+
     fn create_test_verifier() -> PaymentVerifier {
         let config = PaymentVerifierConfig {
             evm: EvmVerifierConfig::default(),

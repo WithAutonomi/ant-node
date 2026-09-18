@@ -561,7 +561,21 @@ impl NodeBuilder {
         let storage = Arc::new(storage);
         let payment_verifier = Arc::new(payment_verifier);
 
-        let protocol = AntProtocol::new(storage, payment_verifier, Arc::new(quote_generator));
+        // Pointers live beside the chunks, under the same root. Opening the
+        // store here is what makes pointer PUT/GET answerable at all: without
+        // it every pointer request is refused, which is the right answer for a
+        // node that keeps none but the wrong one for a node that should.
+        let pointer_store = crate::pointer::PointerStore::new(&config.root_dir).await?;
+        let pointers = crate::pointer::PointerService::new(pointer_store)
+            // Refuse a pointer whose address a chunk already occupies, rather
+            // than letting one kind silently overwrite the other.
+            .with_chunk_store(Arc::clone(&storage))
+            // Payment is verified against each record's state, so every update
+            // is paid for rather than riding the first one.
+            .with_payments(Arc::clone(&payment_verifier));
+
+        let protocol = AntProtocol::new(storage, payment_verifier, Arc::new(quote_generator))
+            .with_pointer_service(pointers);
 
         info!(
             "ANT protocol handler initialized with ML-DSA-65 signing (protocol={CHUNK_PROTOCOL_ID})"

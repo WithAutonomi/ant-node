@@ -40,10 +40,12 @@ use crate::client::compute_address;
 use crate::error::{Error, Result};
 use crate::logging::{debug, info, warn};
 use crate::payment::{PaymentVerifier, QuoteGenerator, VerificationContext};
+use crate::pointer::PointerService;
 use crate::replication::admission;
 use crate::replication::config::K_BUCKET_SIZE;
 use crate::replication::fresh::FreshWriteEvent;
 use crate::storage::ChunkStore;
+use ant_protocol::chunk::{PointerGetResponse, PointerPutResponse};
 use bytes::Bytes;
 use parking_lot::RwLock;
 use saorsa_core::P2PNode;
@@ -61,7 +63,7 @@ use tokio::sync::mpsc;
 /// onto further peers (ADR-0002) is still accepted here, while a genuinely far
 /// node — which could only mis-attribute fresh-replication failures — is
 /// turned away.
-const SELF_CLOSENESS_GATE_WIDTH: usize = K_BUCKET_SIZE;
+pub const SELF_CLOSENESS_GATE_WIDTH: usize = K_BUCKET_SIZE;
 
 fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
@@ -298,6 +300,12 @@ pub struct AntProtocol {
     /// `attach_p2p_node`. Drives the self-closeness gate on client PUTs;
     /// `None` in unit tests that never attach a node.
     p2p_node: RwLock<Option<Arc<P2PNode>>>,
+    /// Serves pointer requests, when the node has a pointer store.
+    ///
+    /// `None` on a node built without one, so a peer that sends a pointer
+    /// message to a node that does not keep pointers gets a clean refusal
+    /// rather than a silent drop.
+    pointers: Option<PointerService>,
 }
 
 impl AntProtocol {
@@ -335,7 +343,24 @@ impl AntProtocol {
             quote_generator,
             fresh_write_tx: None,
             p2p_node: RwLock::new(None),
+            pointers: None,
         }
+    }
+
+    /// Serve pointer requests from `pointers`.
+    ///
+    /// Opt-in rather than built in: a node with no pointer store refuses
+    /// pointer messages cleanly instead of pretending to hold them.
+    #[must_use]
+    pub fn with_pointer_service(mut self, pointers: PointerService) -> Self {
+        self.pointers = Some(pointers);
+        self
+    }
+
+    /// The pointer service, if this node serves pointers.
+    #[must_use]
+    pub const fn pointer_service(&self) -> Option<&PointerService> {
+        self.pointers.as_ref()
     }
 
     /// Attach the node's P2P handle for payment live-DHT checks.
@@ -345,6 +370,11 @@ impl AntProtocol {
     /// replaces the verifier handle.
     pub fn attach_p2p_node(&self, node: Arc<P2PNode>) {
         *self.p2p_node.write() = Some(Arc::clone(&node));
+        if let Some(pointers) = &self.pointers {
+            // Pointers take the same self-closeness gate as chunks, judged at
+            // the pointer address because that is what the network routes on.
+            pointers.attach_p2p_node(Arc::clone(&node));
+        }
         self.payment_verifier.attach_p2p_node(node);
         debug!("AntProtocol: P2PNode attached for payment live-DHT checks and self-closeness gate");
     }
@@ -509,6 +539,22 @@ impl AntProtocol {
                     self.handle_merkle_candidate_quote_v2(req),
                 )
             }
+            ChunkMessageBody::PointerPutRequest(req) => {
+                ChunkMessageBody::PointerPutResponse(match &self.pointers {
+                    Some(service) => service.handle_put(req).await,
+                    None => PointerPutResponse::Error(ProtocolError::StorageFailed(
+                        "this node does not store pointers".to_string(),
+                    )),
+                })
+            }
+            ChunkMessageBody::PointerGetRequest(req) => {
+                ChunkMessageBody::PointerGetResponse(match &self.pointers {
+                    Some(service) => service.handle_get(req).await,
+                    None => PointerGetResponse::NotFound {
+                        address: req.address,
+                    },
+                })
+            }
             // Anything else — response messages are handled by client
             // subscribers (e.g. send_and_await_chunk_response), not by the
             // protocol handler. Returning None prevents the caller from
@@ -599,6 +645,22 @@ impl AntProtocol {
                 expected: address,
                 actual: computed,
             });
+        }
+
+        // 2b. Refuse a chunk whose address a pointer already occupies.
+        //
+        // The mirror of the check the pointer path makes. Both kinds draw
+        // addresses from the same 32-byte range, and a collision — however
+        // infeasible — must not be resolved by whichever kind arrived second,
+        // because that silently destroys the other's data.
+        if let Some(pointers) = &self.pointers {
+            if pointers.store().contains(&address) {
+                warn!("Refusing chunk {addr_hex}: a pointer already occupies that address");
+                return ChunkPutResponse::Error(ProtocolError::StorageFailed(format!(
+                    "address {addr_hex} is already occupied by a pointer; refusing to \
+                     store a chunk over it"
+                )));
+            }
         }
 
         // 3. Check if already exists (idempotent success)

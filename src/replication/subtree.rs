@@ -31,7 +31,9 @@
 //! leaf range `[slot * span, (slot + 1) * span)` where `span = 2^(D - depth)`,
 //! intersected with `0..N`.
 
-use super::commitment::{leaf_hash, node_hash, StorageCommitment, MAX_COMMITMENT_KEY_COUNT};
+use super::commitment::{
+    leaf_hash, node_hash, pointer_leaf_hash, StorageCommitment, MAX_COMMITMENT_KEY_COUNT,
+};
 use crate::ant_protocol::XorName;
 use serde::{Deserialize, Serialize};
 
@@ -39,9 +41,31 @@ use serde::{Deserialize, Serialize};
 /// meaningless for tiny trees and a full proof is cheap.
 pub const SMALL_TREE_FULL_AUDIT_FLOOR: u32 = 4;
 
+/// What kind of record a subtree leaf attests.
+///
+/// Bound into the leaf hash, so a peer cannot relabel a chunk leaf as a pointer
+/// leaf to escape the content-address guard: relabelling changes the leaf hash,
+/// which changes the root, which fails the structural check against the signed
+/// commitment.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum LeafKind {
+    /// A content-addressed chunk, where `bytes_hash == key`.
+    #[default]
+    Chunk,
+    /// A pointer, whose address is a function of its owner key rather than of
+    /// its bytes, so `bytes_hash != key` by construction.
+    Pointer,
+}
+
 /// One leaf of the selected subtree, as returned by the responder.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SubtreeLeaf {
+    /// What kind of record this leaf attests.
+    ///
+    /// Placed first so the wire shape is obviously different from the
+    /// untagged v1 leaf; the subtree audit family is versioned to v2 for this
+    /// reason and mixed-version audits pause, exactly as ADR-0009 prescribes.
+    pub kind: LeafKind,
     /// The committed key (chunk address) at this leaf position.
     pub key: XorName,
     /// `BLAKE3(record_bytes)` — the plain content hash. For a content-addressed
@@ -368,10 +392,18 @@ pub fn verify_subtree_proof(
     // is the tree's odd tail at some level). `fold_to_root` stopped at a single
     // hash and so skipped the self-pair when a truncated block reached length 1
     // before climbing all the way to the subtree-root level — the geometry bug.
+    // Hash each leaf under the domain its kind selects. Doing this by kind is
+    // what actually binds the kind to the root: a chunk leaf relabelled
+    // `Pointer` (to escape the round-1 `bytes_hash == key` guard) hashes under
+    // the pointer domain here, rebuilds to a different root, and fails against
+    // the peer's own signed commitment.
     let leaf_hashes: Vec<[u8; 32]> = proof
         .leaves
         .iter()
-        .map(|l| leaf_hash(&l.key, &l.bytes_hash))
+        .map(|l| match l.kind {
+            LeafKind::Chunk => leaf_hash(&l.key, &l.bytes_hash),
+            LeafKind::Pointer => pointer_leaf_hash(&l.key, &l.bytes_hash),
+        })
         .collect();
     let levels_to_subtree_root = total_depth - path.depth;
     let mut cur = fold_levels(leaf_hashes, levels_to_subtree_root);
@@ -573,7 +605,25 @@ pub fn subtree_leaf(
     key: &XorName,
     bytes: &[u8],
 ) -> SubtreeLeaf {
+    subtree_leaf_of_kind(LeafKind::Chunk, nonce, challenged_peer_id, key, bytes)
+}
+
+/// Build one subtree leaf of a given kind.
+///
+/// A pointer's address is a function of its owner key, not of its bytes, so its
+/// `bytes_hash` never equals its `key`. The kind is what tells the round-1
+/// verifier that this is expected rather than the possession-forgery it
+/// otherwise looks exactly like.
+#[must_use]
+pub fn subtree_leaf_of_kind(
+    kind: LeafKind,
+    nonce: &[u8; 32],
+    challenged_peer_id: &[u8; 32],
+    key: &XorName,
+    bytes: &[u8],
+) -> SubtreeLeaf {
     SubtreeLeaf {
+        kind,
         key: *key,
         bytes_hash: *blake3::hash(bytes).as_bytes(),
         content_len: u32::try_from(bytes.len()).unwrap_or(u32::MAX),
@@ -590,6 +640,86 @@ pub fn subtree_leaf(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// A pointer leaf and a chunk leaf over identical `(key, bytes_hash)` must
+    /// not produce the same leaf hash, or a peer could relabel a chunk as a
+    /// pointer to escape the round-1 `bytes_hash == key` guard.
+    #[test]
+    fn the_leaf_kind_is_bound_by_the_leaf_hash() {
+        use crate::replication::commitment::{leaf_hash, pointer_leaf_hash};
+
+        let key: XorName = [0xA1u8; 32];
+        let bytes_hash = [0xB2u8; 32];
+        assert_ne!(
+            leaf_hash(&key, &bytes_hash),
+            pointer_leaf_hash(&key, &bytes_hash),
+            "relabelling a chunk leaf as a pointer must change the leaf, and so the root"
+        );
+    }
+
+    /// A chunk-only key set must still produce exactly the root it always did,
+    /// or every existing commitment in the network would be invalidated.
+    #[test]
+    fn a_chunk_only_commitment_root_is_unchanged() {
+        use crate::replication::commitment::MerkleTree;
+
+        let entries: Vec<(XorName, [u8; 32])> = (0u8..8).map(|i| ([i; 32], [i; 32])).collect();
+        let via_build = MerkleTree::build(entries.clone()).expect("build").root();
+        let via_kinds = MerkleTree::build_of_kinds(
+            entries
+                .into_iter()
+                .map(|(k, b)| (k, b, LeafKind::Chunk))
+                .collect(),
+        )
+        .expect("build_of_kinds")
+        .root();
+        assert_eq!(via_build, via_kinds, "chunk-only roots must not move");
+    }
+
+    /// A pointer leaf changes the root, so a peer cannot smuggle one into a
+    /// commitment another peer signed.
+    #[test]
+    fn a_pointer_leaf_changes_the_root() {
+        use crate::replication::commitment::MerkleTree;
+
+        let entries: Vec<(XorName, [u8; 32])> = (0u8..4).map(|i| ([i; 32], [i; 32])).collect();
+        let chunky = MerkleTree::build(entries.clone()).expect("build").root();
+        let mixed = MerkleTree::build_of_kinds(
+            entries
+                .into_iter()
+                .enumerate()
+                .map(|(i, (k, b))| {
+                    let kind = if i == 0 {
+                        LeafKind::Pointer
+                    } else {
+                        LeafKind::Chunk
+                    };
+                    (k, b, kind)
+                })
+                .collect(),
+        )
+        .expect("build_of_kinds")
+        .root();
+        assert_ne!(chunky, mixed);
+    }
+
+    /// The default kind is Chunk, so any leaf built by the existing path keeps
+    /// the round-1 guard it always had.
+    #[test]
+    fn leaves_default_to_chunk() {
+        assert_eq!(LeafKind::default(), LeafKind::Chunk);
+        let leaf = subtree_leaf(&[0u8; 32], &[1u8; 32], &[2u8; 32], b"bytes");
+        assert_eq!(leaf.kind, LeafKind::Chunk);
+        let pointer = subtree_leaf_of_kind(
+            LeafKind::Pointer,
+            &[0u8; 32],
+            &[1u8; 32],
+            &[2u8; 32],
+            b"bytes",
+        );
+        assert_eq!(pointer.kind, LeafKind::Pointer);
+        assert_eq!(pointer.bytes_hash, leaf.bytes_hash, "only the kind differs");
+    }
     use crate::replication::commitment::MerkleTree;
 
     fn xn_u32(i: u32) -> XorName {
@@ -874,6 +1004,95 @@ mod tests {
             sender_public_key: vec![0u8; 1952],
             signature: vec![0u8; 3293],
         }
+    }
+
+    /// Relabelling a leaf's kind must break the proof.
+    ///
+    /// This is the property the pointer exemption rests on: round 1 skips the
+    /// `bytes_hash == key` guard for pointer leaves, so if a peer could flip a
+    /// chunk leaf's kind to `Pointer` it would escape the guard for free. The
+    /// kind picks the leaf-hash domain, so flipping it rebuilds to a different
+    /// root and fails against the peer's own signed commitment.
+    #[test]
+    fn relabelling_a_leaf_kind_breaks_the_proof() {
+        let peer = [0xABu8; 32];
+        let nonce = [0x5Cu8; 32];
+        let entries: Vec<(XorName, [u8; 32])> =
+            (0u8..8).map(|i| (xn_u32(u32::from(i)), [i; 32])).collect();
+        let entries: Vec<(XorName, [u8; 32])> = entries
+            .into_iter()
+            .map(|(k, _)| (k, *blake3::hash(&chunk_bytes(&k)).as_bytes()))
+            .collect();
+
+        let (proof, commitment) = build_proof(&entries, &nonce, &peer);
+        assert!(
+            matches!(
+                verify_subtree_proof(&proof, &nonce, &commitment),
+                StructureVerdict::Valid
+            ),
+            "the honest chunk proof must verify"
+        );
+
+        // Flip one leaf's kind and nothing else.
+        let mut relabelled = proof.clone();
+        if let Some(leaf) = relabelled.leaves.first_mut() {
+            assert_eq!(leaf.kind, LeafKind::Chunk);
+            leaf.kind = LeafKind::Pointer;
+        }
+        assert!(
+            matches!(
+                verify_subtree_proof(&relabelled, &nonce, &commitment),
+                StructureVerdict::Invalid(_)
+            ),
+            "a relabelled leaf must not rebuild to the committed root"
+        );
+    }
+
+    /// And the other direction: a genuine pointer leaf verifies against a
+    /// commitment built with that kind, so the exemption is usable at all.
+    #[test]
+    fn a_genuine_pointer_leaf_verifies_against_its_own_commitment() {
+        use crate::replication::commitment::MerkleTree;
+
+        let peer = [0xCDu8; 32];
+        let nonce = [0x77u8; 32];
+        let keys: Vec<XorName> = (0u8..4).map(|i| xn_u32(u32::from(i))).collect();
+
+        // One pointer leaf among chunks: bytes_hash deliberately != key, which
+        // round 1 would reject for a chunk.
+        let entries: Vec<(XorName, [u8; 32], LeafKind)> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| {
+                let bytes_hash = *blake3::hash(&chunk_bytes(k)).as_bytes();
+                let kind = if i == 0 {
+                    LeafKind::Pointer
+                } else {
+                    LeafKind::Chunk
+                };
+                (*k, bytes_hash, kind)
+            })
+            .collect();
+
+        let tree = MerkleTree::build_of_kinds(entries.clone()).unwrap();
+        let key_count = tree.key_count();
+        let mut proof =
+            build_subtree_proof(&tree, &nonce, &peer, |k| Some(chunk_bytes(k))).unwrap();
+        // The builder tags every leaf Chunk; restore the kinds the tree used.
+        for leaf in &mut proof.leaves {
+            if let Some((_, _, kind)) = entries.iter().find(|(k, _, _)| *k == leaf.key) {
+                leaf.kind = *kind;
+            }
+        }
+        let commitment = fake_commitment(tree.root(), key_count, peer);
+
+        assert!(
+            matches!(
+                verify_subtree_proof(&proof, &nonce, &commitment),
+                StructureVerdict::Valid
+            ),
+            "a pointer leaf must verify against a commitment that declared it one"
+        );
     }
 
     #[test]
