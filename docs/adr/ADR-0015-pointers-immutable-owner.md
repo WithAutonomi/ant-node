@@ -200,7 +200,9 @@ on the same work.
 - A resubmission repairs a record whose file the disk lost — at any counter,
   not just at creation — rather than being acknowledged as unchanged. A file
   swapped for a different valid record is not answered for either.
-- No chunk content produces a pointer address or a paid identifier.
+- The chunk preimages the old prefix construction handed out no longer land on
+  either identity. (No test can say more: that no content does is the preimage
+  assumption, not a property one can check.)
 - End to end against a live testnet with real settlement: create, update, read
   back, resolve a chain to its chunk, repeat a stored state, read an address
   nobody wrote, and refuse a signed record that skips the counter.
