@@ -155,6 +155,12 @@ impl PointerService {
                 )));
             }
             Ok(Inspected::Candidate(parsed)) => parsed,
+            // `inspect` does not verify, so it cannot produce this arm.
+            Ok(Inspected::Verified(_)) => {
+                return PointerPutResponse::Error(ProtocolError::Internal(
+                    "inspect returned a verified record".to_string(),
+                ));
+            }
             Err(e) => {
                 debug!("Pointer PUT refused: {e}");
                 return PointerPutResponse::Error(ProtocolError::StorageFailed(e.to_string()));
@@ -169,8 +175,8 @@ impl PointerService {
         }
 
         // Only now is the record worth a signature check.
-        let prepared = match self.store.verify(parsed).await {
-            Ok(prepared) => prepared,
+        let record = match self.store.verify(parsed).await {
+            Ok(record) => record,
             Err(e) => {
                 debug!("Pointer PUT refused: {e}");
                 return PointerPutResponse::Error(ProtocolError::StorageFailed(e.to_string()));
@@ -190,7 +196,7 @@ impl PointerService {
             }
         }
 
-        match self.store.commit(prepared).await {
+        match self.store.commit(record).await {
             Ok(PutOutcome::Stored | PutOutcome::Replaced) => {
                 PointerPutResponse::Success { address, state_id }
             }

@@ -91,6 +91,7 @@ impl PutOutcome {
 
 /// The result of [`PointerStore::inspect`]: what an arrival claims, before any
 /// signature has been checked.
+#[derive(Debug)]
 pub enum Inspected {
     /// The arrival cannot change what is held. No signature check is owed, and
     /// none was done.
@@ -99,6 +100,11 @@ pub enum Inspected {
     /// checked yet — pass it to [`PointerStore::verify`] once admission gates
     /// have had their say.
     Candidate(ParsedPointer),
+    /// A signature-checked record, ready to commit.
+    ///
+    /// Boxed because a verified record is two orders of magnitude larger than
+    /// the other arms, and an enum is as big as its widest one.
+    Verified(Box<Pointer>),
 }
 
 impl Inspected {
@@ -106,50 +112,11 @@ impl Inspected {
     #[must_use]
     pub fn state(&self) -> Option<&ant_protocol::pointer::PointerState> {
         match self {
-            Self::Noop(_) => None,
             Self::Candidate(parsed) => Some(parsed.state()),
+            // A no-op claims nothing worth acting on, and a verified record
+            // carries its own state directly.
+            Self::Noop(_) | Self::Verified(_) => None,
         }
-    }
-}
-
-/// The result of [`PointerStore::prepare`].
-#[derive(Debug)]
-pub enum Prepared {
-    /// The arrival cannot change what is held, and was rejected without a
-    /// signature check. There is nothing to pay for and nothing to commit.
-    Noop(PutOutcome),
-    /// A validated record that would win as of the moment it was prepared.
-    Candidate(PreparedPut),
-}
-
-/// A record that parsed, out-ranked what was held, and verified.
-///
-/// Carries what a payment check needs — [`Self::address`] to route and
-/// [`Self::state_id`] to authorize — and holds the validated record so nothing
-/// can change between validation and commit.
-#[derive(Debug)]
-pub struct PreparedPut {
-    /// The validated record.
-    record: Pointer,
-}
-
-impl PreparedPut {
-    /// The address this record belongs at, which is what routing uses.
-    #[must_use]
-    pub fn address(&self) -> XorName {
-        self.record.address()
-    }
-
-    /// The authenticated-state identifier, which is what a quote is paid against.
-    #[must_use]
-    pub fn state_id(&self) -> XorName {
-        self.record.state_id()
-    }
-
-    /// The validated record.
-    #[must_use]
-    pub const fn record(&self) -> &Pointer {
-        &self.record
     }
 }
 
@@ -291,10 +258,14 @@ impl PointerStore {
     ///
     /// Returns [`Error::Protocol`] if the bytes are not a well-formed record
     /// and [`Error::Crypto`] if a would-be winner's signature does not verify.
-    pub async fn prepare(&self, bytes: &[u8]) -> Result<Prepared> {
+    pub async fn prepare(&self, bytes: &[u8]) -> Result<Inspected> {
         match self.inspect(bytes)? {
-            Inspected::Noop(outcome) => Ok(Prepared::Noop(outcome)),
-            Inspected::Candidate(parsed) => Ok(Prepared::Candidate(self.verify(parsed).await?)),
+            Inspected::Noop(outcome) => Ok(Inspected::Noop(outcome)),
+            Inspected::Candidate(parsed) => {
+                Ok(Inspected::Verified(Box::new(self.verify(parsed).await?)))
+            }
+            // `inspect` never returns this; only `prepare` produces it.
+            verified @ Inspected::Verified(_) => Ok(verified),
         }
     }
 
@@ -337,11 +308,11 @@ impl PointerStore {
     /// # Errors
     ///
     /// Returns [`Error::Crypto`] if the signature does not verify.
-    pub async fn verify(&self, parsed: ParsedPointer) -> Result<PreparedPut> {
-        let record = spawn_blocking(move || Pointer::verify_parsed(parsed))
+    pub async fn verify(&self, parsed: ParsedPointer) -> Result<Pointer> {
+        spawn_blocking(move || Pointer::verify_parsed(parsed))
             .await
-            .map_err(|e| Error::Storage(format!("pointer verification panicked: {e}")))??;
-        Ok(PreparedPut { record })
+            .map_err(|e| Error::Storage(format!("pointer verification panicked: {e}")))?
+            .map_err(Into::into)
     }
 
     /// Commit a prepared record.
@@ -354,11 +325,11 @@ impl PointerStore {
     /// # Errors
     ///
     /// Returns [`Error::Storage`] if the write fails.
-    pub async fn commit(&self, prepared: PreparedPut) -> Result<PutOutcome> {
+    pub async fn commit(&self, record: Pointer) -> Result<PutOutcome> {
         let inner = Arc::clone(&self.inner);
         // The whole transaction runs in one task, so dropping this future
         // cannot leave the write done and the index un-updated.
-        spawn_blocking(move || inner.commit_blocking(&prepared.record))
+        spawn_blocking(move || inner.commit_blocking(&record))
             .await
             .map_err(|e| Error::Storage(format!("pointer commit panicked: {e}")))?
     }
@@ -374,8 +345,12 @@ impl PointerStore {
     /// As [`Self::prepare`] and [`Self::commit`].
     pub async fn put_bytes(&self, bytes: &[u8]) -> Result<PutOutcome> {
         match self.prepare(bytes).await? {
-            Prepared::Noop(outcome) => Ok(outcome),
-            Prepared::Candidate(prepared) => self.commit(prepared).await,
+            Inspected::Noop(outcome) => Ok(outcome),
+            Inspected::Verified(record) => self.commit(*record).await,
+            Inspected::Candidate(parsed) => {
+                let record = self.verify(parsed).await?;
+                self.commit(record).await
+            }
         }
     }
 
@@ -1042,16 +1017,20 @@ mod tests {
         store.put_bytes(&held.to_bytes()).await.expect("put");
 
         match store.prepare(&held.to_bytes()).await.expect("prepare") {
-            Prepared::Noop(outcome) => assert_eq!(outcome, PutOutcome::Unchanged),
-            Prepared::Candidate(_) => panic!("an identical state is not a candidate"),
+            Inspected::Noop(outcome) => assert_eq!(outcome, PutOutcome::Unchanged),
+            Inspected::Verified(_) | Inspected::Candidate(_) => {
+                panic!("an identical state is not a candidate")
+            }
         }
         match store
             .prepare(&signed(1, 1, 6).to_bytes())
             .await
             .expect("prepare")
         {
-            Prepared::Noop(outcome) => assert_eq!(outcome, PutOutcome::Stale),
-            Prepared::Candidate(_) => panic!("a stale record is not a candidate"),
+            Inspected::Noop(outcome) => assert_eq!(outcome, PutOutcome::Stale),
+            Inspected::Verified(_) | Inspected::Candidate(_) => {
+                panic!("a stale record is not a candidate")
+            }
         }
     }
 
@@ -1060,16 +1039,19 @@ mod tests {
         let (store, _dir) = store().await;
         let record = signed(1, 2, 2);
         match store.prepare(&record.to_bytes()).await.expect("prepare") {
-            Prepared::Candidate(prepared) => {
-                assert_eq!(prepared.address(), record.address());
-                assert_eq!(prepared.state_id(), record.state_id());
-                assert_eq!(prepared.record().to_bytes(), record.to_bytes());
+            Inspected::Verified(verified) => {
+                // A verified record is a `Pointer`, so the payment check reads
+                // the address and state straight off it — there is no wrapper
+                // type in between restating what it already knows.
+                assert_eq!(verified.address(), record.address());
+                assert_eq!(verified.state_id(), record.state_id());
+                assert_eq!(verified.to_bytes(), record.to_bytes());
                 assert_eq!(
-                    store.commit(prepared).await.expect("commit"),
+                    store.commit(*verified).await.expect("commit"),
                     PutOutcome::Stored
                 );
             }
-            Prepared::Noop(_) => panic!("a new record is a candidate"),
+            other => panic!("a new record verifies, got {other:?}"),
         }
         assert_eq!(store.len(), 1);
     }
@@ -1084,8 +1066,8 @@ mod tests {
             .await
             .expect("prepare")
         {
-            Prepared::Candidate(prepared) => prepared,
-            Prepared::Noop(_) => panic!("expected a candidate"),
+            Inspected::Verified(record) => *record,
+            other => panic!("expected a verified record, got {other:?}"),
         };
 
         // Someone else's newer state arrives while the payment is being checked.
@@ -1303,8 +1285,8 @@ mod tests {
         let (store, _dir) = store().await;
         let record = signed(1, 3, 3);
         let prepared = match store.prepare(&record.to_bytes()).await.expect("prepare") {
-            Prepared::Candidate(prepared) => prepared,
-            Prepared::Noop(_) => panic!("expected a candidate"),
+            Inspected::Verified(record) => *record,
+            other => panic!("expected a verified record, got {other:?}"),
         };
 
         let abandoned = {

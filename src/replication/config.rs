@@ -426,7 +426,7 @@ pub const REPLICATION_PROTOCOL_ID: &str = "autonomi.ant.replication.v2";
 /// possession/repair/commitment-fetch) with no per-peer limiter. A truly
 /// zero-penalty rollout needs an upstream `send_request` that does not
 /// auto-report trust; tracked as a saorsa-core follow-up.
-pub const SUBTREE_AUDIT_PROTOCOL_ID: &str = "autonomi.ant.replication.subtree-audit.v2";
+pub const SUBTREE_AUDIT_PROTOCOL_ID: &str = "autonomi.ant.replication.subtree-audit.v1";
 
 /// 10 MiB — maximum replication wire message size (accommodates hint batches).
 const REPLICATION_MESSAGE_SIZE_MIB: usize = 10;
@@ -1488,15 +1488,9 @@ mod tests {
         // Core replication, including all digest audit lanes, stays on v2.
         // Only the subtree family changed and therefore receives a separate id.
         assert_eq!(REPLICATION_PROTOCOL_ID, "autonomi.ant.replication.v2");
-        // Bumped v1 -> v2 when the subtree leaf gained its record-kind tag, so
-        // a pointer leaf can be told from a chunk leaf at round 1. The leaf is
-        // postcard-encoded positionally, so the new field is wire-incompatible
-        // and needs the new id. ADR-0009 provides for exactly this: the subtree
-        // family versions independently of core replication, and mixed-version
-        // audits pause rather than misdecode.
         assert_eq!(
             SUBTREE_AUDIT_PROTOCOL_ID,
-            "autonomi.ant.replication.subtree-audit.v2"
+            "autonomi.ant.replication.subtree-audit.v1"
         );
         assert_ne!(REPLICATION_PROTOCOL_ID, SUBTREE_AUDIT_PROTOCOL_ID);
     }

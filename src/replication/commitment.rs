@@ -26,7 +26,6 @@ use blake3::Hasher;
 use saorsa_pqc::api::sig::{ml_dsa_65, MlDsaSecretKey};
 
 use crate::ant_protocol::XorName;
-use crate::replication::subtree::LeafKind;
 
 // ADR-0004: the commitment wire type, its pin (`commitment_hash`), its
 // signature verification, and the key-count cap are the SINGLE SOURCE OF TRUTH
@@ -45,10 +44,6 @@ pub const DOMAIN_LEAF: &[u8] = b"autonomi.ant.replication.storage_leaf.v1";
 /// Domain-separation tag for Merkle internal nodes: `BLAKE3(this || left || right)`.
 pub const DOMAIN_NODE: &[u8] = b"autonomi.ant.replication.storage_node.v1";
 
-/// Domain separator for a pointer leaf, distinct from [`DOMAIN_LEAF`] so the
-/// record kind is bound by the leaf hash itself.
-pub const DOMAIN_POINTER_LEAF: &[u8] = b"autonomi.ant.replication.storage_pointer_leaf.v1";
-
 // `MAX_COMMITMENT_KEY_COUNT` and `StorageCommitment` are re-exported from
 // `ant-protocol` above (single source of truth); their fields and wire size are
 // documented there.
@@ -57,33 +52,14 @@ pub const DOMAIN_POINTER_LEAF: &[u8] = b"autonomi.ant.replication.storage_pointe
 // Hashing helpers
 // ---------------------------------------------------------------------------
 
-/// Compute the Merkle leaf hash for a content-addressed chunk.
+/// Compute the Merkle leaf hash for `(key, bytes_hash)`.
 ///
 /// `bytes_hash` is BLAKE3 over the record bytes; the leaf binds the key to
 /// the content so an adversary cannot reuse a leaf for a different chunk.
-///
-/// Unchanged from v1, so a node holding only chunks produces exactly the root
-/// it always did.
 #[must_use]
 pub fn leaf_hash(key: &XorName, bytes_hash: &[u8; 32]) -> [u8; 32] {
     let mut h = Hasher::new();
     h.update(DOMAIN_LEAF);
-    h.update(key);
-    h.update(bytes_hash);
-    *h.finalize().as_bytes()
-}
-
-/// Compute the Merkle leaf hash for a pointer.
-///
-/// A separate domain from [`leaf_hash`] is what binds the kind. A peer that
-/// relabelled a chunk leaf as a pointer — to escape the round-1 guard that
-/// `bytes_hash == key` — would hash it under this domain instead, changing the
-/// leaf, the root, and therefore the structural check against its own signed
-/// commitment. So the exemption cannot be claimed for a chunk.
-#[must_use]
-pub fn pointer_leaf_hash(key: &XorName, bytes_hash: &[u8; 32]) -> [u8; 32] {
-    let mut h = Hasher::new();
-    h.update(DOMAIN_POINTER_LEAF);
     h.update(key);
     h.update(bytes_hash);
     *h.finalize().as_bytes()
@@ -166,28 +142,7 @@ impl MerkleTree {
     /// Returns an error if `entries` is empty (no commitment to make), if
     /// `entries.len() > MAX_COMMITMENT_KEY_COUNT`, or if it contains
     /// duplicate keys.
-    pub fn build(entries: Vec<(XorName, [u8; 32])>) -> Result<Self, CommitmentError> {
-        Self::build_of_kinds(
-            entries
-                .into_iter()
-                .map(|(key, bytes_hash)| (key, bytes_hash, LeafKind::Chunk))
-                .collect(),
-        )
-    }
-
-    /// Build a Merkle tree over `(key, bytes_hash, kind)` triples.
-    ///
-    /// The kind picks the leaf domain, so a chunk-only key set produces exactly
-    /// the root [`Self::build`] always produced, while a pointer leaf — whose
-    /// `bytes_hash` cannot equal its `key` — is distinguishable at round 1
-    /// without a peer being able to claim that exemption for a chunk.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::build`].
-    pub fn build_of_kinds(
-        mut entries: Vec<(XorName, [u8; 32], LeafKind)>,
-    ) -> Result<Self, CommitmentError> {
+    pub fn build(mut entries: Vec<(XorName, [u8; 32])>) -> Result<Self, CommitmentError> {
         if entries.is_empty() {
             return Err(CommitmentError::EmptyKeySet);
         }
@@ -206,11 +161,8 @@ impl MerkleTree {
 
         let leaves: Vec<(XorName, [u8; 32])> = entries
             .into_iter()
-            .map(|(k, bh, kind)| {
-                let lh = match kind {
-                    LeafKind::Chunk => leaf_hash(&k, &bh),
-                    LeafKind::Pointer => pointer_leaf_hash(&k, &bh),
-                };
+            .map(|(k, bh)| {
+                let lh = leaf_hash(&k, &bh);
                 (k, lh)
             })
             .collect();

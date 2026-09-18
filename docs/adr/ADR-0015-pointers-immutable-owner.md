@@ -1,6 +1,6 @@
 # ADR-0015: Pointers — paid mutable references with an immutable owner
 
-- **Status:** Accepted
+- **Status:** Proposed
 - **Date:** 2026-09-18
 - **Decision owners:** Anselme (@grumbach)
 - **Related:** ADR-0002 (audit), ADR-0008 (per-record pricing), ADR-0009 (audit families), ADR-0014 (file store)
@@ -98,16 +98,16 @@ re-checks under its lock, because a newer state can land while payment verifies.
 | Tamper with any byte | Signature over the whole body |
 | Swap the owner key | `A` is derived from it; the record no longer belongs at its address |
 | Store at someone else's address | Same |
-| Fork / equivocate at one counter | Total order on `(counter, target)` — every node picks the same one |
+| Fork / equivocate at one counter | Total order on `(counter, target)`: every node given the same records picks the same one, and a read merges the close group's answers rather than trusting the first. Convergence *across* the network still needs replication — see Not built |
 | Replay an older record | Loses on counter |
 | Re-sign one paid state N times | Equal state never replaces; nothing is written |
 | Pay once, jump the counter | Client updates must be `+1` |
-| Pay for a chunk to fund a pointer | Paid cache keyed by a typed `Chunk` vs `PointerState`, never by a raw 32-byte value a crafted chunk could occupy |
+| Pay for a chunk to fund a pointer | Paid cache keyed by a typed `Chunk` vs `Pointer` target, never a raw 32-byte value a crafted chunk could occupy. The quote signs only its content, not the record kind, so this is a cache defence rather than a cryptographic one |
 | Merkle proof with no issuer check | Refused for pointers; single-node proofs only |
 | Downgrade the format | `version` is signed and inside `state_id`; unknown versions are refused |
 | Unknown target kind | Carried, never interpreted — a node stores 33 opaque bytes |
-| Collide a pointer and a chunk address | Refused in both directions rather than resolved |
-| Mint an audit leaf for someone's key | Pointer leaves are refused at round 1 (see below) |
+| Collide a pointer and a chunk address | Refused in both directions. The two stores take separate locks, so simultaneous commits of both kinds at one address are not yet atomic |
+| Peer lies about storing a pointer | The client checks every acknowledgement names the address and state it sent, and stores on a quorum rather than stopping at the first success |
 
 ## Consequences
 
@@ -124,24 +124,27 @@ re-checks under its lock, because a newer state can land while payment verifies.
   correctly signed value and cannot tell.
 - Replicas may hold different valid signatures of one state; nothing compares
   record bytes across replicas.
-- The audit commitment leaf gains a record kind, bound by hashing pointer leaves
-  under their own domain, so a chunk leaf cannot be relabelled to escape the
-  `bytes_hash == key` guard. **Pointer leaves are refused at round 1** until
-  round 2 serves and validates a whole record: a peer signs its own commitment,
-  so it could otherwise name any key with the hash of cheap bytes it holds.
-  Refusing costs nothing today — commitment rotation reads the chunk store only.
+- Pointers do not take part in storage commitments or audits. The audit format
+  is untouched, so no protocol family is bumped and no rollout pauses. Auditing
+  them needs round 2 to serve a whole record — a peer signs its own commitment,
+  so without that it could name any key with the hash of cheap bytes it holds —
+  and that lands with replication.
 
 ## Implementation status
 
-Built: the record and wire messages (`ant-protocol`), the store with
-merge-on-put, request dispatch, payment routed at `state_id` with the close
-group of `A`, admission gates, cross-kind refusal, the kind-tagged audit leaf,
-and the client API.
+Built: the record and wire messages (`ant-protocol`); the store with
+merge-on-put; request dispatch; payment routed at `state_id` with the close
+group of `A`; admission gates; cross-kind refusal; and the client — create,
+update, quorum store, merged reads and chain resolution.
 
-Not built: replication does not yet carry `(A, state_id)` through fresh offers,
-sync hints, presence, repair and paid-list, so a pointer is not replicated
-version-aware; and audit round 2 does not yet serve a whole record, which is why
-pointer leaves are refused rather than trusted.
+**Not built: replication.** No node forwards a pointer to another, so the copies
+that exist are the ones the client wrote. That is the load-bearing gap: the
+merge rule guarantees nodes holding the same records agree, and nothing yet
+guarantees they hold the same records. Until it lands, availability and
+cross-network fork convergence are the client's doing, not the network's.
+
+Also not built: pointer participation in commitments and audits, which depends
+on the same work.
 
 ## Validation
 
@@ -153,6 +156,6 @@ pointer leaves are refused rather than trusted.
   and a wrap back to 0 — is refused as a non-successor.
 - All 256 `version` values give distinct paid identifiers.
 - Golden vectors pin the encoding, both identities and the signing context.
-- A relabelled audit leaf fails structural verification; a chunk-only commitment
-  root is bit-identical to before.
 - A crafted chunk cannot satisfy a pointer's paid-cache entry.
+- An acknowledgement naming a different address or state is refused, and a read
+  keeps the winner whatever order the replies arrive in.

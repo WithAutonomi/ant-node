@@ -41,7 +41,6 @@ use crate::replication::commitment::{
     commitment_hash, sign_commitment, verify_commitment_signature, CommitmentError, MerkleTree,
     StorageCommitment,
 };
-use crate::replication::subtree::LeafKind;
 
 /// Auditor-side per-peer commitment state.
 ///
@@ -183,27 +182,6 @@ impl BuiltCommitment {
         sender_public_key: &[u8],
     ) -> Result<Self, CommitmentError> {
         let tree = MerkleTree::build(entries)?;
-        Self::build_from_tree(tree, sender_peer_id, secret_key, sender_public_key)
-    }
-
-    /// Build over a mixed key set of chunks and pointers.
-    ///
-    /// A pointer's `bytes_hash` cannot equal its key, so its leaf is hashed
-    /// under a different domain; passing the kind is what lets the round-1
-    /// verifier tell the two apart without letting a peer claim a pointer's
-    /// exemption for a chunk. A key set containing only chunks produces exactly
-    /// the root [`Self::build`] produces.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::build`].
-    pub fn build_of_kinds(
-        entries: Vec<(XorName, [u8; 32], LeafKind)>,
-        sender_peer_id: &[u8; 32],
-        secret_key: &MlDsaSecretKey,
-        sender_public_key: &[u8],
-    ) -> Result<Self, CommitmentError> {
-        let tree = MerkleTree::build_of_kinds(entries)?;
         Self::build_from_tree(tree, sender_peer_id, secret_key, sender_public_key)
     }
 
