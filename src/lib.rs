@@ -81,8 +81,7 @@ pub use event::{NodeEvent, NodeEventsChannel};
 pub use node::{NodeBuilder, RunningNode};
 pub use payment::{PaymentStatus, PaymentVerifier, PaymentVerifierConfig};
 pub use pointer::{
-    Pointer, PointerState, PointerStore, PointerTarget, PointerTargetKind, Prepared, PreparedPut,
-    PutOutcome,
+    Inspected, Pointer, PointerState, PointerStore, PointerTarget, PointerTargetKind, PutOutcome,
 };
 pub use replication::{config::ReplicationConfig, ReplicationEngine};
 pub use storage::{AntProtocol, ChunkStore, ChunkStoreConfig, LmdbStorage, LmdbStorageConfig};

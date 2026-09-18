@@ -59,4 +59,4 @@ pub use ant_protocol::pointer::{
     POINTER_BODY_LEN, POINTER_FORMAT_VERSION, POINTER_WIRE_LEN, TARGET_WIRE_LEN,
 };
 pub use service::PointerService;
-pub use store::{PointerStore, Prepared, PreparedPut, PutOutcome};
+pub use store::{Inspected, PointerStore, PutOutcome};

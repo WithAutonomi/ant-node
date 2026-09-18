@@ -30,8 +30,7 @@ use crate::replication::protocol::{
 };
 use crate::replication::recent_provers::RecentProvers;
 use crate::replication::subtree::{
-    select_subtree_path, subtree_plan, verify_subtree_proof, LeafKind, StructureVerdict,
-    SubtreeProof,
+    select_subtree_path, subtree_plan, verify_subtree_proof, StructureVerdict, SubtreeProof,
 };
 use crate::replication::types::{AuditFailureReason, AuditFailureSummary, FailureEvidence};
 use crate::storage::ChunkStore;
@@ -727,25 +726,6 @@ pub(crate) fn evaluate_subtree_structure(
     if proof.leaves.iter().any(|l| l.bytes_hash != l.key) {
         return Err(AuditFailureReason::DigestMismatch);
     }
-
-    // Pointer leaves are refused outright, not merely denied credit.
-    //
-    // The kind is bound by the leaf hash, so a peer cannot relabel a chunk leaf
-    // as a pointer to escape the guard above. What it *can* still do is sign a
-    // commitment of its own naming any key with the hash of cheap bytes it
-    // really holds: a pointer's key derives from its owner, not its bytes, so
-    // round 1 has nothing to check it against, and round 2 authenticates the
-    // served block against that same peer-chosen `bytes_hash`. Such a proof
-    // would pass, and a pass clears bootstrap state and earns trust even with
-    // holder credit withheld.
-    //
-    // Admitting them safely needs round 2 to serve the whole record and the
-    // auditor to verify its signature and derived address. Until that exists,
-    // refusing costs nothing: commitment rotation builds from the chunk store
-    // alone, so no honest proof carries a pointer leaf.
-    if proof.leaves.iter().any(|l| l.kind != LeafKind::Chunk) {
-        return Err(AuditFailureReason::DigestMismatch);
-    }
     Ok(())
 }
 
@@ -974,40 +954,6 @@ pub(crate) fn verify_slice_response(
     AuditVerdict::Pass { checked }
 }
 
-/// Credit a peer as a proven holder of the leaves its passing proof covers.
-///
-/// A **chunk** leaf is credited on the strength of round 1 alone: round 1
-/// enforces `bytes_hash == key` there, so a peer cannot commit a chunk leaf for
-/// a key whose bytes it does not have.
-///
-/// A **pointer** leaf earns **nothing**, sampled or not. Its address is a
-/// function of its owner key rather than of its bytes, so round 1 cannot bind
-/// the two — and round 2 does not close the gap either, because it authenticates
-/// the served block against the leaf's own `bytes_hash`, which the peer chose.
-/// A peer can therefore sign a one-leaf commitment naming any key `K` with the
-/// hash of cheap bytes it really holds, be sampled (the sole leaf always is),
-/// pass, and be credited as a holder of `K`. Sampling does not help: the bytes
-/// are attacker-chosen either way.
-///
-/// Closing this needs round 2 to serve the **whole record** and the auditor to
-/// parse it, check its signature and that its owner derives `K`. Until that
-/// exists, no credit is the only sound answer — and it costs nothing today,
-/// because production commitments are still built from the chunk store alone.
-async fn credit_proven_holder(
-    credit: &AuditCredit<'_>,
-    proof: &SubtreeProof,
-    challenged_peer: &PeerId,
-    pin: [u8; 32],
-) {
-    let now = std::time::Instant::now();
-    let mut provers = credit.recent_provers.write().await;
-    for leaf in &proof.leaves {
-        if leaf.kind == LeafKind::Chunk {
-            provers.record_proof(leaf.key, *challenged_peer, pin, now);
-        }
-    }
-}
-
 /// Verify a subtree-proof response (auditor side), ADR-0002 two-round audit.
 ///
 /// **Round 1** (this proof): pin + identity + signature + structure. If the
@@ -1144,7 +1090,11 @@ async fn verify_subtree_response(
             observe_closeness(ctx.p2p_node, ctx.config, challenged_peer, proof).await;
             // Credit the peer as a proven holder of its committed keys.
             if let (Some(credit), Some(pin)) = (ctx.credit, commitment_hash(commitment)) {
-                credit_proven_holder(credit, proof, challenged_peer, pin).await;
+                let now = std::time::Instant::now();
+                let mut provers = credit.recent_provers.write().await;
+                for leaf in &proof.leaves {
+                    provers.record_proof(leaf.key, *challenged_peer, pin, now);
+                }
             }
             info!(
                 "Audit: peer {challenged_peer} passed subtree audit ({} leaves, {checked} \
@@ -1829,7 +1779,7 @@ async fn serve_committed_key_openings(
 mod tests {
     use super::*;
     use crate::replication::commitment_state::BuiltCommitment;
-    use crate::replication::subtree::{build_subtree_proof, LeafKind, SubtreeLeaf};
+    use crate::replication::subtree::{build_subtree_proof, SubtreeLeaf};
     use saorsa_pqc::api::sig::ml_dsa_65;
     use std::time::Instant;
 
@@ -2026,7 +1976,6 @@ mod tests {
     #[test]
     fn verify_slice_response_rejects_malformed_item_sets() {
         let leaf = |k: XorName| SubtreeLeaf {
-            kind: LeafKind::Chunk,
             key: k,
             bytes_hash: [0u8; 32],
             content_len: 0,
@@ -2558,7 +2507,6 @@ mod tests {
     #[test]
     fn subtree_leaf_is_constructible() {
         let _l = SubtreeLeaf {
-            kind: LeafKind::Chunk,
             key: key(1),
             bytes_hash: [0u8; 32],
             content_len: 0,

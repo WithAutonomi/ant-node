@@ -10,30 +10,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub use super::quote::XorName;
+pub use super::verifier::PaymentTarget as PaidKey;
 
 /// Default cache capacity (100,000 entries = 3.2MB memory).
 const DEFAULT_CACHE_CAPACITY: usize = 100_000;
-
-/// What a cache entry is about.
-///
-/// A typed key, not a hashed one. Hashing a pointer's two addresses back into
-/// 32 bytes would not create a separate namespace: a chunk's address is
-/// `BLAKE3(content)`, so a client could store a chunk whose *content* is
-/// exactly that preimage and land on the same key — paying chunk price for a
-/// pointer update, and skipping issuer proximity, the price floor and the
-/// proof-shape rule with it. Distinct variants cannot collide at all.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum PaidKey {
-    /// A chunk, paid for and stored at one address.
-    Chunk(XorName),
-    /// A pointer state: routed at the pointer's address, paid at its `state_id`.
-    PointerState {
-        /// The pointer's address, stable for its life.
-        routing: XorName,
-        /// The state paid for, which changes with every update.
-        state_id: XorName,
-    },
-}
 
 /// LRU cache for verified `XorName` values.
 ///
