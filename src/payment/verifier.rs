@@ -448,36 +448,6 @@ pub struct PaymentVerifierConfig {
     pub price_floor: PriceFloorConfig,
 }
 
-/// The fresh admission path a payment proof is being verified for.
-///
-/// - **`ClientPut`** — the node is admitting a chunk store from a direct
-///   client PUT. The verifier applies store-strength cache semantics and live
-///   payment checks.
-/// - **`FreshReplication`** — the node is admitting a chunk store via the
-///   immediate fresh-write fan-out. The receiver is about to store the newly
-///   written chunk as if the client PUT it there directly, so this context is
-///   verified EXACTLY like `ClientPut` (store-strength cache semantics, same
-///   live checks, same price-floor policy). It exists as a separate variant so
-///   price-floor telemetry can distinguish direct ingress from fan-out — the
-///   two paths can legitimately diverge during commitment rotation, and the
-///   floor policy for fan-out must be tunable from observed data without
-///   touching direct-PUT behaviour.
-/// - **`PaidListAdmission`** — the node is admitting fresh paid-list metadata.
-///   It runs the same live payment checks, but writes a weaker cache entry
-///   that does not authorize future chunk stores. The price floor never
-///   applies here: paid-list records reprice no fresh economic decision.
-///
-/// The caller must check local receiver/admission membership before invoking
-/// the verifier for replication admission: fresh chunk replication requires
-/// local close-group responsibility, and fresh paid-list replication requires
-/// local paid-list close-group membership. Direct client PUT deliberately does
-/// not perform a receiver-responsibility gate. The verifier itself only checks
-/// payment proof validity and that the paid quote's issuer is in the K closest
-/// peers for the quoted chunk address.
-///
-/// Later neighbour-sync repair does not include proof-of-payment bytes and
-/// does not call this verifier. It authorizes repair from network evidence:
-/// majority storage among the configured close group, or majority paid-list
 /// What a payment authorizes, and where it routes.
 ///
 /// One typed value doing both jobs. A chunk pays for its own address; a pointer
@@ -537,7 +507,37 @@ impl PaymentTarget {
     }
 }
 
-/// What a payment verification is admitting.
+/// The fresh admission path a payment proof is being verified for.
+///
+/// - **`ClientPut`** — the node is admitting a chunk store from a direct
+///   client PUT. The verifier applies store-strength cache semantics and live
+///   payment checks.
+/// - **`FreshReplication`** — the node is admitting a chunk store via the
+///   immediate fresh-write fan-out. The receiver is about to store the newly
+///   written chunk as if the client PUT it there directly, so this context is
+///   verified EXACTLY like `ClientPut` (store-strength cache semantics, same
+///   live checks, same price-floor policy). It exists as a separate variant so
+///   price-floor telemetry can distinguish direct ingress from fan-out — the
+///   two paths can legitimately diverge during commitment rotation, and the
+///   floor policy for fan-out must be tunable from observed data without
+///   touching direct-PUT behaviour.
+/// - **`PaidListAdmission`** — the node is admitting fresh paid-list metadata.
+///   It runs the same live payment checks, but writes a weaker cache entry
+///   that does not authorize future chunk stores. The price floor never
+///   applies here: paid-list records reprice no fresh economic decision.
+///
+/// The caller must check local receiver/admission membership before invoking
+/// the verifier for replication admission: fresh chunk replication requires
+/// local close-group responsibility, and fresh paid-list replication requires
+/// local paid-list close-group membership. Direct client PUT deliberately does
+/// not perform a receiver-responsibility gate. The verifier itself only checks
+/// payment proof validity and that the paid quote's issuer is in the K closest
+/// peers for the quoted chunk address.
+///
+/// Later neighbour-sync repair does not include proof-of-payment bytes and
+/// does not call this verifier. It authorizes repair from network evidence:
+/// majority storage among the configured close group, or majority paid-list
+/// membership among the closest K.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerificationContext {
     /// The node is admitting a chunk store from a direct client PUT, with
