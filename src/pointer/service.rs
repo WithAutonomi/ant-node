@@ -408,6 +408,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_nodes_given_the_same_states_in_opposite_orders_agree() {
+        // The convergence property, driven through the request handler rather
+        // than the store. The gate in front of the merge rule is part of the
+        // production path, and a gate that admits records by arrival order
+        // would leave these two nodes holding different records for ever --
+        // which is the fork the merge rule exists to prevent.
+        let (first_node, _a) = service().await;
+        let (second_node, _b) = service().await;
+
+        // Two separately paid states at one counter. The merge rule says the
+        // smaller target wins, whichever arrives first.
+        let loser = signed(1, 0, 9);
+        let winner = signed(1, 0, 1);
+        assert!(winner.replaces(&loser));
+
+        for record in [&loser, &winner] {
+            first_node.handle_put(put(record)).await;
+        }
+        for record in [&winner, &loser] {
+            second_node.handle_put(put(record)).await;
+        }
+
+        for (name, node) in [("first", &first_node), ("second", &second_node)] {
+            match node
+                .handle_get(PointerGetRequest::new(winner.address()))
+                .await
+            {
+                PointerGetResponse::Success { record: bytes } => assert_eq!(
+                    Pointer::from_bytes(&bytes).expect("parse").state_id(),
+                    winner.state_id(),
+                    "the {name} node kept the wrong record"
+                ),
+                other => panic!("expected the winner, got {other:?}"),
+            }
+        }
+
+        // And the node that already had the winner refused to go back.
+        assert!(matches!(
+            second_node.handle_put(put(&loser)).await,
+            PointerPutResponse::Stale { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_counter_jump_is_still_refused_after_a_tie_break() {
+        // Taking a tie-break winner must not loosen the increment rule: the
+        // counter has not moved, so the next state is still exactly one on.
+        let (service, _dir) = service().await;
+        service.handle_put(put(&signed(1, 0, 9))).await;
+        assert!(matches!(
+            service.handle_put(put(&signed(1, 0, 1))).await,
+            PointerPutResponse::Success { .. }
+        ));
+        assert!(matches!(
+            service.handle_put(put(&signed(1, 7, 1))).await,
+            PointerPutResponse::PaymentRequired { .. }
+        ));
+        assert!(matches!(
+            service.handle_put(put(&signed(1, 1, 1))).await,
+            PointerPutResponse::Success { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn re_submitting_a_held_state_is_unchanged_not_success() {
         // A client that retries must be able to tell "your update landed" from
         // "you paid for something already stored".

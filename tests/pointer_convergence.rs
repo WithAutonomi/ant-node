@@ -389,7 +389,7 @@ fn the_wire_format_is_what_the_adr_says() {
     assert_ne!(
         record.address(),
         *prefixed.finalize().as_bytes(),
-        "the address must not be reachable as a plain hash"
+        "the prefix construction must not still produce the address"
     );
 
     // The signature verifies over the body under the literal context, and does

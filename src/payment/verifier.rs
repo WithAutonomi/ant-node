@@ -3743,8 +3743,8 @@ mod tests {
     /// pay for that pointer's update.
     ///
     /// Reaching a pointer's `state_id` with a chunk now takes a BLAKE3
-    /// collision across two modes — it is a `derive_key` output, and a chunk
-    /// address is a plain hash. This is the second line: were the two ever to
+    /// preimage under one BLAKE3 mode for an output of the other — it is a
+    /// `derive_key` output, and a chunk address is a plain hash. This is the second line: were the two ever to
     /// meet at one value, filing both "already paid" entries under it would let
     /// chunk price buy a pointer update, skipping issuer proximity, the price
     /// floor and the proof-shape rule with it. The typed key holds whatever the
