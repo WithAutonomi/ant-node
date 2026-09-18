@@ -124,7 +124,7 @@ thread, so a flood of arrivals cannot occupy the runtime's workers.
 | Peer lies about storing a pointer | Every acknowledgement must name the address and state the client sent. A read asks the same group by the same definition, so the quorums intersect — though each does its own lookup, so churn between them is not covered |
 | One peer decides what a pointer says | A read returns a state only if two of the answering peers name it, and a write must reach a majority **plus one** so that two always do. Otherwise a single close-group peer serving an owner-signed state nobody paid to store would be believed by every reader: the record verifies, belongs at the address, and wins the merge. It cannot make a second peer agree. The read counts each state separately, so a state one peer names cannot bury the one the rest agree on — that would be denial of service in place of forgery, and it is also what an ordinary read during an update looks like |
 | Two peers decide it | **Not defended against.** Two colluding close-group peers clear the bar, and only the owner can sign, so what this buys is the owner's own updates unpaid. Raising the bar only raises the number of nodes to grind: both the pointer's address and a node's id are choosable, so an owner determined to sit beside their own pointer can reach any fixed threshold. What actually answers it is replication and audits, neither of which is built |
-| Node claims a record it no longer holds | An index entry is only a claim about a file. Before answering "unchanged" or "stale" the node reads the record back and checks it is still the one the index names; if it is not, the node stops answering for that address and the arrival becomes a repair. It keeps what it lost, because an address nothing is known about admits only a counter 0 record, and a loss above that would otherwise be permanent |
+| Node claims a record it no longer holds | An index entry is only a claim about a file. Before answering "unchanged" or "stale" the node reads the record back and checks it is still the one the index names; if it is not, the node stops answering for that address and the arrival becomes a repair. It keeps what it lost, because an address nothing is known about admits only a counter 0 record, and a loss above that would otherwise be permanent. That check parses the body, so a signature corrupted in place passes it and is caught on the next read instead — verifying there would put ML-DSA in front of the payment gate, which is the one place it must not be |
 
 ## Consequences
 
@@ -200,6 +200,9 @@ on the same work.
 - A resubmission repairs a record whose file the disk lost — at any counter,
   not just at creation — rather than being acknowledged as unchanged. A file
   swapped for a different valid record is not answered for either.
+- Two nodes given the same two paid states in opposite orders keep the same
+  record, through the request handler and its admission gate rather than the
+  store alone.
 - The chunk preimages the old prefix construction handed out no longer land on
   either identity. (No test can say more: that no content does is the preimage
   assumption, not a property one can check.)

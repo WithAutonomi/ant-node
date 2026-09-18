@@ -863,7 +863,7 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "2.5.0"
-source = "git+https://github.com/WithAutonomi/ant-protocol?branch=feat/pointers-immutable-owner#070c71d406c81476bd8b05bbab92a0d2d7e5d22b"
+source = "git+https://github.com/WithAutonomi/ant-protocol?branch=feat/pointers-immutable-owner#2edbe4265d2949e30b4cf1ae32d3e8ebafaf400c"
 dependencies = [
  "blake3",
  "bytes",
@@ -6330,7 +6330,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

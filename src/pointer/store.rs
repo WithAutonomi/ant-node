@@ -322,10 +322,19 @@ impl PointerStore {
 
     /// Read the record held at `address`, if any.
     ///
-    /// Re-validates on the way out, so a file corrupted under the node is
-    /// reported as missing rather than served as authentic — and the index
-    /// entry for it is dropped, so the node will accept a fresh copy of that
-    /// state instead of answering "unchanged" to its own repair.
+    /// Re-validates on the way out: the signature is checked and the record
+    /// must belong at the address asked for, so a file corrupted under the node
+    /// is reported as missing rather than served as authentic, and the entry is
+    /// disowned so the node will take a fresh copy instead of answering
+    /// "unchanged" to its own repair.
+    ///
+    /// The file is what is served, not the index. A file replaced under the
+    /// node by a *different* record that is genuinely signed for this address
+    /// is served as held — it is a real record, the reader verifies it, and the
+    /// read quorum is what decides between replicas that disagree. What the
+    /// index is not allowed to do is claim a state the file does not have —
+    /// that check guards [`Self::inspect`]'s two early answers, the ones that
+    /// assert this node already holds something.
     ///
     /// # Errors
     ///
@@ -389,12 +398,15 @@ impl PointerStore {
             .map(|entry| entry.state.state_id)
     }
 
-    /// Whether `state` is the paid successor of what is held.
+    /// Whether `state` is a paid update of what is held.
     ///
     /// One payment buys one increment: a new pointer starts at counter 0, and
-    /// an update must be exactly one past what this node holds. Without it an
-    /// owner pays once, jumps the counter, skips every intermediate payment and
-    /// strands the pointer at a counter nothing can advance.
+    /// an update either advances the counter by one or wins the target
+    /// tie-break at the counter already held. Without the bound an owner pays
+    /// once, jumps the counter, skips every intermediate payment and strands
+    /// the pointer where nothing can advance it; without the tie-break, two
+    /// separately paid states at one counter would leave every node holding
+    /// whichever reached it first.
     ///
     /// Only the client path asks this. Replication uses the merge rule instead,
     /// so a replica that missed an update can still catch up rather than being
@@ -413,7 +425,7 @@ impl PointerStore {
             || state.is_genesis(),
             |entry| {
                 if entry.on_disk {
-                    state.is_successor_of(&entry.state)
+                    state.is_paid_update_of(&entry.state)
                 } else {
                     state.state_id == entry.state.state_id || state.replaces(&entry.state)
                 }
@@ -461,7 +473,11 @@ impl PointerStore {
     ///
     /// Only the structure is parsed: these bytes verified when they were
     /// committed, and the question here is what is held, not whether it is
-    /// authentic. A failed check disowns the entry, so the arrival that found
+    /// authentic. Corruption inside the signature therefore passes here — the
+    /// state is read from the body — and is caught by [`Self::get`], which
+    /// verifies and disowns. Checking it here instead would put an ML-DSA
+    /// verification in front of the payment gate, which is the one place it
+    /// must not be. A failed check disowns the entry, so the arrival that found
     /// it becomes a repair.
     fn held_state(&self, address: &XorName) -> Option<PointerState> {
         let entry = self.snapshot(address).filter(|entry| entry.on_disk)?;
