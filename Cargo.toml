@@ -42,7 +42,7 @@ mimalloc = "0.1"
 # Pinned to the ant-protocol main commit that merged the settlement wire
 # types (WithAutonomi/ant-protocol#25). Swap back to a published version pin
 # once the release train publishes them.
-# Pointers (ADR-0016) add the `Pointer` record and its wire messages to
+# Pointers (ADR-0015) add the `Pointer` record and its wire messages to
 # ant-protocol. Tracked by branch until that PR lands and a version is cut.
 ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", branch = "feat/pointers-immutable-owner" }
 
