@@ -8,18 +8,20 @@
 //!
 //! # The shape of a write
 //!
-//! A put is two steps, because the payment check sits between them:
+//! A put is three steps, because the caller's gates sit between them:
 //!
-//! 1. [`PointerStore::prepare`] parses, compares against what is held and, only
-//!    if the arrival could win, verifies its signature. It returns either a
-//!    no-op outcome or a [`PreparedPut`].
-//! 2. The caller verifies payment against the candidate's address and state
-//!    identifier, then calls [`PointerStore::commit`].
+//! 1. [`PointerStore::inspect`] parses and compares against what is held: the
+//!    arrival is either unchanged, stale, or a candidate that would win.
+//! 2. [`PointerStore::verify`] checks the candidate's signature — after the
+//!    caller's admission gates, and before it verifies payment.
+//! 3. [`PointerStore::commit`] writes it.
 //!
-//! Signature verification happens in step 1 **outside** any store lock, so a
-//! flood of unpaid candidates cannot block every other address behind one
-//! ML-DSA check. Step 2 re-checks under the lock, because the world may have
-//! moved while payment was being verified.
+//! Nothing cheap happens after something expensive: a resubmission of what is
+//! held is refused before any signature check, so repeatedly submitting one
+//! paid state buys no ML-DSA verifications. Step 2 runs **outside** any store
+//! lock, so a flood of unpaid candidates cannot block every other address
+//! behind one verification, and step 3 re-checks under the lock, because the
+//! world may have moved while payment was being verified.
 //!
 //! # Atomicity
 //!
@@ -95,9 +97,12 @@ impl PutOutcome {
 /// signature has been checked.
 #[derive(Debug)]
 pub enum Inspected {
-    /// The arrival cannot change what is held. No signature check is owed, and
-    /// none was done.
-    Noop(PutOutcome),
+    /// The node already holds exactly this state. No signature check is owed:
+    /// a resubmission of what was paid for and a forgery of it are the same
+    /// no-op.
+    Unchanged(PointerState),
+    /// The arrival loses to what is held, so it changes nothing either.
+    Stale(PointerState),
     /// The arrival would win as it stands. Its signature has **not** been
     /// checked yet — pass it to [`PointerStore::verify`] once admission gates
     /// have had their say.
@@ -253,10 +258,10 @@ impl PointerStore {
             .filter(|_| self.reread(&state.address))
         {
             if entry.state.state_id == state.state_id {
-                return Ok(Inspected::Noop(PutOutcome::Unchanged));
+                return Ok(Inspected::Unchanged(state));
             }
             if !state.replaces(&entry.state) {
-                return Ok(Inspected::Noop(PutOutcome::Stale));
+                return Ok(Inspected::Stale(state));
             }
         }
         Ok(Inspected::Candidate(parsed))
@@ -308,7 +313,8 @@ impl PointerStore {
     /// As [`Self::inspect`], [`Self::verify`] and [`Self::commit`].
     pub async fn put_bytes(&self, bytes: &[u8]) -> Result<PutOutcome> {
         match self.inspect(bytes)? {
-            Inspected::Noop(outcome) => Ok(outcome),
+            Inspected::Unchanged(_) => Ok(PutOutcome::Unchanged),
+            Inspected::Stale(_) => Ok(PutOutcome::Stale),
             Inspected::Candidate(parsed) => {
                 let record = self.verify(parsed).await?;
                 self.commit(record).await
@@ -757,6 +763,7 @@ fn sync_directory(dir: &Path) -> Result<()> {
 )]
 mod tests {
     use super::*;
+    use std::future::Future;
     use ant_protocol::pointer::{PointerTarget, PointerTargetKind, POINTER_BODY_LEN};
     use saorsa_pqc::api::sig::{ml_dsa_65, MlDsaPublicKey, MlDsaSecretKey};
 
@@ -937,12 +944,12 @@ mod tests {
         store.put_bytes(&held.to_bytes()).await.expect("put");
 
         match store.inspect(&held.to_bytes()).expect("inspect") {
-            Inspected::Noop(outcome) => assert_eq!(outcome, PutOutcome::Unchanged),
-            Inspected::Candidate(_) => panic!("an identical state is not a candidate"),
+            Inspected::Unchanged(_) => (),
+            other => panic!("an identical state is not a candidate, got {other:?}"),
         }
         match store.inspect(&signed(1, 1, 6).to_bytes()).expect("inspect") {
-            Inspected::Noop(outcome) => assert_eq!(outcome, PutOutcome::Stale),
-            Inspected::Candidate(_) => panic!("a stale record is not a candidate"),
+            Inspected::Stale(_) => (),
+            other => panic!("a stale record is not a candidate, got {other:?}"),
         }
     }
 
@@ -1114,7 +1121,7 @@ mod tests {
     async fn verified(store: &PointerStore, record: &Pointer) -> Pointer {
         match store.inspect(&record.to_bytes()).expect("inspect") {
             Inspected::Candidate(parsed) => store.verify(parsed).await.expect("verify"),
-            Inspected::Noop(outcome) => panic!("expected a candidate, got {outcome:?}"),
+            other => panic!("expected a candidate, got {other:?}"),
         }
     }
 
@@ -1216,16 +1223,20 @@ mod tests {
         let record = signed(1, 3, 3);
         let prepared = verified(&store, &record).await;
 
-        let abandoned = {
+        {
             let committing = store.commit(prepared);
             tokio::pin!(committing);
-            // Poll once, then abandon it. If it happened to finish inside the
-            // timeout there was no cancellation to test, and the assertion
-            // below still has to hold.
-            tokio::time::timeout(std::time::Duration::from_nanos(1), &mut committing)
-                .await
-                .is_err()
-        };
+            // Poll exactly once, then drop. That first poll hands the write to
+            // a blocking thread and returns `Pending`, so the caller is always
+            // abandoned mid-commit. A timeout would not be: on a fast machine
+            // the commit finishes inside any timeout and the test then proves
+            // nothing, which is how this failed on CI and passed locally.
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(
+                committing.as_mut().poll(&mut cx).is_pending(),
+                "the first poll must hand the write to a blocking task, not finish it"
+            );
+        }
 
         // Wait for the detached task to settle rather than guessing at a
         // duration: poll until the disk and the index agree and stop changing.
@@ -1243,12 +1254,7 @@ mod tests {
         let indexed = store.contains(&record.address());
         assert_eq!(
             on_disk, indexed,
-            "the index and the disk must agree however the commit was interrupted \
-             (caller was cancelled: {abandoned})"
-        );
-        assert!(
-            abandoned,
-            "the caller must actually have been cancelled, or this proves nothing"
+            "the index and the disk must agree however the commit was interrupted"
         );
         assert!(
             settled,
