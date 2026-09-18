@@ -127,32 +127,19 @@ impl PointerService {
         // serve is rejected by the gates below without buying an ML-DSA
         // verification.
         let parsed = match self.store.inspect(&request.record) {
-            Ok(Inspected::Noop(PutOutcome::Unchanged)) => {
-                return match Self::state_of(&request.record) {
-                    Some((address, state_id)) => {
-                        PointerPutResponse::Unchanged { address, state_id }
-                    }
-                    None => PointerPutResponse::Error(ProtocolError::Internal(
-                        "pointer parsed then failed to re-parse".to_string(),
-                    )),
+            Ok(Inspected::Unchanged(state)) => {
+                return PointerPutResponse::Unchanged {
+                    address: state.address,
+                    state_id: state.state_id,
                 };
             }
-            Ok(Inspected::Noop(PutOutcome::Stale)) => {
-                let Some((address, _)) = Self::state_of(&request.record) else {
-                    return PointerPutResponse::Error(ProtocolError::Internal(
-                        "pointer parsed then failed to re-parse".to_string(),
-                    ));
-                };
-                let held = self.store.state_id(&address).unwrap_or_default();
+            Ok(Inspected::Stale(state)) => {
+                // The state named is the one this node keeps, not the one that
+                // arrived: it is what the sender needs in order to catch up.
                 return PointerPutResponse::Stale {
-                    address,
-                    state_id: held,
+                    address: state.address,
+                    state_id: self.store.state_id(&state.address).unwrap_or_default(),
                 };
-            }
-            Ok(Inspected::Noop(other)) => {
-                return PointerPutResponse::Error(ProtocolError::Internal(format!(
-                    "unexpected no-op outcome {other:?}"
-                )));
             }
             Ok(Inspected::Candidate(parsed)) => parsed,
             Err(e) => {
@@ -306,13 +293,6 @@ impl PointerService {
         payments
             .verify_pointer_payment(&routing_address, &paid_content, proof)
             .await
-    }
-
-    /// Re-read the address and state a record claims, for a response.
-    fn state_of(record: &[u8]) -> Option<(XorName, XorName)> {
-        ant_protocol::pointer::PointerState::parse(record)
-            .ok()
-            .map(|state| (state.address, state.state_id))
     }
 }
 
