@@ -487,9 +487,10 @@ pub struct PaymentVerifierConfig {
 /// This is also the paid-cache key, and being an enum is what makes that safe:
 /// a raw 32-byte key would file both kinds under one value, so anything that
 /// put a chunk on a pointer's identifier would buy the pointer's update at
-/// chunk price. `state_id` is a `derive_key` output, which no chunk address can
-/// reach, so that now takes a BLAKE3 collision — and distinct variants cannot
-/// collide however the bytes are chosen, so the cache does not depend on it.
+/// chunk price. `state_id` is a `derive_key` output, so putting a chunk on one
+/// is a preimage problem rather than a string anyone can write down — and
+/// distinct variants cannot collide however the bytes are chosen, so the cache
+/// does not rest on that assumption either.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum PaymentTarget {
     /// A chunk: paid for and stored at one address.
@@ -3726,8 +3727,8 @@ mod tests {
     /// address is a plain hash. This is the second line: were the two ever to
     /// meet at one value, filing both "already paid" entries under it would let
     /// chunk price buy a pointer update, skipping issuer proximity, the price
-    /// floor and the proof-shape rule with it. The typed key does not depend on
-    /// the addresses being unreachable from each other.
+    /// floor and the proof-shape rule with it. The typed key holds whatever the
+    /// two hash modes do.
     #[test]
     fn a_chunk_cannot_pay_for_a_pointer_that_shares_its_address() {
         let state_id: XorName = [0x5Au8; 32];

@@ -30,8 +30,8 @@
 //! addressed by a plain hash of its content, so a prefix would put both of
 //! these inside the chunk address space for anyone who could write the
 //! preimage — squatting an address before its owner used it, or buying a
-//! pointer and a chunk with one payment. Nothing rules out a collision between
-//! the two modes, but nothing produces one either.
+//! pointer and a chunk with one payment. The two modes still share a 32-byte
+//! range; what changed is that crossing it is a preimage problem.
 //!
 //! They are separate because `A` must be stable for the pointer's life while
 //! the paid identifier must change with every update, or updates after the
