@@ -23,8 +23,15 @@
 //!
 //! | Name | Derivation | Job |
 //! |---|---|---|
-//! | `A` | `BLAKE3(domain \|\| owner)` | routes, and decides which nodes are responsible |
-//! | `state_id` | `BLAKE3(domain \|\| body)` | names the state, and is what a quote is paid against |
+//! | `A` | `derive_key("autonomi.pointer.address.v1", owner)` | routes, and decides which nodes are responsible |
+//! | `state_id` | `derive_key("autonomi.pointer.state.v1", body)` | names the state, and is what a quote is paid against |
+//!
+//! BLAKE3's derive-key mode, not a hash of a prefix and the input. A chunk is
+//! addressed by a plain hash of its content, so a prefix would put both of
+//! these inside the chunk address space for anyone who could write the
+//! preimage — squatting an address before its owner used it, or buying a
+//! pointer and a chunk with one payment. Nothing rules out a collision between
+//! the two modes, but nothing produces one either.
 //!
 //! They are separate because `A` must be stable for the pointer's life while
 //! the paid identifier must change with every update, or updates after the

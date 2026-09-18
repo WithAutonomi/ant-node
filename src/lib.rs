@@ -20,7 +20,7 @@
 //! Two data types:
 //! - **Chunk**: Immutable content-addressed data (hash(value) == key)
 //! - **Pointer**: A paid mutable reference signed by an immutable owner, stored
-//!   at `BLAKE3(domain || owner_key)` (see [`mod@pointer`] and ADR-0015)
+//!   at an address derived from the owner key (see [`mod@pointer`] and ADR-0015)
 //!
 //! ## Example
 //!

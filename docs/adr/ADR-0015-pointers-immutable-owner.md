@@ -34,8 +34,8 @@ pub struct Pointer {          // 5,303 bytes
 Five fields and nothing else — no cached bytes, no cached identifiers. Encoding
 is fixed-width, big-endian and hand-rolled with no serde, so there is exactly
 one byte sequence for a record and re-encoding is always identical to what was
-signed. The address and `state_id` are hashes of fields already present, so they
-are computed rather than stored.
+signed. The address and `state_id` are derived from fields
+already present, so they are computed rather than stored.
 
 The key is carried because it has to be: ML-DSA has no key recovery and a
 1,952-byte key cannot be a 32-byte address. That is the whole reason a pointer
@@ -54,7 +54,10 @@ prefix separates nothing: a chunk holding the prefix and an owner key would land
 on exactly that owner's address, letting anyone squat an address before its
 owner used it, and — since `state_id` is what a pointer's storage is paid
 against — letting one settled quote buy both a pointer and a chunk. Derive-key
-is a different function, so no content hashes into either space.
+is a different BLAKE3 mode, so neither identity is reachable from any content a
+chunk could hold. The two spaces are both 32 bytes and nothing proves them
+disjoint; what changed is that landing on one now takes a collision rather than
+a preimage anyone can write down.
 
 **Public-key addressed and self-verifying.** `A` is a pure function of the owner
 key, and the key is in the record, so a node validates a pointer from its own
@@ -94,8 +97,12 @@ length → version → structure → compare with held → admission → signatu
 
 Cheap first. A resubmission of what is held is refused before any signature
 check. Admission (capacity, responsibility for `A`) precedes the signature, so a
-forged record for someone else's address buys no cryptography. The commit
-re-checks under its lock, because a newer state can land while payment verifies.
+forged record for someone else's address buys no cryptography. "Compare with
+held" reads the held record back rather than trusting the index, so no answer
+describes a record the node cannot serve. The commit re-checks under its lock,
+because a newer state can land while payment verifies. Every step off the async
+executor: the read, the signature check and the write each run on a blocking
+thread, so a flood of arrivals cannot occupy the runtime's workers.
 
 ## What this defends against
 
@@ -113,7 +120,8 @@ re-checks under its lock, because a newer state can land while payment verifies.
 | Downgrade the format | `version` is signed and inside `state_id`; unknown versions are refused |
 | Unknown target kind | Carried, never interpreted — a node stores 33 opaque bytes |
 | Collide a pointer and a chunk address | Only a genuine BLAKE3 collision can produce one, and it is refused in both directions anyway. The two stores take separate locks, so simultaneous commits of both kinds at one address are not yet atomic |
-| Peer lies about storing a pointer | Every acknowledgement must name the address and state the client sent, and a write needs a majority of the close group. A read asks the same group by the same definition, so the two quorums intersect — though each does its own lookup, so churn between them is not covered. A majority of dishonest peers is not defended against at all: there is no storage receipt beyond quorum |
+| Peer lies about storing a pointer | Every acknowledgement must name the address and state the client sent. A read asks the same group by the same definition, so the quorums intersect — though each does its own lookup, so churn between them is not covered |
+| One peer decides what a pointer says | A read returns a state only if two of the answering peers name it, and a write must reach a majority **plus one** so that two always do. Otherwise a single close-group peer serving an owner-signed state nobody paid to store would be believed by every reader: the record verifies, belongs at the address, and wins the merge. It cannot make a second peer agree. A dishonest *majority* is not defended against: there is no storage receipt beyond quorum |
 | Node claims a record it no longer holds | An index entry is only a claim about a file. Before answering "unchanged" or "stale" the node reads the record back and checks it is still the one the index names; if it is not, the node stops answering for that address and the arrival becomes a repair. It keeps what it lost, because an address nothing is known about admits only a counter 0 record, and a loss above that would otherwise be permanent |
 
 ## Consequences
@@ -121,6 +129,10 @@ re-checks under its lock, because a newer state can land while payment verifies.
 - Validating a pointer needs nothing but the pointer — no quorum, no lineage, no
   Sybil exposure in ownership.
 - Creation is one record and one payment, with no retention dependency.
+- A pointer write must reach one more peer than a chunk write does. A chunk is
+  self-proving, so one copy settles it; a pointer read has to decide which of
+  several signed states is current, and that answer has to come from more than
+  one peer.
 - **Ownership cannot change.** Handover is indirection: point at a new pointer
   the recipient owns. The old owner keeps write access forever, so it is a
   revocable forwarding state, not a sale.
@@ -150,6 +162,14 @@ merge rule guarantees nodes holding the same records agree, and nothing yet
 guarantees they hold the same records. Until it lands, availability and
 cross-network fork convergence are the client's doing, not the network's.
 
+Two consequences follow from it and land with it. A node that joins a close
+group after a pointer was created can never obtain it: the increment rule admits
+only a counter 0 record at an address nothing is known about. And a node that
+loses a record can repair it while it is running — it keeps what it lost, and
+takes back that state or any that replaces it — but not across a restart, where
+a missing file leaves nothing to remember. Both are the same missing mechanism:
+a node cannot ask another node for a record.
+
 Also not built: pointer participation in commitments and audits, which depends
 on the same work.
 
@@ -166,9 +186,11 @@ on the same work.
 - A crafted chunk cannot satisfy a pointer's paid-cache entry.
 - An acknowledgement naming a different address or state is refused, and a read
   keeps the winner whatever order the replies arrive in.
-- A majority of the group answering ends a write or a read, so one unreachable
-  peer cannot stall either; a minority is reported as a shortfall, never
-  presented as the network's answer.
+- A quorum answering ends a write or a read, so one unreachable peer cannot
+  stall either; a minority is reported as a shortfall, never presented as the
+  network's answer, and neither is a state only one peer named.
+- The write and read thresholds overlap in at least the two peers a read
+  demands, at every group width from 1 to 64.
 - A resubmission repairs a record whose file the disk lost — at any counter,
   not just at creation — rather than being acknowledged as unchanged. A file
   swapped for a different valid record is not answered for either.

@@ -485,10 +485,11 @@ pub struct PaymentVerifierConfig {
 /// its address — two different addresses with two different meanings.
 ///
 /// This is also the paid-cache key, and being an enum is what makes that safe:
-/// a raw 32-byte key would let a client store a chunk crafted to sit exactly on
-/// a pointer's entry — `state_id` is `BLAKE3(domain || body)`, so its preimage
-/// can be a chunk's content — and buy the pointer's update at chunk price.
-/// Distinct variants cannot collide however the bytes are chosen.
+/// a raw 32-byte key would file both kinds under one value, so anything that
+/// put a chunk on a pointer's identifier would buy the pointer's update at
+/// chunk price. `state_id` is a `derive_key` output, which no chunk address can
+/// reach, so that now takes a BLAKE3 collision — and distinct variants cannot
+/// collide however the bytes are chosen, so the cache does not depend on it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum PaymentTarget {
     /// A chunk: paid for and stored at one address.
@@ -3720,12 +3721,13 @@ mod tests {
     /// A chunk whose address equals a pointer's `state_id` must not be able to
     /// pay for that pointer's update.
     ///
-    /// `state_id` is `BLAKE3(domain || body)`, so a client can store a chunk
-    /// whose *content* is exactly `domain || body`; that chunk's address is the
-    /// pointer's state identifier. If both filed their "already paid" entry
-    /// under that one value, paying chunk price for the chunk would buy the
-    /// pointer update — and skip issuer proximity, the price floor and the
-    /// proof-shape rule with it.
+    /// Reaching a pointer's `state_id` with a chunk now takes a BLAKE3
+    /// collision across two modes — it is a `derive_key` output, and a chunk
+    /// address is a plain hash. This is the second line: were the two ever to
+    /// meet at one value, filing both "already paid" entries under it would let
+    /// chunk price buy a pointer update, skipping issuer proximity, the price
+    /// floor and the proof-shape rule with it. The typed key does not depend on
+    /// the addresses being unreachable from each other.
     #[test]
     fn a_chunk_cannot_pay_for_a_pointer_that_shares_its_address() {
         let state_id: XorName = [0x5Au8; 32];
@@ -3770,9 +3772,6 @@ mod tests {
             "still no chunk address satisfies the pointer's typed entry"
         );
     }
-
-    #[test]
-    fn a_single_address_target_is_reported_as_one() {}
 
     fn create_test_verifier() -> PaymentVerifier {
         let config = PaymentVerifierConfig {
