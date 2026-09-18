@@ -763,9 +763,8 @@ fn stage(temp: &Path, bytes: &[u8]) -> Result<()> {
 /// Flush the directory entry a rename created.
 ///
 /// Without it a crash can leave the entry unflushed and the record invisible on
-/// restart. Opening a directory is not portable, so a directory that cannot be
-/// opened is reported as success with a note: there is nothing to sync and
-/// nothing went wrong with the write.
+/// restart.
+#[cfg(unix)]
 fn sync_directory(dir: &Path) -> Result<()> {
     match File::open(dir) {
         Ok(handle) => handle
@@ -776,6 +775,17 @@ fn sync_directory(dir: &Path) -> Result<()> {
             dir.display()
         ))),
     }
+}
+
+/// As above, where there is no such thing to ask for.
+///
+/// A directory cannot be opened as a file on Windows without backup semantics,
+/// so the Unix form fails on every write there — which is not a durability
+/// warning, it is the wrong question. NTFS orders the rename's own metadata.
+#[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps, reason = "one signature for both platforms")]
+fn sync_directory(_dir: &Path) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
