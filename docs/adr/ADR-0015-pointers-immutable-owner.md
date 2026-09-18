@@ -54,10 +54,11 @@ prefix separates nothing: a chunk holding the prefix and an owner key would land
 on exactly that owner's address, letting anyone squat an address before its
 owner used it, and — since `state_id` is what a pointer's storage is paid
 against — letting one settled quote buy both a pointer and a chunk. Derive-key
-is a different BLAKE3 mode, so neither identity is reachable from any content a
-chunk could hold. The two spaces are both 32 bytes and nothing proves them
-disjoint; what changed is that landing on one now takes a collision rather than
-a preimage anyone can write down.
+is a different BLAKE3 mode. Both still produce 32 bytes and the ranges are not
+disjoint; what changed is the cost. Landing a chunk on a pointer identity now
+means finding a preimage under one mode for an output of the other, which is
+the security assumption BLAKE3 is built on, rather than a string anyone can
+write down.
 
 **Public-key addressed and self-verifying.** `A` is a pure function of the owner
 key, and the key is in the record, so a node validates a pointer from its own
@@ -115,13 +116,14 @@ thread, so a flood of arrivals cannot occupy the runtime's workers.
 | Replay an older record | Loses on counter |
 | Re-sign one paid state N times | Equal state never replaces; nothing is written |
 | Pay once, jump the counter | Client updates must be `+1` |
-| Pay for a chunk to fund a pointer | A quote signs its content, not the record kind, so the defence is that the content cannot be shared: `state_id` is a derive-key output and no chunk can sit at one. The paid cache is keyed by a typed `Chunk` vs `Pointer` target as well, so the two never alias even in memory |
+| Pay for a chunk to fund a pointer | A quote signs its content, not the record kind, so the defence is that the content cannot be shared: putting a chunk on a `state_id` means breaking BLAKE3 across its two modes. The paid cache is keyed by a typed `Chunk` vs `Pointer` target as well, so the two never alias even in memory, whatever the bytes |
 | Merkle proof with no issuer check | Refused for pointers; single-node proofs only |
 | Downgrade the format | `version` is signed and inside `state_id`; unknown versions are refused |
 | Unknown target kind | Carried, never interpreted — a node stores 33 opaque bytes |
-| Collide a pointer and a chunk address | Only a genuine BLAKE3 collision can produce one, and it is refused in both directions anyway. The two stores take separate locks, so simultaneous commits of both kinds at one address are not yet atomic |
+| Collide a pointer and a chunk address | Takes a cross-mode BLAKE3 break, and is refused in both directions anyway. The two stores take separate locks, so simultaneous commits of both kinds at one address are not yet atomic |
 | Peer lies about storing a pointer | Every acknowledgement must name the address and state the client sent. A read asks the same group by the same definition, so the quorums intersect — though each does its own lookup, so churn between them is not covered |
-| One peer decides what a pointer says | A read returns a state only if two of the answering peers name it, and a write must reach a majority **plus one** so that two always do. Otherwise a single close-group peer serving an owner-signed state nobody paid to store would be believed by every reader: the record verifies, belongs at the address, and wins the merge. It cannot make a second peer agree. A dishonest *majority* is not defended against: there is no storage receipt beyond quorum |
+| One peer decides what a pointer says | A read returns a state only if two of the answering peers name it, and a write must reach a majority **plus one** so that two always do. Otherwise a single close-group peer serving an owner-signed state nobody paid to store would be believed by every reader: the record verifies, belongs at the address, and wins the merge. It cannot make a second peer agree. The read counts each state separately, so a state one peer names cannot bury the one the rest agree on — that would be denial of service in place of forgery, and it is also what an ordinary read during an update looks like |
+| Two peers decide it | **Not defended against.** Two colluding close-group peers clear the bar, and only the owner can sign, so what this buys is the owner's own updates unpaid. Raising the bar only raises the number of nodes to grind: both the pointer's address and a node's id are choosable, so an owner determined to sit beside their own pointer can reach any fixed threshold. What actually answers it is replication and audits, neither of which is built |
 | Node claims a record it no longer holds | An index entry is only a claim about a file. Before answering "unchanged" or "stale" the node reads the record back and checks it is still the one the index names; if it is not, the node stops answering for that address and the arrival becomes a repair. It keeps what it lost, because an address nothing is known about admits only a counter 0 record, and a loss above that would otherwise be permanent |
 
 ## Consequences
@@ -186,9 +188,13 @@ on the same work.
 - A crafted chunk cannot satisfy a pointer's paid-cache entry.
 - An acknowledgement naming a different address or state is refused, and a read
   keeps the winner whatever order the replies arrive in.
-- A quorum answering ends a write or a read, so one unreachable peer cannot
-  stall either; a minority is reported as a shortfall, never presented as the
-  network's answer, and neither is a state only one peer named.
+- A write ends as soon as its quorum acknowledges, so one unreachable peer
+  cannot stall it. A read ends when a quorum has answered *and* one of the
+  states they named has the backing a read demands; short of that it keeps
+  asking, and if the group is exhausted without either, it reports a shortfall
+  rather than presenting one peer's word as the network's answer.
+- A state only one peer named does not suppress the state the others agree on,
+  in any arrival order.
 - The write and read thresholds overlap in at least the two peers a read
   demands, at every group width from 1 to 64.
 - A resubmission repairs a record whose file the disk lost — at any counter,
