@@ -126,7 +126,7 @@ impl PointerService {
         // checked yet, so a forged record for an address this node does not
         // serve is rejected by the gates below without buying an ML-DSA
         // verification.
-        let parsed = match self.store.inspect(&request.record) {
+        let parsed = match self.store.inspect(&request.record).await {
             Ok(Inspected::Unchanged(state)) => {
                 return PointerPutResponse::Unchanged {
                     address: state.address,

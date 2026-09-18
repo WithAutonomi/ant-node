@@ -45,9 +45,16 @@ fetch.
 ### Two identities
 
 ```text
-A        = BLAKE3("autonomi.pointer.address.v1" || owner)   routes
-state_id = BLAKE3("autonomi.pointer.state.v1"   || body)    authorizes payment
+A        = BLAKE3::derive_key("autonomi.pointer.address.v1", owner)  routes
+state_id = BLAKE3::derive_key("autonomi.pointer.state.v1",   body)   authorizes payment
 ```
+
+Derive-key, not a hash of a prefix. A chunk's address is `BLAKE3(content)`, so a
+prefix separates nothing: a chunk holding the prefix and an owner key would land
+on exactly that owner's address, letting anyone squat an address before its
+owner used it, and — since `state_id` is what a pointer's storage is paid
+against — letting one settled quote buy both a pointer and a chunk. Derive-key
+is a different function, so no content hashes into either space.
 
 **Public-key addressed and self-verifying.** `A` is a pure function of the owner
 key, and the key is in the record, so a node validates a pointer from its own
@@ -101,13 +108,13 @@ re-checks under its lock, because a newer state can land while payment verifies.
 | Replay an older record | Loses on counter |
 | Re-sign one paid state N times | Equal state never replaces; nothing is written |
 | Pay once, jump the counter | Client updates must be `+1` |
-| Pay for a chunk to fund a pointer | Paid cache keyed by a typed `Chunk` vs `Pointer` target, never a raw 32-byte value a crafted chunk could occupy. The quote signs only its content, not the record kind, so this is a cache defence rather than a cryptographic one |
+| Pay for a chunk to fund a pointer | A quote signs its content, not the record kind, so the defence is that the content cannot be shared: `state_id` is a derive-key output and no chunk can sit at one. The paid cache is keyed by a typed `Chunk` vs `Pointer` target as well, so the two never alias even in memory |
 | Merkle proof with no issuer check | Refused for pointers; single-node proofs only |
 | Downgrade the format | `version` is signed and inside `state_id`; unknown versions are refused |
 | Unknown target kind | Carried, never interpreted — a node stores 33 opaque bytes |
-| Collide a pointer and a chunk address | Refused in both directions. The two stores take separate locks, so simultaneous commits of both kinds at one address are not yet atomic |
-| Peer lies about storing a pointer | Every acknowledgement must name the address and state the client sent, and a write needs a majority of the close group — the same group, by the same call, that a read asks, so an acknowledged pointer is readable |
-| Node claims a record it no longer holds | An index entry is only a claim about a file; before answering "unchanged" or "stale" the node reads the file back, and a lost or corrupt one makes the submission a repair |
+| Collide a pointer and a chunk address | Only a genuine BLAKE3 collision can produce one, and it is refused in both directions anyway. The two stores take separate locks, so simultaneous commits of both kinds at one address are not yet atomic |
+| Peer lies about storing a pointer | Every acknowledgement must name the address and state the client sent, and a write needs a majority of the close group. A read asks the same group by the same definition, so the two quorums intersect — though each does its own lookup, so churn between them is not covered. A majority of dishonest peers is not defended against at all: there is no storage receipt beyond quorum |
+| Node claims a record it no longer holds | An index entry is only a claim about a file. Before answering "unchanged" or "stale" the node reads the record back and checks it is still the one the index names; if it is not, the node stops answering for that address and the arrival becomes a repair. It keeps what it lost, because an address nothing is known about admits only a counter 0 record, and a loss above that would otherwise be permanent |
 
 ## Consequences
 
@@ -162,5 +169,10 @@ on the same work.
 - A majority of the group answering ends a write or a read, so one unreachable
   peer cannot stall either; a minority is reported as a shortfall, never
   presented as the network's answer.
-- A resubmission repairs a record whose file the disk lost, rather than being
-  acknowledged as unchanged.
+- A resubmission repairs a record whose file the disk lost — at any counter,
+  not just at creation — rather than being acknowledged as unchanged. A file
+  swapped for a different valid record is not answered for either.
+- No chunk content produces a pointer address or a paid identifier.
+- End to end against a live testnet with real settlement: create, update, read
+  back, resolve a chain to its chunk, repeat a stored state, read an address
+  nobody wrote, and refuse a signed record that skips the counter.

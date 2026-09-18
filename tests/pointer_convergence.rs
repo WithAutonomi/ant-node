@@ -356,32 +356,40 @@ fn the_wire_format_is_what_the_adr_says() {
     // written out rather than recomputed from the code under test.
     assert_eq!(
         hex::encode(record.address()),
-        "f82d07b1e8be4b9bc9b87df513baf57f65478ff321e4ecb5a0883f9bf8f594b7",
+        "83671eca6ee18b38987207922fdc23a1c378818c8a076b69dcbd40509f8786a8",
         "the pointer address for seed 42"
     );
     assert_eq!(
         hex::encode(record.state_id()),
-        "36684c7d59d7f5ac2aeef581377fcbf8d88689fda0c01ead2fde66d7a8120aea",
+        "2d611afab3f72642b0196d99faebb74fb9b4f659f0f0b3b4f73dc85847efab42",
         "the paid state identifier for this record"
     );
 
     // And the derivations those constants come from, restated independently.
-    let mut address_hasher = Hasher::new();
-    address_hasher.update(b"autonomi.pointer.address.v1");
-    address_hasher.update(&pk.to_bytes());
     assert_eq!(
         record.address(),
-        *address_hasher.finalize().as_bytes(),
+        blake3::derive_key("autonomi.pointer.address.v1", &pk.to_bytes()),
         "the address derives from the owner key alone"
     );
-
-    let mut state_hasher = Hasher::new();
-    state_hasher.update(b"autonomi.pointer.state.v1");
-    state_hasher.update(bytes.get(..1994).expect("body range"));
     assert_eq!(
         record.state_id(),
-        *state_hasher.finalize().as_bytes(),
+        blake3::derive_key(
+            "autonomi.pointer.state.v1",
+            bytes.get(..1994).expect("body range")
+        ),
         "state_id covers the whole body and nothing else"
+    );
+
+    // Derive-key, not a hash of a prefix: a chunk is addressed by BLAKE3 over
+    // its content, so a prefix construction would put both identities inside
+    // the chunk address space for anyone who could write the preimage.
+    let mut prefixed = Hasher::new();
+    prefixed.update(b"autonomi.pointer.address.v1");
+    prefixed.update(&pk.to_bytes());
+    assert_ne!(
+        record.address(),
+        *prefixed.finalize().as_bytes(),
+        "the address must not be reachable as a plain hash"
     );
 
     // The signature verifies over the body under the literal context, and does
