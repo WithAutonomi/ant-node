@@ -155,12 +155,6 @@ impl PointerService {
                 )));
             }
             Ok(Inspected::Candidate(parsed)) => parsed,
-            // `inspect` does not verify, so it cannot produce this arm.
-            Ok(Inspected::Verified(_)) => {
-                return PointerPutResponse::Error(ProtocolError::Internal(
-                    "inspect returned a verified record".to_string(),
-                ));
-            }
             Err(e) => {
                 debug!("Pointer PUT refused: {e}");
                 return PointerPutResponse::Error(ProtocolError::StorageFailed(e.to_string()));
@@ -197,9 +191,7 @@ impl PointerService {
         }
 
         match self.store.commit(record).await {
-            Ok(PutOutcome::Stored | PutOutcome::Replaced) => {
-                PointerPutResponse::Success { address, state_id }
-            }
+            Ok(PutOutcome::Changed) => PointerPutResponse::Success { address, state_id },
             // The re-check under the commit lock found a newer state. The
             // client paid for a state that lost a race; say so plainly.
             Ok(PutOutcome::Unchanged) => PointerPutResponse::Unchanged { address, state_id },
@@ -366,6 +358,7 @@ fn cross_kind_refusal(address: XorName, chunk_present: Result<bool>) -> Option<P
 )]
 mod tests {
     use super::*;
+    use crate::payment::{EvmVerifierConfig, PriceFloorConfig};
     use ant_protocol::pointer::{Pointer, PointerTarget, PointerTargetKind};
     use saorsa_pqc::api::sig::{ml_dsa_65, MlDsaPublicKey, MlDsaSecretKey};
 
@@ -478,7 +471,7 @@ mod tests {
     async fn a_forged_signature_is_refused() {
         let (service, _dir) = service().await;
         let record = signed(1, 0, 1);
-        let mut bytes = record.to_bytes().to_vec();
+        let mut bytes = record.to_bytes();
         if let Some(byte) = bytes.get_mut(ant_protocol::pointer::POINTER_BODY_LEN + 3) {
             *byte ^= 0xff;
         }
@@ -498,11 +491,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = PointerStore::new(dir.path()).await.expect("store");
         let verifier = Arc::new(PaymentVerifier::new(PaymentVerifierConfig {
-            evm: Default::default(),
+            evm: EvmVerifierConfig::default(),
             cache_capacity: 16,
             close_group_size: ant_protocol::chunk::CLOSE_GROUP_SIZE,
             local_rewards_address: evmlib::common::Address::new([1u8; 20]),
-            price_floor: Default::default(),
+            price_floor: PriceFloorConfig::default(),
         }));
         let service = PointerService::new(store).with_payments(verifier);
 

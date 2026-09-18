@@ -19,25 +19,16 @@
 //!   immutable chunk store cannot do.
 //! - [`service`] — the request handler: validate, check payment, merge.
 //!
-//! # The three identifiers
+//! # The two identifiers
 //!
 //! | Name | Derivation | Job |
 //! |---|---|---|
 //! | `A` | `BLAKE3(domain \|\| owner)` | routes, and decides which nodes are responsible |
-//! | `state_id` | `BLAKE3(domain \|\| body)` | names the authenticated state: sync hints, and what a quote is paid against |
-//! | `bytes_hash` | `BLAKE3(record)` | what *this* node's storage commitment binds |
+//! | `state_id` | `BLAKE3(domain \|\| body)` | names the state, and is what a quote is paid against |
 //!
-//! `A` and `state_id` are separate because `A` must be stable for the pointer's
-//! life while the paid identifier must change with every update, or updates
-//! after the first would be free — which is exactly the 1.0 defect this design
-//! exists to fix. There is deliberately no fourth name hashed from `state_id`:
-//! it is already a domain-separated, owner-bound identifier for exactly one
-//! signed state.
-//!
-//! `bytes_hash` is per-storer rather than per-state, because two replicas may
-//! hold one state under different signatures. That is fine: a storage
-//! commitment is built and signed by one node and audited against that node's
-//! own bytes, so it never has to agree with a peer's.
+//! They are separate because `A` must be stable for the pointer's life while
+//! the paid identifier must change with every update, or updates after the
+//! first would be free — the 1.0 defect this design exists to fix.
 //!
 //! # Why the merge rule ignores signature bytes
 //!
@@ -54,9 +45,9 @@ pub mod service;
 pub mod store;
 
 pub use ant_protocol::pointer::{
-    cmp_merge, merge, pointer_address, state_id_for_body, MergeRank, ParsedPointer, Pointer,
-    PointerError, PointerState, PointerTarget, PointerTargetKind, DATA_TYPE_POINTER,
-    POINTER_BODY_LEN, POINTER_FORMAT_VERSION, POINTER_WIRE_LEN, TARGET_WIRE_LEN,
+    pointer_address, state_id_for_body, ParsedPointer, Pointer, PointerError, PointerState,
+    PointerTarget, PointerTargetKind, DATA_TYPE_POINTER, POINTER_BODY_LEN, POINTER_FORMAT_VERSION,
+    POINTER_WIRE_LEN, TARGET_WIRE_LEN,
 };
 pub use service::PointerService;
 pub use store::{Inspected, PointerStore, PutOutcome};

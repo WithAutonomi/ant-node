@@ -50,7 +50,7 @@ use tokio::task::spawn_blocking;
 use crate::ant_protocol::XorName;
 use crate::error::{Error, Result};
 use crate::logging::{debug, warn};
-use ant_protocol::pointer::{MergeRank, ParsedPointer, Pointer, PointerState, POINTER_WIRE_LEN};
+use ant_protocol::pointer::{ParsedPointer, Pointer, PointerState, POINTER_WIRE_LEN};
 
 /// Directory under the store root that holds pointer records.
 const POINTERS_DIR_NAME: &str = "pointers";
@@ -64,10 +64,12 @@ const LOCK_FILE_NAME: &str = ".pointer-store-lock";
 /// What a put did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PutOutcome {
-    /// No record was held for this address; the incoming one was stored.
-    Stored,
-    /// The incoming record won under the merge rule and replaced the held one.
-    Replaced,
+    /// The record was written: either nothing was held, or it won the merge.
+    ///
+    /// One outcome rather than two, because nothing downstream treats "stored"
+    /// differently from "replaced" — both mean the node now holds this state
+    /// and both are what `changed()` reports.
+    Changed,
     /// The held record is the same authenticated state. Nothing was written.
     ///
     /// This is the case that keeps one payment from funding many writes: an
@@ -85,7 +87,7 @@ impl PutOutcome {
     /// commitment rebuild.
     #[must_use]
     pub const fn changed(self) -> bool {
-        matches!(self, Self::Stored | Self::Replaced)
+        matches!(self, Self::Changed)
     }
 }
 
@@ -100,39 +102,17 @@ pub enum Inspected {
     /// checked yet — pass it to [`PointerStore::verify`] once admission gates
     /// have had their say.
     Candidate(ParsedPointer),
-    /// A signature-checked record, ready to commit.
-    ///
-    /// Boxed because a verified record is two orders of magnitude larger than
-    /// the other arms, and an enum is as big as its widest one.
-    Verified(Box<Pointer>),
-}
-
-impl Inspected {
-    /// What this arrival claims, whether or not it is a candidate.
-    #[must_use]
-    pub fn state(&self) -> Option<&ant_protocol::pointer::PointerState> {
-        match self {
-            Self::Candidate(parsed) => Some(parsed.state()),
-            // A no-op claims nothing worth acting on, and a verified record
-            // carries its own state directly.
-            Self::Noop(_) | Self::Verified(_) => None,
-        }
-    }
 }
 
 /// What the store knows about a held record without reading it back.
 #[derive(Debug, Clone, Copy)]
 struct IndexEntry {
-    /// The held record's authenticated-state identifier.
-    state_id: XorName,
-    /// The held record's place in the merge order.
+    /// The held record's authenticated state.
     ///
-    /// Carried as the record's own [`MergeRank`] rather than as the fields it
-    /// is built from, so the store cannot drift from the rule in
-    /// `PointerState::replaces`.
-    rank: MergeRank,
-    /// The held record's counter, for the paid-increment check.
-    counter: u64,
+    /// The state itself rather than fields copied out of it, so every rule the
+    /// store applies — merge order, the paid increment — is the protocol's own
+    /// rule applied to the held state, and cannot drift from it.
+    state: PointerState,
     /// Which insertion this entry is.
     ///
     /// Monotonic for the life of this store, so an entry can be told apart
@@ -149,9 +129,7 @@ impl IndexEntry {
     /// Describe a validated record.
     fn of(record: &Pointer, generation: u64) -> Self {
         Self {
-            state_id: record.state_id(),
-            rank: record.state().rank(),
-            counter: record.counter(),
+            state: record.state(),
             generation,
         }
     }
@@ -242,35 +220,15 @@ impl PointerStore {
         })
     }
 
-    /// Validate an arriving record against what is held.
+    /// Parse an arrival and decide whether it could change anything, without
+    /// verifying its signature.
     ///
     /// Cheap checks first: an arrival that cannot change anything is refused
     /// before its signature is looked at, because it is a no-op whether or not
     /// it is correctly signed. That ordering is what stops repeated submission
-    /// of one paid state from buying ML-DSA verifications. A record that would
-    /// win is always verified — outside the store lock, so one slow
-    /// verification cannot stall every other address.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Protocol`] if the bytes are not a well-formed record
-    /// and [`Error::Crypto`] if a would-be winner's signature does not verify.
-    pub async fn prepare(&self, bytes: &[u8]) -> Result<Inspected> {
-        match self.inspect(bytes)? {
-            Inspected::Noop(outcome) => Ok(Inspected::Noop(outcome)),
-            Inspected::Candidate(parsed) => {
-                Ok(Inspected::Verified(Box::new(self.verify(parsed).await?)))
-            }
-            // `inspect` never returns this; only `prepare` produces it.
-            verified @ Inspected::Verified(_) => Ok(verified),
-        }
-    }
-
-    /// Parse an arrival and decide whether it could change anything, without
-    /// verifying its signature.
-    ///
-    /// The cheap half of [`Self::prepare`]. Callers that gate on admission —
-    /// capacity, responsibility for the address — run this first, apply their
+    /// of one paid state from buying ML-DSA verifications. Callers that gate on
+    /// admission — capacity, responsibility for the address — run this first,
+    /// apply their
     /// gates, and only then pay for [`Self::verify`]. Otherwise a forged record
     /// for an address the node is not responsible for still buys an ML-DSA
     /// verification before anything rejects it.
@@ -285,11 +243,19 @@ impl PointerStore {
         let parsed = ParsedPointer::parse(bytes.to_vec())?;
         let state = *parsed.state();
 
-        if let Some(entry) = self.snapshot(&state.address) {
-            if entry.state_id == state.state_id {
+        // The index is only a claim about a file. Both early answers below
+        // assert that this node holds something at least as good as what
+        // arrived, so neither may be given on a claim alone: if the file has
+        // gone or stopped validating, `reread` disowns the entry and the
+        // submission falls through as the repair it should be.
+        if let Some(entry) = self
+            .snapshot(&state.address)
+            .filter(|_| self.reread(&state.address))
+        {
+            if entry.state.state_id == state.state_id {
                 return Ok(Inspected::Noop(PutOutcome::Unchanged));
             }
-            if state.rank() <= entry.rank {
+            if !state.replaces(&entry.state) {
                 return Ok(Inspected::Noop(PutOutcome::Stale));
             }
         }
@@ -334,16 +300,15 @@ impl PointerStore {
     /// Validate and store in one step, with no payment gate.
     ///
     /// For callers that have already settled payment, and for tests. The
-    /// request path should use [`Self::prepare`] and [`Self::commit`] so the
-    /// payment check can sit between them.
+    /// request path runs the same three steps with its admission and payment
+    /// gates between them.
     ///
     /// # Errors
     ///
-    /// As [`Self::prepare`] and [`Self::commit`].
+    /// As [`Self::inspect`], [`Self::verify`] and [`Self::commit`].
     pub async fn put_bytes(&self, bytes: &[u8]) -> Result<PutOutcome> {
-        match self.prepare(bytes).await? {
+        match self.inspect(bytes)? {
             Inspected::Noop(outcome) => Ok(outcome),
-            Inspected::Verified(record) => self.commit(*record).await,
             Inspected::Candidate(parsed) => {
                 let record = self.verify(parsed).await?;
                 self.commit(record).await
@@ -415,7 +380,7 @@ impl PointerStore {
     /// under different signatures agree and do not refetch each other forever.
     #[must_use]
     pub fn state_id(&self, address: &XorName) -> Option<XorName> {
-        self.snapshot(address).map(|e| e.state_id)
+        self.snapshot(address).map(|e| e.state.state_id)
     }
 
     /// Whether `state` is the paid successor of what is held.
@@ -432,7 +397,7 @@ impl PointerStore {
     pub fn accepts_as_paid_update(&self, state: &PointerState) -> bool {
         self.snapshot(&state.address).map_or_else(
             || state.is_genesis(),
-            |entry| state.counter == entry.counter.wrapping_add(1) && entry.counter != u64::MAX,
+            |entry| state.is_successor_of(&entry.state),
         )
     }
 
@@ -469,6 +434,26 @@ impl PointerStore {
     #[must_use]
     pub fn dir(&self) -> &Path {
         &self.inner.dir
+    }
+
+    /// Whether the file behind `address` still reads back as a valid record.
+    ///
+    /// Guards the two early answers in `inspect`, both of which claim this
+    /// node already holds something at least as good as what arrived. A failed
+    /// read disowns the entry, exactly as `get` does.
+    fn reread(&self, address: &XorName) -> bool {
+        let claimed = self.snapshot(address).map(|entry| entry.generation);
+        let valid = matches!(
+            read_record_file(&self.path_for(address)),
+            Ok(Some(ref bytes)) if matches!(
+                Pointer::from_bytes(bytes),
+                Ok(ref record) if record.address() == *address
+            )
+        );
+        if !valid {
+            self.forget_if_unchanged(address, claimed);
+        }
+        valid
     }
 
     /// Copy out what is held for `address`, releasing the index lock at once.
@@ -526,10 +511,10 @@ impl Inner {
         // one under the lock below; this only avoids staging a file for an
         // arrival that is already obviously a no-op.
         if let Some(entry) = self.index.lock().get(&address) {
-            if entry.state_id == record.state_id() {
+            if entry.state.state_id == record.state_id() {
                 return Ok(PutOutcome::Unchanged);
             }
-            if record.state().rank() <= entry.rank {
+            if !record.state().replaces(&entry.state) {
                 return Ok(PutOutcome::Stale);
             }
         }
@@ -550,9 +535,9 @@ impl Inner {
             // Re-check: staging is not instantaneous and a newer state may
             // have committed while it ran.
             let outcome = match index.get(&address) {
-                None => PutOutcome::Stored,
-                Some(entry) if entry.state_id == record.state_id() => PutOutcome::Unchanged,
-                Some(entry) if record.state().rank() > entry.rank => PutOutcome::Replaced,
+                None => PutOutcome::Changed,
+                Some(entry) if entry.state.state_id == record.state_id() => PutOutcome::Unchanged,
+                Some(entry) if record.state().replaces(&entry.state) => PutOutcome::Changed,
                 Some(_) => PutOutcome::Stale,
             };
             if !outcome.changed() {
@@ -764,6 +749,12 @@ fn sync_directory(dir: &Path) -> Result<()> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test assertions"
+)]
 mod tests {
     use super::*;
     use ant_protocol::pointer::{PointerTarget, PointerTargetKind, POINTER_BODY_LEN};
@@ -782,7 +773,7 @@ mod tests {
     /// A record with its signature destroyed: the body still parses, the
     /// record does not verify.
     fn forged(record: &Pointer) -> Vec<u8> {
-        let mut bytes = record.to_bytes().to_vec();
+        let mut bytes = record.to_bytes();
         if let Some(byte) = bytes.get_mut(POINTER_BODY_LEN + 3) {
             *byte ^= 0xff;
         }
@@ -805,7 +796,7 @@ mod tests {
         let record = signed(1, 1, 1);
         assert_eq!(
             store.put_bytes(&record.to_bytes()).await.expect("put"),
-            PutOutcome::Stored
+            PutOutcome::Changed
         );
 
         let read = store
@@ -826,11 +817,11 @@ mod tests {
         let second = signed(1, 2, 1);
         assert_eq!(
             store.put_bytes(&first.to_bytes()).await.expect("put"),
-            PutOutcome::Stored
+            PutOutcome::Changed
         );
         assert_eq!(
             store.put_bytes(&second.to_bytes()).await.expect("put"),
-            PutOutcome::Replaced
+            PutOutcome::Changed
         );
         assert_eq!(
             store.put_bytes(&first.to_bytes()).await.expect("put"),
@@ -940,64 +931,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_reports_a_no_op_without_a_candidate() {
+    async fn an_arrival_that_changes_nothing_is_not_a_candidate() {
         let (store, _dir) = store().await;
         let held = signed(1, 6, 6);
         store.put_bytes(&held.to_bytes()).await.expect("put");
 
-        match store.prepare(&held.to_bytes()).await.expect("prepare") {
+        match store.inspect(&held.to_bytes()).expect("inspect") {
             Inspected::Noop(outcome) => assert_eq!(outcome, PutOutcome::Unchanged),
-            Inspected::Verified(_) | Inspected::Candidate(_) => {
-                panic!("an identical state is not a candidate")
-            }
+            Inspected::Candidate(_) => panic!("an identical state is not a candidate"),
         }
-        match store
-            .prepare(&signed(1, 1, 6).to_bytes())
-            .await
-            .expect("prepare")
-        {
+        match store.inspect(&signed(1, 1, 6).to_bytes()).expect("inspect") {
             Inspected::Noop(outcome) => assert_eq!(outcome, PutOutcome::Stale),
-            Inspected::Verified(_) | Inspected::Candidate(_) => {
-                panic!("a stale record is not a candidate")
-            }
+            Inspected::Candidate(_) => panic!("a stale record is not a candidate"),
         }
     }
 
     #[tokio::test]
-    async fn a_candidate_exposes_what_a_payment_check_needs() {
+    async fn a_verified_record_exposes_what_a_payment_check_needs() {
         let (store, _dir) = store().await;
         let record = signed(1, 2, 2);
-        match store.prepare(&record.to_bytes()).await.expect("prepare") {
-            Inspected::Verified(verified) => {
-                // A verified record is a `Pointer`, so the payment check reads
-                // the address and state straight off it — there is no wrapper
-                // type in between restating what it already knows.
-                assert_eq!(verified.address(), record.address());
-                assert_eq!(verified.state_id(), record.state_id());
-                assert_eq!(verified.to_bytes(), record.to_bytes());
-                assert_eq!(
-                    store.commit(*verified).await.expect("commit"),
-                    PutOutcome::Stored
-                );
-            }
-            other => panic!("a new record verifies, got {other:?}"),
-        }
+        let verified = verified(&store, &record).await;
+        // A verified record is a `Pointer`, so the payment check reads the
+        // address and state straight off it — there is no wrapper type in
+        // between restating what it already knows.
+        assert_eq!(verified.address(), record.address());
+        assert_eq!(verified.state_id(), record.state_id());
+        assert_eq!(verified.to_bytes(), record.to_bytes());
+        assert_eq!(
+            store.commit(verified).await.expect("commit"),
+            PutOutcome::Changed
+        );
         assert_eq!(store.len(), 1);
     }
 
     #[tokio::test]
-    async fn a_commit_rechecks_what_prepare_saw() {
-        // `prepare` runs before the payment check; a newer state can land while
-        // that check is in flight, and must not then be overwritten.
+    async fn a_commit_rechecks_what_verification_saw() {
+        // Verification runs before the payment check; a newer state can land
+        // while that check is in flight, and must not then be overwritten.
         let (store, _dir) = store().await;
-        let slow = match store
-            .prepare(&signed(1, 2, 1).to_bytes())
-            .await
-            .expect("prepare")
-        {
-            Inspected::Verified(record) => *record,
-            other => panic!("expected a verified record, got {other:?}"),
-        };
+        let slow = verified(&store, &signed(1, 2, 1)).await;
 
         // Someone else's newer state arrives while the payment is being checked.
         store
@@ -1028,7 +1000,7 @@ mod tests {
 
     #[tokio::test]
     async fn every_rotation_of_a_delivery_reaches_one_answer() {
-        let records = vec![
+        let records = [
             signed(1, 1, 9),
             signed(1, 3, 4),
             signed(1, 3, 1),
@@ -1089,8 +1061,7 @@ mod tests {
         let _first = PointerStore::new(dir.path()).await.expect("open");
         let err = PointerStore::new(dir.path())
             .await
-            .err()
-            .expect("a second store must not open the same directory");
+            .expect_err("a second store must not open the same directory");
         let message = format!("{err}");
         assert!(
             message.contains("another pointer store already has"),
@@ -1133,7 +1104,41 @@ mod tests {
         // "unchanged", which is the whole point of forgetting it.
         assert_eq!(
             store.put_bytes(&record.to_bytes()).await.expect("put"),
-            PutOutcome::Stored
+            PutOutcome::Changed
+        );
+        assert!(store.get(&record.address()).await.expect("get").is_some());
+    }
+
+    /// Run the production sequence as far as the payment gate: inspect, then
+    /// verify the candidate it yields.
+    async fn verified(store: &PointerStore, record: &Pointer) -> Pointer {
+        match store.inspect(&record.to_bytes()).expect("inspect") {
+            Inspected::Candidate(parsed) => store.verify(parsed).await.expect("verify"),
+            Inspected::Noop(outcome) => panic!("expected a candidate, got {outcome:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_resubmission_repairs_a_record_the_disk_lost() {
+        // "Unchanged" is an acknowledgement: the sender stops on it. If the
+        // index still claims a record whose file has gone, answering Unchanged
+        // would end the write while this node holds nothing.
+        let (store, _dir) = store().await;
+        let record = signed(1, 0, 1);
+        store.put_bytes(&record.to_bytes()).await.expect("put");
+
+        // The file disappears under the node; the index has not noticed.
+        std::fs::remove_file(store.dir().join(hex::encode(record.address()))).expect("remove");
+        assert!(
+            store.contains(&record.address()),
+            "the index still claims it"
+        );
+
+        // The same state arriving again is a repair, not a no-op.
+        assert_eq!(
+            store.put_bytes(&record.to_bytes()).await.expect("put"),
+            PutOutcome::Changed,
+            "a resubmission must repair a record the disk lost"
         );
         assert!(store.get(&record.address()).await.expect("get").is_some());
     }
@@ -1182,7 +1187,7 @@ mod tests {
         let mut tasks = Vec::new();
         for counter in 1..=12u64 {
             let store = store.clone();
-            let bytes = signed(1, counter, 1).to_bytes().to_vec();
+            let bytes = signed(1, counter, 1).to_bytes();
             tasks.push(tokio::spawn(async move { store.put_bytes(&bytes).await }));
         }
         for task in tasks {
@@ -1209,10 +1214,7 @@ mod tests {
         // the write and the index update both happened, or neither did.
         let (store, _dir) = store().await;
         let record = signed(1, 3, 3);
-        let prepared = match store.prepare(&record.to_bytes()).await.expect("prepare") {
-            Inspected::Verified(record) => *record,
-            other => panic!("expected a verified record, got {other:?}"),
-        };
+        let prepared = verified(&store, &record).await;
 
         let abandoned = {
             let committing = store.commit(prepared);
@@ -1313,7 +1315,7 @@ mod tests {
         // A peer repairs it with the very same state.
         assert_eq!(
             store.put_bytes(&record.to_bytes()).await.expect("put"),
-            PutOutcome::Stored
+            PutOutcome::Changed
         );
 
         // Reader two, still holding its stale observation, must not erase it.
@@ -1343,7 +1345,7 @@ mod tests {
         let reopened = PointerStore::new(dir.path()).await.expect("reopen");
         assert_eq!(
             reopened.put_bytes(&record.to_bytes()).await.expect("put"),
-            PutOutcome::Stored,
+            PutOutcome::Changed,
             "a swept leftover must not block the first write to its address"
         );
     }

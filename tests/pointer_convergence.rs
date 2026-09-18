@@ -7,6 +7,8 @@
 //! properties the merge rule exists to provide: one payment funds one state,
 //! and no re-signature of a stored state can displace it.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use std::collections::BTreeSet;
 
 use ant_protocol::pointer::{Pointer, PointerTarget, PointerTargetKind};
@@ -253,7 +255,7 @@ proptest! {
         mask in 1u8..255,
     ) {
         let record = signed(5, 11, 22, PointerTargetKind::Chunk);
-        let mut bytes = record.to_bytes().to_vec();
+        let mut bytes = record.to_bytes();
         let Some(byte) = bytes.get_mut(index) else {
             return Ok(());
         };
@@ -289,7 +291,7 @@ fn sixty_four_signatures_over_one_state_yield_one_winner() {
     // Sorted worst-first is the submission order that would have made every
     // record win under a byte-ordering tie-break.
     let mut sorted: Vec<&Pointer> = records.iter().collect();
-    sorted.sort_by_key(|record| record.to_bytes().to_vec());
+    sorted.sort_by_key(|record| record.to_bytes());
 
     let first = sorted.first().copied().expect("non-empty");
     for candidate in &sorted {
@@ -436,7 +438,7 @@ async fn sixty_four_signatures_buy_exactly_one_write() {
     let first = signed(7, 9, 9, PointerTargetKind::Chunk);
     assert_eq!(
         store.put_bytes(&first.to_bytes()).await.expect("put"),
-        PutOutcome::Stored
+        PutOutcome::Changed
     );
 
     let path = store.dir().join(hex::encode(first.address()));
@@ -530,7 +532,7 @@ fn an_unknown_version_is_refused_rather_than_accepted_at_its_own_price() {
     let record = signed(12, 1, 1, PointerTargetKind::Chunk);
     for version in [0u8, 2, 7, u8::MAX] {
         assert_ne!(version, POINTER_FORMAT_VERSION);
-        let mut bytes = record.to_bytes().to_vec();
+        let mut bytes = record.to_bytes();
         if let Some(byte) = bytes.first_mut() {
             *byte = version;
         }
@@ -602,7 +604,7 @@ async fn migration_must_happen_before_the_terminal_update() {
     assert!(!penultimate.is_terminal());
     assert_eq!(
         store.put_bytes(&penultimate.to_bytes()).await.expect("put"),
-        PutOutcome::Stored
+        PutOutcome::Changed
     );
 
     // The safe migration: spend the last counter. A strictly larger counter
@@ -613,7 +615,7 @@ async fn migration_must_happen_before_the_terminal_update() {
     );
     assert_eq!(
         store.put_bytes(&migration.to_bytes()).await.expect("put"),
-        PutOutcome::Replaced
+        PutOutcome::Changed
     );
     assert!(migration.is_terminal());
     assert!(migration.next_counter().is_err());
@@ -633,7 +635,7 @@ async fn migration_must_happen_before_the_terminal_update() {
             .put_bytes(&smaller_target.to_bytes())
             .await
             .expect("put"),
-        PutOutcome::Replaced,
+        PutOutcome::Changed,
         "a terminal pointer is NOT frozen: a smaller target still displaces it"
     );
 

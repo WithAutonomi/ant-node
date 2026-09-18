@@ -27,7 +27,6 @@
 //! └─────────────────────────────────────────────────────────┘
 //! ```
 
-#[cfg(test)]
 use crate::ant_protocol::DATA_TYPE_CHUNK;
 use crate::ant_protocol::{
     settlement_compatibility, ChunkGetRequest, ChunkGetResponse, ChunkMessage, ChunkMessageBody,
@@ -918,17 +917,24 @@ impl AntProtocol {
 
         // Check if the chunk is already stored so we can tell the client
         // to skip payment (already_stored = true).
+        //
+        // Only chunks: this reads the chunk store, so asking it about any other
+        // kind answers a question about the wrong address space. A pointer
+        // quote names a state, not content, and every pointer state — creation
+        // or update — is paid for, so it is never already stored.
+        //
         // The match intentionally logs the error when the `logging` feature is
         // active. Clippy suggests `unwrap_or_default()` when logging is compiled
         // out, but keeping the explicit match preserves the diagnostic intent.
         #[allow(clippy::manual_unwrap_or_default)]
-        let already_stored = match self.storage.exists(&request.address) {
-            Ok(exists) => exists,
-            Err(e) => {
-                warn!("Storage check failed for {addr_hex}: {e}");
-                false // Assume not stored on error — generate a normal quote.
-            }
-        };
+        let already_stored = request.data_type == DATA_TYPE_CHUNK
+            && match self.storage.exists(&request.address) {
+                Ok(exists) => exists,
+                Err(e) => {
+                    warn!("Storage check failed for {addr_hex}: {e}");
+                    false // Assume not stored on error — generate a normal quote.
+                }
+            };
 
         if already_stored {
             debug!("Chunk {addr_hex} already stored — returning quote with already_stored=true");
@@ -1156,6 +1162,7 @@ mod tests {
     use super::*;
     use crate::payment::metrics::QuotingMetricsTracker;
     use crate::payment::{EvmVerifierConfig, PaymentVerifierConfig};
+    use crate::pointer::{DATA_TYPE_POINTER, POINTER_WIRE_LEN};
     use crate::storage::ChunkStoreConfig;
     use evmlib::RewardsAddress;
     use saorsa_core::identity::NodeIdentity;
@@ -2009,6 +2016,56 @@ mod tests {
             result.is_none(),
             "expected None for response message, got: {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_stored_chunk_does_not_suppress_a_pointer_quote() {
+        // A pointer quote names a state, not content. If a chunk sitting at
+        // that address could set `already_stored`, a majority of nodes would
+        // tell the client to skip payment and the write would then be refused
+        // as unpaid. Only chunks may answer from the chunk store.
+        let (protocol, _temp) = create_test_protocol().await;
+
+        let content = b"a chunk that shares a pointer state address";
+        let address = ChunkStore::compute_address(content);
+        protocol.payment_verifier().cache_insert(address);
+        let put_msg = ChunkMessage {
+            request_id: 320,
+            body: ChunkMessageBody::PutRequest(ChunkPutRequest::new(
+                address,
+                Bytes::copy_from_slice(content),
+            )),
+        };
+        let put_bytes = put_msg.encode().expect("encode put");
+        let _ = protocol
+            .try_handle_request(&put_bytes)
+            .await
+            .expect("handle put");
+
+        let quote_msg = ChunkMessage {
+            request_id: 321,
+            body: ChunkMessageBody::QuoteRequest(ChunkQuoteRequest {
+                address,
+                data_size: POINTER_WIRE_LEN as u64,
+                data_type: DATA_TYPE_POINTER,
+            }),
+        };
+        let quote_bytes = quote_msg.encode().expect("encode quote");
+        let response_bytes = protocol
+            .try_handle_request(&quote_bytes)
+            .await
+            .expect("handle quote")
+            .expect("expected response");
+
+        match ChunkMessage::decode(&response_bytes).expect("decode").body {
+            ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success {
+                already_stored, ..
+            }) => assert!(
+                !already_stored,
+                "a chunk must not answer for a pointer state"
+            ),
+            other => panic!("expected a quote, got: {other:?}"),
+        }
     }
 
     #[tokio::test]
