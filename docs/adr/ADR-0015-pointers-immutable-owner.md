@@ -106,7 +106,8 @@ re-checks under its lock, because a newer state can land while payment verifies.
 | Downgrade the format | `version` is signed and inside `state_id`; unknown versions are refused |
 | Unknown target kind | Carried, never interpreted — a node stores 33 opaque bytes |
 | Collide a pointer and a chunk address | Refused in both directions. The two stores take separate locks, so simultaneous commits of both kinds at one address are not yet atomic |
-| Peer lies about storing a pointer | The client checks every acknowledgement names the address and state it sent, and stores on a quorum rather than stopping at the first success |
+| Peer lies about storing a pointer | Every acknowledgement must name the address and state the client sent, and a write needs a majority of the close group — the same group, by the same call, that a read asks, so an acknowledged pointer is readable |
+| Node claims a record it no longer holds | An index entry is only a claim about a file; before answering "unchanged" or "stale" the node reads the file back, and a lost or corrupt one makes the submission a repair |
 
 ## Consequences
 
@@ -158,3 +159,8 @@ on the same work.
 - A crafted chunk cannot satisfy a pointer's paid-cache entry.
 - An acknowledgement naming a different address or state is refused, and a read
   keeps the winner whatever order the replies arrive in.
+- A majority of the group answering ends a write or a read, so one unreachable
+  peer cannot stall either; a minority is reported as a shortfall, never
+  presented as the network's answer.
+- A resubmission repairs a record whose file the disk lost, rather than being
+  acknowledged as unchanged.
