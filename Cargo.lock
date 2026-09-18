@@ -882,9 +882,8 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "3.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c7b4fbfd0a8b397d0dc1a0dc7308308242911147224c4e1a56130168e7ad48f"
+version = "3.1.0"
+source = "git+https://github.com/WithAutonomi/ant-protocol?rev=34b7832a001df8b80b18555ca058734baae43496#34b7832a001df8b80b18555ca058734baae43496"
 dependencies = [
  "blake3",
  "bytes",
@@ -7104,7 +7103,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

@@ -973,11 +973,19 @@ impl Devnet {
         let storage = Arc::new(storage);
         let payment_verifier = Arc::new(payment_verifier);
 
-        Ok(AntProtocol::new(
-            storage,
-            payment_verifier,
-            Arc::new(quote_generator),
-        ))
+        // Same pointer wiring as a production node, so a devnet exercises the
+        // real path rather than a node that silently refuses every pointer.
+        let pointer_store = crate::pointer::PointerStore::new(storage.root_dir())
+            .await
+            .map_err(|e| DevnetError::Startup(format!("Failed to open pointer store: {e}")))?;
+        let pointers = crate::pointer::PointerService::new(pointer_store)
+            .with_chunk_store(Arc::clone(&storage))
+            .with_payments(Arc::clone(&payment_verifier));
+
+        Ok(
+            AntProtocol::new(storage, payment_verifier, Arc::new(quote_generator))
+                .with_pointer_service(pointers),
+        )
     }
 
     #[allow(clippy::too_many_lines)]

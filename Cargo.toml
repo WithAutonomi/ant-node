@@ -228,6 +228,13 @@ webrtc-direct = [
     "dep:self_encryption",
 ]
 
+[patch.crates-io]
+# Pointers (ADR-0016) add the `Pointer` record and its wire messages on top of
+# the published 3.0.0, so this is the only entry that has to leave the release
+# baseline. A rev, not a branch, so the pin is immutable. Drop it once the
+# pointer PR lands and 3.1.0 is published.
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "34b7832a001df8b80b18555ca058734baae43496" }
+
 [profile.release]
 lto = true
 codegen-units = 1

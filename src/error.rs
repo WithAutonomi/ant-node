@@ -60,3 +60,20 @@ pub enum Error {
     #[error("node is shutting down")]
     ShuttingDown,
 }
+
+impl From<ant_protocol::pointer::PointerError> for Error {
+    /// Map a wire-level pointer rejection onto the node's error type.
+    ///
+    /// Signature failures become [`Error::Crypto`] and everything else becomes
+    /// [`Error::Protocol`], so a caller can still tell "these bytes are not a
+    /// pointer" from "these bytes are not signed by the key they carry".
+    fn from(error: ant_protocol::pointer::PointerError) -> Self {
+        use ant_protocol::pointer::PointerError;
+        match error {
+            PointerError::SignatureInvalid | PointerError::SigningFailed(_) => {
+                Self::Crypto(error.to_string())
+            }
+            other => Self::Protocol(other.to_string()),
+        }
+    }
+}

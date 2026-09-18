@@ -74,7 +74,7 @@ use ant_node::replication::slice::{
 };
 use ant_node::replication::subtree::{
     build_subtree_proof, select_spotcheck_indices, select_subtree_path, verify_subtree_proof,
-    StructureVerdict, SubtreeLeaf, SubtreeProof,
+    LeafKind, StructureVerdict, SubtreeLeaf, SubtreeProof,
 };
 use rand::Rng;
 use saorsa_pqc::api::sig::{ml_dsa_65, MlDsaPublicKey, MlDsaSecretKey};
@@ -385,6 +385,7 @@ fn relay_holding_only_addresses_caught_by_real_bytes_check() {
         // commitment because it lacks the bytes.
         let forged_nonced_root = *blake3::hash(b"i-do-not-have-the-bytes").as_bytes();
         leaves.push(SubtreeLeaf {
+            kind: LeafKind::Chunk,
             key: k,
             bytes_hash: k,
             content_len: u32::try_from(c.len()).unwrap(),
@@ -491,6 +492,7 @@ fn predict_and_fetch_relay_is_caught_by_fresh_random_sample() {
                 *blake3::hash(b"forged").as_bytes()
             };
             leaves.push(SubtreeLeaf {
+                kind: LeafKind::Chunk,
                 key: k,
                 bytes_hash: k,
                 content_len: u32::try_from(c.len()).unwrap(),

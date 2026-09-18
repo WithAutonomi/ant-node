@@ -1453,11 +1453,14 @@ mod tests {
     fn max_round1_proof_fits_the_audit_family_ceiling() {
         use crate::replication::commitment::{StorageCommitment, MAX_COMMITMENT_KEY_COUNT};
         use crate::replication::config::MAX_SUBTREE_AUDIT_MESSAGE_SIZE;
-        use crate::replication::subtree::{max_subtree_leaves, SubtreeLeaf, SubtreeProof};
+        use crate::replication::subtree::{
+            max_subtree_leaves, LeafKind, SubtreeLeaf, SubtreeProof,
+        };
 
         let leaf_count = max_subtree_leaves(MAX_COMMITMENT_KEY_COUNT) as usize;
         let leaves: Vec<SubtreeLeaf> = (0..leaf_count)
             .map(|_| SubtreeLeaf {
+                kind: LeafKind::Chunk,
                 key: [0xAB; 32],
                 bytes_hash: [0xCD; 32],
                 content_len: u32::MAX,
