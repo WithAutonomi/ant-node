@@ -79,7 +79,7 @@ use crate::replication::commitment_state::{
 use crate::replication::config::{
     max_parallel_fetch, storage_admission_width, ReplicationConfig, MAX_AUDIT_RESPONSES_PER_PEER,
     MAX_CONCURRENT_AUDIT_RESPONSES, MAX_CONCURRENT_REPLICATION_SENDS,
-    MAX_DIGEST_AUDIT_RESPONSES_PER_PEER, MAX_INCOMING_VERIFICATION_KEYS,
+    MAX_DIGEST_AUDIT_RESPONSES_PER_PEER, MAX_INCOMING_VERIFICATION_KEYS, MAX_PENDING_FRESH_OFFERS,
     MAX_SUBTREE_ROUND1_PER_PEER, MAX_SUBTREE_SESSIONS, MAX_VERIFICATION_KEYS_PER_CYCLE,
     REPLICATION_PROTOCOL_ID, SUBTREE_AUDIT_PROTOCOL_ID, SUBTREE_ROUND1_WORK_BURST_BYTES,
     SUBTREE_ROUND1_WORK_REFILL_BYTES_PER_SEC, SUBTREE_SESSION_TTL,
@@ -1746,6 +1746,9 @@ pub struct ReplicationEngine {
     /// Limits concurrent outbound replication sends to prevent bandwidth
     /// saturation on home broadband connections.
     send_semaphore: Arc<Semaphore>,
+    /// Bounds how many encoded fresh offers can wait behind `send_semaphore`;
+    /// see [`MAX_PENDING_FRESH_OFFERS`].
+    pending_offer_semaphore: Arc<Semaphore>,
     /// Bounds concurrent IN-FLIGHT LIGHT audit-responder tasks (responsible-chunk
     /// audits + subtree slice round 2). The heavy subtree round 1 has its own
     /// tighter pool ([`SubtreeRound1Limiter`]). Those are spawned off the serial
@@ -1911,6 +1914,7 @@ impl ReplicationEngine {
             recent_provers: Arc::new(RwLock::new(RecentProvers::new())),
             sig_verify_attempts: Arc::new(RwLock::new(HashMap::new())),
             send_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_REPLICATION_SENDS)),
+            pending_offer_semaphore: Arc::new(Semaphore::new(MAX_PENDING_FRESH_OFFERS)),
             audit_responder_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_AUDIT_RESPONSES)),
             audit_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
             audit_responder_metrics: Arc::new(AuditResponderMetrics::default()),
@@ -2369,6 +2373,13 @@ impl ReplicationEngine {
     /// drainer; this direct entry point schedules here so callers (and tests)
     /// that drive replication directly still get the possession check.
     pub async fn replicate_fresh(&self, key: &XorName, data: &[u8], proof_of_payment: &[u8]) {
+        // The semaphore is never closed, so this only fails at shutdown.
+        let Ok(pending_offer) = Arc::clone(&self.pending_offer_semaphore)
+            .acquire_owned()
+            .await
+        else {
+            return;
+        };
         let peers = fresh::replicate_fresh(
             key,
             data,
@@ -2377,6 +2388,7 @@ impl ReplicationEngine {
             &self.paid_list,
             &self.config,
             &self.send_semaphore,
+            pending_offer,
         )
         .await;
         if !peers.is_empty() {
@@ -2398,37 +2410,62 @@ impl ReplicationEngine {
         };
         let p2p = Arc::clone(&self.p2p_node);
         let paid_list = Arc::clone(&self.paid_list);
+        let storage = Arc::clone(&self.storage);
         let config = Arc::clone(&self.config);
         let send_semaphore = Arc::clone(&self.send_semaphore);
+        let pending_offer_semaphore = Arc::clone(&self.pending_offer_semaphore);
         let possession_tx = self.possession_check_tx.clone();
         let shutdown = self.shutdown.clone();
 
         let handle = tokio::spawn(async move {
             loop {
-                tokio::select! {
+                let event = tokio::select! {
                     () = shutdown.cancelled() => break,
                     event = rx.recv() => {
                         let Some(event) = event else { break };
-                        let peers = fresh::replicate_fresh(
-                            &event.key,
-                            &event.data,
-                            &event.payment_proof,
-                            &p2p,
-                            &paid_list,
-                            &config,
-                            &send_semaphore,
-                        )
-                        .await;
-                        // Schedule the delayed possession check (ADR-0003) for
-                        // the responsible close-group peers. A closed receiver
-                        // (engine shutting down) is ignored.
-                        if !peers.is_empty() {
-                            let _ = possession_tx.send(possession::PossessionCheckEvent {
-                                key: event.key,
-                                peers,
-                            });
-                        }
+                        event
                     }
+                };
+                // Wait for a pending-offer permit before touching the chunk so a
+                // send backlog holds queued events, not encoded chunk buffers.
+                let pending_offer = tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    permit = Arc::clone(&pending_offer_semaphore).acquire_owned() => {
+                        let Ok(permit) = permit else { break };
+                        permit
+                    }
+                };
+                let key_hex = hex::encode(event.key);
+                let data = match storage.get(&event.key).await {
+                    Ok(Some(data)) => data,
+                    Ok(None) => {
+                        debug!("Chunk {key_hex} no longer stored, skipping fresh replication");
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!("Failed to read chunk {key_hex} for fresh replication: {e}");
+                        continue;
+                    }
+                };
+                let peers = fresh::replicate_fresh(
+                    &event.key,
+                    &data,
+                    &event.payment_proof,
+                    &p2p,
+                    &paid_list,
+                    &config,
+                    &send_semaphore,
+                    pending_offer,
+                )
+                .await;
+                // Schedule the delayed possession check (ADR-0003) for
+                // the responsible close-group peers. A closed receiver
+                // (engine shutting down) is ignored.
+                if !peers.is_empty() {
+                    let _ = possession_tx.send(possession::PossessionCheckEvent {
+                        key: event.key,
+                        peers,
+                    });
                 }
             }
             debug!("Fresh-write drainer shut down");

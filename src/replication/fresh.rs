@@ -11,7 +11,7 @@ use crate::logging::{debug, warn};
 use rand::Rng;
 use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::ant_protocol::XorName;
 use crate::replication::config::{
@@ -26,14 +26,25 @@ use crate::replication::protocol::{
 ///
 /// Sent from the chunk PUT handler to the replication engine via an
 /// unbounded channel so that the PUT response is not blocked by
-/// replication fan-out.
+/// replication fan-out. The event deliberately carries no chunk bytes: the
+/// chunk is already on disk, and the drainer reads it back only once it
+/// holds a pending-offer permit, so a replication backlog queues as small
+/// events rather than chunk-sized buffers.
 pub struct FreshWriteEvent {
     /// Content-address of the stored chunk.
     pub key: XorName,
-    /// The chunk data.
-    pub data: Vec<u8>,
     /// Serialized proof-of-payment.
     pub payment_proof: Vec<u8>,
+}
+
+/// An encoded fresh offer shared by the per-peer send tasks.
+///
+/// The pending-offer permit is released together with the buffer, once the
+/// last send task drops its reference, which caps how many encoded offers
+/// can wait behind the send permits at `MAX_PENDING_FRESH_OFFERS`.
+struct EncodedOffer {
+    bytes: Vec<u8>,
+    _pending: OwnedSemaphorePermit,
 }
 
 /// Execute fresh replication for a newly accepted record.
@@ -45,7 +56,10 @@ pub struct FreshWriteEvent {
 ///
 /// The `send_semaphore` limits how many outbound chunk transfers can be
 /// in-flight concurrently across the entire replication engine, preventing
-/// bandwidth saturation on home broadband connections.
+/// bandwidth saturation on home broadband connections. `pending_offer` is the
+/// caller's permit from the pending-offer semaphore; it is held with the
+/// encoded offer until the last per-peer send finishes.
+#[allow(clippy::too_many_arguments)]
 pub async fn replicate_fresh(
     key: &XorName,
     data: &[u8],
@@ -54,6 +68,7 @@ pub async fn replicate_fresh(
     paid_list: &Arc<PaidList>,
     config: &ReplicationConfig,
     send_semaphore: &Arc<Semaphore>,
+    pending_offer: OwnedSemaphorePermit,
 ) -> Vec<PeerId> {
     let self_id = *p2p_node.peer_id();
 
@@ -95,11 +110,15 @@ pub async fn replicate_fresh(
     };
     // Share one encoded copy across the per-peer send tasks so a retry only
     // re-materialises the buffer for the (consuming) send call, keeping the
-    // common single-attempt path at one clone per peer.
-    let encoded = Arc::new(encoded);
+    // common single-attempt path at one clone per peer. The pending-offer
+    // permit travels with the buffer.
+    let encoded = Arc::new(EncodedOffer {
+        bytes: encoded,
+        _pending: pending_offer,
+    });
     for peer in &target_peers {
         let p2p = Arc::clone(p2p_node);
-        let data = Arc::clone(&encoded);
+        let offer = Arc::clone(&encoded);
         let peer_id = *peer;
         let sem = Arc::clone(send_semaphore);
         tokio::spawn(async move {
@@ -117,12 +136,7 @@ pub async fn replicate_fresh(
             let mut attempt = 0u32;
             loop {
                 match p2p
-                    .send_message(
-                        &peer_id,
-                        REPLICATION_PROTOCOL_ID,
-                        data.as_ref().clone(),
-                        &[],
-                    )
+                    .send_message(&peer_id, REPLICATION_PROTOCOL_ID, offer.bytes.clone(), &[])
                     .await
                 {
                     Ok(()) => break,
