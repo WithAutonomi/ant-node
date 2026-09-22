@@ -2427,7 +2427,7 @@ impl ReplicationEngine {
         };
         let peers = fresh::replicate_fresh(
             key,
-            data,
+            data.to_vec(),
             proof_of_payment,
             &self.p2p_node,
             &self.paid_list,
@@ -2494,7 +2494,7 @@ impl ReplicationEngine {
                 };
                 let peers = fresh::replicate_fresh(
                     &event.key,
-                    &data,
+                    data,
                     &event.payment_proof,
                     &p2p,
                     &paid_list,
