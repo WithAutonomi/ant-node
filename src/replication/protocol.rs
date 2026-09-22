@@ -46,7 +46,13 @@ impl ReplicationMessage {
     /// Returns [`ReplicationProtocolError::SerializationFailed`] if postcard
     /// serialization fails.
     pub fn encode(&self) -> Result<Vec<u8>, ReplicationProtocolError> {
-        let bytes = postcard::to_stdvec(self)
+        // Size the buffer exactly up front. Chunk-carrying bodies run to
+        // several MiB, and a growing `Vec` would otherwise end up with up to
+        // twice the needed capacity, retained for as long as the encoded
+        // message is queued for sending.
+        let size = postcard::experimental::serialized_size(self)
+            .map_err(|e| ReplicationProtocolError::SerializationFailed(e.to_string()))?;
+        let bytes = postcard::to_extend(self, Vec::with_capacity(size))
             .map_err(|e| ReplicationProtocolError::SerializationFailed(e.to_string()))?;
 
         // The same family ceiling the decoder applies, from the same table and
@@ -2426,6 +2432,24 @@ mod tests {
         let encoded = msg.encode().expect("encode should succeed");
         let decoded = ReplicationMessage::decode_subtree_audit_response(&encoded)
             .expect("a small audit reply must decode");
+        assert_eq!(decoded.request_id, 7);
+    }
+
+    #[test]
+    fn encode_allocates_exactly_the_serialized_size() {
+        // A chunk-sized offer must not carry growth slack: the encoded buffer is
+        // shared by every per-peer send task for as long as it is queued.
+        let msg = ReplicationMessage {
+            request_id: 7,
+            body: ReplicationMessageBody::FreshReplicationOffer(FreshReplicationOffer {
+                key: [3; 32],
+                data: vec![0xAB; 3 * 1024 * 1024 + 123],
+                proof_of_payment: vec![1, 2, 3],
+            }),
+        };
+        let encoded = msg.encode().unwrap();
+        assert_eq!(encoded.capacity(), encoded.len());
+        let decoded = ReplicationMessage::decode(&encoded).unwrap();
         assert_eq!(decoded.request_id, 7);
     }
 
