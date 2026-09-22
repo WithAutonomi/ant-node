@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use crate::logging::{debug, warn};
+use bytes::Bytes;
 use rand::Rng;
 use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
@@ -41,9 +42,11 @@ pub struct FreshWriteEvent {
 ///
 /// The pending-offer permit is released together with the buffer, once the
 /// last send task drops its reference, which caps how many encoded offers
-/// can wait behind the send permits at `MAX_PENDING_FRESH_OFFERS`.
+/// can wait behind the send permits at `MAX_PENDING_FRESH_OFFERS`. The bytes
+/// are shared with the transport as well: each send attempt hands out a
+/// reference-counted handle rather than a copy.
 struct EncodedOffer {
-    bytes: Vec<u8>,
+    bytes: Bytes,
     _pending: OwnedSemaphorePermit,
 }
 
@@ -113,12 +116,11 @@ pub async fn replicate_fresh(
         );
         return Vec::new();
     };
-    // Share one encoded copy across the per-peer send tasks so a retry only
-    // re-materialises the buffer for the (consuming) send call, keeping the
-    // common single-attempt path at one clone per peer. The pending-offer
-    // permit travels with the buffer.
+    // One encoded copy serves every per-peer send task and every retry; the
+    // transport borrows it through `Bytes` instead of taking a copy. The
+    // pending-offer permit travels with the buffer.
     let encoded = Arc::new(EncodedOffer {
-        bytes: encoded,
+        bytes: Bytes::from(encoded),
         _pending: pending_offer,
     });
     for peer in &target_peers {
