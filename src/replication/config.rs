@@ -170,6 +170,28 @@ pub const SELF_LOOKUP_INTERVAL_MAX: Duration = Duration::from_secs(SELF_LOOKUP_I
 /// at most ~12 MB queued for the upload link at any instant.
 pub const MAX_CONCURRENT_REPLICATION_SENDS: usize = 3;
 
+/// Maximum number of encoded fresh-replication offers held in memory.
+///
+/// Each accepted write is encoded once (chunk plus proof, up to ~4 MB) and
+/// that buffer stays alive until the last of its per-peer sends completes.
+/// With only `MAX_CONCURRENT_REPLICATION_SENDS` transfers in flight, a write
+/// rate above the network's send rate would otherwise queue an unbounded
+/// number of encoded offers behind the send permits. The fresh-write drainer
+/// takes one of these permits before it reads and encodes a chunk, so the
+/// backlog waits as small queued events instead of chunk-sized buffers.
+pub const MAX_PENDING_FRESH_OFFERS: usize = 8;
+
+/// How many times the offer dispatcher tries to read an accepted chunk back
+/// from storage before giving up on its fresh offers.
+///
+/// The chunk was stored moments earlier, so a failed read is a transient
+/// fault (exhausted descriptors, an I/O hiccup) far more often than a lost
+/// chunk; a lost chunk reports `None` and is skipped without retry.
+pub const MAX_FRESH_READ_ATTEMPTS: u32 = 3;
+
+/// Pause before retrying a failed chunk read-back in the offer dispatcher.
+pub const FRESH_READ_RETRY_DELAY: Duration = Duration::from_secs(1);
+
 /// Maximum number of concurrent in-flight audit-responder tasks.
 ///
 /// The LIGHT audit-responder handlers — responsible-chunk audits and subtree

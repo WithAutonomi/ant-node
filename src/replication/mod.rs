@@ -77,12 +77,12 @@ use crate::replication::commitment_state::{
     PeerCommitmentRecord, PersistedRetention, ResponderCommitmentState, GOSSIP_ANSWERABILITY_TTL,
 };
 use crate::replication::config::{
-    max_parallel_fetch, storage_admission_width, ReplicationConfig, MAX_AUDIT_RESPONSES_PER_PEER,
-    MAX_CONCURRENT_AUDIT_RESPONSES, MAX_CONCURRENT_REPLICATION_SENDS,
-    MAX_DIGEST_AUDIT_RESPONSES_PER_PEER, MAX_INCOMING_VERIFICATION_KEYS,
-    MAX_SUBTREE_ROUND1_PER_PEER, MAX_SUBTREE_SESSIONS, MAX_VERIFICATION_KEYS_PER_CYCLE,
-    REPLICATION_PROTOCOL_ID, SUBTREE_AUDIT_PROTOCOL_ID, SUBTREE_ROUND1_WORK_BURST_BYTES,
-    SUBTREE_ROUND1_WORK_REFILL_BYTES_PER_SEC, SUBTREE_SESSION_TTL,
+    max_parallel_fetch, storage_admission_width, ReplicationConfig, FRESH_READ_RETRY_DELAY,
+    MAX_AUDIT_RESPONSES_PER_PEER, MAX_CONCURRENT_AUDIT_RESPONSES, MAX_CONCURRENT_REPLICATION_SENDS,
+    MAX_DIGEST_AUDIT_RESPONSES_PER_PEER, MAX_FRESH_READ_ATTEMPTS, MAX_INCOMING_VERIFICATION_KEYS,
+    MAX_PENDING_FRESH_OFFERS, MAX_SUBTREE_ROUND1_PER_PEER, MAX_SUBTREE_SESSIONS,
+    MAX_VERIFICATION_KEYS_PER_CYCLE, REPLICATION_PROTOCOL_ID, SUBTREE_AUDIT_PROTOCOL_ID,
+    SUBTREE_ROUND1_WORK_BURST_BYTES, SUBTREE_ROUND1_WORK_REFILL_BYTES_PER_SEC, SUBTREE_SESSION_TTL,
 };
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
@@ -1746,6 +1746,9 @@ pub struct ReplicationEngine {
     /// Limits concurrent outbound replication sends to prevent bandwidth
     /// saturation on home broadband connections.
     send_semaphore: Arc<Semaphore>,
+    /// Bounds how many encoded fresh offers can wait behind `send_semaphore`;
+    /// see [`MAX_PENDING_FRESH_OFFERS`].
+    pending_offer_semaphore: Arc<Semaphore>,
     /// Bounds concurrent IN-FLIGHT LIGHT audit-responder tasks (responsible-chunk
     /// audits + subtree slice round 2). The heavy subtree round 1 has its own
     /// tighter pool ([`SubtreeRound1Limiter`]). Those are spawned off the serial
@@ -1812,9 +1815,15 @@ pub struct ReplicationEngine {
     subtree_round1: SubtreeRound1Limiter,
     /// Receiver for fresh-write events from the chunk PUT handler.
     ///
-    /// When present, `start()` spawns a drainer task that calls
-    /// `replicate_fresh` for each event.
+    /// When present, `start()` spawns the fresh-write drainer, which records
+    /// paid-list evidence for each event immediately and forwards it to the
+    /// offer dispatcher.
     fresh_write_rx: Option<mpsc::UnboundedReceiver<fresh::FreshWriteEvent>>,
+    /// Hand-off from the fresh-write drainer to the offer dispatcher, the only
+    /// permit-gated stage. Unbounded and FIFO, holding key + proof only.
+    fresh_offer_tx: mpsc::UnboundedSender<fresh::FreshOfferEvent>,
+    /// Receiver paired with `fresh_offer_tx`; taken by the dispatcher task.
+    fresh_offer_rx: Option<mpsc::UnboundedReceiver<fresh::FreshOfferEvent>>,
     /// Sender for delayed possession-check events (ADR-0003). The fresh-write
     /// drainer pushes the responsible close-group peers here after each fresh
     /// replication; the possession-check scheduler drains the paired receiver.
@@ -1878,6 +1887,7 @@ impl ReplicationEngine {
         let initial_neighbors = NeighborSyncState::new_cycle(Vec::new());
         let config = Arc::new(config);
         let (possession_check_tx, possession_check_rx) = mpsc::unbounded_channel();
+        let (fresh_offer_tx, fresh_offer_rx) = mpsc::unbounded_channel();
 
         // ADR-0004: monetized-pin channel (verifier -> first-audit drainer).
         // Bounded (Amendment 2): every stage of the first-audit pipeline is
@@ -1911,6 +1921,7 @@ impl ReplicationEngine {
             recent_provers: Arc::new(RwLock::new(RecentProvers::new())),
             sig_verify_attempts: Arc::new(RwLock::new(HashMap::new())),
             send_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_REPLICATION_SENDS)),
+            pending_offer_semaphore: Arc::new(Semaphore::new(MAX_PENDING_FRESH_OFFERS)),
             audit_responder_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_AUDIT_RESPONSES)),
             audit_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
             audit_responder_metrics: Arc::new(AuditResponderMetrics::default()),
@@ -1948,6 +1959,8 @@ impl ReplicationEngine {
                 config.subtree_round1_max_concurrent,
             ),
             fresh_write_rx: Some(fresh_write_rx),
+            fresh_offer_tx,
+            fresh_offer_rx: Some(fresh_offer_rx),
             possession_check_tx,
             possession_check_rx: Some(possession_check_rx),
             monetized_pin_tx,
@@ -2231,6 +2244,7 @@ impl ReplicationEngine {
         self.start_verification_worker();
         self.start_bootstrap_sync(dht_events);
         self.start_fresh_write_drainer();
+        self.start_fresh_offer_dispatcher();
         self.start_possession_check_scheduler();
         // ADR-0004: deterministic first audit of commitments that backed a
         // payment (surfaced by the verifier cross-check).
@@ -2369,20 +2383,38 @@ impl ReplicationEngine {
     /// drainer; this direct entry point schedules here so callers (and tests)
     /// that drive replication directly still get the possession check.
     pub async fn replicate_fresh(&self, key: &XorName, data: &[u8], proof_of_payment: &[u8]) {
-        let peers = fresh::replicate_fresh(
+        fresh::announce_paid_write(
             key,
-            data,
             proof_of_payment,
-            &self.p2p_node,
             &self.paid_list,
+            &self.p2p_node,
             &self.config,
-            &self.send_semaphore,
         )
         .await;
-        if !peers.is_empty() {
-            let _ = self
-                .possession_check_tx
-                .send(possession::PossessionCheckEvent { key: *key, peers });
+        // The semaphore is never closed, so this only fails at shutdown.
+        let Ok(pending_offer) = Arc::clone(&self.pending_offer_semaphore)
+            .acquire_owned()
+            .await
+        else {
+            return;
+        };
+        fresh::dispatch_fresh_offer(
+            &self.fresh_offer_context(),
+            key,
+            data.to_vec(),
+            proof_of_payment,
+            pending_offer,
+        )
+        .await;
+    }
+
+    /// Handles the offer dispatcher and the direct entry point share.
+    fn fresh_offer_context(&self) -> fresh::FreshOfferContext {
+        fresh::FreshOfferContext {
+            p2p_node: Arc::clone(&self.p2p_node),
+            config: Arc::clone(&self.config),
+            send_semaphore: Arc::clone(&self.send_semaphore),
+            possession_check_tx: self.possession_check_tx.clone(),
         }
     }
 
@@ -2399,39 +2431,123 @@ impl ReplicationEngine {
         let p2p = Arc::clone(&self.p2p_node);
         let paid_list = Arc::clone(&self.paid_list);
         let config = Arc::clone(&self.config);
-        let send_semaphore = Arc::clone(&self.send_semaphore);
-        let possession_tx = self.possession_check_tx.clone();
+        let offer_tx = self.fresh_offer_tx.clone();
         let shutdown = self.shutdown.clone();
 
         let handle = tokio::spawn(async move {
             loop {
-                tokio::select! {
+                let event = tokio::select! {
                     () = shutdown.cancelled() => break,
                     event = rx.recv() => {
                         let Some(event) = event else { break };
-                        let peers = fresh::replicate_fresh(
-                            &event.key,
-                            &event.data,
-                            &event.payment_proof,
-                            &p2p,
-                            &paid_list,
-                            &config,
-                            &send_semaphore,
-                        )
-                        .await;
-                        // Schedule the delayed possession check (ADR-0003) for
-                        // the responsible close-group peers. A closed receiver
-                        // (engine shutting down) is ignored.
-                        if !peers.is_empty() {
-                            let _ = possession_tx.send(possession::PossessionCheckEvent {
-                                key: event.key,
-                                peers,
-                            });
-                        }
+                        event
                     }
+                };
+                // Stage one never waits for chunk back-pressure: the paid-list
+                // entry and PaidNotify are what let peers repair the key later,
+                // so every queued write gets them at arrival rate.
+                fresh::announce_paid_write(
+                    &event.key,
+                    &event.payment_proof,
+                    &paid_list,
+                    &p2p,
+                    &config,
+                )
+                .await;
+                if offer_tx
+                    .send(fresh::FreshOfferEvent {
+                        key: event.key,
+                        payment_proof: event.payment_proof,
+                        read_attempts: 0,
+                    })
+                    .is_err()
+                {
+                    break;
                 }
             }
             debug!("Fresh-write drainer shut down");
+        });
+        self.task_handles.push(handle);
+    }
+
+    /// Spawn the fresh-offer dispatcher: the only stage of fresh replication
+    /// that waits for a pending-offer permit.
+    ///
+    /// For each forwarded write it acquires a permit, reads the chunk back
+    /// from storage and dispatches the offers. A missing chunk is skipped; a
+    /// failed read is retried up to `MAX_FRESH_READ_ATTEMPTS` times with the
+    /// permit released in between, so a transient I/O fault does not lose the
+    /// write's replication.
+    fn start_fresh_offer_dispatcher(&mut self) {
+        let Some(mut rx) = self.fresh_offer_rx.take() else {
+            return;
+        };
+        let storage = Arc::clone(&self.storage);
+        let pending_offer_semaphore = Arc::clone(&self.pending_offer_semaphore);
+        let offer_tx = self.fresh_offer_tx.clone();
+        let ctx = self.fresh_offer_context();
+        let shutdown = self.shutdown.clone();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let event = tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    event = rx.recv() => {
+                        let Some(event) = event else { break };
+                        event
+                    }
+                };
+                // Wait for a pending-offer permit before touching the chunk so a
+                // send backlog holds queued events, not encoded chunk buffers.
+                let pending_offer = tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    permit = Arc::clone(&pending_offer_semaphore).acquire_owned() => {
+                        let Ok(permit) = permit else { break };
+                        permit
+                    }
+                };
+                let key_hex = hex::encode(event.key);
+                // The chunk was content-checked when it was stored; the
+                // receiver validates the offer against its address anyway.
+                let data = match storage.get_raw(&event.key).await {
+                    Ok(Some(data)) => data,
+                    Ok(None) => {
+                        debug!("Chunk {key_hex} no longer stored, skipping fresh replication");
+                        continue;
+                    }
+                    Err(e) => {
+                        drop(pending_offer);
+                        let attempts = event.read_attempts + 1;
+                        if attempts >= MAX_FRESH_READ_ATTEMPTS {
+                            warn!(
+                                "Giving up fresh replication of {key_hex} after {attempts} failed reads: {e}"
+                            );
+                            continue;
+                        }
+                        warn!(
+                            "Failed to read chunk {key_hex} for fresh replication (attempt {attempts}): {e}"
+                        );
+                        tokio::select! {
+                            () = shutdown.cancelled() => break,
+                            () = tokio::time::sleep(FRESH_READ_RETRY_DELAY) => {}
+                        }
+                        let _ = offer_tx.send(fresh::FreshOfferEvent {
+                            read_attempts: attempts,
+                            ..event
+                        });
+                        continue;
+                    }
+                };
+                fresh::dispatch_fresh_offer(
+                    &ctx,
+                    &event.key,
+                    data,
+                    &event.payment_proof,
+                    pending_offer,
+                )
+                .await;
+            }
+            debug!("Fresh-offer dispatcher shut down");
         });
         self.task_handles.push(handle);
     }

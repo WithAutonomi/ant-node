@@ -357,6 +357,13 @@ impl AntProtocol {
         self.fresh_write_tx = Some(tx);
     }
 
+    /// The fresh-write sender, if one was set. Lets tests drive the
+    /// replication engine's fresh-write pipeline exactly as a PUT would.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn fresh_write_sender(&self) -> Option<mpsc::UnboundedSender<FreshWriteEvent>> {
+        self.fresh_write_tx.clone()
+    }
+
     /// Get the protocol identifier.
     #[must_use]
     pub fn protocol_id(&self) -> &'static str {
@@ -733,14 +740,11 @@ impl AntProtocol {
                     // fall back to the original proof rather than dropping the
                     // replication entirely.
                     let proof = Self::strip_commitment_sidecars(proof);
-                    // `request.content` is now `bytes::Bytes`; FreshWriteEvent
-                    // still carries the chunk as `Vec<u8>` for compatibility
-                    // with the replication wire format, so materialise once
-                    // here. Done only on the success path, where storage has
-                    // already accepted the chunk.
+                    // Storage has already accepted the chunk on this path, so
+                    // the event carries only the key; the replication drainer
+                    // reads the chunk back when it is ready to send it.
                     let event = FreshWriteEvent {
                         key: address,
-                        data: request.content.to_vec(),
                         payment_proof: proof,
                     };
                     if tx.send(event).is_err() {

@@ -23,6 +23,7 @@ use ant_node::payment::{
     QuotingMetricsTracker,
 };
 use ant_node::replication::config::MAX_REPLICATION_MESSAGE_SIZE;
+use ant_node::replication::fresh::FreshWriteEvent;
 use ant_node::storage::{AntProtocol, ChunkStore, ChunkStoreConfig};
 use ant_node::{ReplicationConfig, ReplicationEngine};
 use bytes::Bytes;
@@ -425,6 +426,10 @@ pub struct TestNode {
 
     /// Shutdown token for the replication engine.
     pub replication_shutdown: Option<CancellationToken>,
+
+    /// Sender feeding the replication engine's fresh-write pipeline, kept so
+    /// tests can queue writes exactly as the PUT handler does.
+    pub fresh_write_tx: Option<tokio::sync::mpsc::UnboundedSender<FreshWriteEvent>>,
 }
 
 impl TestNode {
@@ -1090,6 +1095,7 @@ impl TestNetwork {
             protocol_task: None,
             replication_engine: None,
             replication_shutdown: None,
+            fresh_write_tx: None,
         })
     }
 
@@ -1333,7 +1339,8 @@ impl TestNetwork {
         {
             let shutdown = CancellationToken::new();
             let repl_config = self.config.replication_config.clone().unwrap_or_default();
-            let (_fresh_tx, fresh_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (fresh_tx, fresh_rx) = tokio::sync::mpsc::unbounded_channel();
+            node.fresh_write_tx = Some(fresh_tx);
             let node_identity = Arc::clone(id);
             match ReplicationEngine::new(
                 repl_config,

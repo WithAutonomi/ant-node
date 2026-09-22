@@ -13,6 +13,7 @@ use ant_node::replication::commitment_state::{BuiltCommitment, ResponderCommitme
 use ant_node::replication::config::{
     storage_admission_width, K_BUCKET_SIZE, REPLICATION_PROTOCOL_ID,
 };
+use ant_node::replication::fresh::FreshWriteEvent;
 use ant_node::replication::protocol::{
     compute_audit_digest, AuditChallenge, AuditResponse, FetchRequest, FetchResponse,
     FreshReplicationOffer, FreshReplicationResponse, NeighborSyncRequest, ReplicationMessage,
@@ -251,6 +252,82 @@ async fn test_fresh_replication_propagates_to_close_group() {
     assert!(
         found_on_other,
         "Chunk should have replicated to at least one other node"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// The PUT-driven pipeline (fresh-write drainer → offer dispatcher) replicates
+/// a queued write, and a write whose chunk is no longer stored is skipped
+/// without stalling the pipeline or leaking a pending-offer permit.
+#[tokio::test]
+async fn fresh_write_pipeline_replicates_queued_writes_and_skips_missing_chunks() {
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let source_idx = 3; // first regular node
+    let source = harness.test_node(source_idx).expect("source node");
+    let source_protocol = source.ant_protocol.as_ref().expect("protocol");
+    let fresh_tx = source
+        .fresh_write_tx
+        .clone()
+        .expect("fresh-write sender wired by the harness");
+
+    let content = b"queued write through the fresh-write pipeline";
+    let address = compute_address(content);
+    source_protocol
+        .storage()
+        .put(&address, content)
+        .await
+        .expect("put");
+    for i in 0..harness.node_count() {
+        if let Some(node) = harness.test_node(i) {
+            if let Some(protocol) = &node.ant_protocol {
+                protocol.payment_verifier().cache_insert(address);
+            }
+        }
+    }
+
+    let dummy_pop = vec![0x01u8; 64];
+    // A write whose chunk was never stored goes first: the dispatcher must
+    // skip it and carry on with the next event.
+    let missing = compute_address(b"never stored anywhere");
+    fresh_tx
+        .send(FreshWriteEvent {
+            key: missing,
+            payment_proof: dummy_pop.clone(),
+        })
+        .expect("queue missing write");
+    fresh_tx
+        .send(FreshWriteEvent {
+            key: address,
+            payment_proof: dummy_pop,
+        })
+        .expect("queue write");
+
+    let deadline = tokio::time::Instant::now() + PROPAGATION_TIMEOUT;
+    let mut found_on_other = false;
+    while tokio::time::Instant::now() < deadline {
+        for i in 0..harness.node_count() {
+            if i == source_idx {
+                continue;
+            }
+            if let Some(node) = harness.test_node(i) {
+                if let Some(protocol) = &node.ant_protocol {
+                    if protocol.storage().exists(&address).unwrap_or(false) {
+                        found_on_other = true;
+                    }
+                }
+            }
+        }
+        if found_on_other {
+            break;
+        }
+        tokio::time::sleep(PROPAGATION_POLL_INTERVAL).await;
+    }
+    assert!(
+        found_on_other,
+        "queued write should have replicated through the fresh-write pipeline"
     );
 
     harness.teardown().await.expect("teardown");
