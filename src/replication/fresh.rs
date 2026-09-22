@@ -53,9 +53,12 @@ struct EncodedOffer {
 /// Execute fresh replication for a newly accepted record.
 ///
 /// Sends fresh offers to close group members (with bounded delivery retries,
-/// ADR-0003) and `PaidNotify` to `PaidCloseGroup`. Returns the close-group
-/// peers responsible for the key (excluding self) so the caller can schedule
-/// the delayed possession check; `PaidNotify` remains fire-and-forget.
+/// ADR-0003). Returns the close-group peers responsible for the key
+/// (excluding self) so the caller can schedule the delayed possession check.
+/// `PaidNotify` is deliberately not sent here: it carries the paid-list
+/// evidence peers need to repair the key later, so callers send it with
+/// [`send_paid_notify`] as soon as the write is accepted, before waiting for
+/// a pending-offer permit.
 ///
 /// The `send_semaphore` limits how many outbound chunk transfers can be
 /// in-flight concurrently across the entire replication engine, preventing
@@ -166,13 +169,8 @@ pub async fn replicate_fresh(
         });
     }
 
-    // Rule 7-8: Send PaidNotify to every member of PaidCloseGroup(K).
-    // PaidNotify messages are small metadata (no chunk data), so they don't
-    // need semaphore gating.
-    send_paid_notify(key, proof_of_payment, p2p_node, config).await;
-
     debug!(
-        "Fresh replication initiated for {} to {} peers + PaidNotify",
+        "Fresh replication initiated for {} to {} peers",
         hex::encode(key),
         target_peers.len()
     );
@@ -182,8 +180,11 @@ pub async fn replicate_fresh(
 
 /// Send `PaidNotify(K)` to every peer in `PaidCloseGroup(K)` (fire-and-forget).
 ///
-/// Per Invariant 16: sender MUST attempt delivery to every member.
-async fn send_paid_notify(
+/// Per Invariant 16: sender MUST attempt delivery to every member. The
+/// message is small metadata (no chunk data), so it is neither gated by the
+/// send semaphore nor by the pending-offer permit: rules 7-8 run as soon as
+/// the write is accepted, even when chunk offers are backed up.
+pub(crate) async fn send_paid_notify(
     key: &XorName,
     proof_of_payment: &[u8],
     p2p_node: &Arc<P2PNode>,

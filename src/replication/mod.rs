@@ -2373,6 +2373,7 @@ impl ReplicationEngine {
     /// drainer; this direct entry point schedules here so callers (and tests)
     /// that drive replication directly still get the possession check.
     pub async fn replicate_fresh(&self, key: &XorName, data: &[u8], proof_of_payment: &[u8]) {
+        fresh::send_paid_notify(key, proof_of_payment, &self.p2p_node, &self.config).await;
         // The semaphore is never closed, so this only fails at shutdown.
         let Ok(pending_offer) = Arc::clone(&self.pending_offer_semaphore)
             .acquire_owned()
@@ -2426,6 +2427,10 @@ impl ReplicationEngine {
                         event
                     }
                 };
+                // Paid-list evidence goes out immediately: it is what lets the
+                // paid close group repair the key later, so it must never wait
+                // behind chunk offers.
+                fresh::send_paid_notify(&event.key, &event.payment_proof, &p2p, &config).await;
                 // Wait for a pending-offer permit before touching the chunk so a
                 // send backlog holds queued events, not encoded chunk buffers.
                 let pending_offer = tokio::select! {
