@@ -1819,11 +1819,14 @@ impl PaymentVerifier {
         let vault_address = *self.config.evm.network.payment_vault_address();
         let contract = payment_vault::interface::IPaymentVault::new(vault_address, provider);
 
-        let result = contract
-            .completedPayments(quote_hash)
-            .call()
-            .await
-            .map_err(|e| Error::Payment(format!("completedPayments lookup failed: {e}")))?;
+        let result = contract.completedPayments(quote_hash).call().await;
+        // V2-834: EVM RPC is counted per call (bodies live inside alloy).
+        super::traffic::record(
+            super::traffic::EvmRpcCall::CompletedPayments,
+            result.is_ok(),
+        );
+        let result =
+            result.map_err(|e| Error::Payment(format!("completedPayments lookup failed: {e}")))?;
 
         Ok((Amount::from(result.amount), Some(result.rewardsAddress.0)))
     }
@@ -3254,13 +3257,18 @@ impl PaymentVerifier {
             // Query on-chain for completed merkle payment
             let info =
                 payment_vault::get_completed_merkle_payment(&self.config.evm.network, pool_hash)
-                    .await
-                    .map_err(|e| {
-                        let pool_hex = hex::encode(pool_hash);
-                        Error::Payment(format!(
-                            "Failed to query merkle payment info for pool {pool_hex}: {e}"
-                        ))
-                    })?;
+                    .await;
+            // V2-834: EVM RPC is counted per call (bodies live inside alloy).
+            super::traffic::record(
+                super::traffic::EvmRpcCall::CompletedMerklePayment,
+                info.is_ok(),
+            );
+            let info = info.map_err(|e| {
+                let pool_hex = hex::encode(pool_hash);
+                Error::Payment(format!(
+                    "Failed to query merkle payment info for pool {pool_hex}: {e}"
+                ))
+            })?;
 
             let paid_node_addresses: Vec<_> = info
                 .paidNodeAddresses

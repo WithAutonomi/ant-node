@@ -14,6 +14,7 @@ mod monitor;
 mod release_cache;
 mod rollout;
 mod signature;
+pub(crate) mod traffic;
 
 pub use apply::{AutoApplyUpgrader, RESTART_EXIT_CODE};
 pub use binary_cache::BinaryCache;
@@ -212,9 +213,29 @@ impl Upgrader {
     /// # Errors
     ///
     /// Returns an error if the download fails.
-    async fn download(&self, url: &str, dest: &Path) -> Result<()> {
+    async fn download(&self, url: &str, dest: &Path, kind: traffic::UpgradeFetch) -> Result<()> {
         debug!("Downloading: {}", url);
 
+        // V2-834: count the body once fully read; anything short of that is
+        // an error for this fetch kind.
+        let bytes = match self.fetch_body(url).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                traffic::record_error(kind);
+                return Err(e);
+            }
+        };
+        traffic::record_rx(kind, bytes.len());
+
+        Self::enforce_max_binary_size(bytes.len())?;
+
+        fs::write(dest, &bytes)?;
+        debug!("Downloaded {} bytes to {}", bytes.len(), dest.display());
+        Ok(())
+    }
+
+    /// GET `url` and read the whole body.
+    async fn fetch_body(&self, url: &str) -> Result<bytes::Bytes> {
         let response = self
             .client
             .get(url)
@@ -229,16 +250,10 @@ impl Upgrader {
             )));
         }
 
-        let bytes = response
+        response
             .bytes()
             .await
-            .map_err(|e| Error::Network(format!("Failed to read response: {e}")))?;
-
-        Self::enforce_max_binary_size(bytes.len())?;
-
-        fs::write(dest, &bytes)?;
-        debug!("Downloaded {} bytes to {}", bytes.len(), dest.display());
-        Ok(())
+            .map_err(|e| Error::Network(format!("Failed to read response: {e}")))
     }
 
     /// Ensure the downloaded binary is within a sane size limit.
@@ -313,14 +328,28 @@ impl Upgrader {
         let new_binary = temp_dir.path().join("new_binary");
         let sig_path = temp_dir.path().join("signature");
 
-        if let Err(e) = self.download(&info.download_url, &new_binary).await {
+        if let Err(e) = self
+            .download(
+                &info.download_url,
+                &new_binary,
+                traffic::UpgradeFetch::Binary,
+            )
+            .await
+        {
             warn!("Download failed: {e}");
             return Ok(UpgradeResult::RolledBack {
                 reason: format!("Download failed: {e}"),
             });
         }
 
-        if let Err(e) = self.download(&info.signature_url, &sig_path).await {
+        if let Err(e) = self
+            .download(
+                &info.signature_url,
+                &sig_path,
+                traffic::UpgradeFetch::Signature,
+            )
+            .await
+        {
             warn!("Signature download failed: {e}");
             return Ok(UpgradeResult::RolledBack {
                 reason: format!("Signature download failed: {e}"),

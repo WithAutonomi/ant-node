@@ -15,6 +15,7 @@ use crate::payment::{
 use crate::replication::config::ReplicationConfig;
 use crate::replication::fresh::FreshWriteEvent;
 use crate::replication::ReplicationEngine;
+use crate::storage::traffic as storage_traffic;
 use crate::storage::MIB;
 use crate::storage::{AntProtocol, ChunkRequestContext, ChunkStore, ChunkStoreConfig};
 use crate::upgrade::{
@@ -1082,6 +1083,7 @@ impl RunningNode {
             )
             .await;
         let telemetry = handled.get_telemetry;
+        let traffic_key = handled.traffic_key;
         match handled.response {
             Ok(Some(response)) => {
                 let send_started = Instant::now();
@@ -1090,6 +1092,18 @@ impl RunningNode {
                     .await;
                 if let Some(telemetry) = telemetry {
                     telemetry.finish_send(send_started.elapsed(), send_result.is_ok());
+                }
+                // V2-834: attribute response bytes only once the send is
+                // confirmed; failed sends are itemised separately.
+                match (&send_result, traffic_key) {
+                    (Ok(()), Some(key)) => storage_traffic::record_tx(key, response.len()),
+                    (Ok(()), None) => {
+                        storage_traffic::record_tx(
+                            storage_traffic::ChunkResponseKey::Other,
+                            response.len(),
+                        );
+                    }
+                    (Err(_), _) => storage_traffic::record_send_failed(response.len()),
                 }
                 if let Err(e) = send_result {
                     warn!("Failed to send {data_type} protocol response to {source}: {e}");

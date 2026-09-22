@@ -12,6 +12,7 @@ use crate::error::{Error, Result};
 use crate::logging::{debug, info, warn};
 use crate::upgrade::release_cache::ReleaseCache;
 use crate::upgrade::rollout::StagedRollout;
+use crate::upgrade::traffic;
 use crate::upgrade::UpgradeInfo;
 use semver::Version;
 use serde::Deserialize;
@@ -357,18 +358,29 @@ impl UpgradeMonitor {
             .header("Accept", "application/vnd.github+json")
             .send()
             .await
-            .map_err(|e| Error::Network(format!("GitHub API request failed: {e}")))?;
+            .map_err(|e| {
+                traffic::record_error(traffic::UpgradeFetch::Manifest);
+                Error::Network(format!("GitHub API request failed: {e}"))
+            })?;
 
         if !response.status().is_success() {
+            traffic::record_error(traffic::UpgradeFetch::Manifest);
             return Err(Error::Network(format!(
                 "GitHub API returned status: {}",
                 response.status()
             )));
         }
 
-        response
-            .json()
-            .await
+        // V2-834: materialise the body so its size is observable, then parse.
+        let body = match response.bytes().await {
+            Ok(body) => body,
+            Err(e) => {
+                traffic::record_error(traffic::UpgradeFetch::Manifest);
+                return Err(Error::Network(format!("Failed to read releases: {e}")));
+            }
+        };
+        traffic::record_rx(traffic::UpgradeFetch::Manifest, body.len());
+        serde_json::from_slice(&body)
             .map_err(|e| Error::Network(format!("Failed to parse releases: {e}")))
     }
 
