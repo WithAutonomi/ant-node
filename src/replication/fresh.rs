@@ -58,11 +58,12 @@ struct EncodedOffer {
 /// in-flight concurrently across the entire replication engine, preventing
 /// bandwidth saturation on home broadband connections. `pending_offer` is the
 /// caller's permit from the pending-offer semaphore; it is held with the
-/// encoded offer until the last per-peer send finishes.
+/// encoded offer until the last per-peer send finishes. `data` is taken by
+/// value so the chunk moves into the offer instead of being copied.
 #[allow(clippy::too_many_arguments)]
 pub async fn replicate_fresh(
     key: &XorName,
-    data: &[u8],
+    data: Vec<u8>,
     proof_of_payment: &[u8],
     p2p_node: &Arc<P2PNode>,
     paid_list: &Arc<PaidList>,
@@ -92,7 +93,7 @@ pub async fn replicate_fresh(
 
     let offer = FreshReplicationOffer {
         key: *key,
-        data: data.to_vec(),
+        data,
         proof_of_payment: proof_of_payment.to_vec(),
     };
     let request_id = rand::thread_rng().gen::<u64>();
@@ -101,7 +102,11 @@ pub async fn replicate_fresh(
         body: ReplicationMessageBody::FreshReplicationOffer(offer),
     };
 
-    let Ok(encoded) = offer_msg.encode() else {
+    let encoded = offer_msg.encode();
+    // Only the encoded bytes are needed from here on; release the chunk now
+    // rather than holding it alongside the encoding while sends are queued.
+    drop(offer_msg);
+    let Ok(encoded) = encoded else {
         warn!(
             "Failed to encode FreshReplicationOffer for {}",
             hex::encode(key),
