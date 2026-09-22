@@ -52,6 +52,12 @@ impl ReplicationMessage {
         // message is queued for sending.
         let size = postcard::experimental::serialized_size(self)
             .map_err(|e| ReplicationProtocolError::SerializationFailed(e.to_string()))?;
+        // The size is known before anything is allocated, so an oversized body
+        // is refused without serializing it first.
+        let max_size = ceiling_for(family_of_variant(self.body.variant_index()));
+        if size > max_size {
+            return Err(ReplicationProtocolError::MessageTooLarge { size, max_size });
+        }
         let bytes = postcard::to_extend(self, Vec::with_capacity(size))
             .map_err(|e| ReplicationProtocolError::SerializationFailed(e.to_string()))?;
 
@@ -72,13 +78,6 @@ impl ReplicationMessage {
         // the largest is a round-1 proof at the commitment
         // key-count cap, pinned under it with headroom by
         // `max_round1_proof_fits_the_audit_family_ceiling`.
-        let max_size = ceiling_for(family_of_variant(self.body.variant_index()));
-        if bytes.len() > max_size {
-            return Err(ReplicationProtocolError::MessageTooLarge {
-                size: bytes.len(),
-                max_size,
-            });
-        }
 
         // V2-623: cumulative per-variant tx accounting. Every replication send
         // funnels through here, so this is the single tx choke point.
@@ -803,9 +802,13 @@ pub(crate) fn log_served_peers_summary() {
 pub struct FreshReplicationOffer {
     /// The record key.
     pub key: XorName,
-    /// The record data.
+    /// The record data. Encoded as a byte string, which postcard lays out
+    /// exactly like a `u8` sequence, so the wire format is unchanged while
+    /// serialization and sizing copy the payload in one pass.
+    #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
     /// Proof of Payment (required, validated by receiver).
+    #[serde(with = "serde_bytes")]
     pub proof_of_payment: Vec<u8>,
 }
 
@@ -835,6 +838,7 @@ pub struct PaidNotify {
     /// The record key.
     pub key: XorName,
     /// Proof of Payment for receiver-side verification.
+    #[serde(with = "serde_bytes")]
     pub proof_of_payment: Vec<u8>,
 }
 
@@ -2433,6 +2437,57 @@ mod tests {
         let decoded = ReplicationMessage::decode_subtree_audit_response(&encoded)
             .expect("a small audit reply must decode");
         assert_eq!(decoded.request_id, 7);
+    }
+
+    /// `serde_bytes` must not change the wire layout: postcard encodes a byte
+    /// string and a `u8` sequence identically (varint length + raw bytes).
+    #[test]
+    fn byte_string_fields_encode_like_u8_sequences() {
+        #[derive(Serialize)]
+        struct PlainOffer {
+            key: XorName,
+            data: Vec<u8>,
+            proof_of_payment: Vec<u8>,
+        }
+        #[derive(Serialize)]
+        struct PlainNotify {
+            key: XorName,
+            proof_of_payment: Vec<u8>,
+        }
+        let data: Vec<u8> = (0..=255u8).cycle().take(70_000).collect();
+        let proof = vec![9u8; 300];
+
+        let offer = FreshReplicationOffer {
+            key: [5; 32],
+            data: data.clone(),
+            proof_of_payment: proof.clone(),
+        };
+        let plain_offer = PlainOffer {
+            key: [5; 32],
+            data: data.clone(),
+            proof_of_payment: proof.clone(),
+        };
+        assert_eq!(
+            postcard::to_stdvec(&offer).unwrap(),
+            postcard::to_stdvec(&plain_offer).unwrap()
+        );
+        let decoded: FreshReplicationOffer =
+            postcard::from_bytes(&postcard::to_stdvec(&plain_offer).unwrap()).unwrap();
+        assert_eq!(decoded.data, data);
+        assert_eq!(decoded.proof_of_payment, proof);
+
+        let notify = PaidNotify {
+            key: [6; 32],
+            proof_of_payment: proof.clone(),
+        };
+        let plain_notify = PlainNotify {
+            key: [6; 32],
+            proof_of_payment: proof,
+        };
+        assert_eq!(
+            postcard::to_stdvec(&notify).unwrap(),
+            postcard::to_stdvec(&plain_notify).unwrap()
+        );
     }
 
     #[test]

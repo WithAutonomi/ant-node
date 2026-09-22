@@ -357,6 +357,13 @@ impl AntProtocol {
         self.fresh_write_tx = Some(tx);
     }
 
+    /// The fresh-write sender, if one was set. Lets tests drive the
+    /// replication engine's fresh-write pipeline exactly as a PUT would.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn fresh_write_sender(&self) -> Option<mpsc::UnboundedSender<FreshWriteEvent>> {
+        self.fresh_write_tx.clone()
+    }
+
     /// Get the protocol identifier.
     #[must_use]
     pub fn protocol_id(&self) -> &'static str {

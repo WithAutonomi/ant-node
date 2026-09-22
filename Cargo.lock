@@ -862,6 +862,7 @@ dependencies = [
  "self_encryption",
  "semver 1.0.28",
  "serde",
+ "serde_bytes",
  "serde_json",
  "serial_test",
  "sha2",
@@ -883,7 +884,7 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "2.4.0"
-source = "git+https://github.com/WithAutonomi/ant-protocol?rev=ac25b717d99e70468d934b66c32d6e6219a37350#ac25b717d99e70468d934b66c32d6e6219a37350"
+source = "git+https://github.com/WithAutonomi/ant-protocol?rev=79a68a80c9b35393fc36c8b69d174567e6a3cda4#79a68a80c9b35393fc36c8b69d174567e6a3cda4"
 dependencies = [
  "blake3",
  "bytes",
@@ -5324,7 +5325,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.27.4"
-source = "git+https://github.com/WithAutonomi/saorsa-core?rev=e1f1ef92aacb0dab60e6c3dded5da8bae3b63d07#e1f1ef92aacb0dab60e6c3dded5da8bae3b63d07"
+source = "git+https://github.com/WithAutonomi/saorsa-core?rev=9baba9c5ba1e0992a4855892db759a312f27414a#9baba9c5ba1e0992a4855892db759a312f27414a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5392,7 +5393,7 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.36.4"
-source = "git+https://github.com/WithAutonomi/saorsa-transport?rev=3bd451d2d2c86b01df1dd355a88e81bcb854d815#3bd451d2d2c86b01df1dd355a88e81bcb854d815"
+source = "git+https://github.com/WithAutonomi/saorsa-transport?rev=0f55bfc779fd367c2b1f1a01a12b13d6d559989d#0f55bfc779fd367c2b1f1a01a12b13d6d559989d"
 dependencies = [
  "anyhow",
  "async-trait",
