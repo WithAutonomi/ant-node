@@ -48,7 +48,7 @@ use crate::logging::{info, warn};
 /// It is a heartbeat as much as a count: a node that stops saying anything is a node the
 /// release gate must treat as unfinished, and it can only do that if a healthy node says
 /// something on a known cadence.
-const REPORT_INTERVAL: Duration = Duration::from_secs(15 * 60);
+const REPORT_INTERVAL: Duration = Duration::from_mins(15);
 
 /// The directory the old chunk store lives in.
 const LEGACY_ENV_DIR: &str = "chunks.mdb";

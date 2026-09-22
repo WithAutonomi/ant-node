@@ -402,7 +402,7 @@ impl FirstAuditLimiter {
     /// call at ENQUEUE time — suppressed nominations never occupy pending
     /// slots — without disturbing LRU recency.
     fn window_allows(&self, peer: &PeerId, key_count: u32, now: Instant) -> bool {
-        self.recent.peek(peer).map_or(true, |prev| {
+        self.recent.peek(peer).is_none_or(|prev| {
             now.saturating_duration_since(prev.launched_at)
                 >= config::FIRST_AUDIT_PEER_REAUDIT_INTERVAL
                 || first_audit_count_jump(prev.key_count, key_count)
@@ -558,7 +558,7 @@ async fn open_first_audit_reservation(
 /// needs to be comfortably past the next tick.
 fn first_audit_far_future() -> Instant {
     Instant::now()
-        .checked_add(Duration::from_secs(3600))
+        .checked_add(Duration::from_hours(1))
         .unwrap_or_else(Instant::now)
 }
 
@@ -1541,7 +1541,7 @@ const BOOTSTRAP_STATE_SNAPSHOT_INTERVAL_SECS: u64 = 60;
 /// (`quote_ts ≈ now`), far from either bound. The gossip-lottery path (which pins
 /// the responder's OWN freshly-gossiped root) is the clock-skew-immune backstop.
 /// 30 min dwarfs any realistic honest skew while leaving a wide audit window.
-const MONETIZED_AUDIT_SKEW_MARGIN: Duration = Duration::from_secs(30 * 60);
+const MONETIZED_AUDIT_SKEW_MARGIN: Duration = Duration::from_mins(30);
 
 /// ADR-0004 A1 (guardrail A): whether a monetized pin's SIGNED `quote_ts` lands
 /// inside the answerability window relative to `now`, so first-auditing it cannot
@@ -1568,7 +1568,7 @@ fn quote_within_audit_window(quote_ts: SystemTime, now: SystemTime) -> bool {
 /// per gossip message. This rate limit caps the verify-per-peer rate
 /// at 1/min, which is comfortably above the legitimate gossip cadence
 /// (the 10-20 min neighbor-sync round on each peer).
-const COMMITMENT_SIG_VERIFY_MIN_INTERVAL: Duration = Duration::from_secs(60);
+const COMMITMENT_SIG_VERIFY_MIN_INTERVAL: Duration = Duration::from_mins(1);
 
 /// Hard cap on the size of `last_commitment_by_peer`.
 ///
@@ -3949,23 +3949,21 @@ impl ReplicationEngine {
                     let q = queues.read().await;
                     q.pending_keys().into_iter().collect()
                 };
-                let admission_futures = completed.iter().map(|(_, outcome)| async {
-                    match outcome {
-                        Some(outcome) if !outcome.response.bootstrapping => Some(
-                            admission::admit_hints(
-                                &self_id,
-                                &outcome.response.replica_hints,
-                                &outcome.response.paid_hints,
-                                &p2p,
-                                &config,
-                                &storage,
-                                &paid_list,
-                                &pending_keys,
-                            )
-                            .await,
-                        ),
-                        _ => None,
-                    }
+                let admission_futures = completed.iter().map(async |(_, outcome)| match outcome {
+                    Some(outcome) if !outcome.response.bootstrapping => Some(
+                        admission::admit_hints(
+                            &self_id,
+                            &outcome.response.replica_hints,
+                            &outcome.response.paid_hints,
+                            &p2p,
+                            &config,
+                            &storage,
+                            &paid_list,
+                            &pending_keys,
+                        )
+                        .await,
+                    ),
+                    _ => None,
                 });
                 let admitted = join_all(admission_futures).await;
 
@@ -9476,9 +9474,8 @@ fn cooldown_allows_audit(map: &mut HashMap<PeerId, Instant>, peer: &PeerId, now:
 /// so this is only an optimization and never the security boundary.
 fn cooldown_would_allow(map: &HashMap<PeerId, Instant>, peer: &PeerId, now: Instant) -> bool {
     let cooldown = Duration::from_secs(config::AUDIT_ON_GOSSIP_COOLDOWN_SECS);
-    map.get(peer).map_or(true, |&last| {
-        now.saturating_duration_since(last) >= cooldown
-    })
+    map.get(peer)
+        .is_none_or(|&last| now.saturating_duration_since(last) >= cooldown)
 }
 
 /// The gossip-audit launch decision in ONE place so the ordering is shared
@@ -10509,7 +10506,7 @@ mod tests {
     #[tokio::test]
     async fn subtree_round1_limiter_cooldown_and_single_use_session() {
         let limiter = SubtreeRound1Limiter::new(
-            Duration::from_secs(3600),
+            Duration::from_hours(1),
             config::MAX_CONCURRENT_SUBTREE_ROUND1,
         );
         let peer = test_peer(1);
@@ -11668,7 +11665,7 @@ mod tests {
         limiter.commit_launch(peer, 100, base);
 
         // A rotated pin with a similar count inside the window is dropped...
-        let soon = base + Duration::from_secs(60);
+        let soon = base + Duration::from_mins(1);
         assert_eq!(
             limiter.assess(&peer, 100, soon, 0),
             LimiterVerdict::WindowDeduped
@@ -11747,7 +11744,7 @@ mod tests {
         // horizon.
         let future = now
             .checked_add(MONETIZED_AUDIT_SKEW_MARGIN)
-            .and_then(|t| t.checked_add(Duration::from_secs(60)))
+            .and_then(|t| t.checked_add(Duration::from_mins(1)))
             .expect("future");
         assert!(!quote_answerable_through_nominal_jitter(future, now));
     }
@@ -11773,7 +11770,7 @@ mod tests {
 
         let dead_quote = SystemTime::now()
             .checked_sub(GOSSIP_ANSWERABILITY_TTL)
-            .and_then(|t| t.checked_sub(Duration::from_secs(60)))
+            .and_then(|t| t.checked_sub(Duration::from_mins(1)))
             .expect("past wall time");
         let stale_high = MonetizedPinEvent {
             peer,
@@ -12076,7 +12073,7 @@ mod tests {
 
         let dead_quote = SystemTime::now()
             .checked_sub(GOSSIP_ANSWERABILITY_TTL)
-            .and_then(|t| t.checked_sub(Duration::from_secs(60)))
+            .and_then(|t| t.checked_sub(Duration::from_mins(1)))
             .expect("past wall time");
         scheduler.enqueue(
             MonetizedPinEvent {
@@ -12775,17 +12772,14 @@ mod tests {
         let now = SystemTime::now();
         // Fresh (just quoted) and small future/past skew -> audited.
         assert!(quote_within_audit_window(now, now));
+        assert!(quote_within_audit_window(now + Duration::from_mins(1), now));
         assert!(quote_within_audit_window(
-            now + Duration::from_secs(60),
-            now
-        ));
-        assert!(quote_within_audit_window(
-            now - Duration::from_secs(3600),
+            now - Duration::from_hours(1),
             now
         ));
         // Far future (badly-skewed / replayed) -> skipped.
         assert!(!quote_within_audit_window(
-            now + MONETIZED_AUDIT_SKEW_MARGIN + Duration::from_secs(60),
+            now + MONETIZED_AUDIT_SKEW_MARGIN + Duration::from_mins(1),
             now
         ));
         // Older than the window -> skipped (pin may have aged out).
@@ -13313,7 +13307,7 @@ mod tests {
 
     #[test]
     fn no_longer_responsible_is_terminal_and_releases_the_retry_slot() {
-        const RETRY_AFTER: Duration = Duration::from_secs(60);
+        const RETRY_AFTER: Duration = Duration::from_mins(1);
 
         let mut q = ReplicationQueues::new();
         let key = test_key(0xAB);
@@ -13346,7 +13340,7 @@ mod tests {
 
     #[test]
     fn no_longer_responsible_shares_the_stored_terminal_path() {
-        const RETRY_AFTER: Duration = Duration::from_secs(60);
+        const RETRY_AFTER: Duration = Duration::from_mins(1);
 
         // Both variants must walk the identical terminal gate so the
         // battle-tested Stored accounting (retry-slot release + bootstrap
@@ -13366,7 +13360,7 @@ mod tests {
 
     #[test]
     fn source_failure_walks_alternate_sources_then_requeues_for_verification() {
-        const RETRY_AFTER: Duration = Duration::from_secs(60);
+        const RETRY_AFTER: Duration = Duration::from_mins(1);
 
         let mut q = ReplicationQueues::new();
         let key = test_key(0xEF);
@@ -13398,7 +13392,7 @@ mod tests {
 
     #[test]
     fn source_failure_without_retry_metadata_is_terminal() {
-        const RETRY_AFTER: Duration = Duration::from_secs(60);
+        const RETRY_AFTER: Duration = Duration::from_mins(1);
 
         // Direct enqueue (no pending entry) models a fetch with no
         // verification retry reservation to restore.
@@ -13417,7 +13411,7 @@ mod tests {
 
     #[test]
     fn already_held_key_leaves_the_pipeline_terminally() {
-        const RETRY_AFTER: Duration = Duration::from_secs(60);
+        const RETRY_AFTER: Duration = Duration::from_mins(1);
 
         let mut q = ReplicationQueues::new();
         let key = test_key(0x4C);
@@ -13444,7 +13438,7 @@ mod tests {
 
     #[test]
     fn local_write_failure_does_not_conscript_the_remaining_sources() {
-        const RETRY_AFTER: Duration = Duration::from_secs(60);
+        const RETRY_AFTER: Duration = Duration::from_mins(1);
 
         let mut q = ReplicationQueues::new();
         let key = test_key(0x2A);
@@ -13475,7 +13469,7 @@ mod tests {
 
     #[test]
     fn local_write_failure_without_retry_metadata_is_terminal() {
-        const RETRY_AFTER: Duration = Duration::from_secs(60);
+        const RETRY_AFTER: Duration = Duration::from_mins(1);
 
         // No pending entry to restore, so the only way not to strand the key
         // in `in_flight_fetch` forever — which would also stall bootstrap

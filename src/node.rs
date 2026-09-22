@@ -100,10 +100,20 @@ impl NodeBuilder {
     /// # Errors
     ///
     /// Returns an error if the node fails to start.
+    #[allow(clippy::too_many_lines)]
     pub async fn build(mut self) -> Result<RunningNode> {
         info!("Building ant-node with config: {:?}", self.config);
 
         Self::validate_production_rewards_address(&self.config)?;
+
+        #[cfg(not(feature = "webrtc-direct"))]
+        if self.config.webrtc_direct.enabled {
+            return Err(Error::Config(
+                "webrtc_direct is enabled but this binary was not built with the \
+                 'webrtc-direct' feature"
+                    .to_string(),
+            ));
+        }
 
         // Resolve identity and root_dir (may update self.config.root_dir)
         let identity = Arc::new(Self::resolve_identity(&mut self.config).await?);
@@ -196,6 +206,10 @@ impl NodeBuilder {
             protocol_task: None,
             migration_task,
             protocol_children: TaskTracker::new(),
+            #[cfg(feature = "webrtc-direct")]
+            webrtc_direct_task: None,
+            #[cfg(feature = "webrtc-direct")]
+            webrtc_diagnostics: tokio::sync::watch::channel(None).0,
             upgrade_exit_code: Arc::new(AtomicI32::new(-1)),
         };
 
@@ -457,7 +471,7 @@ impl NodeBuilder {
         if let Ok(cache_dir) = upgrade_cache_dir() {
             monitor = monitor.with_release_cache(ReleaseCache::new(
                 cache_dir,
-                std::time::Duration::from_secs(3600),
+                std::time::Duration::from_hours(1),
             ));
         }
 
@@ -597,11 +611,26 @@ pub struct RunningNode {
     /// a chunk read that outlives the loop keeps the legacy store busy exactly while the
     /// migration is trying to drain it.
     protocol_children: TaskTracker,
+    /// ADR-0015 browser listener task.
+    #[cfg(feature = "webrtc-direct")]
+    webrtc_direct_task: Option<JoinHandle<()>>,
+    #[cfg(feature = "webrtc-direct")]
+    webrtc_diagnostics: tokio::sync::watch::Sender<Option<crate::web_rtc::WebRtcServerDiagnostics>>,
     /// Exit code requested by a successful upgrade (-1 = no upgrade exit pending).
     upgrade_exit_code: Arc<AtomicI32>,
 }
 
 impl RunningNode {
+    /// Subscribe before `run()` to receive the browser diagnostics handle after startup.
+    /// The handle can be sampled at any time and retains counters after shutdown.
+    #[cfg(feature = "webrtc-direct")]
+    #[must_use]
+    pub fn subscribe_webrtc_diagnostics(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<crate::web_rtc::WebRtcServerDiagnostics>> {
+        self.webrtc_diagnostics.subscribe()
+    }
+
     /// Get the node's root directory.
     #[must_use]
     pub fn root_dir(&self) -> &PathBuf {
@@ -626,8 +655,24 @@ impl RunningNode {
     /// # Errors
     ///
     /// Returns an error if the node encounters a fatal error.
-    #[allow(clippy::too_many_lines)]
     pub async fn run(&mut self) -> Result<()> {
+        let result = self.run_until_shutdown().await;
+        self.cleanup().await;
+        // If an upgrade triggered the shutdown, exit with the requested code.
+        // This happens *after* all cleanup (P2P shutdown, log flush, etc.) so
+        // that destructors and async resources are properly torn down.
+        let exit_code = self.upgrade_exit_code.load(Ordering::SeqCst);
+        if result.is_ok() && exit_code >= 0 {
+            info!("Exiting with code {} for upgrade restart", exit_code);
+            std::process::exit(exit_code);
+        }
+
+        result
+    }
+
+    /// Start serving and wait for shutdown; the caller owns cleanup on every exit.
+    #[allow(clippy::too_many_lines)]
+    async fn run_until_shutdown(&mut self) -> Result<()> {
         info!("Node runtime loop starting");
 
         // Subscribe to DHT events BEFORE starting the P2P node so the
@@ -656,6 +701,32 @@ impl RunningNode {
             port = actual_port,
             "Node is running on port: {}", actual_port
         );
+
+        #[cfg(feature = "webrtc-direct")]
+        if self.config.webrtc_direct.enabled {
+            let evm_network = self.config.payment.evm_network.clone().into_evm_network();
+            match crate::web_rtc::spawn(
+                &self.config.webrtc_direct,
+                &self.config.root_dir,
+                Arc::clone(&self.p2p_node),
+                self.ant_protocol.clone(),
+                &evm_network,
+                self.shutdown.clone(),
+                None,
+            )
+            .await
+            {
+                Ok(server) => {
+                    let _ = self
+                        .webrtc_diagnostics
+                        .send_replace(Some(server.diagnostics));
+                    self.webrtc_direct_task = Some(server.task);
+                }
+                Err(error) => {
+                    return Err(error);
+                }
+            }
+        }
 
         // Emit started event
         if let Err(e) = self.events_tx.send(NodeEvent::Started) {
@@ -855,7 +926,20 @@ impl RunningNode {
         info!("Node running, waiting for shutdown signal");
 
         // Run the main event loop with signal handling
-        self.run_event_loop().await?;
+        self.run_event_loop().await
+    }
+
+    /// Drain dependent work before shutting down native networking.
+    async fn cleanup(&mut self) {
+        self.shutdown.cancel();
+        // The shared token closes the WebRtcDirect accept loop and active
+        // browser sessions before storage and native P2P are torn down.
+        #[cfg(feature = "webrtc-direct")]
+        if let Some(task) = self.webrtc_direct_task.take() {
+            if let Err(error) = task.await {
+                warn!("WebRtcDirect task shutdown failed: {error}");
+            }
+        }
 
         // Protocol routing stops FIRST, loop and children both. The migration's last step
         // drains the legacy store's in-flight reads, and inbound protocol traffic keeps
@@ -922,17 +1006,6 @@ impl RunningNode {
             warn!("Failed to send ShuttingDown event: {e}");
         }
         info!("Node shutdown complete");
-
-        // If an upgrade triggered the shutdown, exit with the requested code.
-        // This happens *after* all cleanup (P2P shutdown, log flush, etc.) so
-        // that destructors and async resources are properly torn down.
-        let exit_code = self.upgrade_exit_code.load(Ordering::SeqCst);
-        if exit_code >= 0 {
-            info!("Exiting with code {} for upgrade restart", exit_code);
-            std::process::exit(exit_code);
-        }
-
-        Ok(())
     }
 
     /// Run the main event loop, handling shutdown and signals.
@@ -1232,6 +1305,34 @@ mod tests {
             },
             ..NodeConfig::default()
         }
+    }
+
+    #[cfg(feature = "webrtc-direct")]
+    #[tokio::test]
+    async fn browser_startup_failure_drains_existing_migration() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("node");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        seed_legacy_store(&root).await;
+        let occupied = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let mut config = local_node_config(&root, 0);
+        config.webrtc_direct.enabled = true;
+        config.webrtc_direct.bind = occupied.local_addr().expect("address");
+        let mut node = NodeBuilder::new(config).build().await.expect("build");
+        assert!(node.migration_task.is_some());
+        let cancelled = node.shutdown.clone();
+        let result = node.run().await;
+        assert!(result.is_err(), "occupied browser port must fail startup");
+        assert!(cancelled.is_cancelled());
+        assert!(
+            node.migration_task.is_none(),
+            "migration must be joined before returning"
+        );
+        assert!(node.protocol_children.is_empty());
+        // The test runtime remains alive: cleanup must not rely on process exit.
+        tokio::task::yield_now().await;
     }
 
     /// A real, fully built node with a legacy store is actually migrating it.
