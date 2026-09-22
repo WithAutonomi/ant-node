@@ -68,10 +68,15 @@ We will bound the number of encoded fresh offers that can exist at once and
 make the send path hand a single owned buffer down to the QUIC stream:
 
 - `FreshWriteEvent` carries only the key and the payment proof. The drainer
-  acquires a `MAX_PENDING_FRESH_OFFERS` (8) permit before it reads the chunk
-  back from storage and encodes it; the permit lives with the encoded offer
-  until the last per-peer send drops it. A backlog therefore waits as small
-  queued events, and at most ~40 MiB of encoded offers exist per node.
+  sends `PaidNotify` to the paid close group as soon as it dequeues a write,
+  so the paid-list evidence that later repair depends on is never delayed by
+  chunk back-pressure. It then acquires a `MAX_PENDING_FRESH_OFFERS` (8)
+  permit before it reads the chunk back from storage and encodes it; the
+  permit lives with the encoded offer until the last per-peer send drops it.
+  A backlog therefore waits as small queued events, and at most ~40 MiB of
+  encoded offers exist per node. Nothing is dropped: the queue is unbounded
+  and FIFO, and every offer is still dispatched with the same fan-out,
+  retries and delayed possession check.
 - The chunk moves into the offer rather than being copied, and
   `ReplicationMessage::encode` serializes into an exactly-sized buffer.
 - The encoded offer is shared as `Bytes`; saorsa-core's `send_message`
@@ -99,7 +104,12 @@ make the send path hand a single owned buffer down to the QUIC stream:
 
 - Replication of a burst of writes is spread out in time rather than
   encoded eagerly; the delayed possession check is scheduled after each
-  offer's sends are dispatched, so it shifts by the same amount.
+  offer's sends are dispatched, so it shifts by the same amount. A chunk
+  fetched seconds after its upload can therefore have fewer replicas than
+  before (the 2026-09-22 comparison measured downloads of just-uploaded
+  files 8% slower). Paid-list evidence is not affected, and the previous
+  unbounded fan-out lost that evidence outright under load (2,795
+  "paid notify dropped at admission" in one hour on the baseline fleet).
 - The drainer re-reads each chunk from disk when its permit arrives, one
   extra read per accepted write.
 
