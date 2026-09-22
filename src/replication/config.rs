@@ -181,6 +181,17 @@ pub const MAX_CONCURRENT_REPLICATION_SENDS: usize = 3;
 /// backlog waits as small queued events instead of chunk-sized buffers.
 pub const MAX_PENDING_FRESH_OFFERS: usize = 8;
 
+/// How many times the offer dispatcher tries to read an accepted chunk back
+/// from storage before giving up on its fresh offers.
+///
+/// The chunk was stored moments earlier, so a failed read is a transient
+/// fault (exhausted descriptors, an I/O hiccup) far more often than a lost
+/// chunk; a lost chunk reports `None` and is skipped without retry.
+pub const MAX_FRESH_READ_ATTEMPTS: u32 = 3;
+
+/// Pause before retrying a failed chunk read-back in the offer dispatcher.
+pub const FRESH_READ_RETRY_DELAY: Duration = Duration::from_secs(1);
+
 /// Maximum number of concurrent in-flight audit-responder tasks.
 ///
 /// The LIGHT audit-responder handlers — responsible-chunk audits and subtree

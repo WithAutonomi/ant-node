@@ -67,16 +67,22 @@ up to twice their length in capacity).
 We will bound the number of encoded fresh offers that can exist at once and
 make the send path hand a single owned buffer down to the QUIC stream:
 
-- `FreshWriteEvent` carries only the key and the payment proof. The drainer
-  sends `PaidNotify` to the paid close group as soon as it dequeues a write,
-  so the paid-list evidence that later repair depends on is never delayed by
-  chunk back-pressure. It then acquires a `MAX_PENDING_FRESH_OFFERS` (8)
-  permit before it reads the chunk back from storage and encodes it; the
-  permit lives with the encoded offer until the last per-peer send drops it.
-  A backlog therefore waits as small queued events, and at most ~40 MiB of
-  encoded offers exist per node. Nothing is dropped: the queue is unbounded
-  and FIFO, and every offer is still dispatched with the same fan-out,
-  retries and delayed possession check.
+- `FreshWriteEvent` carries only the key and the payment proof, and fresh
+  replication runs as two stages. The fresh-write drainer never waits for
+  chunk back-pressure: for every event, at arrival rate, it records the key
+  in `PaidForList(self)` and sends `PaidNotify` to the paid close group —
+  the evidence later repair depends on — then forwards the event to the
+  offer dispatcher. The dispatcher is the only permit-gated stage: it
+  acquires a `MAX_PENDING_FRESH_OFFERS` (8) permit before it reads the
+  chunk back from storage (`get_raw`; the chunk was content-checked when
+  stored) and encodes it; the permit lives with the encoded offer until the
+  last per-peer send drops it. A backlog therefore waits as small queued
+  events, and at most ~40 MiB of encoded offers exist per node. Nothing is
+  dropped by back-pressure: both queues are unbounded and FIFO, every offer
+  is dispatched with the same fan-out, retries and delayed possession check,
+  and a failed read-back is retried `MAX_FRESH_READ_ATTEMPTS` times with the
+  permit released in between; only a chunk that is no longer stored is
+  skipped.
 - The chunk moves into the offer rather than being copied, and
   `ReplicationMessage::encode` serializes into an exactly-sized buffer.
 - The encoded offer is shared as `Bytes`; saorsa-core's `send_message`
