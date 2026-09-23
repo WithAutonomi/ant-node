@@ -826,7 +826,7 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.19.0"
+version = "0.20.0-rc.1"
 dependencies = [
  "alloy",
  "ant-protocol",
@@ -882,8 +882,8 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "2.4.0"
-source = "git+https://github.com/WithAutonomi/ant-protocol?rev=17949f860740fed494f2d0c98f710f5749e8b85b#17949f860740fed494f2d0c98f710f5749e8b85b"
+version = "3.0.0-rc.1"
+source = "git+https://github.com/WithAutonomi/ant-protocol?branch=rc-2026.9.3#686151834391c766fd8ba7a394953e82de79cc27"
 dependencies = [
  "blake3",
  "bytes",
@@ -2598,8 +2598,8 @@ dependencies = [
 
 [[package]]
 name = "evmlib"
-version = "0.9.1"
-source = "git+https://github.com/WithAutonomi/evmlib?rev=8ad5ec02dfc2673c9ffb7e5ea5d315f059c76954#8ad5ec02dfc2673c9ffb7e5ea5d315f059c76954"
+version = "0.10.0-rc.1"
+source = "git+https://github.com/WithAutonomi/evmlib?branch=rc-2026.9.3#94ac34b4a4860be031dbd9e51c7746ae7c1bc266"
 dependencies = [
  "alloy",
  "ant-merkle",
@@ -3173,27 +3173,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hpke"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f65d16b699dd1a1fa2d851c970b0c971b388eeeb40f744252b8de48860980c8f"
-dependencies = [
- "aead",
- "aes-gcm",
- "chacha20poly1305",
- "digest 0.10.7",
- "generic-array",
- "hkdf",
- "hmac",
- "p256",
- "rand_core 0.9.5",
- "sha2",
- "subtle",
- "x25519-dalek",
- "zeroize",
-]
-
-[[package]]
 name = "http"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3312,7 +3291,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core",
 ]
 
 [[package]]
@@ -5323,8 +5302,8 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.27.4"
-source = "git+https://github.com/WithAutonomi/saorsa-core?rev=3dec586c41eb3a9febe9fd4ed01db07d73e017c5#3dec586c41eb3a9febe9fd4ed01db07d73e017c5"
+version = "0.28.0-rc.1"
+source = "git+https://github.com/WithAutonomi/saorsa-core?branch=rc-2026.9.3#1412309b13159bf205adfc4807a6b5ba98c56d8e"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5355,8 +5334,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-pqc"
-version = "0.5.1"
-source = "git+https://github.com/saorsa-labs/saorsa-pqc?rev=29a2b272c4ee8b72c17102da00033dbfe1ddcd37#29a2b272c4ee8b72c17102da00033dbfe1ddcd37"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "211578bef9588f0f57162139f1c214bcc6207fb632e9368040d52e4e36471938"
 dependencies = [
  "aead",
  "aes-gcm",
@@ -5370,7 +5350,6 @@ dependencies = [
  "getrandom 0.2.17",
  "hkdf",
  "hmac",
- "hpke",
  "log",
  "pbkdf2",
  "postcard",
@@ -5391,8 +5370,8 @@ dependencies = [
 
 [[package]]
 name = "saorsa-transport"
-version = "0.36.4"
-source = "git+https://github.com/WithAutonomi/saorsa-transport?rev=1995901c69d34af43c9d22144a253a92670240d9#1995901c69d34af43c9d22144a253a92670240d9"
+version = "0.37.0-rc.1"
+source = "git+https://github.com/WithAutonomi/saorsa-transport?branch=rc-2026.9.3#c7c14f3bc96428093faa6330a7aef463e77d55aa"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6169,7 +6148,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -7137,7 +7116,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9babd3a767a4c1aef6900409f85f5d53ce2544ccdfaa86dad48c91782c6d6893"
 dependencies = [
  "windows-collections",
- "windows-core 0.61.2",
+ "windows-core",
  "windows-future",
  "windows-link 0.1.3",
  "windows-numerics",
@@ -7149,7 +7128,7 @@ version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3beeceb5e5cfd9eb1d76b381630e82c4241ccd0d27f1a39ed41b2760b255c5e8"
 dependencies = [
- "windows-core 0.61.2",
+ "windows-core",
 ]
 
 [[package]]
@@ -7161,21 +7140,8 @@ dependencies = [
  "windows-implement",
  "windows-interface",
  "windows-link 0.1.3",
- "windows-result 0.3.4",
- "windows-strings 0.4.2",
-]
-
-[[package]]
-name = "windows-core"
-version = "0.62.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8e83a14d34d0623b51dce9581199302a221863196a1dde71a7663a4c2be9deb"
-dependencies = [
- "windows-implement",
- "windows-interface",
- "windows-link 0.2.1",
- "windows-result 0.4.1",
- "windows-strings 0.5.1",
+ "windows-result",
+ "windows-strings",
 ]
 
 [[package]]
@@ -7184,7 +7150,7 @@ version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc6a41e98427b19fe4b73c550f060b59fa592d7d686537eebf9385621bfbad8e"
 dependencies = [
- "windows-core 0.61.2",
+ "windows-core",
  "windows-link 0.1.3",
  "windows-threading",
 ]
@@ -7229,7 +7195,7 @@ version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9150af68066c4c5c07ddc0ce30421554771e528bde427614c61038bc2c92c2b1"
 dependencies = [
- "windows-core 0.61.2",
+ "windows-core",
  "windows-link 0.1.3",
 ]
 
@@ -7243,30 +7209,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "windows-result"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7781fa89eaf60850ac3d2da7af8e5242a5ea78d1a11c49bf2910bb5a73853eb5"
-dependencies = [
- "windows-link 0.2.1",
-]
-
-[[package]]
 name = "windows-strings"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "56e6c93f3a0c3b36176cb1327a4958a0353d5d166c2a35cb268ace15e91d3b57"
 dependencies = [
  "windows-link 0.1.3",
-]
-
-[[package]]
-name = "windows-strings"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7837d08f69c77cf6b07689544538e017c1bfcf57e34b4c0ff58e6c2cd3b37091"
-dependencies = [
- "windows-link 0.2.1",
 ]
 
 [[package]]
