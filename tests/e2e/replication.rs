@@ -11,7 +11,8 @@ use ant_node::client::compute_address;
 use ant_node::replication::audit_coordinator::AuditChallengeCoordinator;
 use ant_node::replication::commitment_state::{BuiltCommitment, ResponderCommitmentState};
 use ant_node::replication::config::{
-    storage_admission_width, K_BUCKET_SIZE, REPLICATION_PROTOCOL_ID,
+    storage_admission_width, FRESH_READ_RETRY_DELAY, K_BUCKET_SIZE, MAX_PENDING_FRESH_OFFERS,
+    REPLICATION_PROTOCOL_ID,
 };
 use ant_node::replication::fresh::FreshWriteEvent;
 use ant_node::replication::protocol::{
@@ -22,11 +23,17 @@ use ant_node::replication::protocol::{
 use ant_node::replication::pruning;
 use ant_node::replication::scheduling::ReplicationQueues;
 use ant_node::replication::types::{NeighborSyncState, RepairProofs};
+use ant_node::storage::file_store::CHUNKS_DIR_NAME;
+use ant_node::storage::XorName;
 use ant_node::ReplicationConfig;
 use saorsa_core::identity::PeerId;
 use saorsa_core::{P2PNode, TrustEvent};
 use serial_test::serial;
 use std::collections::HashSet;
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -49,6 +56,17 @@ const FULL_NODE_SHUN_POSSESSION_DELAY_MAX: Duration = Duration::from_millis(500)
 const DUMMY_PAYMENT_PROOF_LEN: usize = 64;
 /// Dummy proof byte used when a test only needs to reach pre-payment gates.
 const DUMMY_PAYMENT_PROOF_BYTE: u8 = 0x01;
+/// First regular (non-bootstrap) node of the minimal harness; source of the
+/// fresh-write pipeline tests.
+const FRESH_PIPELINE_SOURCE_INDEX: usize = 3;
+/// Writes queued at once by the saturation test: three times the pending-offer
+/// budget, so the dispatcher must block on and recycle permits to drain it.
+const FRESH_BURST_WRITES: usize = 3 * MAX_PENDING_FRESH_OFFERS;
+/// Wait budget for the whole burst to replicate and release its permits.
+const FRESH_BURST_TIMEOUT: Duration = Duration::from_secs(45);
+/// File mode that makes a chunk unreadable, injecting a transient read fault.
+#[cfg(unix)]
+const UNREADABLE_FILE_MODE: u32 = 0o000;
 /// Minimal paid-list repair close group used by the deterministic repair e2e.
 const PAID_REPAIR_GROUP_SIZE: usize = 5;
 /// Storage threshold configured above majority so one holder is below quorum.
@@ -265,72 +283,292 @@ async fn fresh_write_pipeline_replicates_queued_writes_and_skips_missing_chunks(
     let harness = TestHarness::setup_minimal().await.expect("setup");
     harness.warmup_dht().await.expect("warmup");
 
-    let source_idx = 3; // first regular node
-    let source = harness.test_node(source_idx).expect("source node");
-    let source_protocol = source.ant_protocol.as_ref().expect("protocol");
+    let source = harness
+        .test_node(FRESH_PIPELINE_SOURCE_INDEX)
+        .expect("source node");
     let fresh_tx = source
         .fresh_write_tx
         .clone()
         .expect("fresh-write sender wired by the harness");
+    let address = store_paid_chunk(
+        &harness,
+        FRESH_PIPELINE_SOURCE_INDEX,
+        b"queued write through the fresh-write pipeline",
+    )
+    .await;
 
-    let content = b"queued write through the fresh-write pipeline";
-    let address = compute_address(content);
-    source_protocol
-        .storage()
-        .put(&address, content)
-        .await
-        .expect("put");
-    for i in 0..harness.node_count() {
-        if let Some(node) = harness.test_node(i) {
-            if let Some(protocol) = &node.ant_protocol {
-                protocol.payment_verifier().cache_insert(address);
-            }
-        }
-    }
-
-    let dummy_pop = vec![0x01u8; 64];
     // A write whose chunk was never stored goes first: the dispatcher must
     // skip it and carry on with the next event.
     let missing = compute_address(b"never stored anywhere");
     fresh_tx
         .send(FreshWriteEvent {
             key: missing,
-            payment_proof: dummy_pop.clone(),
+            payment_proof: dummy_payment_proof(),
         })
         .expect("queue missing write");
     fresh_tx
         .send(FreshWriteEvent {
             key: address,
-            payment_proof: dummy_pop,
+            payment_proof: dummy_payment_proof(),
         })
         .expect("queue write");
 
-    let deadline = tokio::time::Instant::now() + PROPAGATION_TIMEOUT;
-    let mut found_on_other = false;
-    while tokio::time::Instant::now() < deadline {
-        for i in 0..harness.node_count() {
-            if i == source_idx {
-                continue;
-            }
-            if let Some(node) = harness.test_node(i) {
-                if let Some(protocol) = &node.ant_protocol {
-                    if protocol.storage().exists(&address).unwrap_or(false) {
-                        found_on_other = true;
-                    }
-                }
-            }
-        }
-        if found_on_other {
-            break;
-        }
-        tokio::time::sleep(PROPAGATION_POLL_INTERVAL).await;
-    }
     assert!(
-        found_on_other,
+        wait_until_replicated(
+            &harness,
+            FRESH_PIPELINE_SOURCE_INDEX,
+            &address,
+            PROPAGATION_TIMEOUT
+        )
+        .await,
         "queued write should have replicated through the fresh-write pipeline"
     );
 
     harness.teardown().await.expect("teardown");
+}
+
+/// Saturation: a burst of writes three times larger than the pending-offer
+/// budget, queued in one go, all replicate. The dispatcher has to block on the
+/// `MAX_PENDING_FRESH_OFFERS` semaphore and recycle permits to get through it,
+/// and once the burst has drained every permit is back — no write was lost to
+/// back-pressure and no permit leaked.
+#[tokio::test]
+async fn fresh_write_pipeline_drains_a_burst_larger_than_the_offer_budget() {
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let source = harness
+        .test_node(FRESH_PIPELINE_SOURCE_INDEX)
+        .expect("source node");
+    let engine = source
+        .replication_engine
+        .as_ref()
+        .expect("replication engine");
+    let fresh_tx = source
+        .fresh_write_tx
+        .clone()
+        .expect("fresh-write sender wired by the harness");
+
+    let mut addresses = Vec::with_capacity(FRESH_BURST_WRITES);
+    for i in 0..FRESH_BURST_WRITES {
+        let content = format!("fresh-write burst chunk {i}");
+        addresses.push(
+            store_paid_chunk(&harness, FRESH_PIPELINE_SOURCE_INDEX, content.as_bytes()).await,
+        );
+    }
+    assert_eq!(
+        engine.pending_offer_permits_available(),
+        MAX_PENDING_FRESH_OFFERS,
+        "all permits must be free before the burst"
+    );
+
+    for &address in &addresses {
+        fresh_tx
+            .send(FreshWriteEvent {
+                key: address,
+                payment_proof: dummy_payment_proof(),
+            })
+            .expect("queue write");
+    }
+
+    let deadline = tokio::time::Instant::now() + FRESH_BURST_TIMEOUT;
+    let mut replicated: HashSet<XorName> = HashSet::new();
+    while tokio::time::Instant::now() < deadline && replicated.len() < addresses.len() {
+        for address in &addresses {
+            if !replicated.contains(address)
+                && stored_on_another_node(&harness, FRESH_PIPELINE_SOURCE_INDEX, address)
+            {
+                replicated.insert(*address);
+            }
+        }
+        tokio::time::sleep(PROPAGATION_POLL_INTERVAL).await;
+    }
+    assert_eq!(
+        replicated.len(),
+        addresses.len(),
+        "only {} of {} burst writes replicated within {FRESH_BURST_TIMEOUT:?}",
+        replicated.len(),
+        addresses.len()
+    );
+
+    // A permit is released when the last per-peer send of its offer finishes,
+    // which can trail the chunk landing on a peer by a moment.
+    while tokio::time::Instant::now() < deadline
+        && engine.pending_offer_permits_available() < MAX_PENDING_FRESH_OFFERS
+    {
+        tokio::time::sleep(PROPAGATION_POLL_INTERVAL).await;
+    }
+    assert_eq!(
+        engine.pending_offer_permits_available(),
+        MAX_PENDING_FRESH_OFFERS,
+        "the burst leaked a pending-offer permit"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// Retry: a chunk whose file cannot be read when its offer permit arrives is
+/// not dropped. The dispatcher releases the permit, waits
+/// `FRESH_READ_RETRY_DELAY` and reads again; once the fault has cleared the
+/// write replicates. The fault is injected by making the chunk file
+/// unreadable on disk and restored inside the retry window.
+#[cfg(unix)]
+#[tokio::test]
+async fn fresh_write_pipeline_retries_a_transient_read_failure() {
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let source = harness
+        .test_node(FRESH_PIPELINE_SOURCE_INDEX)
+        .expect("source node");
+    let storage = source.ant_protocol.as_ref().expect("protocol").storage();
+    let fresh_tx = source
+        .fresh_write_tx
+        .clone()
+        .expect("fresh-write sender wired by the harness");
+    let address = store_paid_chunk(
+        &harness,
+        FRESH_PIPELINE_SOURCE_INDEX,
+        b"chunk whose first read-back fails",
+    )
+    .await;
+
+    let chunk_file = chunk_file_path(storage.root_dir(), &address).expect("chunk file on disk");
+    let readable = fs::metadata(&chunk_file)
+        .expect("chunk metadata")
+        .permissions();
+    fs::set_permissions(
+        &chunk_file,
+        fs::Permissions::from_mode(UNREADABLE_FILE_MODE),
+    )
+    .expect("make chunk unreadable");
+    if fs::File::open(&chunk_file).is_ok() {
+        // File modes are not enforced for this user (root): the fault cannot
+        // be injected, so there is nothing to test here.
+        eprintln!("skipping: file modes are not enforced for this user");
+        fs::set_permissions(&chunk_file, readable).expect("restore chunk mode");
+        harness.teardown().await.expect("teardown");
+        return;
+    }
+    assert!(
+        storage.exists(&address).unwrap_or(false),
+        "chunk is indexed before the fault is hit"
+    );
+
+    fresh_tx
+        .send(FreshWriteEvent {
+            key: address,
+            payment_proof: dummy_payment_proof(),
+        })
+        .expect("queue write");
+
+    // A failed read marks the chunk suspect, which hides it from `exists`:
+    // that is the observable proof the dispatcher's first attempt hit the
+    // fault. Only then clear it, inside the retry delay.
+    assert!(
+        wait_until(
+            || !storage.exists(&address).unwrap_or(true),
+            PROPAGATION_TIMEOUT
+        )
+        .await,
+        "dispatcher never attempted the faulty read"
+    );
+    fs::set_permissions(&chunk_file, readable).expect("restore chunk mode");
+
+    assert!(
+        wait_until_replicated(
+            &harness,
+            FRESH_PIPELINE_SOURCE_INDEX,
+            &address,
+            FRESH_READ_RETRY_DELAY + PROPAGATION_TIMEOUT
+        )
+        .await,
+        "write should have replicated on the retried read"
+    );
+    assert!(
+        storage.exists(&address).unwrap_or(false),
+        "the successful retry clears the suspect mark on the source"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// Proof bytes for tests that only need to reach the pre-payment gates.
+fn dummy_payment_proof() -> Vec<u8> {
+    vec![DUMMY_PAYMENT_PROOF_BYTE; DUMMY_PAYMENT_PROOF_LEN]
+}
+
+/// Store `content` on `source_idx` and mark it paid on every node, so a fresh
+/// offer for it is accepted wherever it lands. Returns the chunk's address.
+async fn store_paid_chunk(harness: &TestHarness, source_idx: usize, content: &[u8]) -> XorName {
+    let address = compute_address(content);
+    harness
+        .test_node(source_idx)
+        .expect("source node")
+        .ant_protocol
+        .as_ref()
+        .expect("protocol")
+        .storage()
+        .put(&address, content)
+        .await
+        .expect("put");
+    for i in 0..harness.node_count() {
+        if let Some(protocol) = harness
+            .test_node(i)
+            .and_then(|node| node.ant_protocol.as_ref())
+        {
+            protocol.payment_verifier().cache_insert(address);
+        }
+    }
+    address
+}
+
+/// Whether any node other than `source_idx` currently stores `address`.
+fn stored_on_another_node(harness: &TestHarness, source_idx: usize, address: &XorName) -> bool {
+    (0..harness.node_count())
+        .filter(|&i| i != source_idx)
+        .filter_map(|i| harness.test_node(i))
+        .filter_map(|node| node.ant_protocol.as_ref())
+        .any(|protocol| protocol.storage().exists(address).unwrap_or(false))
+}
+
+/// Poll until `address` is stored on a node other than `source_idx`, or
+/// `budget` runs out.
+async fn wait_until_replicated(
+    harness: &TestHarness,
+    source_idx: usize,
+    address: &XorName,
+    budget: Duration,
+) -> bool {
+    wait_until(
+        || stored_on_another_node(harness, source_idx, address),
+        budget,
+    )
+    .await
+}
+
+/// Poll `condition` every `PROPAGATION_POLL_INTERVAL` until it holds or
+/// `budget` runs out.
+async fn wait_until(mut condition: impl FnMut() -> bool, budget: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + budget;
+    while tokio::time::Instant::now() < deadline {
+        if condition() {
+            return true;
+        }
+        tokio::time::sleep(PROPAGATION_POLL_INTERVAL).await;
+    }
+    false
+}
+
+/// On-disk file of a stored chunk: the store shards `root/chunks/` into
+/// subdirectories, so look through them for the file named after the address.
+fn chunk_file_path(root_dir: &Path, address: &XorName) -> Option<PathBuf> {
+    let file_name = hex::encode(address);
+    fs::read_dir(root_dir.join(CHUNKS_DIR_NAME))
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|shard| shard.path().join(&file_name))
+        .find(|candidate| candidate.is_file())
 }
 
 /// ADR-0003: the delayed possession check penalises a responsible peer that

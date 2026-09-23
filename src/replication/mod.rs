@@ -2218,6 +2218,16 @@ impl ReplicationEngine {
         })
     }
 
+    /// Test-only: pending-offer permits not currently held by an encoded
+    /// fresh offer. Equals [`MAX_PENDING_FRESH_OFFERS`] when no fresh
+    /// replication is in flight, which is how tests prove a burst of writes
+    /// drained without leaking a permit.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn pending_offer_permits_available(&self) -> usize {
+        self.pending_offer_semaphore.available_permits()
+    }
+
     /// Start all background tasks.
     ///
     /// `dht_events` must be subscribed **before** `P2PNode::start()` so that
