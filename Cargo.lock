@@ -883,7 +883,7 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "2.4.0"
-source = "git+https://github.com/WithAutonomi/ant-protocol?rev=3f41f74c4a96c499d3e698c7c1210afe0e1b8742#3f41f74c4a96c499d3e698c7c1210afe0e1b8742"
+source = "git+https://github.com/WithAutonomi/ant-protocol?rev=17949f860740fed494f2d0c98f710f5749e8b85b#17949f860740fed494f2d0c98f710f5749e8b85b"
 dependencies = [
  "blake3",
  "bytes",
@@ -2599,7 +2599,7 @@ dependencies = [
 [[package]]
 name = "evmlib"
 version = "0.9.1"
-source = "git+https://github.com/WithAutonomi/evmlib?rev=ccd65f18bf3750af8b8c3cfe07548bc77e3c368d#ccd65f18bf3750af8b8c3cfe07548bc77e3c368d"
+source = "git+https://github.com/WithAutonomi/evmlib?rev=8ad5ec02dfc2673c9ffb7e5ea5d315f059c76954#8ad5ec02dfc2673c9ffb7e5ea5d315f059c76954"
 dependencies = [
  "alloy",
  "ant-merkle",
@@ -7121,7 +7121,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
