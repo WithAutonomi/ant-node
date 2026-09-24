@@ -372,7 +372,7 @@ impl CapacityGuard {
 ///
 /// Held by whatever is actually doing the write, so the charge is released even if the
 /// caller's future is dropped and only the blocking closure survives.
-struct Reservation {
+pub(crate) struct Reservation {
     /// The guard this was taken from.
     capacity: Arc<CapacityGuard>,
     /// Payload size, before rounding.
@@ -383,7 +383,7 @@ struct Reservation {
 
 impl Reservation {
     /// The write landed: move the charge from in-flight to written.
-    fn commit(mut self) {
+    pub(crate) fn commit(mut self) {
         self.capacity.commit_reservation(self.bytes);
         self.settled = true;
     }
@@ -1512,6 +1512,16 @@ impl FileStore {
     /// Returns [`Error::Storage`] when the write would not fit above the reserve.
     pub fn check_capacity_for(&self, bytes: u64) -> Result<()> {
         self.capacity.check(bytes)
+    }
+
+    /// Charge `bytes` against the disk before writing them, releasing the charge if the
+    /// write does not happen.
+    ///
+    /// For stores that share this disk but keep their own files — the pointer store does.
+    /// They must not check and then write: that is the race [`CapacityGuard::reserve`]
+    /// exists to close.
+    pub(crate) fn reserve_bytes(&self, bytes: u64) -> Result<Reservation> {
+        self.capacity.reserve(bytes)
     }
 
     /// Force the next capacity question to re-measure the filesystem.

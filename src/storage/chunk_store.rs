@@ -1023,6 +1023,19 @@ impl ChunkStore {
         self.files.check_capacity_for(bytes)
     }
 
+    /// Charge `bytes` against the disk before writing them.
+    ///
+    /// For the pointer store, which keeps its own files on this disk. Checking capacity
+    /// and then writing is a race the file store names explicitly: concurrent writers all
+    /// pass one cached measurement and cross the reserve together.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] if the disk cannot take `bytes` more.
+    pub(crate) fn reserve(&self, bytes: u64) -> Result<crate::storage::Reservation> {
+        self.files.reserve_bytes(bytes)
+    }
+
     /// Wait until every blocking task in either backing has finished.
     pub async fn wait_idle(&self) {
         self.files.wait_idle().await;

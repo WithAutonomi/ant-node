@@ -57,6 +57,7 @@ pub(crate) mod traffic;
 
 pub use crate::ant_protocol::XorName;
 pub use chunk_store::{ChunkStore, ChunkStoreConfig, VerifyReport, LEGACY_ENV_DIR};
+pub(crate) use file_store::Reservation;
 pub use file_store::{FileStore, FileStoreConfig, StoreLayout};
 pub use handler::AntProtocol;
 pub(crate) use handler::ChunkRequestContext;

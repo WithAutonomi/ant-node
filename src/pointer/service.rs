@@ -44,6 +44,7 @@ use crate::payment::PaymentVerifier;
 use crate::pointer::store::{Inspected, PointerStore, PutOutcome};
 use crate::replication::admission;
 use crate::storage::{ChunkStore, SELF_CLOSENESS_GATE_WIDTH};
+use ant_protocol::pointer::POINTER_WIRE_LEN;
 
 /// Handles pointer requests against a [`PointerStore`].
 #[derive(Clone)]
@@ -177,7 +178,42 @@ impl PointerService {
             }
         }
 
-        match self.store.commit(record).await {
+        // Charge the bytes this write will take, and hold the charge until it
+        // lands. Checking capacity and then writing is the race the file store
+        // exists to close: concurrent writers all pass one cached measurement
+        // before any of them has written a byte, and cross the reserve
+        // together. A record is a fixed `POINTER_WIRE_LEN`, so that is the
+        // whole charge.
+        let reservation = match &self.chunks {
+            Some(chunks) => match chunks.reserve(POINTER_WIRE_LEN as u64) {
+                Ok(reservation) => Some(reservation),
+                Err(e) => {
+                    debug!("Rejecting pointer PUT for {}: {e}", hex::encode(address));
+                    return PointerPutResponse::Error(ProtocolError::StorageFailed(e.to_string()));
+                }
+            },
+            None => None,
+        };
+        // Whether this write grows the disk or overwrites a record already
+        // there. Racy by nature — another writer may create it in between — and
+        // wrong only towards counting bytes that are not there, which the next
+        // measurement corrects. The opposite error would under-count and let
+        // the reserve be crossed.
+        let replacing = self.store.contains(&address);
+
+        let outcome = self.store.commit(record).await;
+        match (&outcome, replacing) {
+            // A new file landed: the charge becomes bytes on disk.
+            (Ok(PutOutcome::Changed), false) => {
+                if let Some(reservation) = reservation {
+                    reservation.commit();
+                }
+            }
+            // Replaced in place, or nothing written. Dropping releases it.
+            _ => drop(reservation),
+        }
+
+        match outcome {
             Ok(PutOutcome::Changed) => PointerPutResponse::Success { address, state_id },
             // The re-check under the commit lock found a newer state. The
             // client paid for a state that lost a race; say so plainly.
@@ -233,8 +269,11 @@ impl PointerService {
             if let Some(refusal) = cross_kind_refusal(address, chunks.exists(&address)) {
                 return Some(refusal);
             }
-            // Capacity before payment, as the chunk path does.
-            if let Err(e) = chunks.check_capacity() {
+            // Capacity before payment, as the chunk path does, and for the
+            // size a record actually is rather than for nothing. The binding
+            // charge is taken at the commit; this only avoids paying to find
+            // out the disk is full.
+            if let Err(e) = chunks.check_capacity_for(POINTER_WIRE_LEN as u64) {
                 debug!("Rejecting pointer PUT for {}: {e}", hex::encode(address));
                 return Some(PointerPutResponse::Error(ProtocolError::StorageFailed(
                     e.to_string(),
@@ -359,6 +398,136 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = PointerStore::new(dir.path()).await.expect("store");
         (PointerService::new(store), dir)
+    }
+
+    /// A service whose chunk store guards a disk that cannot take another byte.
+    async fn service_with_full_disk() -> (PointerService, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = PointerStore::new(dir.path()).await.expect("store");
+        let chunks = ChunkStore::new(crate::storage::ChunkStoreConfig {
+            root_dir: dir.path().to_path_buf(),
+            verify_on_read: false,
+            max_map_size: 0,
+            // Larger than any disk, so every capacity question answers "full".
+            disk_reserve: u64::MAX,
+            migration: crate::storage::MigrationConfig::default(),
+        })
+        .await
+        .expect("chunk store");
+        (
+            PointerService::new(store).with_chunk_store(Arc::new(chunks)),
+            dir,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_full_disk_refuses_a_pointer_before_it_is_written() {
+        // The write must be charged against the disk, not merely checked
+        // against it: a check that passes and a write that follows are the
+        // race the file store exists to close. With no room at all, the
+        // reservation cannot be taken and nothing lands.
+        let (service, _dir) = service_with_full_disk().await;
+        let record = signed(1, 0, 1);
+
+        match service.handle_put(put(&record)).await {
+            PointerPutResponse::Error(ProtocolError::StorageFailed(message)) => {
+                assert!(
+                    message.contains("disk space") || message.contains("reserve"),
+                    "a full disk should say so, got: {message}"
+                );
+            }
+            other => panic!("a full disk must refuse the write, got {other:?}"),
+        }
+
+        assert!(
+            matches!(
+                service
+                    .handle_get(PointerGetRequest::new(record.address()))
+                    .await,
+                PointerGetResponse::NotFound { .. }
+            ),
+            "nothing may be stored when the disk had no room for it"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_creations_are_each_charged_against_the_disk() {
+        // Every one of these would pass a bare capacity *check* against one
+        // cached measurement. What stops them collectively crossing the
+        // reserve is that each holds a charge until its write lands.
+        let (service, dir) = service().await;
+        let chunks = ChunkStore::new(crate::storage::ChunkStoreConfig {
+            root_dir: dir.path().to_path_buf(),
+            verify_on_read: false,
+            max_map_size: 0,
+            disk_reserve: 0,
+            migration: crate::storage::MigrationConfig::default(),
+        })
+        .await
+        .expect("chunk store");
+        let service = service.with_chunk_store(Arc::new(chunks));
+
+        let mut writes = Vec::new();
+        for seed in 1..=8u8 {
+            let record = signed(seed, 0, 1);
+            let service = service.clone();
+            writes.push(tokio::spawn(async move {
+                (record.address(), service.handle_put(put(&record)).await)
+            }));
+        }
+
+        for write in writes {
+            let (address, response) = write.await.expect("join");
+            assert!(
+                matches!(response, PointerPutResponse::Success { .. }),
+                "a disk with room must take the write, got {response:?}"
+            );
+            assert!(matches!(
+                service.handle_get(PointerGetRequest::new(address)).await,
+                PointerGetResponse::Success { .. }
+            ));
+        }
+        assert_eq!(service.store().len(), 8);
+    }
+
+    #[tokio::test]
+    async fn writes_that_change_nothing_give_their_charge_back() {
+        // The charge is released by dropping the reservation, which is the path
+        // a re-submission and a stale arrival take. A charge that leaked there
+        // would be permanent — nothing else decrements it — and enough of them
+        // would make an empty disk look full until the process restarted.
+        let (service, dir) = service().await;
+        let chunks = ChunkStore::new(crate::storage::ChunkStoreConfig {
+            root_dir: dir.path().to_path_buf(),
+            verify_on_read: false,
+            max_map_size: 0,
+            disk_reserve: 0,
+            migration: crate::storage::MigrationConfig::default(),
+        })
+        .await
+        .expect("chunk store");
+        let service = service.with_chunk_store(Arc::new(chunks));
+
+        let held = signed(1, 0, 1);
+        service.handle_put(put(&held)).await;
+        for _ in 0..32 {
+            // Same state: nothing is written, so nothing may stay charged.
+            assert!(matches!(
+                service.handle_put(put(&held)).await,
+                PointerPutResponse::Unchanged { .. }
+            ));
+            // And a losing state: also nothing written.
+            assert!(matches!(
+                service.handle_put(put(&signed(1, 0, 9))).await,
+                PointerPutResponse::Stale { .. }
+            ));
+        }
+
+        // If those 64 no-ops had each stranded a charge, this would be refused.
+        assert!(matches!(
+            service.handle_put(put(&signed(2, 0, 1))).await,
+            PointerPutResponse::Success { .. }
+        ));
     }
 
     fn put(record: &Pointer) -> PointerPutRequest {
