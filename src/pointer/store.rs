@@ -107,9 +107,9 @@ pub(crate) enum Inspected {
 struct IndexEntry {
     /// The held record's authenticated state.
     ///
-    /// The state itself rather than fields copied out of it, so every rule the
-    /// store applies — merge order, the paid increment — is the protocol's own
-    /// rule applied to the held state, and cannot drift from it.
+    /// The state itself rather than fields copied out of it, so the merge order
+    /// the store applies is the protocol's own rule applied to the held state,
+    /// and cannot drift from it.
     state: PointerState,
     /// Whether the file behind `state` is still there and still that record.
     ///
@@ -117,8 +117,8 @@ struct IndexEntry {
     /// the entry. The node stops serving the record, because it does not have
     /// it — but it still knows what it had, and that is what lets the state be
     /// restored. Dropping the entry would leave the address looking untouched,
-    /// where only a counter 0 record is admissible, so a pointer that had ever
-    /// been updated could never be repaired.
+    /// where any record is admissible, so a replay of an older state could roll
+    /// the node back.
     on_disk: bool,
     /// Which insertion this entry is.
     ///
@@ -414,39 +414,25 @@ impl PointerStore {
             .map(|entry| entry.state.state_id)
     }
 
-    /// Whether `state` is a paid update of what is held.
+    /// Whether a paid PUT of `state` may be taken.
     ///
-    /// One payment buys one increment: a new pointer starts at counter 0, and
-    /// an update either advances the counter by one or wins the target
-    /// tie-break at the counter already held. Without the bound an owner pays
-    /// once, jumps the counter, skips every intermediate payment and strands
-    /// the pointer where nothing can advance it; without the tie-break, two
-    /// separately paid states at one counter would leave every node holding
-    /// whichever reached it first.
+    /// Any state the merge rule prefers to what is held, whatever its counter.
+    /// The counter orders states; it does not meter them, since each state is
+    /// paid for on its own. That is also what lets a node catch up: a write
+    /// ends once its quorum has answered, so a node can miss an update, and one
+    /// that joins the group later holds nothing at all. Either takes the next
+    /// update, however far ahead of it that is.
     ///
-    /// Only the client path asks this. Replication uses the merge rule instead,
-    /// so a replica that missed an update can still catch up rather than being
-    /// stuck behind a gap it can never fill.
-    ///
-    /// A record this node knew and lost takes that same merge rule: anything at
-    /// least as good as the lost state restores it. The increment rule exists to
-    /// stop an owner buying one state and skipping to it, and a repair skips
-    /// nothing — the state it carries was paid for and the rest of the group
-    /// already serves it. Holding a lost address to the increment rule would
-    /// make every loss above counter 0 permanent, because only a counter 0
-    /// record is admissible at an address nothing is known about.
+    /// A record this node knew and lost admits the lost state itself as well,
+    /// so the arrival that restores it is not mistaken for a resubmission. It
+    /// admits nothing older, so a node that lost its copy cannot be rolled
+    /// back by a replay.
     #[must_use]
-    pub fn accepts_as_paid_update(&self, state: &PointerState) -> bool {
-        self.snapshot(&state.address).map_or_else(
-            || state.is_genesis(),
-            |entry| {
-                if entry.on_disk {
-                    state.is_paid_update_of(&entry.state)
-                } else {
-                    state.state_id == entry.state.state_id || state.replaces(&entry.state)
-                }
-            },
-        )
+    pub fn admits(&self, state: &PointerState) -> bool {
+        self.snapshot(&state.address).is_none_or(|entry| {
+            state.replaces(&entry.state)
+                || (!entry.on_disk && state.state_id == entry.state.state_id)
+        })
     }
 
     /// Whether a record is held at `address`.
@@ -1370,11 +1356,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_lost_record_above_counter_zero_is_still_repairable() {
-        // The admission rule alone would make this impossible: an address the
-        // node knows nothing about admits only a counter 0 record, so an entry
-        // that was *forgotten* on a failed read could never be restored above
-        // genesis, and every loss would be permanent.
+    async fn a_lost_record_is_restored_and_cannot_be_rolled_back() {
+        // The node remembers what it lost. Without that the address would look
+        // untouched, where any record is admissible, and a replay of an older
+        // state would roll the node back.
         let (store, _dir) = store().await;
         for counter in 0..=3u64 {
             store
@@ -1392,15 +1377,15 @@ mod tests {
 
         // What it lost is what it will take back, and so is anything newer.
         assert!(
-            store.accepts_as_paid_update(&held.state()),
+            store.admits(&held.state()),
             "the state this node lost must be admissible again"
         );
         assert!(
-            store.accepts_as_paid_update(&signed(1, 9, 1).state()),
+            store.admits(&signed(1, 9, 1).state()),
             "so must a newer state the rest of the group has moved on to"
         );
         assert!(
-            !store.accepts_as_paid_update(&signed(1, 2, 1).state()),
+            !store.admits(&signed(1, 2, 1).state()),
             "but not one that loses to what was lost"
         );
 
@@ -1417,9 +1402,13 @@ mod tests {
         assert_eq!(back.counter(), 3);
         assert_eq!(back.state_id(), held.state_id());
 
-        // And the increment rule is back in force now that it holds one.
-        assert!(store.accepts_as_paid_update(&signed(1, 4, 1).state()));
-        assert!(!store.accepts_as_paid_update(&signed(1, 6, 1).state()));
+        // Held again: any later counter is admitted, the held state is not.
+        assert!(store.admits(&signed(1, 4, 1).state()));
+        assert!(store.admits(&signed(1, 6, 1).state()), "a skip is admitted");
+        assert!(
+            !store.admits(&held.state()),
+            "held again, so a resubmission"
+        );
     }
 
     #[tokio::test]

@@ -224,26 +224,21 @@ impl PointerService {
     ) -> Option<PointerPutResponse> {
         let address = state.address;
 
-        // One payment buys one state and at most one increment. A create is
-        // counter 0; an update is one past what this node holds, or the
-        // tie-break winner at that same counter, which two concurrent updates
-        // must both be able to land on or the group stays split. What is
-        // refused is a jump, which would let an owner pay once and skip every
-        // intermediate payment. Replication does not come through here — it
-        // merges on the counter order, so a replica behind a gap can still
-        // catch up.
-        if !self.store.accepts_as_paid_update(state) {
+        // Any state the merge rule prefers to what this node knows, whatever
+        // its counter: a node that missed updates, or joined the group after
+        // them, must take the next one or it never catches up. An arrival that
+        // loses to what is held was already answered as stale; this also
+        // covers a record the node lost, which that comparison cannot see, so
+        // a replay cannot roll it back.
+        if !self.store.admits(state) {
             debug!(
-                "Rejecting pointer PUT for {}: counter {} is not the paid successor",
+                "Rejecting pointer PUT for {}: counter {} does not beat the state this node knows",
                 hex::encode(address),
                 state.counter
             );
-            return Some(PointerPutResponse::PaymentRequired {
-                message: format!(
-                    "a pointer is created at counter 0 and updated by exactly one \
-                     increment; counter {} does not follow what this node holds",
-                    state.counter
-                ),
+            return Some(PointerPutResponse::Stale {
+                address,
+                state_id: self.store.state_id(&address).unwrap_or_default(),
             });
         }
 
@@ -584,23 +579,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_counter_jump_is_still_refused_after_a_tie_break() {
-        // Taking a tie-break winner must not loosen the increment rule: the
-        // counter has not moved, so the next state is still exactly one on.
-        let (service, _dir) = service().await;
-        service.handle_put(put(&signed(1, 0, 9))).await;
+    async fn a_fork_between_two_nodes_is_healed_by_any_later_counter() {
+        // Two paid states at one counter, each reaching a different node: a
+        // fork no read can settle for them. The next update, at any later
+        // counter, lands on both and leaves them holding the same record.
+        let (first_node, _a) = service().await;
+        let (second_node, _b) = service().await;
+        let one_side = signed(1, 1, 9);
+        let other_side = signed(1, 1, 1);
         assert!(matches!(
-            service.handle_put(put(&signed(1, 0, 1))).await,
+            first_node.handle_put(put(&one_side)).await,
             PointerPutResponse::Success { .. }
         ));
         assert!(matches!(
-            service.handle_put(put(&signed(1, 7, 1))).await,
-            PointerPutResponse::PaymentRequired { .. }
-        ));
-        assert!(matches!(
-            service.handle_put(put(&signed(1, 1, 1))).await,
+            second_node.handle_put(put(&other_side)).await,
             PointerPutResponse::Success { .. }
         ));
+
+        let healed = signed(1, 5, 4);
+        for (name, node) in [("first", &first_node), ("second", &second_node)] {
+            match node.handle_put(put(&healed)).await {
+                PointerPutResponse::Success { address, state_id } => {
+                    assert_eq!(address, healed.address());
+                    assert_eq!(state_id, healed.state_id());
+                }
+                other => panic!("the {name} node refused the healing update: {other:?}"),
+            }
+            let held = node
+                .store()
+                .get(&healed.address())
+                .await
+                .expect("get")
+                .expect("present");
+            assert_eq!(held.state_id(), healed.state_id(), "the {name} node");
+        }
     }
 
     #[tokio::test]
@@ -689,45 +701,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_pointer_is_created_at_zero_and_updated_one_step_at_a_time() {
+    async fn any_counter_that_beats_what_is_held_is_taken() {
         let (service, _dir) = service().await;
 
-        // A create must be counter 0.
+        // A node that joined after the pointer was created holds nothing, so
+        // the first record it sees need not be counter 0.
+        let first_seen = signed(1, 5, 1);
         assert!(matches!(
-            service.handle_put(put(&signed(1, 5, 1))).await,
-            PointerPutResponse::PaymentRequired { .. }
-        ));
-        assert!(service.store().is_empty(), "nothing was stored");
-
-        let created = signed(1, 0, 1);
-        assert!(matches!(
-            service.handle_put(put(&created)).await,
+            service.handle_put(put(&first_seen)).await,
             PointerPutResponse::Success { .. }
         ));
 
-        // A jump is refused however large, including the terminal counter.
-        for jump in [0u64, 2, 3, 99, u64::MAX] {
+        // Anything older is stale, whatever else it says.
+        for older in [0u64, 4] {
             assert!(
                 matches!(
-                    service.handle_put(put(&signed(1, jump, 2))).await,
-                    PointerPutResponse::PaymentRequired { .. } | PointerPutResponse::Stale { .. }
+                    service.handle_put(put(&signed(1, older, 2))).await,
+                    PointerPutResponse::Stale { .. }
                 ),
-                "counter {jump} must not be accepted after 0"
+                "counter {older} must not replace counter 5"
             );
         }
 
-        // Exactly one increment lands.
-        assert!(matches!(
-            service.handle_put(put(&signed(1, 1, 2))).await,
-            PointerPutResponse::Success { .. }
-        ));
+        // Anything newer lands, however far it skips.
+        for newer in [6u64, 99, u64::MAX] {
+            let record = signed(1, newer, 2);
+            match service.handle_put(put(&record)).await {
+                PointerPutResponse::Success { state_id, .. } => {
+                    assert_eq!(state_id, record.state_id());
+                }
+                other => panic!("counter {newer} was refused: {other:?}"),
+            }
+        }
         let held = service
             .store()
-            .get(&created.address())
+            .get(&first_seen.address())
             .await
             .expect("get")
             .expect("present");
-        assert_eq!(held.counter(), 1);
+        assert_eq!(held.counter(), u64::MAX);
     }
 
     #[test]

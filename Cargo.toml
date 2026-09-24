@@ -233,7 +233,7 @@ webrtc-direct = [
 # the published 3.0.0, so this is the only entry that has to leave the release
 # baseline. A rev, not a branch, so the pin is immutable. Drop it once the
 # pointer PR lands and 3.1.0 is published.
-ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "34b7832a001df8b80b18555ca058734baae43496" }
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "4412b6af4fab2ceb0a4e1efea1efca08e68c6e4e" }
 
 [profile.release]
 lto = true

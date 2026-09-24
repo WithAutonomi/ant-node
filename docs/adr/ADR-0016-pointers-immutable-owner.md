@@ -25,7 +25,7 @@ One record. No genesis object, no certificates, no lineage.
 pub struct Pointer {          // 5,303 bytes
     version: u8,              //     1
     owner: MlDsa65PublicKey,  // 1,952 — the identity; the address derives from it
-    counter: u64,             //     8 — 0 to create, +1 per paid update
+    counter: u64,             //     8 — orders states; larger wins
     target: PointerTarget,    //    33 — kind tag + address; opaque to a node
     sig: MlDsa65Signature,    // 3,309 — over every field above
 }
@@ -70,17 +70,23 @@ would make every update after the first free.
 
 ### Pay to create, pay to update
 
-Creation is `counter = 0`. An update is `counter + 1`, or the same counter with
-a smaller target — the merge rule's tie-break, which two concurrent updates must
-both be able to land on or they leave the group split. Every one of them is paid
-against its own `state_id`, so **one payment buys one state and at most one
-increment**. A tie-break moves the pointer without advancing the counter, but it
-must strictly descend in target bytes and each step is bought separately, so it
-buys nothing an ordinary update would not.
+Every stored state is paid against its own `state_id`, so **one payment buys
+one state**. Creating and updating are the same operation: a node takes any
+paid record that beats what it holds under the merge rule, whatever its counter.
+The client creates at 0 and updates by signing one past the counter the network
+serves, but nothing requires exactly one.
 
-The client path enforces `+1`. Replication accepts any strictly greater counter,
-because a replica that missed an update must be able to catch up; refusing the
-gap would leave it permanently stale instead.
+The counter orders states; it does not meter them. A number that is skipped is
+never stored, so skipping avoids no payment that was owed. And requiring `+1`
+would break catching up, since nothing replicates a pointer. A write ends once
+its quorum has answered — five of the seven peers — so a peer can miss an
+update, and one that joins the group later holds nothing at all. Under a `+1`
+rule either would refuse every later update for good, and three such peers
+would leave no write able to reach its quorum. Under the merge rule each takes
+the next update, however far ahead of it that is.
+
+An owner who jumps straight to `u64::MAX` limits only themself, and does not
+even freeze the pointer: equal counters still resolve by target, below.
 
 ### Merge
 
@@ -120,7 +126,7 @@ thread, so a flood of arrivals cannot occupy the runtime's workers.
 | Fork / equivocate at one counter | Total order on `(counter, target)`: every node given the same records picks the same one, and a read merges the close group's answers rather than trusting the first. Convergence *across* the network still needs replication — see Not built |
 | Replay an older record | Loses on counter |
 | Re-sign one paid state N times | Equal state never replaces; nothing is written |
-| Pay once, jump the counter | Client updates must be `+1` |
+| Pay once, jump the counter | Nothing to defend: one payment stores one state whatever its counter, and a skipped number is never stored |
 | Pay for a chunk to fund a pointer | A quote signs its content, not the record kind, so the defence is that the content cannot be shared: putting a chunk on a `state_id` means breaking BLAKE3 across its two modes. The paid cache is keyed by a typed `Chunk` vs `Pointer` target as well, so the two never alias even in memory, whatever the bytes |
 | Merkle proof with no issuer check | Refused for pointers; single-node proofs only |
 | Downgrade the format | `version` is signed and inside `state_id`; unknown versions are refused |
@@ -129,7 +135,7 @@ thread, so a flood of arrivals cannot occupy the runtime's workers.
 | Peer lies about storing a pointer | Every acknowledgement must name the address and state the client sent. A read asks the same group by the same definition, so the quorums intersect — though each does its own lookup, so churn between them is not covered |
 | One peer decides what a pointer says | A read returns a state only if two of the answering peers name it, and a write must reach a majority **plus one** so that two always do. Otherwise a single close-group peer serving an owner-signed state nobody paid to store would be believed by every reader: the record verifies, belongs at the address, and wins the merge. It cannot make a second peer agree. The read counts each state separately, so a state one peer names cannot bury the one the rest agree on — that would be denial of service in place of forgery, and it is also what an ordinary read during an update looks like |
 | Two peers decide it | **Not defended against.** Two colluding close-group peers clear the bar, and only the owner can sign, so what this buys is the owner's own updates unpaid. Raising the bar only raises the number of nodes to grind: both the pointer's address and a node's id are choosable, so an owner determined to sit beside their own pointer can reach any fixed threshold. What actually answers it is replication and audits, neither of which is built |
-| Node claims a record it no longer holds | An index entry is only a claim about a file. Before answering "unchanged" or "stale" the node reads the record back and checks it is still the one the index names; if it is not, the node stops answering for that address and the arrival becomes a repair. It keeps what it lost, because an address nothing is known about admits only a counter 0 record, and a loss above that would otherwise be permanent. That check parses the body, so a signature corrupted in place passes it and is caught on the next read instead — verifying there would put ML-DSA in front of the payment gate, which is the one place it must not be |
+| Node claims a record it no longer holds | An index entry is only a claim about a file. Before answering "unchanged" or "stale" the node reads the record back and checks it is still the one the index names; if it is not, the node stops answering for that address and the arrival becomes a repair. It keeps what it lost, so the lost state is taken back and nothing older is: an address nothing is known about admits any record, and a replay could otherwise roll the node back. That check parses the body, so a signature corrupted in place passes it and is caught on the next read instead — verifying there would put ML-DSA in front of the payment gate, which is the one place it must not be |
 
 ## Consequences
 
@@ -170,12 +176,14 @@ guarantees they hold the same records. Until it lands, availability and
 cross-network fork convergence are the client's doing, not the network's.
 
 Two consequences follow from it and land with it. A node that joins a close
-group after a pointer was created can never obtain it: the increment rule admits
-only a counter 0 record at an address nothing is known about. And a node that
-loses a record can repair it while it is running — it keeps what it lost, and
-takes back that state or any that replaces it — but not across a restart, where
-a missing file leaves nothing to remember. Both are the same missing mechanism:
-a node cannot ask another node for a record.
+group after a pointer was created, or that missed updates, does not hold the
+current state until the owner next updates it; that update is admitted however
+far ahead it is, so the next write brings it level. And a node that loses a
+record can repair it while it is running — it keeps what it lost, and takes back
+that state or any that replaces it — but across a restart, where a missing file
+leaves nothing to remember, it waits for the next update like a node that just
+joined. Both are the same missing mechanism: a node cannot ask another node for
+a record.
 
 Also not built: pointer participation in commitments and audits, which depends
 on the same work.
@@ -195,8 +203,10 @@ the browser client the same quorum and corroboration rules the native one uses.
   all permutations, including on a node started empty and one restarted.
 - 64 valid signatures over one paid state yield one stored record and one file.
 - A resubmission and a stale arrival are both refused before any signature check.
-- Creation is counter 0; an update is `+1`; every jump — including to `u64::MAX`
-  and a wrap back to 0 — is refused as a non-successor.
+- Any paid record that beats the held one is taken, including a first record
+  above counter 0 and a jump to `u64::MAX`; anything older is refused as stale,
+  and the client cannot wrap a terminal counter back to 0.
+- A fork at one counter held by two nodes is healed on both by any later counter.
 - All 256 `version` values give distinct paid identifiers.
 - Golden vectors pin the encoding, both identities and the signing context.
 - A crafted chunk cannot satisfy a pointer's paid-cache entry.
@@ -222,4 +232,8 @@ the browser client the same quorum and corroboration rules the native one uses.
   assumption, not a property one can check.)
 - End to end against a live testnet with real settlement: create, update, read
   back, resolve a chain to its chunk, repeat a stored state, read an address
-  nobody wrote, and refuse a signed record that skips the counter.
+  nobody wrote. Every close-group node answers a paid update to a pointer it
+  already holds with success, not a refusal. A record that skips counters is
+  taken. Nodes that missed updates take the next one and the group converges.
+  A fork at one counter across the group reads as its merge winner, and one
+  update at the next counter heals it on every node.
