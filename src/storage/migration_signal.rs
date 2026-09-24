@@ -332,13 +332,21 @@ pub async fn tally_peers(p2p: &Arc<P2PNode>) -> PeerTally {
     let transport = p2p.transport();
     let observer = p2p.peer_id().to_hex();
     for peer in transport.connected_peers().await {
-        let agent = transport.peer_user_agent(&peer).await;
-        // A peer that disconnected after the list above was taken has no agent any more. It is
-        // not a peer this node can see, so it is skipped: counting it put a departing client in
-        // the unreported bucket on a testnet. A peer still connected with no agent recorded is
-        // not evidence of completion either, so that one stays in the unreported bucket.
-        if agent.is_none() && !transport.is_peer_connected(&peer).await {
-            continue;
+        let mut agent = transport.peer_user_agent(&peer).await;
+        if agent.is_none() {
+            // saorsa-core records a peer's agent and drops it together with the peer's
+            // connection entry, so no agent means the peer was not connected when it was read:
+            // it disconnected after the list above was taken. A peer that is still gone is not
+            // a peer this node can see, so it is skipped. Counting it put a departing client in
+            // the unreported bucket on a testnet.
+            if !transport.is_peer_connected(&peer).await {
+                continue;
+            }
+            // It came back between the two reads, so the first one is stale and would put a
+            // peer that may have finished in the unreported bucket. Read what it announced this
+            // time. If that is still nothing, it stays in the unreported bucket: no agent is not
+            // evidence of completion.
+            agent = transport.peer_user_agent(&peer).await;
         }
         let state = agent
             .as_deref()
