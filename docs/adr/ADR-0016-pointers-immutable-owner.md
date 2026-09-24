@@ -180,6 +180,15 @@ a node cannot ask another node for a record.
 Also not built: pointer participation in commitments and audits, which depends
 on the same work.
 
+**Not built: browser clients.** ADR-0015's WebRTC-direct transport admits,
+sanitizes and classifies message kinds by an explicit list, and pointer requests
+are in none of them. The client's pointer API is therefore native-only rather
+than compiled for a transport that would reject it. Reaching a pointer from a
+browser needs four things, each a deliberate decision at a security boundary:
+admit the two request kinds, let the response sanitizer pass their replies,
+classify a pointer GET as a read and a pointer PUT as paid-exclusive, and give
+the browser client the same quorum and corroboration rules the native one uses.
+
 ## Validation
 
 - Every delivery order of a record set converges to one value, exhaustively over
