@@ -1036,6 +1036,12 @@ impl ChunkStore {
         self.files.reserve_bytes(bytes)
     }
 
+    /// `(written_since, in_flight)` from the capacity guard. Tests only.
+    #[cfg(test)]
+    pub(crate) fn capacity_counters(&self) -> (u64, u64) {
+        self.files.capacity_counters()
+    }
+
     /// Wait until every blocking task in either backing has finished.
     pub async fn wait_idle(&self) {
         self.files.wait_idle().await;

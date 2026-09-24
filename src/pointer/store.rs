@@ -591,7 +591,14 @@ impl Inner {
         let temp = self
             .dir
             .join(format!("{TEMP_PREFIX}{}-{seq}", hex::encode(address)));
-        stage(&temp, &record.to_bytes())?;
+        if let Err(failed) = stage(&temp, &record.to_bytes()) {
+            // Bytes that could not be cleaned up are still on the disk, so the
+            // charge for them stands rather than going back.
+            if failed.bytes_remain {
+                settle(reservation);
+            }
+            return Err(failed.error);
+        }
 
         let outcome = {
             let mut index = self.index.lock();
@@ -790,24 +797,43 @@ fn scan(dir: &Path) -> Result<HashMap<XorName, IndexEntry>> {
 /// Leaves nothing half written: the bytes are durable in the temporary file
 /// before any rename can make them visible, and a failure at any step removes
 /// it. The caller performs the rename, which is the commit point.
-fn stage(temp: &Path, bytes: &[u8]) -> Result<()> {
+/// Returns `Err(StagingFailed { bytes_remain })` where `bytes_remain` says whether
+/// the partial file is still on the disk, so the caller knows whether the charge
+/// for it can be given back.
+fn stage(temp: &Path, bytes: &[u8]) -> std::result::Result<(), StagingFailed> {
     // `create_new` so a leftover temporary file from a crashed write is never
     // silently appended to or shared with a concurrent writer.
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(temp)
-        .map_err(|e| Error::Storage(format!("cannot create {}: {e}", temp.display())))?;
+        .map_err(|e| StagingFailed {
+            // Nothing was created, so nothing is left behind.
+            error: Error::Storage(format!("cannot create {}: {e}", temp.display())),
+            bytes_remain: false,
+        })?;
     let written = file
         .write_all(bytes)
         .and_then(|()| file.sync_all())
         .map_err(|e| Error::Storage(format!("cannot write {}: {e}", temp.display())));
     drop(file);
-    if let Err(e) = written {
-        let _ = std::fs::remove_file(temp);
-        return Err(e);
+    if let Err(error) = written {
+        // A partial file exists. If it cannot be removed it is still occupying
+        // the disk, and its charge has to stand for it.
+        return Err(StagingFailed {
+            error,
+            bytes_remain: std::fs::remove_file(temp).is_err(),
+        });
     }
     Ok(())
+}
+
+/// A staged write that did not complete, and whether it left bytes behind.
+struct StagingFailed {
+    /// What went wrong, for the caller to return.
+    error: Error,
+    /// Whether a partial file is still on the disk.
+    bytes_remain: bool,
 }
 
 /// Turn a charge into bytes that are now on the disk.
@@ -1073,8 +1099,11 @@ mod tests {
     async fn a_commit_that_writes_nothing_gives_its_charge_back() {
         // The reservation settles inside the commit transaction, so this is
         // where a no-op has to release it. Losing a race is the reachable way
-        // to get there: the arrival is a candidate when it is inspected, and
-        // by the time it commits a better state is held.
+        // to get there: the arrival is a candidate when it is inspected, and by
+        // the time it commits a better state is held.
+        //
+        // Asserted on the guard's own counters, because "the next reservation
+        // still succeeds" would pass just as well with the charge stranded.
         let (store, dir) = store().await;
         let chunks = crate::storage::ChunkStore::new(crate::storage::ChunkStoreConfig {
             root_dir: dir.path().to_path_buf(),
@@ -1094,21 +1123,67 @@ mod tests {
             .await
             .expect("put");
 
+        let before = chunks.capacity_counters();
         let charge = chunks.reserve(POINTER_WIRE_LEN as u64).expect("reserve");
+        assert!(
+            chunks.capacity_counters().1 > before.1,
+            "taking a charge must raise in-flight"
+        );
+
         assert_eq!(
             store.commit(slow, Some(charge)).await.expect("commit"),
             PutOutcome::Stale,
             "the newer state must stand"
         );
-
-        // The charge was released rather than stranded: a disk with no room to
-        // spare still takes the next write.
-        let charge = chunks.reserve(POINTER_WIRE_LEN as u64).expect("reserve");
-        let next = verified(&store, &signed(1, 8, 1)).await;
         assert_eq!(
-            store.commit(next, Some(charge)).await.expect("commit"),
+            chunks.capacity_counters(),
+            before,
+            "a write that did not happen must leave both counters where it found them"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_commit_that_writes_charges_the_disk_for_it() {
+        // The other half: bytes that land move from in-flight to written, so
+        // the guard counts them against the reserve from then on.
+        let (store, dir) = store().await;
+        let chunks = crate::storage::ChunkStore::new(crate::storage::ChunkStoreConfig {
+            root_dir: dir.path().to_path_buf(),
+            verify_on_read: false,
+            max_map_size: 0,
+            disk_reserve: 0,
+            migration: crate::storage::MigrationConfig::default(),
+        })
+        .await
+        .expect("chunk store");
+
+        let record = verified(&store, &signed(1, 0, 1)).await;
+        let (written_before, in_flight_before) = chunks.capacity_counters();
+        let charge = chunks.reserve(POINTER_WIRE_LEN as u64).expect("reserve");
+
+        assert_eq!(
+            store.commit(record, Some(charge)).await.expect("commit"),
             PutOutcome::Changed
         );
+        let (written_after, in_flight_after) = chunks.capacity_counters();
+        assert!(
+            written_after > written_before,
+            "the bytes that landed must be counted as written"
+        );
+        assert_eq!(
+            in_flight_after, in_flight_before,
+            "and must no longer be counted as in flight"
+        );
+
+        // A replacement charges too: telling it apart would mean trusting an
+        // observation taken before the rename.
+        let update = verified(&store, &signed(1, 1, 1)).await;
+        let charge = chunks.reserve(POINTER_WIRE_LEN as u64).expect("reserve");
+        assert_eq!(
+            store.commit(update, Some(charge)).await.expect("commit"),
+            PutOutcome::Changed
+        );
+        assert!(chunks.capacity_counters().0 > written_after);
     }
 
     #[tokio::test]

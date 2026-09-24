@@ -347,6 +347,14 @@ impl CapacityGuard {
         })
     }
 
+    /// The two accounting counters, for tests that need to prove a charge was
+    /// settled one way rather than the other.
+    #[cfg(test)]
+    fn counters(&self) -> (u64, u64) {
+        let snapshot = self.snapshot.lock();
+        (snapshot.written_since, snapshot.in_flight)
+    }
+
     /// Give back a reservation whose write did not happen.
     fn release(&self, needed: u64) {
         let mut snapshot = self.snapshot.lock();
@@ -1522,6 +1530,13 @@ impl FileStore {
     /// exists to close.
     pub(crate) fn reserve_bytes(&self, bytes: u64) -> Result<Reservation> {
         self.capacity.reserve(bytes)
+    }
+
+    /// `(written_since, in_flight)` from the capacity guard. Tests only: it is
+    /// how a released charge is told apart from a stranded one.
+    #[cfg(test)]
+    pub(crate) fn capacity_counters(&self) -> (u64, u64) {
+        self.capacity.counters()
     }
 
     /// Force the next capacity question to re-measure the filesystem.

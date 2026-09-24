@@ -406,10 +406,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_full_disk_refuses_a_pointer_before_it_is_written() {
-        // The write must be charged against the disk, not merely checked
-        // against it: a check that passes and a write that follows are the
-        // race the file store exists to close. With no room at all, the
-        // reservation cannot be taken and nothing lands.
+        // A disk with no room refuses at the admission check, before payment,
+        // so a client is not charged to find out. This does not reach the
+        // reservation — the store-level tests cover that — it covers the early
+        // refusal and that nothing is stored when it fires.
         let (service, _dir) = service_with_full_disk().await;
         let record = signed(1, 0, 1);
 
@@ -451,6 +451,9 @@ mod tests {
         .expect("chunk store");
         let service = service.with_chunk_store(Arc::new(chunks));
 
+        let chunks = service.chunks.clone().expect("chunk store");
+        let (written_before, in_flight_before) = chunks.capacity_counters();
+
         let mut writes = Vec::new();
         for seed in 1..=8u8 {
             let record = signed(seed, 0, 1);
@@ -472,6 +475,19 @@ mod tests {
             ));
         }
         assert_eq!(service.store().len(), 8);
+
+        // Each of the eight was charged, and none of the charges was left
+        // hanging. Without the counters this would pass just as well against a
+        // bare capacity check that charges nothing.
+        let (written_after, in_flight_after) = chunks.capacity_counters();
+        assert!(
+            written_after >= written_before + 8 * POINTER_WIRE_LEN as u64,
+            "eight writes must be charged: {written_before} -> {written_after}"
+        );
+        assert_eq!(
+            in_flight_after, in_flight_before,
+            "and none of them may stay in flight"
+        );
     }
 
     fn put(record: &Pointer) -> PointerPutRequest {
