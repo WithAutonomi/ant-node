@@ -57,4 +57,4 @@ pub use ant_protocol::pointer::{
     POINTER_WIRE_LEN, TARGET_WIRE_LEN,
 };
 pub use service::PointerService;
-pub use store::{Inspected, PointerStore, PutOutcome};
+pub use store::{PointerStore, PutOutcome};

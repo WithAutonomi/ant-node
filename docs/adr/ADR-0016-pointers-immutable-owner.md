@@ -144,7 +144,7 @@ thread, so a flood of arrivals cannot occupy the runtime's workers.
   the recipient owns. The old owner keeps write access forever, so it is a
   revocable forwarding state, not a sale.
 - **Key compromise is permanent.** No rotation, no recovery.
-- The inlined key costs 1,920 bytes on every read, forever — a deliberate trade
+- The inlined key costs 1,952 bytes on every read, forever — a deliberate trade
   for self-contained validation.
 - Determinism is not freshness: an eclipsed reader can be handed an older,
   correctly signed value and cannot tell.

@@ -10,11 +10,14 @@
 //!
 //! A put is three steps, because the caller's gates sit between them:
 //!
-//! 1. [`PointerStore::inspect`] parses and compares against what is held: the
-//!    arrival is either unchanged, stale, or a candidate that would win.
-//! 2. [`PointerStore::verify`] checks the candidate's signature — after the
-//!    caller's admission gates, and before it verifies payment.
-//! 3. [`PointerStore::commit`] writes it.
+//! 1. `inspect` parses and compares against what is held: the arrival is
+//!    either unchanged, stale, or a candidate that would win.
+//! 2. `verify` checks the candidate's signature — after the caller's
+//!    admission gates, and before it verifies payment.
+//! 3. `commit` writes it, and settles the disk charge taken for it.
+//!
+//! Those three are internal to the crate; [`PointerStore::put_bytes`] is the
+//! same sequence in one call, for callers with nothing to do in between.
 //!
 //! Nothing cheap happens after something expensive: a resubmission of what is
 //! held is refused before any signature check, so repeatedly submitting one
@@ -54,6 +57,8 @@ use crate::error::{Error, Result};
 use crate::logging::{debug, warn};
 use ant_protocol::pointer::{ParsedPointer, Pointer, PointerState, POINTER_WIRE_LEN};
 
+use crate::storage::Reservation;
+
 /// Directory under the store root that holds pointer records.
 const POINTERS_DIR_NAME: &str = "pointers";
 
@@ -84,7 +89,7 @@ pub enum PutOutcome {
 /// The result of [`PointerStore::inspect`]: what an arrival claims, before any
 /// signature has been checked.
 #[derive(Debug)]
-pub enum Inspected {
+pub(crate) enum Inspected {
     /// The node already holds exactly this state. No signature check is owed:
     /// a resubmission of what was paid for and a forgery of it are the same
     /// no-op.
@@ -232,7 +237,7 @@ impl PointerStore {
     /// # Errors
     ///
     /// Returns [`Error::Protocol`] if the bytes are not a well-formed record.
-    pub async fn inspect(&self, bytes: &[u8]) -> Result<Inspected> {
+    pub(crate) async fn inspect(&self, bytes: &[u8]) -> Result<Inspected> {
         // Off the executor: deciding this reads the held record back off the
         // disk, and a flood of arrivals must not put a blocking read on a
         // runtime worker for each one.
@@ -274,7 +279,7 @@ impl PointerStore {
     /// # Errors
     ///
     /// Returns [`Error::Crypto`] if the signature does not verify.
-    pub async fn verify(&self, parsed: ParsedPointer) -> Result<Pointer> {
+    pub(crate) async fn verify(&self, parsed: ParsedPointer) -> Result<Pointer> {
         spawn_blocking(move || Pointer::verify_parsed(parsed))
             .await
             .map_err(|e| Error::Storage(format!("pointer verification panicked: {e}")))?
@@ -288,14 +293,24 @@ impl PointerStore {
     /// arrive, and the re-check is what keeps that newer state from being
     /// overwritten.
     ///
+    /// `reservation` is the disk charge for this write, taken before the call.
+    /// It moves into the blocking transaction rather than staying with the
+    /// caller, because the caller's future can be dropped while that
+    /// transaction runs on: a charge released here would leave the file that
+    /// landed a moment later uncounted.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Storage`] if the write fails.
-    pub async fn commit(&self, record: Pointer) -> Result<PutOutcome> {
+    pub(crate) async fn commit(
+        &self,
+        record: Pointer,
+        reservation: Option<Reservation>,
+    ) -> Result<PutOutcome> {
         let inner = Arc::clone(&self.inner);
         // The whole transaction runs in one task, so dropping this future
         // cannot leave the write done and the index un-updated.
-        spawn_blocking(move || inner.commit_blocking(&record))
+        spawn_blocking(move || inner.commit_blocking(&record, reservation))
             .await
             .map_err(|e| Error::Storage(format!("pointer commit panicked: {e}")))?
     }
@@ -308,14 +323,15 @@ impl PointerStore {
     ///
     /// # Errors
     ///
-    /// As [`Self::inspect`], [`Self::verify`] and [`Self::commit`].
+    /// As the three steps it runs: a malformed record, a signature that does
+    /// not verify, or a write that fails.
     pub async fn put_bytes(&self, bytes: &[u8]) -> Result<PutOutcome> {
         match self.inspect(bytes).await? {
             Inspected::Unchanged(_) => Ok(PutOutcome::Unchanged),
             Inspected::Stale(_) => Ok(PutOutcome::Stale),
             Inspected::Candidate(parsed) => {
                 let record = self.verify(parsed).await?;
-                self.commit(record).await
+                self.commit(record, None).await
             }
         }
     }
@@ -333,7 +349,7 @@ impl PointerStore {
     /// is served as held — it is a real record, the reader verifies it, and the
     /// read quorum is what decides between replicas that disagree. What the
     /// index is not allowed to do is claim a state the file does not have —
-    /// that check guards [`Self::inspect`]'s two early answers, the ones that
+    /// that check guards `inspect`'s two early answers, the ones that
     /// assert this node already holds something.
     ///
     /// # Errors
@@ -547,7 +563,11 @@ impl Inner {
         clippy::significant_drop_tightening,
         reason = "the write must happen under the same guard as the decision"
     )]
-    fn commit_blocking(&self, record: &Pointer) -> Result<PutOutcome> {
+    fn commit_blocking(
+        &self,
+        record: &Pointer,
+        reservation: Option<Reservation>,
+    ) -> Result<PutOutcome> {
         let address = record.address();
         let path = self.dir.join(hex::encode(address));
 
@@ -587,14 +607,21 @@ impl Inner {
                 Some(_) => PutOutcome::Stale,
             };
             if outcome != PutOutcome::Changed {
-                let _ = std::fs::remove_file(&temp);
+                // Nothing lands, so the charge goes back — unless the staged
+                // bytes could not be removed, in which case they are still on
+                // the disk and the charge has to stand for them.
+                if std::fs::remove_file(&temp).is_err() {
+                    settle(reservation);
+                }
                 return Ok(outcome);
             }
 
             // The rename is the commit point: nothing fallible happens between
             // it and the index update, and both are under this one lock.
             if let Err(e) = std::fs::rename(&temp, &path) {
-                let _ = std::fs::remove_file(&temp);
+                if std::fs::remove_file(&temp).is_err() {
+                    settle(reservation);
+                }
                 return Err(Error::Storage(format!(
                     "cannot rename {} onto {}: {e}",
                     temp.display(),
@@ -603,6 +630,13 @@ impl Inner {
             }
             let generation = self.generation.fetch_add(1, Ordering::Relaxed);
             index.insert(address, IndexEntry::of(record, generation));
+            // A file is on the disk now. Charge it whether or not this replaced
+            // one: telling those apart would mean trusting an observation taken
+            // before the rename, and that observation can be wrong in the one
+            // direction that matters — a file the index claims can be gone, so
+            // what looks like a replacement grows the disk after all.
+            // Over-counting corrects itself at the next measurement.
+            settle(reservation);
             outcome
         };
 
@@ -774,6 +808,16 @@ fn stage(temp: &Path, bytes: &[u8]) -> Result<()> {
         return Err(e);
     }
     Ok(())
+}
+
+/// Turn a charge into bytes that are now on the disk.
+///
+/// A charge that is simply dropped is released instead, which is what every
+/// path that writes nothing wants.
+fn settle(reservation: Option<Reservation>) {
+    if let Some(reservation) = reservation {
+        reservation.commit();
+    }
 }
 
 /// Flush the directory entry a rename created.
@@ -1019,10 +1063,52 @@ mod tests {
         assert_eq!(verified.state_id(), record.state_id());
         assert_eq!(verified.to_bytes(), record.to_bytes());
         assert_eq!(
-            store.commit(verified).await.expect("commit"),
+            store.commit(verified, None).await.expect("commit"),
             PutOutcome::Changed
         );
         assert_eq!(store.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_commit_that_writes_nothing_gives_its_charge_back() {
+        // The reservation settles inside the commit transaction, so this is
+        // where a no-op has to release it. Losing a race is the reachable way
+        // to get there: the arrival is a candidate when it is inspected, and
+        // by the time it commits a better state is held.
+        let (store, dir) = store().await;
+        let chunks = crate::storage::ChunkStore::new(crate::storage::ChunkStoreConfig {
+            root_dir: dir.path().to_path_buf(),
+            verify_on_read: false,
+            max_map_size: 0,
+            disk_reserve: 0,
+            migration: crate::storage::MigrationConfig::default(),
+        })
+        .await
+        .expect("chunk store");
+
+        // Verified while nothing is held, so it is a candidate...
+        let slow = verified(&store, &signed(1, 2, 1)).await;
+        // ...and a better state lands before it commits.
+        store
+            .put_bytes(&signed(1, 7, 1).to_bytes())
+            .await
+            .expect("put");
+
+        let charge = chunks.reserve(POINTER_WIRE_LEN as u64).expect("reserve");
+        assert_eq!(
+            store.commit(slow, Some(charge)).await.expect("commit"),
+            PutOutcome::Stale,
+            "the newer state must stand"
+        );
+
+        // The charge was released rather than stranded: a disk with no room to
+        // spare still takes the next write.
+        let charge = chunks.reserve(POINTER_WIRE_LEN as u64).expect("reserve");
+        let next = verified(&store, &signed(1, 8, 1)).await;
+        assert_eq!(
+            store.commit(next, Some(charge)).await.expect("commit"),
+            PutOutcome::Changed
+        );
     }
 
     #[tokio::test]
@@ -1039,7 +1125,7 @@ mod tests {
             .expect("put");
 
         assert_eq!(
-            store.commit(slow).await.expect("commit"),
+            store.commit(slow, None).await.expect("commit"),
             PutOutcome::Stale,
             "the newer state must survive a late commit"
         );
@@ -1353,7 +1439,7 @@ mod tests {
         let prepared = verified(&store, &record).await;
 
         {
-            let committing = store.commit(prepared);
+            let committing = store.commit(prepared, None);
             tokio::pin!(committing);
             // Poll exactly once, then drop. That first poll hands the write to
             // a blocking thread and returns `Pending`, so the caller is always

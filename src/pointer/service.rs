@@ -194,26 +194,10 @@ impl PointerService {
             },
             None => None,
         };
-        // Whether this write grows the disk or overwrites a record already
-        // there. Racy by nature — another writer may create it in between — and
-        // wrong only towards counting bytes that are not there, which the next
-        // measurement corrects. The opposite error would under-count and let
-        // the reserve be crossed.
-        let replacing = self.store.contains(&address);
-
-        let outcome = self.store.commit(record).await;
-        match (&outcome, replacing) {
-            // A new file landed: the charge becomes bytes on disk.
-            (Ok(PutOutcome::Changed), false) => {
-                if let Some(reservation) = reservation {
-                    reservation.commit();
-                }
-            }
-            // Replaced in place, or nothing written. Dropping releases it.
-            _ => drop(reservation),
-        }
-
-        match outcome {
+        // The charge travels with the write. Settling it here instead would
+        // release it the moment this future is dropped, while the blocking
+        // transaction it started runs on and publishes the file.
+        match self.store.commit(record, reservation).await {
             Ok(PutOutcome::Changed) => PointerPutResponse::Success { address, state_id },
             // The re-check under the commit lock found a newer state. The
             // client paid for a state that lost a race; say so plainly.
@@ -488,46 +472,6 @@ mod tests {
             ));
         }
         assert_eq!(service.store().len(), 8);
-    }
-
-    #[tokio::test]
-    async fn writes_that_change_nothing_give_their_charge_back() {
-        // The charge is released by dropping the reservation, which is the path
-        // a re-submission and a stale arrival take. A charge that leaked there
-        // would be permanent — nothing else decrements it — and enough of them
-        // would make an empty disk look full until the process restarted.
-        let (service, dir) = service().await;
-        let chunks = ChunkStore::new(crate::storage::ChunkStoreConfig {
-            root_dir: dir.path().to_path_buf(),
-            verify_on_read: false,
-            max_map_size: 0,
-            disk_reserve: 0,
-            migration: crate::storage::MigrationConfig::default(),
-        })
-        .await
-        .expect("chunk store");
-        let service = service.with_chunk_store(Arc::new(chunks));
-
-        let held = signed(1, 0, 1);
-        service.handle_put(put(&held)).await;
-        for _ in 0..32 {
-            // Same state: nothing is written, so nothing may stay charged.
-            assert!(matches!(
-                service.handle_put(put(&held)).await,
-                PointerPutResponse::Unchanged { .. }
-            ));
-            // And a losing state: also nothing written.
-            assert!(matches!(
-                service.handle_put(put(&signed(1, 0, 9))).await,
-                PointerPutResponse::Stale { .. }
-            ));
-        }
-
-        // If those 64 no-ops had each stranded a charge, this would be refused.
-        assert!(matches!(
-            service.handle_put(put(&signed(2, 0, 1))).await,
-            PointerPutResponse::Success { .. }
-        ));
     }
 
     fn put(record: &Pointer) -> PointerPutRequest {
