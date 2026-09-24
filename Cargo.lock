@@ -826,7 +826,7 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.20.0-rc.1"
+version = "0.20.0"
 dependencies = [
  "alloy",
  "ant-protocol",
@@ -882,8 +882,9 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "3.0.0-rc.1"
-source = "git+https://github.com/WithAutonomi/ant-protocol?branch=rc-2026.9.3#686151834391c766fd8ba7a394953e82de79cc27"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c7b4fbfd0a8b397d0dc1a0dc7308308242911147224c4e1a56130168e7ad48f"
 dependencies = [
  "blake3",
  "bytes",
@@ -2598,8 +2599,9 @@ dependencies = [
 
 [[package]]
 name = "evmlib"
-version = "0.10.0-rc.1"
-source = "git+https://github.com/WithAutonomi/evmlib?branch=rc-2026.9.3#94ac34b4a4860be031dbd9e51c7746ae7c1bc266"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad3029a8577d05908399d5ddf3a1c2e34bead87016a72bbcb4c707f46dfd69a1"
 dependencies = [
  "alloy",
  "ant-merkle",
@@ -5302,8 +5304,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.28.0-rc.1"
-source = "git+https://github.com/WithAutonomi/saorsa-core?branch=rc-2026.9.3#1412309b13159bf205adfc4807a6b5ba98c56d8e"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84923dc4955c42dfad8e06cfc34ef75b8e89d4d2fed048b18b81dc9ebadf790b"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5370,8 +5373,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-transport"
-version = "0.37.0-rc.1"
-source = "git+https://github.com/WithAutonomi/saorsa-transport?branch=rc-2026.9.3#c7c14f3bc96428093faa6330a7aef463e77d55aa"
+version = "0.37.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "261ed20ee1ed8555594fef412b428fa20c21d2cbeebfe3f11868c7df9489a410"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6148,7 +6152,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

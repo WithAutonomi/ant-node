@@ -1,6 +1,6 @@
 [package]
 name = "ant-node"
-version = "0.20.0-rc.1"
+version = "0.20.0"
 edition = "2021"
 authors = ["David Irvine <david.irvine@maidsafe.net>"]
 description = "Pure quantum-proof network node for the Autonomi decentralized network"
@@ -35,14 +35,14 @@ mimalloc = "0.1"
 # node-only DHT internals (DHTNode, TrustEvent, DhtNetworkEvent), which
 # Cargo unifies with ant-protocol's version constraint.
 #
-ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", branch = "rc-2026.9.3" }
+ant-protocol = "3.0.0"
 
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
-saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core", branch = "rc-2026.9.3" }
+saorsa-core = "0.28.0"
 saorsa-pqc = "0.5.2"
 
 # Payment verification - autonomi network lookup + EVM payment
-evmlib = { git = "https://github.com/WithAutonomi/evmlib", branch = "rc-2026.9.3" }
+evmlib = "0.10.0"
 xor_name = "5"
 
 # Caching - LRU cache for verified XorNames
@@ -111,7 +111,7 @@ bao = "0.13.1"
 
 # Shared portable browser profile. The native listener is enabled separately
 # by the `webrtc-direct` feature.
-saorsa-transport = { git = "https://github.com/WithAutonomi/saorsa-transport", branch = "rc-2026.9.3", default-features = false, features = ["webrtc"] }
+saorsa-transport = { version = "0.37.0", default-features = false, features = ["webrtc"] }
 self_encryption = { version = "0.36", optional = true }
 
 [target.'cfg(unix)'.dependencies]
