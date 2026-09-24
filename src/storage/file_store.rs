@@ -1539,6 +1539,15 @@ impl FileStore {
         self.capacity.counters()
     }
 
+    /// What a payload of `bytes` actually costs the disk, rounded to the
+    /// allocation unit. Tests only, so they can assert exact counter deltas
+    /// rather than "it went up" — which a charge of one allocation unit would
+    /// satisfy for several payloads at once.
+    #[cfg(test)]
+    pub(crate) fn capacity_charge_for(bytes: u64) -> u64 {
+        CapacityGuard::charge(bytes)
+    }
+
     /// Force the next capacity question to re-measure the filesystem.
     ///
     /// Called after the legacy environment is removed, because that is a step change in

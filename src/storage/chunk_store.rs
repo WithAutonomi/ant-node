@@ -1042,6 +1042,12 @@ impl ChunkStore {
         self.files.capacity_counters()
     }
 
+    /// What a payload of `bytes` costs the disk. Tests only.
+    #[cfg(test)]
+    pub(crate) fn capacity_charge_for(bytes: u64) -> u64 {
+        crate::storage::FileStore::capacity_charge_for(bytes)
+    }
+
     /// Wait until every blocking task in either backing has finished.
     pub async fn wait_idle(&self) {
         self.files.wait_idle().await;

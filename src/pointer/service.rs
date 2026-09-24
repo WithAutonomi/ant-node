@@ -479,14 +479,14 @@ mod tests {
         // Each of the eight was charged, and none of the charges was left
         // hanging. Without the counters this would pass just as well against a
         // bare capacity check that charges nothing.
-        let (written_after, in_flight_after) = chunks.capacity_counters();
-        assert!(
-            written_after >= written_before + 8 * POINTER_WIRE_LEN as u64,
-            "eight writes must be charged: {written_before} -> {written_after}"
-        );
+        // Exactly eight allocation charges. An inequality against the raw
+        // record size would accept four: a record rounds up to the allocation
+        // unit, and four of those already exceed eight record sizes.
+        let one = ChunkStore::capacity_charge_for(POINTER_WIRE_LEN as u64);
         assert_eq!(
-            in_flight_after, in_flight_before,
-            "and none of them may stay in flight"
+            chunks.capacity_counters(),
+            (written_before + 8 * one, in_flight_before),
+            "eight writes, eight charges, none left in flight"
         );
     }
 

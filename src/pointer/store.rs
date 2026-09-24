@@ -795,11 +795,12 @@ fn scan(dir: &Path) -> Result<HashMap<XorName, IndexEntry>> {
 /// Write `bytes` to `temp` and fsync it, ready to be renamed into place.
 ///
 /// Leaves nothing half written: the bytes are durable in the temporary file
-/// before any rename can make them visible, and a failure at any step removes
-/// it. The caller performs the rename, which is the commit point.
-/// Returns `Err(StagingFailed { bytes_remain })` where `bytes_remain` says whether
-/// the partial file is still on the disk, so the caller knows whether the charge
-/// for it can be given back.
+/// before any rename can make them visible. The caller performs the rename,
+/// which is the commit point.
+///
+/// A failure tries to remove what it wrote, and says whether that worked:
+/// `Err(StagingFailed { bytes_remain })` reports a partial file still on the
+/// disk, so the caller knows the charge for it cannot be given back.
 fn stage(temp: &Path, bytes: &[u8]) -> std::result::Result<(), StagingFailed> {
     // `create_new` so a leftover temporary file from a crashed write is never
     // silently appended to or shared with a concurrent writer.
@@ -1158,6 +1159,10 @@ mod tests {
         .expect("chunk store");
 
         let record = verified(&store, &signed(1, 0, 1)).await;
+        // Exactly one allocation charge, not merely "more than before": a
+        // record is rounded up to the allocation unit, so an inequality would
+        // accept one charge standing in for two writes.
+        let one = crate::storage::ChunkStore::capacity_charge_for(POINTER_WIRE_LEN as u64);
         let (written_before, in_flight_before) = chunks.capacity_counters();
         let charge = chunks.reserve(POINTER_WIRE_LEN as u64).expect("reserve");
 
@@ -1165,14 +1170,10 @@ mod tests {
             store.commit(record, Some(charge)).await.expect("commit"),
             PutOutcome::Changed
         );
-        let (written_after, in_flight_after) = chunks.capacity_counters();
-        assert!(
-            written_after > written_before,
-            "the bytes that landed must be counted as written"
-        );
         assert_eq!(
-            in_flight_after, in_flight_before,
-            "and must no longer be counted as in flight"
+            chunks.capacity_counters(),
+            (written_before + one, in_flight_before),
+            "the bytes that landed move from in flight to written, exactly once"
         );
 
         // A replacement charges too: telling it apart would mean trusting an
@@ -1183,7 +1184,10 @@ mod tests {
             store.commit(update, Some(charge)).await.expect("commit"),
             PutOutcome::Changed
         );
-        assert!(chunks.capacity_counters().0 > written_after);
+        assert_eq!(
+            chunks.capacity_counters(),
+            (written_before + 2 * one, in_flight_before)
+        );
     }
 
     #[tokio::test]
