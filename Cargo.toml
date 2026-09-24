@@ -1,6 +1,6 @@
 [package]
 name = "ant-node"
-version = "0.19.0"
+version = "0.20.0"
 edition = "2021"
 authors = ["David Irvine <david.irvine@maidsafe.net>"]
 description = "Pure quantum-proof network node for the Autonomi decentralized network"
@@ -35,14 +35,14 @@ mimalloc = "0.1"
 # node-only DHT internals (DHTNode, TrustEvent, DhtNetworkEvent), which
 # Cargo unifies with ant-protocol's version constraint.
 #
-ant-protocol = "2.3.5"
+ant-protocol = "3.0.0"
 
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
-saorsa-core = "0.27.4"
-saorsa-pqc = "0.5"
+saorsa-core = "0.28.0"
+saorsa-pqc = "0.5.2"
 
 # Payment verification - autonomi network lookup + EVM payment
-evmlib = "0.9.1"
+evmlib = "0.10.0"
 xor_name = "5"
 
 # Caching - LRU cache for verified XorNames
@@ -111,7 +111,7 @@ bao = "0.13.1"
 
 # Shared portable browser profile. The native listener is enabled separately
 # by the `webrtc-direct` feature.
-saorsa-transport = { version = "0.36.3", default-features = false, features = ["webrtc"] }
+saorsa-transport = { version = "0.37.0", default-features = false, features = ["webrtc"] }
 self_encryption = { version = "0.36", optional = true }
 
 [target.'cfg(unix)'.dependencies]
@@ -227,13 +227,6 @@ webrtc-direct = [
     "saorsa-transport/webrtc-direct",
     "dep:self_encryption",
 ]
-
-[patch.crates-io]
-saorsa-pqc = { git = "https://github.com/saorsa-labs/saorsa-pqc", rev = "29a2b272c4ee8b72c17102da00033dbfe1ddcd37" }
-evmlib = { git = "https://github.com/WithAutonomi/evmlib", rev = "8ad5ec02dfc2673c9ffb7e5ea5d315f059c76954" }
-ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "17949f860740fed494f2d0c98f710f5749e8b85b" }
-saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core", rev = "3dec586c41eb3a9febe9fd4ed01db07d73e017c5" }
-saorsa-transport = { git = "https://github.com/WithAutonomi/saorsa-transport", rev = "1995901c69d34af43c9d22144a253a92670240d9" }
 
 [profile.release]
 lto = true
