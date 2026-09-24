@@ -13,6 +13,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ant_protocol::{ChunkGetResponse, ChunkMessageBody, ChunkPutResponse};
+use ant_protocol::chunk::{PointerGetResponse, PointerPutResponse};
 
 /// Kind of an inbound chunk message, for the rx table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +24,8 @@ pub enum ChunkRequestKind {
     MerkleQuote,
     QuoteV2,
     MerkleQuoteV2,
+    PointerGet,
+    PointerPut,
     /// A non-request variant (responses meant for client subscribers) or an
     /// unknown future variant.
     Other,
@@ -31,7 +34,7 @@ pub enum ChunkRequestKind {
 }
 
 impl ChunkRequestKind {
-    const N: usize = 8;
+    const N: usize = 10;
 
     const fn index(self) -> usize {
         match self {
@@ -41,8 +44,10 @@ impl ChunkRequestKind {
             Self::MerkleQuote => 3,
             Self::QuoteV2 => 4,
             Self::MerkleQuoteV2 => 5,
-            Self::Other => 6,
-            Self::DecodeError => 7,
+            Self::PointerGet => 6,
+            Self::PointerPut => 7,
+            Self::Other => 8,
+            Self::DecodeError => 9,
         }
     }
 }
@@ -61,13 +66,21 @@ pub enum ChunkResponseKey {
     MerkleQuote,
     QuoteV2,
     MerkleQuoteV2,
+    PointerGetSuccess,
+    PointerGetNotFound,
+    PointerGetError,
+    PointerPutSuccess,
+    PointerPutUnchanged,
+    PointerPutStale,
+    PointerPutPaymentRequired,
+    PointerPutError,
     /// A response variant this table does not itemise (e.g. an `Other`
     /// outcome on a `#[non_exhaustive]` enum).
     Other,
 }
 
 impl ChunkResponseKey {
-    const N: usize = 12;
+    const N: usize = 20;
 
     const fn index(self) -> usize {
         match self {
@@ -82,7 +95,15 @@ impl ChunkResponseKey {
             Self::MerkleQuote => 8,
             Self::QuoteV2 => 9,
             Self::MerkleQuoteV2 => 10,
-            Self::Other => 11,
+            Self::PointerGetSuccess => 11,
+            Self::PointerGetNotFound => 12,
+            Self::PointerGetError => 13,
+            Self::PointerPutSuccess => 14,
+            Self::PointerPutUnchanged => 15,
+            Self::PointerPutStale => 16,
+            Self::PointerPutPaymentRequired => 17,
+            Self::PointerPutError => 18,
+            Self::Other => 19,
         }
     }
 }
@@ -97,6 +118,8 @@ impl ChunkRequestKind {
             ChunkMessageBody::MerkleCandidateQuoteRequest(_) => Self::MerkleQuote,
             ChunkMessageBody::QuoteRequestV2(_) => Self::QuoteV2,
             ChunkMessageBody::MerkleCandidateQuoteRequestV2(_) => Self::MerkleQuoteV2,
+            ChunkMessageBody::PointerGetRequest(_) => Self::PointerGet,
+            ChunkMessageBody::PointerPutRequest(_) => Self::PointerPut,
             _ => Self::Other,
         }
     }
@@ -110,6 +133,34 @@ impl ChunkResponseKey {
             ChunkGetResponse::NotFound { .. } => Self::GetNotFound,
             ChunkGetResponse::Error(_) => Self::GetError,
             _ => Self::Other,
+        }
+    }
+
+    /// Classify a pointer GET response by outcome.
+    ///
+    /// Exhaustive, unlike the chunk classifiers: the pointer response enums are
+    /// not `#[non_exhaustive]`, so a new variant is a compile error here rather
+    /// than silently becoming `Other`.
+    pub fn of_pointer_get(response: &PointerGetResponse) -> Self {
+        match response {
+            PointerGetResponse::Success { .. } => Self::PointerGetSuccess,
+            PointerGetResponse::NotFound { .. } => Self::PointerGetNotFound,
+            PointerGetResponse::Error(_) => Self::PointerGetError,
+        }
+    }
+
+    /// Classify a pointer PUT response by outcome.
+    ///
+    /// `Unchanged` and `Stale` are itemised separately from `Success` because
+    /// they are what a re-submission and a lost race look like, and telling
+    /// those apart is the point of counting paid writes at all.
+    pub fn of_pointer_put(response: &PointerPutResponse) -> Self {
+        match response {
+            PointerPutResponse::Success { .. } => Self::PointerPutSuccess,
+            PointerPutResponse::Unchanged { .. } => Self::PointerPutUnchanged,
+            PointerPutResponse::Stale { .. } => Self::PointerPutStale,
+            PointerPutResponse::PaymentRequired { .. } => Self::PointerPutPaymentRequired,
+            PointerPutResponse::Error(_) => Self::PointerPutError,
         }
     }
 
@@ -160,10 +211,11 @@ pub fn record_send_failed(bytes: usize) {
 /// Emit the cumulative chunk-RPC traffic as INFO summary lines, target
 /// `ant_node::storage::traffic`.
 ///
-/// Flat snake-case keys like the replication summary. Two lines sharing the
+/// Flat snake-case keys like the replication summary. Three lines sharing the
 /// same target and message, distinguished by `group`: rx by request kind
-/// (`group = 1`) and tx by kind × outcome (`group = 2`), keeping each under
-/// `tracing`'s 32-field cap.
+/// (`group = 1`), chunk and quote tx by kind × outcome (`group = 2`), and
+/// pointer tx by kind × outcome (`group = 3`). Pointers take a line of their
+/// own because `group = 2` is already close to `tracing`'s 32-field cap.
 pub fn log_chunk_rpc_traffic_summary() {
     use ChunkRequestKind as Q;
     use ChunkResponseKey as R;
@@ -183,6 +235,8 @@ pub fn log_chunk_rpc_traffic_summary() {
         quote_v2_rx_bytes = rb(Q::QuoteV2), quote_v2_rx_count = rc(Q::QuoteV2),
         merkle_quote_v2_rx_bytes = rb(Q::MerkleQuoteV2),
         merkle_quote_v2_rx_count = rc(Q::MerkleQuoteV2),
+        pointer_get_rx_bytes = rb(Q::PointerGet), pointer_get_rx_count = rc(Q::PointerGet),
+        pointer_put_rx_bytes = rb(Q::PointerPut), pointer_put_rx_count = rc(Q::PointerPut),
         other_rx_bytes = rb(Q::Other), other_rx_count = rc(Q::Other),
         decode_error_rx_bytes = rb(Q::DecodeError), decode_error_rx_count = rc(Q::DecodeError),
         "chunk rpc traffic summary (cumulative)"
@@ -210,6 +264,28 @@ pub fn log_chunk_rpc_traffic_summary() {
         send_failed_tx_count = SEND_FAILED_COUNT.load(Ordering::Relaxed),
         "chunk rpc traffic summary (cumulative)"
     );
+
+    crate::logging::info!(
+        target: "ant_node::storage::traffic",
+        group = 3,
+        pointer_get_success_tx_bytes = tb(R::PointerGetSuccess),
+        pointer_get_success_tx_count = tc(R::PointerGetSuccess),
+        pointer_get_not_found_tx_bytes = tb(R::PointerGetNotFound),
+        pointer_get_not_found_tx_count = tc(R::PointerGetNotFound),
+        pointer_get_error_tx_bytes = tb(R::PointerGetError),
+        pointer_get_error_tx_count = tc(R::PointerGetError),
+        pointer_put_success_tx_bytes = tb(R::PointerPutSuccess),
+        pointer_put_success_tx_count = tc(R::PointerPutSuccess),
+        pointer_put_unchanged_tx_bytes = tb(R::PointerPutUnchanged),
+        pointer_put_unchanged_tx_count = tc(R::PointerPutUnchanged),
+        pointer_put_stale_tx_bytes = tb(R::PointerPutStale),
+        pointer_put_stale_tx_count = tc(R::PointerPutStale),
+        pointer_put_payment_required_tx_bytes = tb(R::PointerPutPaymentRequired),
+        pointer_put_payment_required_tx_count = tc(R::PointerPutPaymentRequired),
+        pointer_put_error_tx_bytes = tb(R::PointerPutError),
+        pointer_put_error_tx_count = tc(R::PointerPutError),
+        "chunk rpc traffic summary (cumulative)"
+    );
 }
 
 #[cfg(test)]
@@ -225,6 +301,8 @@ mod tests {
             ChunkRequestKind::MerkleQuote,
             ChunkRequestKind::QuoteV2,
             ChunkRequestKind::MerkleQuoteV2,
+            ChunkRequestKind::PointerGet,
+            ChunkRequestKind::PointerPut,
             ChunkRequestKind::Other,
             ChunkRequestKind::DecodeError,
         ];
@@ -245,6 +323,14 @@ mod tests {
             ChunkResponseKey::MerkleQuote,
             ChunkResponseKey::QuoteV2,
             ChunkResponseKey::MerkleQuoteV2,
+            ChunkResponseKey::PointerGetSuccess,
+            ChunkResponseKey::PointerGetNotFound,
+            ChunkResponseKey::PointerGetError,
+            ChunkResponseKey::PointerPutSuccess,
+            ChunkResponseKey::PointerPutUnchanged,
+            ChunkResponseKey::PointerPutStale,
+            ChunkResponseKey::PointerPutPaymentRequired,
+            ChunkResponseKey::PointerPutError,
             ChunkResponseKey::Other,
         ];
         let mut seen = std::collections::HashSet::new();

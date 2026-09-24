@@ -599,26 +599,26 @@ impl AntProtocol {
                 ),
                 ChunkResponseKey::MerkleQuoteV2,
             ),
-            // Pointer traffic is attributed to `Other`: the table itemises
-            // chunk response outcomes, and a pointer response is not one.
-            ChunkMessageBody::PointerPutRequest(req) => (
-                ChunkMessageBody::PointerPutResponse(match &self.pointers {
+            ChunkMessageBody::PointerPutRequest(req) => {
+                let response = match &self.pointers {
                     Some(service) => service.handle_put(req).await,
                     None => PointerPutResponse::Error(ProtocolError::StorageFailed(
                         "this node does not store pointers".to_string(),
                     )),
-                }),
-                ChunkResponseKey::Other,
-            ),
-            ChunkMessageBody::PointerGetRequest(req) => (
-                ChunkMessageBody::PointerGetResponse(match &self.pointers {
+                };
+                let key = ChunkResponseKey::of_pointer_put(&response);
+                (ChunkMessageBody::PointerPutResponse(response), key)
+            }
+            ChunkMessageBody::PointerGetRequest(req) => {
+                let response = match &self.pointers {
                     Some(service) => service.handle_get(req).await,
                     None => PointerGetResponse::NotFound {
                         address: req.address,
                     },
-                }),
-                ChunkResponseKey::Other,
-            ),
+                };
+                let key = ChunkResponseKey::of_pointer_get(&response);
+                (ChunkMessageBody::PointerGetResponse(response), key)
+            }
             // Anything else — response messages are handled by client
             // subscribers (e.g. send_and_await_chunk_response), not by the
             // protocol handler. Returning None prevents the caller from
