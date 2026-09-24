@@ -1,4 +1,4 @@
-# ADR-0015: Pointers — paid mutable references with an immutable owner
+# ADR-0016: Pointers — paid mutable references with an immutable owner
 
 - **Status:** Proposed
 - **Date:** 2026-09-18

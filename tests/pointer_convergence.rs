@@ -1,6 +1,6 @@
 //! Convergence and payment-binding properties of the pointer merge rule.
 //!
-//! ADR-0015's claim is that selecting the maximum over a total order on
+//! ADR-0016's claim is that selecting the maximum over a total order on
 //! *states* is idempotent, commutative and associative, so every node reaches
 //! the same value from any delivery interleaving given the same record set.
 //! These are the property tests behind that claim, plus the two anti-abuse

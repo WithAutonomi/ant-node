@@ -1,6 +1,6 @@
 //! Pointers — paid mutable references with an immutable owner.
 //!
-//! Implements `docs/adr/ADR-0015-pointers-immutable-owner.md`.
+//! Implements `docs/adr/ADR-0016-pointers-immutable-owner.md`.
 //!
 //! A pointer is a mutable, owner-signed reference stored at an address derived
 //! from the owner's public key. Ownership is fixed at creation: there is no
