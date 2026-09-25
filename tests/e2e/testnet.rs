@@ -236,6 +236,20 @@ pub struct TestNetworkConfig {
     pub storage_disk_reserve_overrides: HashMap<usize, u64>,
 }
 
+impl TestNetworkConfig {
+    /// The same configuration on a freshly drawn port range and data
+    /// directory, for a network whose first bring-up could not bind.
+    #[must_use]
+    pub fn with_fresh_ports(self) -> Self {
+        let fresh = Self::default();
+        Self {
+            base_port: fresh.base_port,
+            test_data_dir: fresh.test_data_dir,
+            ..self
+        }
+    }
+}
+
 impl Default for TestNetworkConfig {
     fn default() -> Self {
         let mut rng = rand::thread_rng();
