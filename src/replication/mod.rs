@@ -25,6 +25,7 @@ pub mod config;
 pub mod fresh;
 pub mod neighbor_sync;
 pub mod paid_list;
+pub mod pointer;
 pub mod possession;
 pub mod protocol;
 pub mod pruning;
@@ -1815,6 +1816,10 @@ pub struct ReplicationEngine {
     /// When present, `start()` spawns a drainer task that calls
     /// `replicate_fresh` for each event.
     fresh_write_rx: Option<mpsc::UnboundedReceiver<fresh::FreshWriteEvent>>,
+    /// Pointer replication (ADR-0016), when this node stores pointers.
+    pointers: Option<Arc<pointer::PointerReplication>>,
+    /// Receiver for fresh pointer writes, taken by `start()`.
+    pointer_fresh_rx: Option<mpsc::UnboundedReceiver<pointer::PointerFreshWrite>>,
     /// Sender for delayed possession-check events (ADR-0003). The fresh-write
     /// drainer pushes the responsible close-group peers here after each fresh
     /// replication; the possession-check scheduler drains the paired receiver.
@@ -1948,6 +1953,8 @@ impl ReplicationEngine {
                 config.subtree_round1_max_concurrent,
             ),
             fresh_write_rx: Some(fresh_write_rx),
+            pointers: None,
+            pointer_fresh_rx: None,
             possession_check_tx,
             possession_check_rx: Some(possession_check_rx),
             monetized_pin_tx,
@@ -2205,6 +2212,36 @@ impl ReplicationEngine {
         })
     }
 
+    /// Replicate pointers too (ADR-0016): the records in `store`, and the
+    /// fresh writes the pointer PUT handler sends on `fresh_writes`.
+    ///
+    /// Call before [`Self::start`].
+    pub fn with_pointers(
+        &mut self,
+        store: crate::pointer::store::PointerStore,
+        fresh_writes: mpsc::UnboundedReceiver<pointer::PointerFreshWrite>,
+    ) {
+        self.pointers = Some(Arc::new(pointer::PointerReplication::new(
+            store,
+            Arc::clone(&self.storage),
+            Arc::clone(&self.p2p_node),
+            Arc::clone(&self.payment_verifier),
+            Arc::clone(&self.config),
+            Arc::clone(&self.is_bootstrapping),
+            Arc::clone(&self.send_semaphore),
+            self.shutdown.clone(),
+            self.detached_task_tracker.clone(),
+        )));
+        self.pointer_fresh_rx = Some(fresh_writes);
+    }
+
+    /// The pointer replication, when enabled. Tests use it to drive rounds.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn pointer_replication(&self) -> Option<&Arc<pointer::PointerReplication>> {
+        self.pointers.as_ref()
+    }
+
     /// Start all background tasks.
     ///
     /// `dht_events` must be subscribed **before** `P2PNode::start()` so that
@@ -2232,6 +2269,12 @@ impl ReplicationEngine {
         self.start_bootstrap_sync(dht_events);
         self.start_fresh_write_drainer();
         self.start_possession_check_scheduler();
+        if let Some(pointers) = &self.pointers {
+            self.task_handles.push(pointers.start_verification_loop());
+            if let Some(writes) = self.pointer_fresh_rx.take() {
+                self.task_handles.push(pointers.start_fresh_drainer(writes));
+            }
+        }
         // ADR-0004: deterministic first audit of commitments that backed a
         // payment (surfaced by the verifier cross-check).
         self.start_first_audit_drainer();
@@ -2870,6 +2913,7 @@ impl ReplicationEngine {
             paid_notify_worker_semaphore,
             paid_notify_admission_semaphore,
             paid_notify_responder_inflight,
+            pointers: self.pointers.clone(),
             shutdown: shutdown.clone(),
             detached_task_tracker,
         };
@@ -3101,6 +3145,9 @@ impl ReplicationEngine {
                             DhtNetworkEvent::PeerRemoved { peer_id } => {
                                 sync_state.write().await.remove_peer(&peer_id);
                                 repair_proofs.write().await.remove_peer(&peer_id);
+                                if let Some(pointers) = &handler_context.pointers {
+                                    pointers.forget_peer(&peer_id);
+                                }
                                 update_bootstrap_after_peer_removed(
                                     &peer_id,
                                     &handler_context.bootstrap_state,
@@ -3140,6 +3187,7 @@ impl ReplicationEngine {
     }
 
     fn start_neighbor_sync_loop(&mut self) {
+        let pointers = self.pointers.clone();
         let p2p = Arc::clone(&self.p2p_node);
         let storage = Arc::clone(&self.storage);
         let paid_list = Arc::clone(&self.paid_list);
@@ -3216,6 +3264,7 @@ impl ReplicationEngine {
                         &sig_verify_attempts,
                         &audit_challenge_coordinator,
                         &gossip_audit,
+                        pointers.as_ref(),
                     ) => {}
                 }
             }
@@ -4310,6 +4359,8 @@ struct ReplicationMessageHandlerContext {
     paid_notify_worker_semaphore: Arc<Semaphore>,
     paid_notify_admission_semaphore: Arc<Semaphore>,
     paid_notify_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    /// Pointer replication, when this node stores pointers.
+    pointers: Option<Arc<pointer::PointerReplication>>,
     /// The engine's shutdown token, for detached responder work.
     ///
     /// Workers on [`Self::detached_task_tracker`] race this around their
@@ -4399,6 +4450,12 @@ const fn replication_message_class(body: &ReplicationMessageBody) -> &'static st
         ReplicationMessageBody::SubtreeSliceResponse(_) => "subtree_slice_response",
         ReplicationMessageBody::GetCommitmentByPin(_) => "commitment_pin_request",
         ReplicationMessageBody::GetCommitmentByPinResponse(_) => "commitment_pin_response",
+        ReplicationMessageBody::PointerFreshOffer(_) => "pointer_fresh_offer",
+        ReplicationMessageBody::PointerHints(_) => "pointer_hints",
+        ReplicationMessageBody::PointerFetchRequest(_) => "pointer_fetch_request",
+        ReplicationMessageBody::PointerFetchResponse(_) => "pointer_fetch_response",
+        ReplicationMessageBody::PointerStateRequest(_) => "pointer_state_request",
+        ReplicationMessageBody::PointerStateResponse(_) => "pointer_state_response",
     }
 }
 
@@ -5461,6 +5518,42 @@ async fn handle_replication_message(
             drop(guard);
             Ok(())
         }
+        // Pointers (ADR-0016). A node that does not store pointers ignores
+        // them, and so is never marked capable and never asked anything.
+        ReplicationMessageBody::PointerFreshOffer(offer) => {
+            if let Some(pointers) = &ctx.pointers {
+                pointers.accept_offer_detached(*source, offer);
+            }
+            Ok(())
+        }
+        ReplicationMessageBody::PointerHints(hints) => {
+            if let Some(pointers) = &ctx.pointers {
+                pointers.handle_hints(*source, hints.hints).await;
+            }
+            Ok(())
+        }
+        ReplicationMessageBody::PointerFetchRequest(request) => {
+            if let Some(pointers) = &ctx.pointers {
+                pointers.serve_fetch_detached(
+                    *source,
+                    request,
+                    msg.request_id,
+                    rr_message_id.map(ToOwned::to_owned),
+                );
+            }
+            Ok(())
+        }
+        ReplicationMessageBody::PointerStateRequest(request) => {
+            if let Some(pointers) = &ctx.pointers {
+                pointers.serve_state_detached(
+                    *source,
+                    request,
+                    msg.request_id,
+                    rr_message_id.map(ToOwned::to_owned),
+                );
+            }
+            Ok(())
+        }
         // Response messages are handled by their respective request initiators.
         ReplicationMessageBody::FreshReplicationResponse(_)
         | ReplicationMessageBody::NeighborSyncResponse(_)
@@ -5469,7 +5562,9 @@ async fn handle_replication_message(
         | ReplicationMessageBody::AuditResponse(_)
         | ReplicationMessageBody::SubtreeAuditResponse(_)
         | ReplicationMessageBody::SubtreeSliceResponse(_)
-        | ReplicationMessageBody::GetCommitmentByPinResponse(_) => Ok(()),
+        | ReplicationMessageBody::GetCommitmentByPinResponse(_)
+        | ReplicationMessageBody::PointerFetchResponse(_)
+        | ReplicationMessageBody::PointerStateResponse(_) => Ok(()),
     }
 }
 
@@ -6426,6 +6521,12 @@ async fn dispatch_neighbor_sync_request(
     received_at: Instant,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
+    // A peer syncing with us gets our pointer hints as well — including a
+    // node that is bootstrapping, which is how it learns the pointers it
+    // should hold.
+    if let Some(pointers) = &ctx.pointers {
+        pointers.push_hints_detached(vec![source]);
+    }
     let guard = match admit_bounded_responder(
         &ctx.neighbor_sync_responder_admission_semaphore,
         &ctx.neighbor_sync_responder_inflight,
@@ -7390,6 +7491,7 @@ async fn run_neighbor_sync_round(
     sig_verify_attempts: &Arc<RwLock<HashMap<PeerId, Instant>>>,
     audit_challenge_coordinator: &Arc<AuditChallengeCoordinator>,
     gossip_audit: &GossipAuditTrigger,
+    pointers: Option<&Arc<pointer::PointerReplication>>,
 ) {
     let self_id = *p2p_node.peer_id();
     let bootstrapping = *is_bootstrapping.read().await;
@@ -7431,6 +7533,9 @@ async fn run_neighbor_sync_round(
             audit_challenge_coordinator,
         })
         .await;
+        if let Some(pointers) = pointers {
+            pointers.prune_pass(allow_remote_prune_audits).await;
+        }
 
         // Take fresh close-neighbor snapshot (DHT query, no lock held).
         let neighbors =
@@ -7470,6 +7575,9 @@ async fn run_neighbor_sync_round(
     }
 
     debug!("Neighbor sync: syncing with {} peers", batch.len());
+    if let Some(pointers) = pointers {
+        pointers.push_hints_detached(batch.clone());
+    }
 
     // Snapshot our current commitment once per round so all peers in
     // this batch see the same thing (gossip is the responder's attestation;

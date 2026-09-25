@@ -37,12 +37,14 @@ use ant_protocol::chunk::{
 use bytes::Bytes;
 use parking_lot::RwLock;
 use saorsa_core::P2PNode;
+use tokio::sync::mpsc;
 
 use crate::error::{Error, Result};
 use crate::logging::{debug, warn};
 use crate::payment::PaymentVerifier;
 use crate::pointer::store::{Inspected, PointerStore, PutOutcome};
 use crate::replication::admission;
+use crate::replication::pointer::PointerFreshWrite;
 use crate::storage::{ChunkStore, SELF_CLOSENESS_GATE_WIDTH};
 use ant_protocol::pointer::POINTER_WIRE_LEN;
 
@@ -57,6 +59,11 @@ pub struct PointerService {
     /// Confirms a state was paid for. `None` in tests that exercise the merge
     /// rather than the payment.
     payments: Option<Arc<PaymentVerifier>>,
+    /// Where a newly stored paid state goes to be offered to the rest of its
+    /// close group (ADR-0016 replication). Attached once the replication
+    /// engine exists, which is after this service is built; empty where
+    /// nothing replicates, as in unit tests and the devnet.
+    fresh_writes: Arc<RwLock<Option<mpsc::UnboundedSender<PointerFreshWrite>>>>,
     /// The node's P2P handle, for the self-closeness gate.
     ///
     /// Attached after construction, because the node builds its protocol
@@ -83,6 +90,7 @@ impl PointerService {
             store,
             chunks: None,
             payments: None,
+            fresh_writes: Arc::new(RwLock::new(None)),
             p2p_node: Arc::new(RwLock::new(None)),
         }
     }
@@ -110,6 +118,11 @@ impl PointerService {
     pub fn with_payments(mut self, payments: Arc<PaymentVerifier>) -> Self {
         self.payments = Some(payments);
         self
+    }
+
+    /// Hand every newly stored paid state to replication on `writes`.
+    pub fn attach_fresh_writes(&self, writes: mpsc::UnboundedSender<PointerFreshWrite>) {
+        *self.fresh_writes.write() = Some(writes);
     }
 
     /// The store this service fronts.
@@ -197,8 +210,28 @@ impl PointerService {
         // The charge travels with the write. Settling it here instead would
         // release it the moment this future is dropped, while the blocking
         // transaction it started runs on and publishes the file.
+        let record_bytes = request.record.to_vec();
         match self.store.commit(record, reservation).await {
-            Ok(PutOutcome::Changed) => PointerPutResponse::Success { address, state_id },
+            Ok(PutOutcome::Changed) => {
+                // Offer it to the rest of the close group, proof included, so
+                // every member holds it whichever of them the client reached.
+                let writes = self.fresh_writes.read().clone();
+                if let (Some(writes), Some(proof)) = (writes, request.payment_proof) {
+                    if writes
+                        .send(PointerFreshWrite {
+                            record: record_bytes,
+                            payment_proof: proof,
+                        })
+                        .is_err()
+                    {
+                        debug!(
+                            "Replication is not running; pointer {} is not offered on",
+                            hex::encode(address)
+                        );
+                    }
+                }
+                PointerPutResponse::Success { address, state_id }
+            }
             // The re-check under the commit lock found a newer state. The
             // client paid for a state that lost a race; say so plainly.
             Ok(PutOutcome::Unchanged) => PointerPutResponse::Unchanged { address, state_id },

@@ -449,7 +449,7 @@ async fn sixty_four_signatures_buy_exactly_one_write() {
         PutOutcome::Changed
     );
 
-    let path = store.dir().join(hex::encode(first.address()));
+    let path = store.file_for(&first.address());
     let stored = std::fs::read(&path).expect("read back");
 
     for _ in 0..63 {

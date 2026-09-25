@@ -1036,6 +1036,14 @@ impl ChunkStore {
         self.files.reserve_bytes(bytes)
     }
 
+    /// Credit `bytes` deleted from the pointer store back to the disk budget.
+    ///
+    /// The counterpart of [`Self::reserve`]: a record the pointer store removes
+    /// gives its charge back, as a deleted chunk does.
+    pub(crate) fn release(&self, bytes: u64) {
+        self.files.release_bytes(bytes);
+    }
+
     /// `(written_since, in_flight)` from the capacity guard. Tests only.
     #[cfg(test)]
     pub(crate) fn capacity_counters(&self) -> (u64, u64) {

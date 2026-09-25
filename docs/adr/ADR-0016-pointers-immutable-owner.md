@@ -116,6 +116,53 @@ because a newer state can land while payment verifies. Every step off the async
 executor: the read, the signature check and the write each run on a blocking
 thread, so a flood of arrivals cannot occupy the runtime's workers.
 
+### Replication
+
+Pointers replicate through the same engine chunks do — the same close groups,
+neighbour-sync rounds, churn triggers, quorum, pruning and possession rules —
+but by **state**, not by key. The chunk pipeline assumes a record never changes
+and that its key is the hash of its bytes; a pointer's address is stable while
+its state changes, and two honest replicas may hold different valid signatures
+over one state.
+
+- **Fresh.** A node that accepts a paid state from a client forwards the record,
+  with the proof that paid for it, to the rest of the close group. Each receiver
+  checks the signature, its own responsibility (across the paid width, as for a
+  chunk offer) and the payment itself before storing. So a paid state that
+  reached one honest node reaches the whole group, whichever members the client
+  wrote to.
+- **Repair.** Every neighbour-sync round pushes hints — the states the sender
+  holds that the receiver should hold — to the peers being synced, and a peer
+  that syncs with a node gets that node's hints back. A receiver that lacks a
+  hinted state, or holds an older one, asks the close group which state each
+  holds, adopts the best state a quorum of them hold **exactly**, and fetches it
+  from one of them. The record verifies itself; the quorum stands in for the
+  payment proof, as presence quorum does for a chunk. The quorum is the one a
+  chunk needs, counted over the whole close group: a peer that cannot be asked
+  counts as unanswered, never as a vote. This is how a node that missed an
+  update, joined late, or lost a record across a restart is brought level.
+- **Pruning.** A record the node has been outside the retention width of for the
+  hysteresis period is deleted — at once if the node is outside a complete
+  paid-width group, otherwise only once all but one of the current close group
+  prove they hold that state or a newer one by returning a valid record. A proof
+  is a record, not a claim: signatures are checked.
+- **Possession.** Some minutes after offering a fresh state, the offering node
+  asks each member for the record. One that is still responsible and cannot
+  produce that state or a newer one is penalised, as a chunk holder is.
+
+Six messages carry this, appended to the replication enum so every earlier
+discriminant keeps its value: a fresh offer and a hint push (one-way), and a
+fetch and a state query with their responses. An older peer cannot decode them.
+One-way pushes to it are simply lost, and requests only ever go to peers that
+have sent a pointer message themselves — a hint push goes out every round, empty
+or not, so capability is learned within a cycle — so an older peer is never asked
+something it cannot answer and never penalised for its silence.
+
+Records are kept one file each under `{root}/pointers/<shard>/`, 256 shards by
+the address's last byte as the chunk store keeps them. Opening the store parses
+each record's structure but does not verify its signature; every record was
+verified when it was committed and every read verifies it again.
+
 ## What this defends against
 
 | Attack | Defence |
@@ -123,7 +170,7 @@ thread, so a flood of arrivals cannot occupy the runtime's workers.
 | Tamper with any byte | Signature over the whole body |
 | Swap the owner key | `A` is derived from it; the record no longer belongs at its address |
 | Store at someone else's address | Same |
-| Fork / equivocate at one counter | Total order on `(counter, target)`: every node given the same records picks the same one, and a read merges the close group's answers rather than trusting the first. Convergence *across* the network still needs replication — see Not built |
+| Fork / equivocate at one counter | Total order on `(counter, target)`: every node given the same records picks the same one, a read merges the close group's answers rather than trusting the first, and replication gives every member the states that reached a quorum, so the group converges |
 | Replay an older record | Loses on counter |
 | Re-sign one paid state N times | Equal state never replaces; nothing is written |
 | Pay once, jump the counter | Nothing to defend: one payment stores one state whatever its counter, and a skipped number is never stored |
@@ -134,7 +181,8 @@ thread, so a flood of arrivals cannot occupy the runtime's workers.
 | Collide a pointer and a chunk address | Takes a cross-mode BLAKE3 break, and is refused in both directions anyway. The two stores take separate locks, so simultaneous commits of both kinds at one address are not yet atomic |
 | Peer lies about storing a pointer | Every acknowledgement must name the address and state the client sent. A read asks the same group by the same definition, so the quorums intersect — though each does its own lookup, so churn between them is not covered |
 | One peer decides what a pointer says | A read returns a state only if two of the answering peers name it, and a write must reach a majority **plus one** so that two always do. Otherwise a single close-group peer serving an owner-signed state nobody paid to store would be believed by every reader: the record verifies, belongs at the address, and wins the merge. It cannot make a second peer agree. The read counts each state separately, so a state one peer names cannot bury the one the rest agree on — that would be denial of service in place of forgery, and it is also what an ordinary read during an update looks like |
-| Two peers decide it | **Not defended against.** Two colluding close-group peers clear the bar, and only the owner can sign, so what this buys is the owner's own updates unpaid. Raising the bar only raises the number of nodes to grind: both the pointer's address and a node's id are choosable, so an owner determined to sit beside their own pointer can reach any fixed threshold. What actually answers it is replication and audits, neither of which is built |
+| Two peers decide it | **Not defended against, at the read.** Two colluding close-group peers clear a read's bar, and only the owner can sign, so what this buys is the owner's own updates unpaid. Replication does not spread such a state: the rest of the group adopts only what a quorum of it holds, so the honest members keep the paid state, but a reader that happens to hear from both colluders still sees theirs. Raising the read's bar only raises the number of nodes to grind: both the pointer's address and a node's id are choosable, so an owner determined to sit beside their own pointer can reach any fixed threshold |
+| Get a group to adopt a state nobody paid for | Repair adopts only a state a quorum of the close group hold exactly, counted over the whole group, and a fresh offer is stored only after the receiver verifies its payment itself |
 | Node claims a record it no longer holds | An index entry is only a claim about a file. Before answering "unchanged" or "stale" the node reads the record back and checks it is still the one the index names; if it is not, the node stops answering for that address and the arrival becomes a repair. It keeps what it lost, so the lost state is taken back and nothing older is: an address nothing is known about admits any record, and a replay could otherwise roll the node back. That check parses the body, so a signature corrupted in place passes it and is caught on the next read instead — verifying there would put ML-DSA in front of the payment gate, which is the one place it must not be |
 
 ## Consequences
@@ -156,11 +204,10 @@ thread, so a flood of arrivals cannot occupy the runtime's workers.
   correctly signed value and cannot tell.
 - Replicas may hold different valid signatures of one state; nothing compares
   record bytes across replicas.
-- Pointers do not take part in storage commitments or audits. The audit format
-  is untouched, so no protocol family is bumped and no rollout pauses. Auditing
-  them needs round 2 to serve a whole record — a peer signs its own commitment,
-  so without that it could name any key with the hash of cheap bytes it holds —
-  and that lands with replication.
+- Pointers do not yet take part in storage commitments or audits; see
+  Implementation status. Auditing them needs round 2 to serve a whole record — a
+  peer signs its own commitment, so without that it could name any key with the
+  hash of cheap bytes it holds.
 
 ## Implementation status
 
@@ -169,24 +216,16 @@ merge-on-put; request dispatch; payment routed at `state_id` with the close
 group of `A`; admission gates; cross-kind refusal; and the client — create,
 update, quorum store, merged reads and chain resolution.
 
-**Not built: replication.** No node forwards a pointer to another, so the copies
-that exist are the ones the client wrote. That is the load-bearing gap: the
-merge rule guarantees nodes holding the same records agree, and nothing yet
-guarantees they hold the same records. Until it lands, availability and
-cross-network fork convergence are the client's doing, not the network's.
+**Built: replication** (see Replication above): fresh offers with payment,
+neighbour-sync repair by quorum over exact states, pruning with possession
+proofs, and post-offer possession checks, wired into the engine's sync rounds,
+churn triggers and cycle completion. A node that missed an update, joined late,
+or lost a record is brought level by the next sync round rather than the next
+write.
 
-Two consequences follow from it and land with it. A node that joins a close
-group after a pointer was created, or that missed updates, does not hold the
-current state until the owner next updates it; that update is admitted however
-far ahead it is, so the next write brings it level. And a node that loses a
-record can repair it while it is running — it keeps what it lost, and takes back
-that state or any that replaces it — but across a restart, where a missing file
-leaves nothing to remember, it waits for the next update like a node that just
-joined. Both are the same missing mechanism: a node cannot ask another node for
-a record.
-
-Also not built: pointer participation in commitments and audits, which depends
-on the same work.
+**Not built yet: commitments and audits.** Pointers are not yet leaves of the
+storage commitment, so they do not count toward a node's quoted price and are not
+spot-checked by the subtree audit.
 
 **Not built: browser clients.** ADR-0015's WebRTC-direct transport admits,
 sanitizes and classifies message kinds by an explicit list, and pointer requests
@@ -230,6 +269,16 @@ the browser client the same quorum and corroboration rules the native one uses.
 - The chunk preimages the old prefix construction handed out no longer land on
   either identity. (No test can say more: that no content does is the preimage
   assumption, not a property one can check.)
+- Replication across a live multi-node network: a paid PUT to one node reaches
+  its whole close group; an update replaces the old state everywhere; a node that
+  missed an update is repaired by neighbour sync alone; a node that joins later
+  obtains existing pointers through the engine's own loops; a state only one node
+  holds is not adopted, though its hints arrived; an unpaid fresh offer is
+  refused; the possession check penalises only the member that dropped the
+  record; pruning deletes only once the close group proves it holds the record,
+  and a node far outside the group prunes without asking.
+- Fresh offers, hints, fetches and state queries are covered by the replication
+  protocol's per-variant tests: family, size ceiling, round-trip.
 - End to end against a live testnet with real settlement: create, update, read
   back, resolve a chain to its chunk, repeat a stored state, read an address
   nobody wrote. Every close-group node answers a paid update to a pointer it

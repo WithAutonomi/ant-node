@@ -1180,11 +1180,20 @@ impl TestNetwork {
                 .map_or_else(|_| vec![], |sig| sig.as_bytes().to_vec())
         });
 
-        Ok(AntProtocol::new(
-            Arc::new(storage),
-            Arc::new(payment_verifier),
-            Arc::new(quote_generator),
-        ))
+        // Pointers beside the chunks, wired as a real node wires them (ADR-0016).
+        let storage = Arc::new(storage);
+        let payment_verifier = Arc::new(payment_verifier);
+        let pointer_store = ant_node::pointer::PointerStore::new(data_dir)
+            .await
+            .map_err(|e| TestnetError::Core(format!("Failed to create pointer store: {e}")))?;
+        let pointers = ant_node::pointer::PointerService::new(pointer_store)
+            .with_chunk_store(Arc::clone(&storage))
+            .with_payments(Arc::clone(&payment_verifier));
+
+        Ok(
+            AntProtocol::new(storage, payment_verifier, Arc::new(quote_generator))
+                .with_pointer_service(pointers),
+        )
     }
 
     /// Start a single node.
@@ -1348,6 +1357,12 @@ impl TestNetwork {
             .await
             {
                 Ok(mut engine) => {
+                    // Pointers replicate through the same engine (ADR-0016).
+                    if let Some(service) = protocol.pointer_service() {
+                        let (writes, fresh_writes) = tokio::sync::mpsc::unbounded_channel();
+                        service.attach_fresh_writes(writes);
+                        engine.with_pointers(service.store().clone(), fresh_writes);
+                    }
                     let dht_events = p2p.dht_manager().subscribe_events();
                     engine.start(dht_events);
                     node.replication_engine = Some(engine);

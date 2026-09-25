@@ -1332,9 +1332,35 @@ impl PaymentVerifier {
         paid_content: &XorName,
         payment_proof: &[u8],
     ) -> Result<()> {
+        self.verify_pointer_payment_in(
+            routing_address,
+            paid_content,
+            payment_proof,
+            VerificationContext::ClientPut,
+        )
+        .await
+    }
+
+    /// As [`Self::verify_pointer_payment`], in `context`.
+    ///
+    /// Fresh replication verifies under
+    /// [`VerificationContext::FreshReplication`], exactly as a chunk offer does:
+    /// the checks are identical, the context only keeps the price-floor
+    /// telemetry apart.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::verify_pointer_payment`].
+    pub async fn verify_pointer_payment_in(
+        &self,
+        routing_address: &XorName,
+        paid_content: &XorName,
+        payment_proof: &[u8],
+        context: VerificationContext,
+    ) -> Result<()> {
         let target = PaymentTarget::split(*routing_address, *paid_content);
         match self
-            .verify_payment_inner(&target, Some(payment_proof), VerificationContext::ClientPut)
+            .verify_payment_inner(&target, Some(payment_proof), context)
             .await?
         {
             PaymentStatus::CachedAsVerified | PaymentStatus::PaymentVerified => Ok(()),
@@ -1365,6 +1391,15 @@ impl PaymentVerifier {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn cache_insert(&self, xorname: XorName) {
         self.cache.insert(xorname);
+    }
+
+    /// Mark a pointer state as paid, so verifying it needs no chain lookup.
+    /// The pointer counterpart of [`Self::cache_insert`]: keyed by the state
+    /// and routed at the address, as a real pointer payment is.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn cache_insert_pointer(&self, routing_address: XorName, state_id: XorName) {
+        self.cache
+            .insert_key(PaymentTarget::split(routing_address, state_id));
     }
 
     /// Mark startup content as prepaid for the in-process browser devnet.

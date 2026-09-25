@@ -1513,6 +1513,12 @@ impl FileStore {
         }
     }
 
+    /// Credit `len` bytes that were deleted outside this store back to the
+    /// cached measurement. The pointer store keeps its own files on this disk.
+    pub(crate) fn release_bytes(&self, len: u64) {
+        self.capacity.record_removed(len);
+    }
+
     /// Reject work early when the disk cannot take `bytes` more.
     ///
     /// # Errors
@@ -2483,7 +2489,7 @@ fn is_windows_sharing_violation(e: &std::io::Error) -> bool {
 /// file for a few milliseconds after it is created, and `MoveFileEx` fails outright
 /// rather than queueing. Retrying a bounded number of times turns that from a failed
 /// write into a short pause. Every other error returns immediately.
-fn rename_with_retry(temp_path: &Path, final_path: &Path) -> std::io::Result<()> {
+pub(crate) fn rename_with_retry(temp_path: &Path, final_path: &Path) -> std::io::Result<()> {
     let mut last = match std::fs::rename(temp_path, final_path) {
         Ok(()) => return Ok(()),
         Err(e) => e,

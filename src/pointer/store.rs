@@ -35,11 +35,15 @@
 //! whole transaction lives in one task, dropping the caller's future cannot
 //! tear it.
 //!
-//! On disk each record is one file named by its hex address under
-//! `{root}/pointers/`. Writes go to a uniquely named temporary file and are
-//! renamed into place, so a crash leaves either the old record or the new one,
-//! never a torn one. A lock file under the same directory keeps two processes
-//! from keeping two indexes over one set of files.
+//! On disk each record is one file named by its hex address, under
+//! `{root}/pointers/<shard>/`, where the shard is the address's last byte in
+//! hex: 256 directories, as the chunk store keeps, so no directory grows with
+//! the whole store. The last byte rather than the first because a node holds
+//! addresses near its own identity, and their leading bytes cluster. Writes go
+//! to a uniquely named temporary file in the shard and are renamed into place,
+//! so a crash leaves either the old record or the new one, never a torn one. A
+//! lock file under `{root}/pointers/` keeps two processes from keeping two
+//! indexes over one set of files.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -57,7 +61,7 @@ use crate::error::{Error, Result};
 use crate::logging::{debug, warn};
 use ant_protocol::pointer::{ParsedPointer, Pointer, PointerState, POINTER_WIRE_LEN};
 
-use crate::storage::Reservation;
+use crate::storage::{rename_with_retry, Reservation};
 
 /// Directory under the store root that holds pointer records.
 const POINTERS_DIR_NAME: &str = "pointers";
@@ -67,6 +71,26 @@ const TEMP_PREFIX: &str = ".tmp-";
 
 /// Name of the file whose lock grants exclusive use of the directory.
 const LOCK_FILE_NAME: &str = ".pointer-store-lock";
+
+/// How many shard directories records are spread across: one per value of an
+/// address's last byte.
+const SHARD_COUNT: u16 = 256;
+
+/// The name of the shard directory `address` lives in: its last byte in hex.
+fn shard_name(address: &XorName) -> String {
+    let last = address.last().copied().unwrap_or_default();
+    format!("{last:02x}")
+}
+
+/// The shard directory `address` lives in.
+fn shard_dir(dir: &Path, address: &XorName) -> PathBuf {
+    dir.join(shard_name(address))
+}
+
+/// The file that holds the record at `address`.
+fn record_path(dir: &Path, address: &XorName) -> PathBuf {
+    shard_dir(dir, address).join(hex::encode(address))
+}
 
 /// What a put did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +108,52 @@ pub enum PutOutcome {
     Unchanged,
     /// The incoming record lost under the merge rule. Nothing was written.
     Stale,
+}
+
+/// What the store has done since it was opened, for telemetry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PointerStoreStats {
+    /// Records written, whether new or replacing an older state.
+    pub written: u64,
+    /// Arrivals that carried the state already held. Nothing was written.
+    pub unchanged: u64,
+    /// Arrivals that lost to the state already held. Nothing was written.
+    pub stale: u64,
+    /// Records served to a reader.
+    pub served: u64,
+    /// Records removed because this node stopped being responsible for them.
+    pub deleted: u64,
+}
+
+/// The live counters behind [`PointerStoreStats`].
+#[derive(Debug, Default)]
+struct Counters {
+    written: AtomicU64,
+    unchanged: AtomicU64,
+    stale: AtomicU64,
+    served: AtomicU64,
+    deleted: AtomicU64,
+}
+
+impl Counters {
+    fn count(&self, outcome: PutOutcome) {
+        let counter = match outcome {
+            PutOutcome::Changed => &self.written,
+            PutOutcome::Unchanged => &self.unchanged,
+            PutOutcome::Stale => &self.stale,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> PointerStoreStats {
+        PointerStoreStats {
+            written: self.written.load(Ordering::Relaxed),
+            unchanged: self.unchanged.load(Ordering::Relaxed),
+            stale: self.stale.load(Ordering::Relaxed),
+            served: self.served.load(Ordering::Relaxed),
+            deleted: self.deleted.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// The result of [`PointerStore::inspect`]: what an arrival claims, before any
@@ -135,8 +205,13 @@ struct IndexEntry {
 impl IndexEntry {
     /// Describe a validated record.
     fn of(record: &Pointer, generation: u64) -> Self {
+        Self::held(record.state(), generation)
+    }
+
+    /// Describe a record held on disk in `state`.
+    const fn held(state: PointerState, generation: u64) -> Self {
         Self {
-            state: record.state(),
+            state,
             on_disk: true,
             generation,
         }
@@ -166,6 +241,8 @@ struct Inner {
     write_seq: AtomicU64,
     /// Source of index generations, monotonic for this store's lifetime.
     generation: AtomicU64,
+    /// What the store has done, for telemetry.
+    counters: Counters,
     /// Held for the store's lifetime; releasing it releases the directory.
     _lock_file: File,
 }
@@ -194,6 +271,7 @@ impl PointerStore {
                 Error::Storage(format!("cannot create {}: {e}", scan_dir.display()))
             })?;
             let lock_file = acquire_lock(&scan_dir)?;
+            create_shards(&scan_dir)?;
             let index = scan(&scan_dir)?;
             Ok::<_, Error>((lock_file, index))
         })
@@ -216,6 +294,7 @@ impl PointerStore {
                 index: Mutex::new(index),
                 write_seq: AtomicU64::new(0),
                 generation: AtomicU64::new(next_generation),
+                counters: Counters::default(),
                 _lock_file: lock_file,
             }),
         })
@@ -261,9 +340,11 @@ impl PointerStore {
         // word alone.
         if let Some(held) = self.held_state(&state.address) {
             if held.state_id == state.state_id {
+                self.inner.counters.count(PutOutcome::Unchanged);
                 return Ok(Inspected::Unchanged(state));
             }
             if !state.replaces(&held) {
+                self.inner.counters.count(PutOutcome::Stale);
                 return Ok(Inspected::Stale(state));
             }
         }
@@ -310,9 +391,11 @@ impl PointerStore {
         let inner = Arc::clone(&self.inner);
         // The whole transaction runs in one task, so dropping this future
         // cannot leave the write done and the index un-updated.
-        spawn_blocking(move || inner.commit_blocking(&record, reservation))
+        let outcome = spawn_blocking(move || inner.commit_blocking(&record, reservation))
             .await
-            .map_err(|e| Error::Storage(format!("pointer commit panicked: {e}")))?
+            .map_err(|e| Error::Storage(format!("pointer commit panicked: {e}")))??;
+        self.inner.counters.count(outcome);
+        Ok(outcome)
     }
 
     /// Validate and store in one step, with no payment gate.
@@ -381,7 +464,10 @@ impl PointerStore {
         };
 
         match validated {
-            Ok(record) if record.address() == *address => Ok(Some(record)),
+            Ok(record) if record.address() == *address => {
+                self.inner.counters.served.fetch_add(1, Ordering::Relaxed);
+                Ok(Some(record))
+            }
             Ok(_) => {
                 warn!(
                     "Pointer file at {} holds a record for another address; dropping it \
@@ -412,6 +498,19 @@ impl PointerStore {
         self.snapshot(address)
             .filter(|entry| entry.on_disk)
             .map(|entry| entry.state.state_id)
+    }
+
+    /// The state held at `address`, as the index records it, if this node can
+    /// serve one.
+    ///
+    /// What a peer asking "which state do you hold?" is told. Taken from the
+    /// index rather than the file, so answering costs no disk read; a file lost
+    /// since is caught by the first read, which stops the index claiming it.
+    #[must_use]
+    pub fn state(&self, address: &XorName) -> Option<PointerState> {
+        self.snapshot(address)
+            .filter(|entry| entry.on_disk)
+            .map(|entry| entry.state)
     }
 
     /// Whether a paid PUT of `state` may be taken.
@@ -462,6 +561,60 @@ impl PointerStore {
     #[must_use]
     pub fn dir(&self) -> &Path {
         &self.inner.dir
+    }
+
+    /// The file the record at `address` is kept in.
+    #[must_use]
+    pub fn file_for(&self, address: &XorName) -> PathBuf {
+        self.path_for(address)
+    }
+
+    /// Every state this node can serve, sorted by address.
+    ///
+    /// Taken from the index, which every other answer the store gives is also
+    /// based on. A record whose file has gone is left out: it is not something
+    /// this node can offer to anyone.
+    #[must_use]
+    pub fn held_states(&self) -> Vec<PointerState> {
+        let mut states: Vec<PointerState> = self
+            .inner
+            .index
+            .lock()
+            .values()
+            .filter(|entry| entry.on_disk)
+            .map(|entry| entry.state)
+            .collect();
+        states.sort_unstable_by_key(|state| state.address);
+        states
+    }
+
+    /// What the store has done since it was opened.
+    #[must_use]
+    pub fn stats(&self) -> PointerStoreStats {
+        self.inner.counters.snapshot()
+    }
+
+    /// Remove the record at `address` and forget it entirely.
+    ///
+    /// For a node that is no longer responsible for the address. Unlike a
+    /// record lost to the disk, nothing about it is remembered, because the
+    /// node is not meant to take it back. Returns whether a file was removed,
+    /// so the caller can give its space back to the disk budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] if the file exists and cannot be removed; the
+    /// record is then still held and still indexed.
+    pub async fn delete(&self, address: &XorName) -> Result<bool> {
+        let inner = Arc::clone(&self.inner);
+        let address = *address;
+        let removed = spawn_blocking(move || inner.delete_blocking(&address))
+            .await
+            .map_err(|e| Error::Storage(format!("pointer delete panicked: {e}")))??;
+        if removed {
+            self.inner.counters.deleted.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(removed)
     }
 
     /// The state this node can actually serve at `address`, having read it
@@ -531,11 +684,43 @@ impl PointerStore {
 
     /// Path of the file backing `address`.
     fn path_for(&self, address: &XorName) -> PathBuf {
-        self.inner.dir.join(hex::encode(address))
+        record_path(&self.inner.dir, address)
     }
 }
 
 impl Inner {
+    /// Remove the file and the index entry for `address` under one lock, so a
+    /// commit can never land between the two and be forgotten on disk.
+    fn delete_blocking(&self, address: &XorName) -> Result<bool> {
+        let shard = shard_dir(&self.dir, address);
+        let path = record_path(&self.dir, address);
+        let removed = {
+            let mut index = self.index.lock();
+            let removed = match std::fs::remove_file(&path) {
+                Ok(()) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(e) => {
+                    return Err(Error::Storage(format!(
+                        "cannot delete {}: {e}",
+                        path.display()
+                    )))
+                }
+            };
+            index.remove(address);
+            removed
+        };
+        if removed {
+            if let Err(e) = sync_directory(&shard) {
+                warn!(
+                    "{} is deleted, but {} could not be synced: {e}",
+                    path.display(),
+                    shard.display()
+                );
+            }
+        }
+        Ok(removed)
+    }
+
     /// Compare, write and re-index under one lock.
     ///
     /// Runs entirely inside a blocking task: the lock is synchronous and is
@@ -555,7 +740,8 @@ impl Inner {
         reservation: Option<Reservation>,
     ) -> Result<PutOutcome> {
         let address = record.address();
-        let path = self.dir.join(hex::encode(address));
+        let shard = shard_dir(&self.dir, &address);
+        let path = record_path(&self.dir, &address);
 
         // A cheap look before doing any work. The authoritative check is the
         // one under the lock below; this only avoids staging a file for an
@@ -574,9 +760,7 @@ impl Inner {
         // across it would block every other address, including the cheap
         // lookups async callers make.
         let seq = self.write_seq.fetch_add(1, Ordering::Relaxed);
-        let temp = self
-            .dir
-            .join(format!("{TEMP_PREFIX}{}-{seq}", hex::encode(address)));
+        let temp = shard.join(format!("{TEMP_PREFIX}{}-{seq}", hex::encode(address)));
         if let Err(failed) = stage(&temp, &record.to_bytes()) {
             // Bytes that could not be cleaned up are still on the disk, so the
             // charge for them stands rather than going back.
@@ -611,7 +795,7 @@ impl Inner {
 
             // The rename is the commit point: nothing fallible happens between
             // it and the index update, and both are under this one lock.
-            if let Err(e) = std::fs::rename(&temp, &path) {
+            if let Err(e) = rename_with_retry(&temp, &path) {
                 if std::fs::remove_file(&temp).is_err() {
                     settle(reservation);
                 }
@@ -638,13 +822,13 @@ impl Inner {
         // cannot be reported as "nothing happened"; it is logged instead, which
         // is how an operator learns the filesystem is not giving the store what
         // it asks for.
-        if let Err(e) = sync_directory(&self.dir) {
+        if let Err(e) = sync_directory(&shard) {
             warn!(
                 "{} is stored and indexed, but {} could not be synced: {e}. It is \
                  visible now; its survival across a power loss depends on the \
                  filesystem",
                 path.display(),
-                self.dir.display()
+                shard.display()
             );
         }
         Ok(outcome)
@@ -714,7 +898,27 @@ fn read_record_file(path: &Path) -> Result<Option<Vec<u8>>> {
     Ok(Some(bytes))
 }
 
-/// Rebuild the index by reading every record in `dir`.
+/// Create the shard directories, so a write never has to.
+fn create_shards(dir: &Path) -> Result<()> {
+    for shard in 0..SHARD_COUNT {
+        let path = dir.join(format!("{shard:02x}"));
+        std::fs::create_dir_all(&path)
+            .map_err(|e| Error::Storage(format!("cannot create {}: {e}", path.display())))?;
+    }
+    sync_directory(dir)
+}
+
+/// Rebuild the index from the records in `dir`'s shards.
+///
+/// Each record's structure is parsed, but its signature is not checked. Every
+/// record was verified when it was committed, and every read verifies it again
+/// before serving it, so a file damaged in place is caught — and disowned — the
+/// first time anyone asks for it. Checking an ML-DSA signature per record here
+/// instead would make opening a large store take minutes, and the chunk store
+/// likewise opens on names alone.
+///
+/// A record left at the top level by the flat layout earlier builds used is
+/// moved into its shard.
 fn scan(dir: &Path) -> Result<HashMap<XorName, IndexEntry>> {
     let entries = std::fs::read_dir(dir)
         .map_err(|e| Error::Storage(format!("cannot read {}: {e}", dir.display())))?;
@@ -735,6 +939,38 @@ fn scan(dir: &Path) -> Result<HashMap<XorName, IndexEntry>> {
         if name == LOCK_FILE_NAME {
             continue;
         }
+        if path.is_dir() {
+            if name.len() == 2 && name.bytes().all(|b| b.is_ascii_hexdigit()) {
+                scan_shard(&path, &mut index);
+            }
+            continue;
+        }
+        adopt_flat_record(dir, &path, name, &mut index);
+    }
+    Ok(index)
+}
+
+/// Index the records in one shard directory.
+fn scan_shard(shard: &Path, index: &mut HashMap<XorName, IndexEntry>) {
+    let entries = match std::fs::read_dir(shard) {
+        Ok(entries) => entries,
+        Err(e) => {
+            warn!("Skipping unreadable pointer shard {}: {e}", shard.display());
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                warn!("Skipping unreadable pointer directory entry: {e}");
+                continue;
+            }
+        };
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
         if name.starts_with(TEMP_PREFIX) {
             // A temporary file means a crash mid-write: the rename never
             // happened, so the old record (if any) is intact and the partial
@@ -749,23 +985,14 @@ fn scan(dir: &Path) -> Result<HashMap<XorName, IndexEntry>> {
             }
             continue;
         }
-        let bytes = match read_record_file(&path) {
-            Ok(Some(bytes)) => bytes,
-            Ok(None) => continue,
-            Err(e) => {
-                warn!("Skipping unreadable pointer file {}: {e}", path.display());
-                continue;
-            }
+        let Some(state) = parse_record_file(&path) else {
+            continue;
         };
-        let record = match Pointer::from_bytes(&bytes) {
-            Ok(record) => record,
-            Err(e) => {
-                warn!("Skipping invalid pointer file {}: {e}", path.display());
-                continue;
-            }
-        };
-        let address = record.address();
-        if hex::encode(address) != name {
+        let in_its_shard = shard
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n == shard_name(&state.address));
+        if hex::encode(state.address) != name || !in_its_shard {
             warn!(
                 "Skipping pointer file {} that is not at its own address",
                 path.display()
@@ -773,9 +1000,65 @@ fn scan(dir: &Path) -> Result<HashMap<XorName, IndexEntry>> {
             continue;
         }
         let generation = u64::try_from(index.len()).unwrap_or(u64::MAX);
-        index.insert(address, IndexEntry::of(&record, generation));
+        index.insert(state.address, IndexEntry::held(state, generation));
     }
-    Ok(index)
+}
+
+/// Move a record from the flat layout into its shard and index it.
+fn adopt_flat_record(
+    dir: &Path,
+    path: &Path,
+    name: &str,
+    index: &mut HashMap<XorName, IndexEntry>,
+) {
+    if name.starts_with(TEMP_PREFIX) {
+        if let Err(e) = std::fs::remove_file(path) {
+            warn!(
+                "Could not sweep the partial pointer write {}: {e}",
+                path.display()
+            );
+        }
+        return;
+    }
+    let Some(state) = parse_record_file(path) else {
+        return;
+    };
+    if hex::encode(state.address) != name {
+        warn!(
+            "Skipping pointer file {} that is not at its own address",
+            path.display()
+        );
+        return;
+    }
+    let target = record_path(dir, &state.address);
+    if let Err(e) = rename_with_retry(path, &target) {
+        warn!(
+            "Could not move pointer file {} into its shard: {e}",
+            path.display()
+        );
+        return;
+    }
+    let generation = u64::try_from(index.len()).unwrap_or(u64::MAX);
+    index.insert(state.address, IndexEntry::held(state, generation));
+}
+
+/// Read a record file and parse its structure, logging anything unusable.
+fn parse_record_file(path: &Path) -> Option<PointerState> {
+    let bytes = match read_record_file(path) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return None,
+        Err(e) => {
+            warn!("Skipping unreadable pointer file {}: {e}", path.display());
+            return None;
+        }
+    };
+    match PointerState::parse(&bytes) {
+        Ok(state) => Some(state),
+        Err(e) => {
+            warn!("Skipping invalid pointer file {}: {e}", path.display());
+            None
+        }
+    }
 }
 
 /// Write `bytes` to `temp` and fsync it, ready to be renamed into place.
@@ -960,7 +1243,7 @@ mod tests {
         let first = signed(1, 5, 5);
         store.put_bytes(&first.to_bytes()).await.expect("put");
 
-        let path = store.dir().join(hex::encode(first.address()));
+        let path = store.file_for(&first.address());
         let held_bytes = std::fs::read(&path).expect("read");
 
         for _ in 0..16 {
@@ -1298,7 +1581,7 @@ mod tests {
         let record = signed(1, 1, 1);
         store.put_bytes(&record.to_bytes()).await.expect("put");
 
-        let path = store.dir().join(hex::encode(record.address()));
+        let path = store.file_for(&record.address());
         let mut bytes = std::fs::read(&path).expect("read back");
         if let Some(byte) = bytes.get_mut(10) {
             *byte ^= 0xff;
@@ -1340,7 +1623,7 @@ mod tests {
         store.put_bytes(&record.to_bytes()).await.expect("put");
 
         // The file disappears under the node; the index has not noticed.
-        std::fs::remove_file(store.dir().join(hex::encode(record.address()))).expect("remove");
+        std::fs::remove_file(store.file_for(&record.address())).expect("remove");
         assert!(
             store.contains(&record.address()),
             "the index still claims it"
@@ -1369,7 +1652,7 @@ mod tests {
         }
         let held = signed(1, 3, 1);
 
-        std::fs::remove_file(store.dir().join(hex::encode(held.address()))).expect("remove");
+        std::fs::remove_file(store.file_for(&held.address())).expect("remove");
         // A read notices the loss and stops the node answering for it.
         assert!(store.get(&held.address()).await.expect("get").is_none());
         assert!(!store.contains(&held.address()), "it is not served");
@@ -1421,11 +1704,8 @@ mod tests {
         store.put_bytes(&indexed.to_bytes()).await.expect("put");
 
         let other = signed(1, 9, 1);
-        std::fs::write(
-            store.dir().join(hex::encode(indexed.address())),
-            other.to_bytes(),
-        )
-        .expect("swap the file");
+        std::fs::write(store.file_for(&indexed.address()), other.to_bytes())
+            .expect("swap the file");
 
         match store.inspect(&indexed.to_bytes()).await.expect("inspect") {
             Inspected::Candidate(_) => (),
@@ -1439,7 +1719,7 @@ mod tests {
         let record = signed(1, 1, 1);
         store.put_bytes(&record.to_bytes()).await.expect("put");
 
-        std::fs::remove_file(store.dir().join(hex::encode(record.address()))).expect("remove");
+        std::fs::remove_file(store.file_for(&record.address())).expect("remove");
         assert!(store.get(&record.address()).await.expect("get").is_none());
         assert!(!store.contains(&record.address()));
     }
@@ -1453,15 +1733,14 @@ mod tests {
             store.put_bytes(&record.to_bytes()).await.expect("put");
 
             // Junk under a plausible name, an oversized file, and a partial write.
-            std::fs::write(store.dir().join(hex::encode([9u8; 32])), b"not a pointer")
-                .expect("write junk");
+            std::fs::write(store.file_for(&[9u8; 32]), b"not a pointer").expect("write junk");
+            std::fs::write(store.file_for(&[8u8; 32]), vec![0u8; POINTER_WIRE_LEN * 4])
+                .expect("write oversized");
             std::fs::write(
-                store.dir().join(hex::encode([8u8; 32])),
-                vec![0u8; POINTER_WIRE_LEN * 4],
+                store.file_for(&[7u8; 32]).with_file_name(".tmp-abc-0"),
+                vec![0u8; POINTER_WIRE_LEN],
             )
-            .expect("write oversized");
-            std::fs::write(store.dir().join(".tmp-abc-0"), vec![0u8; POINTER_WIRE_LEN])
-                .expect("write temp");
+            .expect("write temp");
         }
 
         let reopened = PointerStore::new(dir.path()).await.expect("reopen");
@@ -1490,12 +1769,195 @@ mod tests {
         assert_eq!(store.len(), 1);
 
         // No temporary file survived the race.
-        let leftovers: Vec<_> = std::fs::read_dir(store.dir())
+        assert!(
+            temporary_files(&store).is_empty(),
+            "temporary files were left behind"
+        );
+    }
+
+    /// Every temporary file anywhere under the store.
+    fn temporary_files(store: &PointerStore) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        for shard in std::fs::read_dir(store.dir()).expect("read dir").flatten() {
+            if !shard.path().is_dir() {
+                continue;
+            }
+            for entry in std::fs::read_dir(shard.path())
+                .expect("read shard")
+                .flatten()
+            {
+                if entry.file_name().to_string_lossy().starts_with(TEMP_PREFIX) {
+                    found.push(entry.path());
+                }
+            }
+        }
+        found
+    }
+
+    #[tokio::test]
+    async fn a_record_is_kept_in_the_shard_named_by_its_last_byte() {
+        let (store, _dir) = store().await;
+        let record = signed(3, 0, 1);
+        store.put_bytes(&record.to_bytes()).await.expect("put");
+
+        let path = store.file_for(&record.address());
+        let last = record.address().last().copied().expect("32 bytes");
+        assert_eq!(
+            path.parent().expect("a shard"),
+            store.dir().join(format!("{last:02x}"))
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read"),
+            record.to_bytes(),
+            "the record is on disk where the store says it is"
+        );
+        let shards = std::fs::read_dir(store.dir())
             .expect("read dir")
-            .filter_map(std::result::Result::ok)
-            .filter(|e| e.file_name().to_string_lossy().starts_with(TEMP_PREFIX))
-            .collect();
-        assert!(leftovers.is_empty(), "temporary files were left behind");
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .count();
+        assert_eq!(shards, 256, "every shard exists before any write needs it");
+    }
+
+    #[tokio::test]
+    async fn held_states_lists_what_is_served_in_address_order() {
+        let (store, _dir) = store().await;
+        let records: Vec<Pointer> = (1..=5u8).map(|seed| signed(seed, 2, seed)).collect();
+        for record in &records {
+            store.put_bytes(&record.to_bytes()).await.expect("put");
+        }
+        let lost = records.first().expect("five records");
+        std::fs::remove_file(store.file_for(&lost.address())).expect("remove");
+        assert!(store.get(&lost.address()).await.expect("get").is_none());
+
+        let held = store.held_states();
+        let mut expected: Vec<XorName> = records.iter().skip(1).map(Pointer::address).collect();
+        expected.sort_unstable();
+        assert_eq!(
+            held.iter().map(|state| state.address).collect::<Vec<_>>(),
+            expected,
+            "sorted, and without the record whose file is gone"
+        );
+        for state in &held {
+            assert_eq!(store.state_id(&state.address), Some(state.state_id));
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_removes_the_record_and_forgets_it() {
+        let (store, _dir) = store().await;
+        let record = signed(4, 3, 1);
+        store.put_bytes(&record.to_bytes()).await.expect("put");
+        let path = store.file_for(&record.address());
+
+        assert!(store.delete(&record.address()).await.expect("delete"));
+        assert!(!path.exists(), "the file is gone");
+        assert!(!store.contains(&record.address()));
+        assert!(store.get(&record.address()).await.expect("get").is_none());
+        // Forgotten, not remembered as lost: an older state is admissible again,
+        // which a lost record would refuse.
+        assert!(store.admits(&signed(4, 1, 1).state()));
+        assert!(
+            !store.delete(&record.address()).await.expect("delete"),
+            "nothing left to delete"
+        );
+        assert_eq!(store.stats().deleted, 1);
+
+        // Still usable afterwards, and gone across a reopen too.
+        store
+            .put_bytes(&record.to_bytes())
+            .await
+            .expect("put again");
+        assert!(store.contains(&record.address()));
+        store.delete(&record.address()).await.expect("delete");
+        let dir = store.dir().parent().expect("root").to_path_buf();
+        drop(store);
+        let reopened = PointerStore::new(&dir).await.expect("reopen");
+        assert!(!reopened.contains(&record.address()));
+    }
+
+    #[tokio::test]
+    async fn stats_count_what_each_arrival_did() {
+        let (store, _dir) = store().await;
+        let first = signed(5, 1, 1);
+        let newer = signed(5, 2, 1);
+        store.put_bytes(&first.to_bytes()).await.expect("put");
+        store.put_bytes(&newer.to_bytes()).await.expect("put");
+        store
+            .put_bytes(&signed(5, 2, 1).to_bytes())
+            .await
+            .expect("put");
+        store.put_bytes(&first.to_bytes()).await.expect("put");
+        store.get(&first.address()).await.expect("get");
+
+        assert_eq!(
+            store.stats(),
+            PointerStoreStats {
+                written: 2,
+                unchanged: 1,
+                stale: 1,
+                served: 1,
+                deleted: 0,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_indexes_records_without_verifying_them_and_a_read_still_does() {
+        // The scan parses structure only. A signature damaged in place is
+        // indexed, and caught by the first read, which disowns it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let record = signed(6, 1, 1);
+        let path = {
+            let store = PointerStore::new(dir.path()).await.expect("open");
+            store.put_bytes(&record.to_bytes()).await.expect("put");
+            store.file_for(&record.address())
+        };
+        let mut bytes = std::fs::read(&path).expect("read");
+        if let Some(byte) = bytes.get_mut(POINTER_BODY_LEN + 7) {
+            *byte ^= 0xff;
+        }
+        std::fs::write(&path, &bytes).expect("damage");
+
+        let reopened = PointerStore::new(dir.path()).await.expect("reopen");
+        assert!(
+            reopened.contains(&record.address()),
+            "indexed on its structure"
+        );
+        assert!(
+            reopened
+                .get(&record.address())
+                .await
+                .expect("get")
+                .is_none(),
+            "never served"
+        );
+        assert!(
+            !reopened.contains(&record.address()),
+            "and disowned once read"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_record_in_the_flat_layout_is_moved_into_its_shard() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let record = signed(7, 4, 2);
+        let flat = dir
+            .path()
+            .join(POINTERS_DIR_NAME)
+            .join(hex::encode(record.address()));
+        std::fs::create_dir_all(flat.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&flat, record.to_bytes()).expect("write");
+
+        let store = PointerStore::new(dir.path()).await.expect("open");
+        assert!(!flat.exists(), "moved out of the top level");
+        assert!(store.file_for(&record.address()).exists(), "into its shard");
+        let held = store
+            .get(&record.address())
+            .await
+            .expect("get")
+            .expect("present");
+        assert_eq!(held.state_id(), record.state_id());
     }
 
     #[tokio::test]

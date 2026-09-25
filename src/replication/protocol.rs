@@ -217,6 +217,25 @@ pub enum ReplicationMessageBody {
     GetCommitmentByPin(GetCommitmentByPin),
     /// Response to [`Self::GetCommitmentByPin`].
     GetCommitmentByPinResponse(GetCommitmentByPinResponse),
+
+    // === Pointers (ADR-0016) ===
+    // APPENDED for the same reason: every earlier discriminant keeps its value.
+    // A peer built before pointers cannot decode these and drops them. The two
+    // one-way pushes are then simply lost, and the requests are only ever sent
+    // to peers that have sent a pointer message themselves, so an older peer is
+    // never asked something it cannot answer and never penalised for silence.
+    /// A newly paid pointer state, with the proof that paid for it.
+    PointerFreshOffer(PointerFreshOffer),
+    /// The pointer states the sender holds that the receiver should hold too.
+    PointerHints(PointerHints),
+    /// Ask a peer for the pointer record it holds at an address.
+    PointerFetchRequest(PointerFetchRequest),
+    /// Response to [`Self::PointerFetchRequest`].
+    PointerFetchResponse(PointerFetchResponse),
+    /// Ask a peer which state it holds at each of some addresses.
+    PointerStateRequest(PointerStateRequest),
+    /// Response to [`Self::PointerStateRequest`].
+    PointerStateResponse(PointerStateResponse),
 }
 
 // ---------------------------------------------------------------------------
@@ -235,7 +254,7 @@ pub enum ReplicationMessageBody {
 // modules that do not carry any shared engine handle.
 
 /// Number of [`ReplicationMessageBody`] variants (the counter-table width).
-pub(crate) const N_REPLICATION_VARIANTS: usize = 17;
+pub(crate) const N_REPLICATION_VARIANTS: usize = 23;
 
 static REPL_TX_BYTES: [AtomicU64; N_REPLICATION_VARIANTS] =
     [const { AtomicU64::new(0) }; N_REPLICATION_VARIANTS];
@@ -270,6 +289,12 @@ impl ReplicationMessageBody {
             Self::SubtreeSliceResponse(_) => 14,
             Self::GetCommitmentByPin(_) => 15,
             Self::GetCommitmentByPinResponse(_) => 16,
+            Self::PointerFreshOffer(_) => 17,
+            Self::PointerHints(_) => 18,
+            Self::PointerFetchRequest(_) => 19,
+            Self::PointerFetchResponse(_) => 20,
+            Self::PointerStateRequest(_) => 21,
+            Self::PointerStateResponse(_) => 22,
         }
     }
 
@@ -336,7 +361,7 @@ impl BodyFamily {
 pub(crate) fn family_of_variant(index: usize) -> Option<BodyFamily> {
     match index {
         11..=14 => Some(BodyFamily::SubtreeAudit),
-        0..=10 | 15 | 16 => Some(BodyFamily::Core),
+        0..=10 | 15..=22 => Some(BodyFamily::Core),
         _ => None,
     }
 }
@@ -985,6 +1010,117 @@ pub enum GetCommitmentByPinResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Pointer Messages (ADR-0016)
+// ---------------------------------------------------------------------------
+
+/// Most hints one [`PointerHints`] message carries. A sender with more splits
+/// them across messages; a receiver ignores anything past this in one message.
+pub const MAX_POINTER_HINTS_PER_MESSAGE: usize = 8192;
+
+/// Most addresses one [`PointerStateRequest`] asks about. A responder answers
+/// only this many, and the requester treats the rest as unanswered.
+pub const MAX_POINTER_STATE_REQUEST_ADDRESSES: usize = 512;
+
+/// A pointer state, as a hint or as an answer about what a node holds.
+///
+/// The fields the merge rule orders by, and the state they identify, so a
+/// receiver can tell whether a hinted state would replace what it holds without
+/// fetching it. Unauthenticated on its own: nothing is stored on the strength
+/// of a summary. A receiver acts on one only through quorum verification and a
+/// fetched record whose signature it checks itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PointerStateSummary {
+    /// The pointer's address.
+    pub address: XorName,
+    /// The state's identifier.
+    pub state_id: XorName,
+    /// The update counter, the merge rule's first key.
+    pub counter: u64,
+    /// The target's kind tag.
+    pub target_tag: u8,
+    /// The target's address. With the tag, the merge rule's second key.
+    pub target_address: XorName,
+}
+
+impl From<ant_protocol::pointer::PointerState> for PointerStateSummary {
+    fn from(state: ant_protocol::pointer::PointerState) -> Self {
+        Self {
+            address: state.address,
+            state_id: state.state_id,
+            counter: state.counter,
+            target_tag: state.target.kind_tag(),
+            target_address: state.target.address,
+        }
+    }
+}
+
+impl From<PointerStateSummary> for ant_protocol::pointer::PointerState {
+    fn from(summary: PointerStateSummary) -> Self {
+        Self {
+            state_id: summary.state_id,
+            address: summary.address,
+            counter: summary.counter,
+            target: ant_protocol::pointer::PointerTarget::from_raw_tag(
+                summary.target_tag,
+                summary.target_address,
+            ),
+        }
+    }
+}
+
+/// A newly paid pointer state, with the proof that paid for it.
+///
+/// Sent by a node that accepted the state from a paying client to the rest of
+/// the pointer's close group, which verifies the proof itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PointerFreshOffer {
+    /// The pointer record, in its canonical encoding.
+    pub record: Vec<u8>,
+    /// Serialized proof of payment for the record's state.
+    pub proof_of_payment: Vec<u8>,
+}
+
+/// The pointer states the sender holds that the receiver should hold too.
+///
+/// Sent on every neighbour-sync round, empty if there is nothing to say: an
+/// empty message still tells the receiver the sender understands pointers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PointerHints {
+    /// The states, at most [`MAX_POINTER_HINTS_PER_MESSAGE`] of them.
+    pub hints: Vec<PointerStateSummary>,
+}
+
+/// Ask a peer for the pointer record it holds at an address.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct PointerFetchRequest {
+    /// The pointer's address.
+    pub address: XorName,
+}
+
+/// Response to [`PointerFetchRequest`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PointerFetchResponse {
+    /// Echo of the requested address.
+    pub address: XorName,
+    /// The record held there, if any.
+    pub record: Option<Vec<u8>>,
+}
+
+/// Ask a peer which state it holds at each of some addresses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PointerStateRequest {
+    /// The addresses, at most [`MAX_POINTER_STATE_REQUEST_ADDRESSES`].
+    pub addresses: Vec<XorName>,
+}
+
+/// Response to [`PointerStateRequest`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PointerStateResponse {
+    /// One entry per requested address, in order: the state held, or `None`.
+    pub states: Vec<Option<PointerStateSummary>>,
+}
+
+// ---------------------------------------------------------------------------
 // Audit Messages
 // ---------------------------------------------------------------------------
 
@@ -1572,6 +1708,18 @@ mod tests {
             ReplicationMessageBody::GetCommitmentByPinResponse(
                 GetCommitmentByPinResponse::NotRetained { pin: z },
             ),
+            ReplicationMessageBody::PointerFreshOffer(PointerFreshOffer {
+                record: vec![],
+                proof_of_payment: vec![],
+            }),
+            ReplicationMessageBody::PointerHints(PointerHints { hints: vec![] }),
+            ReplicationMessageBody::PointerFetchRequest(PointerFetchRequest { address: z }),
+            ReplicationMessageBody::PointerFetchResponse(PointerFetchResponse {
+                address: z,
+                record: None,
+            }),
+            ReplicationMessageBody::PointerStateRequest(PointerStateRequest { addresses: vec![] }),
+            ReplicationMessageBody::PointerStateResponse(PointerStateResponse { states: vec![] }),
         ]
     }
 
@@ -1769,7 +1917,7 @@ mod tests {
     fn an_undeclared_variant_index_classifies_as_nothing() {
         let declared = all_bodies().len();
         assert_eq!(
-            declared, 17,
+            declared, 23,
             "update this test's bounds when a variant is added or removed"
         );
         for index in [declared, declared + 1, 99, usize::MAX] {

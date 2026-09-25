@@ -238,7 +238,7 @@ impl NodeBuilder {
         fresh_rx: UnboundedReceiver<FreshWriteEvent>,
         shutdown: &CancellationToken,
     ) -> Result<(Option<ReplicationEngine>, Option<JoinHandle<()>>)> {
-        let engine = match ReplicationEngine::new(
+        let mut engine = match ReplicationEngine::new(
             repl_config,
             Arc::clone(p2p),
             protocol.storage(),
@@ -270,6 +270,14 @@ impl NodeBuilder {
                 return Ok((None, None));
             }
         };
+
+        // ADR-0016: pointers replicate through the same engine. The PUT handler
+        // hands each newly stored paid state to it on this channel.
+        if let Some(service) = protocol.pointer_service() {
+            let (writes, fresh_writes) = tokio::sync::mpsc::unbounded_channel();
+            service.attach_fresh_writes(writes);
+            engine.with_pointers(service.store().clone(), fresh_writes);
+        }
 
         // ADR-0004: wire the engine's commitment state as the quote generator's
         // commitment source so quotes force their price from the live storage
