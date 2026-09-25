@@ -38,8 +38,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::ant_protocol::XorName;
 use crate::replication::commitment::{
-    commitment_hash, sign_commitment, verify_commitment_signature, CommitmentError, MerkleTree,
-    StorageCommitment,
+    commitment_hash, pointer_leaf_hash, sign_commitment, verify_commitment_signature,
+    CommitmentError, MerkleTree, StorageCommitment,
 };
 
 /// Auditor-side per-peer commitment state.
@@ -280,6 +280,12 @@ impl BuiltCommitment {
         self.tree.leaf_keys()
     }
 
+    /// The subset of [`Self::leaf_keys`] committed as pointers (ADR-0016).
+    #[must_use]
+    pub fn pointer_leaf_keys(&self) -> Vec<XorName> {
+        self.tree.pointer_leaf_keys()
+    }
+
     /// Reconstruct a `BuiltCommitment` from a persisted signed commitment and a
     /// `tree` rebuilt from its leaf keys — WITHOUT re-signing, so the pin
     /// (`commitment_hash`) is preserved exactly across a restart (ML-DSA
@@ -362,13 +368,74 @@ struct PersistedSlot {
     /// slot as already expired. `None` if the slot was never gossiped — then it
     /// survives reload only while it is the current slot.
     expires_at_unix: Option<u64>,
+    /// The subset of `leaf_keys` committed as pointers (ADR-0016). A pointer
+    /// leaf is `(key, pointer_leaf_hash(key))`, not `(key, key)`, so without
+    /// this the rebuilt tree would miss the signed root and the slot be lost.
+    pointer_keys: Vec<XorName>,
 }
 
 /// Persisted-format version. Bump on any layout OR semantic change so an
 /// incompatible on-disk snapshot is rejected (→ empty retention, which self-heals
 /// via re-gossip) rather than silently misinterpreted (e.g. an old field read
 /// under new semantics).
-const RETENTION_FORMAT_VERSION: u32 = 1;
+///
+/// Format 2 added each slot's pointer keys. Format 1 is still read, and still
+/// written whenever no slot commits a pointer (see [`PersistedRetention::to_bytes`]).
+const RETENTION_FORMAT_VERSION: u32 = 2;
+
+/// The format that predates pointers: the same slots with no pointer keys.
+const POINTERLESS_RETENTION_FORMAT_VERSION: u32 = 1;
+
+/// A format-1 slot, as read back from disk.
+#[derive(Deserialize)]
+struct PointerlessSlot {
+    commitment: StorageCommitment,
+    leaf_keys: Vec<XorName>,
+    expires_at_unix: Option<u64>,
+}
+
+/// A format-1 snapshot, as read back from disk.
+#[derive(Deserialize)]
+struct PointerlessRetention {
+    version: u32,
+    slots: Vec<PointerlessSlot>,
+    has_current: bool,
+}
+
+/// A format-1 slot, as written: borrowed, so writing format 1 copies nothing.
+#[derive(Serialize)]
+struct PointerlessSlotRef<'a> {
+    commitment: &'a StorageCommitment,
+    leaf_keys: &'a [XorName],
+    expires_at_unix: Option<u64>,
+}
+
+/// A format-1 snapshot, as written.
+#[derive(Serialize)]
+struct PointerlessRetentionRef<'a> {
+    version: u32,
+    slots: Vec<PointerlessSlotRef<'a>>,
+    has_current: bool,
+}
+
+impl From<PointerlessRetention> for PersistedRetention {
+    fn from(old: PointerlessRetention) -> Self {
+        Self {
+            version: old.version,
+            slots: old
+                .slots
+                .into_iter()
+                .map(|slot| PersistedSlot {
+                    commitment: slot.commitment,
+                    leaf_keys: slot.leaf_keys,
+                    expires_at_unix: slot.expires_at_unix,
+                    pointer_keys: Vec::new(),
+                })
+                .collect(),
+            has_current: old.has_current,
+        }
+    }
+}
 
 /// The persisted responder retention. Slots are newest-first; `has_current`
 /// says whether `slots[0]` was the live advertised commitment.
@@ -384,18 +451,52 @@ impl PersistedRetention {
     /// Serialize for durable persistence (caller writes it atomically). `None`
     /// on a serialization error, so the caller can refuse to overwrite the
     /// durable file rather than truncate it.
+    ///
+    /// A snapshot with no pointer in any slot is written in format 1, which it
+    /// can say exactly. A node rolled back to a release that predates pointers
+    /// then still reloads its retention, instead of dropping every pin a peer
+    /// holds on it.
     #[must_use]
     pub fn to_bytes(&self) -> Option<Vec<u8>> {
-        postcard::to_allocvec(self).ok()
+        let pointerless = self.version == RETENTION_FORMAT_VERSION
+            && self.slots.iter().all(|slot| slot.pointer_keys.is_empty());
+        if !pointerless {
+            return postcard::to_allocvec(self).ok();
+        }
+        let old = PointerlessRetentionRef {
+            version: POINTERLESS_RETENTION_FORMAT_VERSION,
+            slots: self
+                .slots
+                .iter()
+                .map(|slot| PointerlessSlotRef {
+                    commitment: &slot.commitment,
+                    leaf_keys: &slot.leaf_keys,
+                    expires_at_unix: slot.expires_at_unix,
+                })
+                .collect(),
+            has_current: self.has_current,
+        };
+        postcard::to_allocvec(&old).ok()
     }
 
     /// Decode a persisted snapshot. `None` on a corrupt blob OR a version
     /// mismatch — the caller then fails open LOCALLY (empty retention; the node
     /// re-gossips a fresh root), which never grants a remote grace.
+    ///
+    /// The version leads the blob in every format, so it is read first and
+    /// picks the layout the rest is decoded with.
     #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        let this: Self = postcard::from_bytes(bytes).ok()?;
-        (this.version == RETENTION_FORMAT_VERSION).then_some(this)
+        let (version, _) = postcard::take_from_bytes::<u32>(bytes).ok()?;
+        match version {
+            RETENTION_FORMAT_VERSION => postcard::from_bytes(bytes).ok(),
+            POINTERLESS_RETENTION_FORMAT_VERSION => {
+                postcard::from_bytes::<PointerlessRetention>(bytes)
+                    .ok()
+                    .map(Self::from)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -769,6 +870,7 @@ impl ResponderCommitmentState {
                     commitment: c.commitment().clone(),
                     leaf_keys: c.leaf_keys(),
                     expires_at_unix,
+                    pointer_keys: c.pointer_leaf_keys(),
                 }
             })
             .collect();
@@ -796,7 +898,18 @@ impl ResponderCommitmentState {
         // else a later slot would be wrongly promoted to current.
         let mut first_slot_restored = false;
         for (i, slot) in persisted.slots.iter().enumerate() {
-            let entries: Vec<_> = slot.leaf_keys.iter().map(|k| (*k, *k)).collect();
+            let pointer_keys: HashSet<&XorName> = slot.pointer_keys.iter().collect();
+            let entries: Vec<_> = slot
+                .leaf_keys
+                .iter()
+                .map(|k| {
+                    if pointer_keys.contains(k) {
+                        (*k, pointer_leaf_hash(k))
+                    } else {
+                        (*k, *k)
+                    }
+                })
+                .collect();
             let Ok(tree) = MerkleTree::build(entries) else {
                 continue;
             };
@@ -1051,6 +1164,77 @@ mod tests {
         );
     }
 
+    /// A commitment holding pointers (ADR-0016) survives a restart like any
+    /// other. A pointer leaf is not `(key, key)`, so a snapshot that kept only
+    /// the key set would rebuild a different root, fail the signature check and
+    /// drop the slot, and every peer pinning it would then fail this node.
+    #[test]
+    fn a_commitment_holding_pointers_survives_a_restart() {
+        let (pk, sk) = keypair();
+        let pk_bytes = pk.to_bytes();
+        let mut entries: Vec<_> = (1..=4u8).map(|i| (key(i), key(i))).collect();
+        entries.extend((10..=12u8).map(|i| (key(i), pointer_leaf_hash(&key(i)))));
+        let built = BuiltCommitment::build(entries, &[0xAB; 32], &sk, &pk_bytes).unwrap();
+        let pin = built.hash();
+        let state = ResponderCommitmentState::new();
+        state.rotate(built);
+        state.mark_gossiped(pin);
+
+        let bytes = state.snapshot().to_bytes().expect("serialize");
+        assert_eq!(
+            postcard::take_from_bytes::<u32>(&bytes)
+                .map(|(v, _)| v)
+                .ok(),
+            Some(RETENTION_FORMAT_VERSION),
+            "a snapshot holding pointers needs the format that can say so"
+        );
+        let fresh = ResponderCommitmentState::new();
+        fresh.restore(&PersistedRetention::from_bytes(&bytes).expect("deserialize"));
+
+        let got = fresh.lookup_by_hash(&pin).expect("pin survives restart");
+        assert_eq!(got.hash(), pin);
+        assert!(fresh.is_held(&key(11)), "a committed pointer is still held");
+        assert!(fresh.is_held(&key(2)), "a committed chunk is still held");
+        assert_eq!(
+            got.pointer_leaf_keys(),
+            vec![key(10), key(11), key(12)],
+            "the pointers are still told apart from the chunks"
+        );
+    }
+
+    /// A snapshot with no pointer in it is written in format 1, byte for byte
+    /// what a release before pointers writes. Rolling such a node back then
+    /// keeps its retention; format 2 would read as an unknown version there and
+    /// drop every pin its peers hold.
+    #[test]
+    fn a_snapshot_without_pointers_is_written_in_the_old_format() {
+        let (pk, sk) = keypair();
+        let pk_bytes = pk.to_bytes();
+        let entries: Vec<_> = (1..=5u8).map(|i| (key(i), key(i))).collect();
+        let built = BuiltCommitment::build(entries, &[0xAB; 32], &sk, &pk_bytes).unwrap();
+        let pin = built.hash();
+        let state = ResponderCommitmentState::new();
+        state.rotate(built);
+        state.mark_gossiped(pin);
+
+        let bytes = state.snapshot().to_bytes().expect("serialize");
+        let old = postcard::from_bytes::<PointerlessRetention>(&bytes)
+            .expect("the old layout decodes it");
+        assert_eq!(old.version, POINTERLESS_RETENTION_FORMAT_VERSION);
+        assert_eq!(
+            old.slots.first().map(|slot| slot.leaf_keys.len()),
+            Some(5),
+            "the old layout reads the same key set"
+        );
+
+        let fresh = ResponderCommitmentState::new();
+        fresh.restore(&PersistedRetention::from_bytes(&bytes).expect("deserialize"));
+        assert!(
+            fresh.lookup_by_hash(&pin).is_some(),
+            "and this release reads it back too"
+        );
+    }
+
     /// A corrupt snapshot blob decodes to `None`, so the caller fails open with
     /// empty retention rather than trusting garbage.
     #[test]
@@ -1071,6 +1255,7 @@ mod tests {
                 commitment: built.commitment().clone(),
                 leaf_keys: vec![key(1)],
                 expires_at_unix: None,
+                pointer_keys: Vec::new(),
             }],
             has_current: true,
         };
@@ -1102,6 +1287,7 @@ mod tests {
                 commitment: built.commitment().clone(),
                 leaf_keys: leaf_keys.clone(),
                 expires_at_unix,
+                pointer_keys: Vec::new(),
             }],
             has_current: false, // not current -> retention depends on the stamp
         };

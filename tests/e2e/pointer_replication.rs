@@ -14,6 +14,9 @@ use ant_node::ant_protocol::chunk::{
     ChunkMessage, ChunkMessageBody, PointerPutRequest, PointerPutResponse,
 };
 use ant_node::pointer::PointerStore;
+use ant_node::replication::audit::AuditTickResult;
+use ant_node::replication::commitment::pointer_leaf_hash;
+use ant_node::replication::commitment_state::{BuiltCommitment, ResponderCommitmentState};
 use ant_node::replication::pointer::{PointerFreshWrite, PointerReplication};
 use ant_node::ReplicationConfig;
 use ant_protocol::pointer::{Pointer, PointerState, PointerTarget, PointerTargetKind};
@@ -64,6 +67,13 @@ fn replication(node: &TestNode) -> &Arc<PointerReplication> {
         .expect("engine")
         .pointer_replication()
         .expect("pointer replication")
+}
+
+fn commitments(node: &TestNode) -> &ResponderCommitmentState {
+    node.replication_engine
+        .as_ref()
+        .expect("engine")
+        .commitment_state()
 }
 
 fn peer(node: &TestNode) -> PeerId {
@@ -502,8 +512,11 @@ async fn pruning_deletes_only_once_the_close_group_proves_it_holds_the_record() 
     // Nobody else holds it yet: nothing proves it is safe to drop.
     let everyone: Vec<usize> = (0..harness.node_count()).collect();
     exchange_hints(&harness, &everyone, &[pruner]).await;
-    let pruning = replication(harness.test_node(pruner).expect("node"));
-    pruning.prune_pass(true).await;
+    let pruner_node = harness.test_node(pruner).expect("node");
+    let pruning = replication(pruner_node);
+    pruning
+        .prune_pass(true, Some(commitments(pruner_node)))
+        .await;
     assert!(
         holds(harness.test_node(pruner).expect("node"), &record),
         "the only copy was pruned"
@@ -516,7 +529,9 @@ async fn pruning_deletes_only_once_the_close_group_proves_it_holds_the_record() 
             .await
             .expect("put");
     }
-    pruning.prune_pass(true).await;
+    pruning
+        .prune_pass(true, Some(commitments(pruner_node)))
+        .await;
     assert!(
         held(harness.test_node(pruner).expect("node"), &record).is_none(),
         "the record was not pruned though the close group holds it"
@@ -543,12 +558,181 @@ async fn a_node_far_outside_the_group_prunes_without_asking() {
         .await
         .expect("put");
 
-    replication(harness.test_node(pruner).expect("node"))
-        .prune_pass(false)
+    let pruner_node = harness.test_node(pruner).expect("node");
+    replication(pruner_node)
+        .prune_pass(false, Some(commitments(pruner_node)))
         .await;
     assert!(
-        held(harness.test_node(pruner).expect("node"), &record).is_none(),
+        held(pruner_node, &record).is_none(),
         "a far-away record was kept"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// A pointer a retained storage commitment still holds is never pruned, as a
+/// chunk is not: a peer pinning that commitment may yet audit it, and a node
+/// that had deleted it would fail. Once no retained commitment holds it, it
+/// goes.
+#[tokio::test]
+#[serial]
+async fn pruning_keeps_a_pointer_a_retained_commitment_still_holds() {
+    let harness = TestHarness::setup_with_config(prune_network(3))
+        .await
+        .expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let (pk, sk) = owner();
+    let record = signed(&pk, &sk, 1, 1);
+    let pruner = out_of_range_node(&harness, &record).await;
+    let pruner_node = harness.test_node(pruner).expect("node");
+    store(pruner_node)
+        .put_bytes(&record.to_bytes())
+        .await
+        .expect("put");
+
+    // The commitment the node gossiped while it was still responsible.
+    let (node_pk, node_sk) = owner();
+    let committed = BuiltCommitment::build(
+        vec![(record.address(), pointer_leaf_hash(&record.address()))],
+        peer(pruner_node).as_bytes(),
+        &node_sk,
+        &node_pk.to_bytes(),
+    )
+    .expect("commitment");
+    let state = commitments(pruner_node);
+    state.rotate(committed);
+
+    replication(pruner_node)
+        .prune_pass(false, Some(state))
+        .await;
+    assert!(
+        holds(pruner_node, &record),
+        "a pointer a retained commitment holds was pruned"
+    );
+
+    state.clear_all();
+    replication(pruner_node)
+        .prune_pass(false, Some(state))
+        .await;
+    assert!(
+        held(pruner_node, &record).is_none(),
+        "the pointer was kept after no commitment held it"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// Store `count` pointers on node `holder`, have it commit to them, and hand
+/// that commitment to node `auditor`, as its gossip would. Returns what the
+/// holder committed to.
+async fn commit_pointers(
+    harness: &TestHarness,
+    holder: usize,
+    auditor: usize,
+    count: usize,
+) -> Vec<Pointer> {
+    let holder_node = harness.test_node(holder).expect("holder");
+    let records: Vec<Pointer> = (0..count)
+        .map(|_| {
+            let (pk, sk) = owner();
+            signed(&pk, &sk, 1, 1)
+        })
+        .collect();
+    for record in &records {
+        store(holder_node)
+            .put_bytes(&record.to_bytes())
+            .await
+            .expect("put");
+    }
+
+    let engine = holder_node.replication_engine.as_ref().expect("engine");
+    engine.rebuild_commitment_now().await.expect("rebuild");
+    let committed = engine
+        .commitment_state()
+        .current()
+        .expect("a current commitment");
+    let pointers = committed.pointer_leaf_keys();
+    assert!(
+        !pointers.is_empty(),
+        "the holder committed to none of the pointers it is responsible for"
+    );
+    assert_eq!(
+        committed.leaf_keys(),
+        pointers,
+        "the holder has no chunks, so every leaf audited is a pointer"
+    );
+
+    harness
+        .test_node(auditor)
+        .expect("auditor")
+        .replication_engine
+        .as_ref()
+        .expect("engine")
+        .inject_peer_commitment_for_test(&peer(holder_node), committed.commitment().clone())
+        .await;
+    records
+        .into_iter()
+        .filter(|record| pointers.contains(&record.address()))
+        .collect()
+}
+
+/// A node holding the pointers it committed to passes the storage audit over
+/// the wire, proving each opened one with its signed record.
+#[tokio::test]
+#[serial]
+async fn a_node_holding_its_committed_pointers_passes_the_storage_audit() {
+    let harness = TestHarness::setup_small().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+    let (holder, auditor) = (3, 4);
+    commit_pointers(&harness, holder, auditor, 48).await;
+
+    let holder_peer = peer(harness.test_node(holder).expect("holder"));
+    let result = harness
+        .test_node(auditor)
+        .expect("auditor")
+        .replication_engine
+        .as_ref()
+        .expect("engine")
+        .audit_peer_now(&holder_peer)
+        .await;
+    assert!(
+        matches!(result, AuditTickResult::Passed { keys_checked, .. } if keys_checked >= 1),
+        "an honest pointer holder must pass, got {result:?}"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// A node that dropped the pointers it committed to fails the storage audit,
+/// exactly as a node that dropped its chunks does.
+#[tokio::test]
+#[serial]
+async fn a_node_that_dropped_its_committed_pointers_fails_the_storage_audit() {
+    let harness = TestHarness::setup_small().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+    let (holder, auditor) = (5, 6);
+    let committed = commit_pointers(&harness, holder, auditor, 48).await;
+
+    let holder_node = harness.test_node(holder).expect("holder");
+    for record in &committed {
+        assert!(store(holder_node)
+            .delete(&record.address())
+            .await
+            .expect("delete"));
+    }
+
+    let result = harness
+        .test_node(auditor)
+        .expect("auditor")
+        .replication_engine
+        .as_ref()
+        .expect("engine")
+        .audit_peer_now(&peer(holder_node))
+        .await;
+    assert!(
+        matches!(result, AuditTickResult::Failed { .. }),
+        "a node that dropped its committed pointers must fail, got {result:?}"
     );
 
     harness.teardown().await.expect("teardown");

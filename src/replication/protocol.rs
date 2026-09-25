@@ -1366,6 +1366,17 @@ pub enum SubtreeSliceItem {
         /// The committed key the responder could not serve.
         key: XorName,
     },
+    /// The responder holds this committed pointer (ADR-0016) and serves the
+    /// whole signed record. A pointer's address is not a content hash, so no
+    /// slice of it could be authenticated against the address; the record can
+    /// be, by its signature. One per requested pointer key, whatever blocks
+    /// were named.
+    PointerRecord {
+        /// The requested key: the pointer's address.
+        key: XorName,
+        /// The pointer record, in its canonical encoding.
+        record: Vec<u8>,
+    },
 }
 
 /// Response to a [`SubtreeSliceChallenge`] (round 2).

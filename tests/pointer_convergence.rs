@@ -472,8 +472,12 @@ async fn sixty_four_signatures_buy_exactly_one_write() {
     );
     assert_eq!(store.len(), 1, "one address, one record");
 
+    // Records live one level down, in shard directories.
     let files: Vec<_> = std::fs::read_dir(store.dir())
         .expect("read dir")
+        .filter_map(std::result::Result::ok)
+        .filter(|shard| shard.path().is_dir())
+        .flat_map(|shard| std::fs::read_dir(shard.path()).expect("read shard"))
         .filter_map(std::result::Result::ok)
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|name| !name.starts_with('.'))

@@ -614,7 +614,8 @@ async fn slice_challenge_opens_valid_blocks_for_committed_keys() {
                             "nonced opening must fold to the honest nonced root"
                         );
                     }
-                    other @ SubtreeSliceItem::Absent { .. } => {
+                    other @ (SubtreeSliceItem::Absent { .. }
+                    | SubtreeSliceItem::PointerRecord { .. }) => {
                         panic!("expected Present for stored committed key, got {other:?}")
                     }
                 }
@@ -703,7 +704,8 @@ async fn slice_challenge_coalesces_duplicate_and_interleaved_openings() {
                         );
                         seen.push((*key, *block_index));
                     }
-                    other @ SubtreeSliceItem::Absent { .. } => {
+                    other @ (SubtreeSliceItem::Absent { .. }
+                    | SubtreeSliceItem::PointerRecord { .. }) => {
                         panic!("expected Present for a stored committed key, got {other:?}")
                     }
                 }

@@ -426,7 +426,14 @@ pub const REPLICATION_PROTOCOL_ID: &str = "autonomi.ant.replication.v2";
 /// possession/repair/commitment-fetch) with no per-peer limiter. A truly
 /// zero-penalty rollout needs an upstream `send_request` that does not
 /// auto-report trust; tracked as a saorsa-core follow-up.
-pub const SUBTREE_AUDIT_PROTOCOL_ID: &str = "autonomi.ant.replication.subtree-audit.v1";
+///
+/// `v2` (ADR-0016): commitments carry pointer leaves, committed as
+/// `(address, pointer_leaf_hash(address))`, and round 2 answers one with the
+/// whole signed record. A `v1` auditor would reject a pointer leaf in round 1
+/// as a content-address mismatch and penalise an honest holder, so the two
+/// versions must not audit each other: the same bounded pause as the `v1`
+/// introduction, for the same reason.
+pub const SUBTREE_AUDIT_PROTOCOL_ID: &str = "autonomi.ant.replication.subtree-audit.v2";
 
 /// 10 MiB — maximum replication wire message size (accommodates hint batches).
 const REPLICATION_MESSAGE_SIZE_MIB: usize = 10;
@@ -1487,7 +1494,7 @@ mod tests {
         assert_eq!(REPLICATION_PROTOCOL_ID, "autonomi.ant.replication.v2");
         assert_eq!(
             SUBTREE_AUDIT_PROTOCOL_ID,
-            "autonomi.ant.replication.subtree-audit.v1"
+            "autonomi.ant.replication.subtree-audit.v2"
         );
         assert_ne!(REPLICATION_PROTOCOL_ID, SUBTREE_AUDIT_PROTOCOL_ID);
     }

@@ -67,6 +67,7 @@ use crate::payment::{
     PaymentVerifier, VerificationContext, MAX_PAYMENT_PROOF_SIZE_BYTES,
     MIN_PAYMENT_PROOF_SIZE_BYTES,
 };
+use crate::pointer::store::PointerStore;
 use crate::replication::audit::AuditTickResult;
 use crate::replication::audit_coordinator::AuditChallengeCoordinator;
 use crate::replication::audit_metrics::{
@@ -2038,6 +2039,7 @@ impl ReplicationEngine {
     pub async fn rebuild_commitment_now(&self) -> Result<()> {
         rebuild_and_rotate_commitment(
             &self.storage,
+            self.pointers.as_ref().map(|p| p.store()),
             &self.identity,
             &self.commitment_state,
             &self.p2p_node,
@@ -2218,7 +2220,7 @@ impl ReplicationEngine {
     /// Call before [`Self::start`].
     pub fn with_pointers(
         &mut self,
-        store: crate::pointer::store::PointerStore,
+        store: PointerStore,
         fresh_writes: mpsc::UnboundedReceiver<pointer::PointerFreshWrite>,
     ) {
         self.pointers = Some(Arc::new(pointer::PointerReplication::new(
@@ -3404,6 +3406,7 @@ impl ReplicationEngine {
         let config = Arc::clone(&self.config);
         let sync_trigger = Arc::clone(&self.sync_trigger);
         let recent_provers = Arc::clone(&self.recent_provers);
+        let pointer_store = self.pointers.as_ref().map(|p| p.store().clone());
 
         let handle = tokio::spawn(async move {
             // Build the first commitment immediately on startup so a
@@ -3426,9 +3429,15 @@ impl ReplicationEngine {
             // unchanged — preserving the reloaded current pin; otherwise the
             // reloaded roots stay answerable as retained slots until their gossip
             // TTL lapses. Persistence is handled by the retention-persist loop.
-            if let Err(e) =
-                rebuild_and_rotate_commitment(&storage, &identity, &commitment_state, &p2p, &config)
-                    .await
+            if let Err(e) = rebuild_and_rotate_commitment(
+                &storage,
+                pointer_store.as_ref(),
+                &identity,
+                &commitment_state,
+                &p2p,
+                &config,
+            )
+            .await
             {
                 warn!("Initial commitment build failed: {e}");
             } else {
@@ -3442,6 +3451,7 @@ impl ReplicationEngine {
                     ) => {
                         if let Err(e) = rebuild_and_rotate_commitment(
                             &storage,
+                            pointer_store.as_ref(),
                             &identity,
                             &commitment_state,
                             &p2p,
@@ -5183,6 +5193,7 @@ async fn handle_replication_message(
             let storage = Arc::clone(&ctx.storage);
             let p2p_node = Arc::clone(&ctx.p2p_node);
             let my_commitment_state = Arc::clone(&ctx.my_commitment_state);
+            let pointer_store = ctx.pointers.as_ref().map(|p| p.store().clone());
             let source = *source;
             let request_id = msg.request_id;
             let rr_message_id = rr_message_id.map(ToOwned::to_owned);
@@ -5195,9 +5206,10 @@ async fn handle_replication_message(
                 let storage_commitment_audit::Round1Work {
                     response,
                     content_bytes,
-                } = storage_commitment_audit::handle_subtree_challenge_measured(
+                } = storage_commitment_audit::handle_subtree_challenge_measured_with_pointers(
                     &challenge,
                     &storage,
+                    pointer_store.as_ref(),
                     p2p_node.peer_id(),
                     bootstrapping,
                     Some(&my_commitment_state),
@@ -5369,6 +5381,7 @@ async fn handle_replication_message(
             let storage = Arc::clone(&ctx.storage);
             let p2p_node = Arc::clone(&ctx.p2p_node);
             let my_commitment_state = Arc::clone(&ctx.my_commitment_state);
+            let pointer_store = ctx.pointers.as_ref().map(|p| p.store().clone());
             let source = *source;
             let request_id = msg.request_id;
             let rr_message_id = rr_message_id.map(ToOwned::to_owned);
@@ -5377,14 +5390,16 @@ async fn handle_replication_message(
                 let _guard = guard; // global permit + per-peer slot, held until done
                 let worker_started = Instant::now();
                 let processing_started = Instant::now();
-                let response = storage_commitment_audit::handle_subtree_slice_challenge(
-                    &challenge,
-                    &storage,
-                    p2p_node.peer_id(),
-                    bootstrapping,
-                    Some(&my_commitment_state),
-                )
-                .await;
+                let response =
+                    storage_commitment_audit::handle_subtree_slice_challenge_with_pointers(
+                        &challenge,
+                        &storage,
+                        pointer_store.as_ref(),
+                        p2p_node.peer_id(),
+                        bootstrapping,
+                        Some(&my_commitment_state),
+                    )
+                    .await;
                 let processing = processing_started.elapsed();
                 let response_kind = subtree_slice_response_kind(&response);
                 let response_send_started = Instant::now();
@@ -7534,7 +7549,9 @@ async fn run_neighbor_sync_round(
         })
         .await;
         if let Some(pointers) = pointers {
-            pointers.prune_pass(allow_remote_prune_audits).await;
+            pointers
+                .prune_pass(allow_remote_prune_audits, Some(commitment_state))
+                .await;
         }
 
         // Take fresh close-neighbor snapshot (DHT query, no lock held).
@@ -10060,11 +10077,16 @@ async fn write_retention_atomic(path: &Path, bytes: Vec<u8>) -> bool {
 /// BLAKE3(content)`, so `bytes_hash := key` and we don't have to
 /// re-read each chunk's bytes to compute the leaf hash.
 ///
+/// The pointers this node is responsible for are committed alongside, each as
+/// `(address, pointer_leaf_hash(address))` (ADR-0016), so they are audited and
+/// priced exactly as chunks are.
+///
 /// Skips (returns `Ok(())`) if the key set is empty — no commitment to
 /// rotate. The auditor side handles "no commitment for this peer" by
 /// falling back to the legacy plain-digest audit path.
 async fn rebuild_and_rotate_commitment(
     storage: &Arc<ChunkStore>,
+    pointers: Option<&PointerStore>,
     identity: &Arc<NodeIdentity>,
     state: &Arc<ResponderCommitmentState>,
     p2p: &Arc<P2PNode>,
@@ -10097,8 +10119,16 @@ async fn rebuild_and_rotate_commitment(
             keys.push(k);
         }
     }
+    // The same rule for pointers: an out-of-range pointer leaves the next
+    // commitment, and the pruner reclaims it once no retained slot holds it.
+    let mut pointer_keys = Vec::new();
+    for state in pointers.map(PointerStore::held_states).unwrap_or_default() {
+        if admission::is_responsible(&self_id, &state.address, p2p, config.close_group_size).await {
+            pointer_keys.push(state.address);
+        }
+    }
 
-    if keys.is_empty() {
+    if keys.is_empty() && pointer_keys.is_empty() {
         // There used to be a second branch here that dropped every retained root outright
         // when the node looked empty. It is gone, and the reason is worth keeping.
         //
@@ -10146,12 +10176,11 @@ async fn rebuild_and_rotate_commitment(
     // to more than the protocol limit; auditor would reject the
     // commitment otherwise).
     let cap = commitment::MAX_COMMITMENT_KEY_COUNT as usize;
-    if keys.len() > cap {
+    let total = keys.len().saturating_add(pointer_keys.len());
+    if total > cap {
         warn!(
-            "Commitment rotation: key set ({}) exceeds MAX_COMMITMENT_KEY_COUNT ({}); \
-             truncating — investigate as this likely means a misconfiguration",
-            keys.len(),
-            cap
+            "Commitment rotation: key set ({total}) exceeds MAX_COMMITMENT_KEY_COUNT ({cap}); \
+             truncating — investigate as this likely means a misconfiguration"
         );
     }
 
@@ -10173,7 +10202,28 @@ async fn rebuild_and_rotate_commitment(
     // earn credit for `key`. If this module is ever reused for
     // non-content-addressed records, that `(k, k)` shortcut AND the verifier
     // gate must be replaced with `(key, BLAKE3(bytes))` computed from real bytes.
-    let entries: Vec<_> = keys.into_iter().take(cap).map(|k| (k, k)).collect();
+    //
+    // Pointers are that case, and are handled by being told apart rather than
+    // hashed: a pointer leaf is `(address, pointer_leaf_hash(address))`, which
+    // the verifier accepts only for a leaf of exactly a pointer's size, and
+    // round 2 then demands the whole signed record in place of a Bao slice.
+    // The root binds which pointers are held, never their current state, so an
+    // update does not move it.
+    //
+    // A pointer address that is also a chunk key would need a BLAKE3 preimage;
+    // the dedup only keeps such a collision from failing the whole build.
+    let mut entries: Vec<_> = keys
+        .into_iter()
+        .map(|k| (k, k))
+        .chain(
+            pointer_keys
+                .into_iter()
+                .map(|address| (address, commitment::pointer_leaf_hash(&address))),
+        )
+        .collect();
+    entries.sort_by_key(|(k, _)| *k);
+    entries.dedup_by_key(|(k, _)| *k);
+    entries.truncate(cap);
 
     // No-op-rotation guard: compute just the Merkle root from `entries`
     // and compare against the currently-advertised commitment's root.

@@ -65,6 +65,27 @@ pub fn leaf_hash(key: &XorName, bytes_hash: &[u8; 32]) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
+/// Key-derivation context for a pointer's commitment leaf (ADR-0016).
+const POINTER_LEAF_CONTEXT: &str = "autonomi.pointer.commitment-leaf.v1";
+
+/// The `bytes_hash` a pointer at `address` is committed under (ADR-0016).
+///
+/// A chunk is committed as `(key, key)`: its address is the hash of its bytes.
+/// A pointer's address is not, and its bytes change with every update, so it
+/// is committed under a value derived from the address alone. The root then
+/// moves only when a pointer is added or dropped, never on an update, and an
+/// auditor tells the two kinds apart from the leaf itself: `bytes_hash == key`
+/// for a chunk, `bytes_hash == pointer_leaf_hash(key)` for a pointer. Derive-key
+/// keeps them apart — a chunk leaf cannot equal a pointer leaf without a BLAKE3
+/// preimage across modes.
+///
+/// Possession of a pointer is proved in round 2 by serving the whole signed
+/// record, which the auditor verifies; nothing about the bytes is bound here.
+#[must_use]
+pub fn pointer_leaf_hash(address: &XorName) -> [u8; 32] {
+    blake3::derive_key(POINTER_LEAF_CONTEXT, address)
+}
+
 /// Combine two child hashes into a Merkle internal-node hash.
 #[must_use]
 pub fn node_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
@@ -106,6 +127,9 @@ pub struct MerkleTree {
     /// `levels[0].len() == leaves.len()`; `levels[L].len() == 1` where L
     /// is the root level.
     levels: Vec<Vec<[u8; 32]>>,
+    /// Sorted indices of the leaves that commit a pointer, found once at build
+    /// so the audit and persistence paths never re-derive them per leaf.
+    pointer_leaves: Vec<usize>,
 }
 
 impl MerkleTree {
@@ -137,6 +161,15 @@ impl MerkleTree {
             }
         }
 
+        // A chunk leaf is `(key, key)`, so the pointer check only runs on the
+        // leaves that are not.
+        let pointer_leaves: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, (k, bh))| bh != k && *bh == pointer_leaf_hash(k))
+            .map(|(idx, _)| idx)
+            .collect();
+
         let leaves: Vec<(XorName, [u8; 32])> = entries
             .into_iter()
             .map(|(k, bh)| {
@@ -152,7 +185,11 @@ impl MerkleTree {
             levels.push(level.clone());
         }
 
-        Ok(Self { leaves, levels })
+        Ok(Self {
+            leaves,
+            levels,
+            pointer_leaves,
+        })
     }
 
     /// The Merkle root of this tree.
@@ -239,6 +276,34 @@ impl MerkleTree {
     #[must_use]
     pub fn key_at(&self, idx: usize) -> Option<XorName> {
         self.leaves.get(idx).map(|(k, _)| *k)
+    }
+
+    /// Whether the leaf at `idx` commits a pointer rather than a chunk.
+    #[must_use]
+    pub fn is_pointer_leaf(&self, idx: usize) -> bool {
+        self.pointer_leaves.binary_search(&idx).is_ok()
+    }
+
+    /// Whether `key` is committed, as a pointer.
+    #[must_use]
+    pub fn commits_pointer(&self, key: &XorName) -> bool {
+        self.key_index(key)
+            .is_some_and(|idx| self.is_pointer_leaf(idx))
+    }
+
+    /// The keys committed as pointers, in the tree's sorted order.
+    #[must_use]
+    pub fn pointer_leaf_keys(&self) -> Vec<XorName> {
+        self.pointer_leaves
+            .iter()
+            .filter_map(|idx| self.key_at(*idx))
+            .collect()
+    }
+
+    /// How many leaves commit a pointer.
+    #[must_use]
+    pub fn pointer_count(&self) -> usize {
+        self.pointer_leaves.len()
     }
 
     /// The sorted leaf index of `key`, if committed. `O(log n)` binary search
@@ -437,6 +502,30 @@ mod tests {
     fn empty_key_set_rejected() {
         let result = MerkleTree::build(vec![]);
         assert!(matches!(result, Err(CommitmentError::EmptyKeySet)));
+    }
+
+    /// A pointer leaf (ADR-0016) is told apart from a chunk leaf by its hash
+    /// alone, and a leaf hashed any other way is neither.
+    #[test]
+    fn pointer_leaves_are_told_apart_from_chunk_leaves() {
+        let chunk = [1u8; 32];
+        let pointer = [2u8; 32];
+        let other = [3u8; 32];
+        let tree = MerkleTree::build(vec![
+            (chunk, chunk),
+            (pointer, pointer_leaf_hash(&pointer)),
+            (other, [9u8; 32]),
+        ])
+        .unwrap();
+        assert!(tree.commits_pointer(&pointer));
+        assert!(!tree.commits_pointer(&chunk));
+        assert!(!tree.commits_pointer(&other));
+        assert!(
+            !tree.commits_pointer(&[4u8; 32]),
+            "an uncommitted key is not"
+        );
+        assert_eq!(tree.pointer_leaf_keys(), vec![pointer]);
+        assert_eq!(tree.pointer_count(), 1);
     }
 
     #[test]

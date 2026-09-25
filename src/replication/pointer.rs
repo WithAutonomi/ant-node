@@ -56,6 +56,7 @@ use crate::payment::{
 };
 use crate::pointer::store::{Inspected, PointerStore};
 use crate::replication::admission;
+use crate::replication::commitment_state::ResponderCommitmentState;
 use crate::replication::config::{
     storage_admission_width, ReplicationConfig, FRESH_REPLICATION_DELIVERY_MAX_RETRIES,
     REPLICATION_PROTOCOL_ID,
@@ -253,6 +254,11 @@ impl PointerReplication {
             shutdown,
             tracker,
         }
+    }
+
+    /// The pointer store this replication serves from.
+    pub(crate) fn store(&self) -> &PointerStore {
+        &self.store
     }
 
     // -----------------------------------------------------------------------
@@ -1031,7 +1037,16 @@ impl PointerReplication {
     ///
     /// `allow_remote` is false while bootstrapping: candidacy is still tracked,
     /// but nothing that needs other peers' proof is decided.
-    pub async fn prune_pass(&self, allow_remote: bool) {
+    ///
+    /// A record a retained storage commitment still commits to is never
+    /// deleted, exactly as for a chunk: an auditor pinning that commitment may
+    /// still open it, and a node that deleted it would fail that audit.
+    pub async fn prune_pass(
+        &self,
+        allow_remote: bool,
+        commitment_state: Option<&ResponderCommitmentState>,
+    ) {
+        let committed = |address: &XorName| commitment_state.is_some_and(|cs| cs.is_held(address));
         let self_id = *self.p2p.peer_id();
         let retention = storage_admission_width(self.config.close_group_size);
         let now = Instant::now();
@@ -1060,6 +1075,9 @@ impl PointerReplication {
             if self.shutdown.is_cancelled() {
                 return;
             }
+            if committed(&state.address) {
+                continue;
+            }
             let wide = self
                 .p2p
                 .dht_manager()
@@ -1079,6 +1097,7 @@ impl PointerReplication {
             };
             // Revalidate just before deleting: the group may have moved back.
             if confirmed
+                && !committed(&state.address)
                 && !admission::is_responsible(&self_id, &state.address, &self.p2p, retention).await
                 && self.delete(&state.address).await
             {
