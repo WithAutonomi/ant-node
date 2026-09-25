@@ -254,8 +254,11 @@ verified when it was committed and every read verifies it again.
 
 Built: the record and wire messages (`ant-protocol`); the store with
 merge-on-put; request dispatch; payment routed at `state_id` with the close
-group of `A`; admission gates; cross-kind refusal; and the client — create,
-update, quorum store, merged reads and chain resolution.
+group of `A`; admission gates; cross-kind refusal; per-request latency events
+beside the chunk ones (`pointer_put_rpc`, `pointer_get_rpc`); and the client —
+create, update, quorum store, merged reads and chain resolution, a write that
+falls short retried with the proof it already paid for, a split payment for an
+external signer, and the `ant pointer` commands.
 
 **Built: replication** (see Replication above): fresh offers with payment,
 neighbour-sync repair by quorum over exact states, pruning with possession
@@ -270,14 +273,30 @@ quoted price, are spot-checked by the subtree audit in both rounds, survive a
 restart in the persisted retention, and are kept from pruning while a retained
 commitment holds them.
 
-**Not built: browser clients.** ADR-0015's WebRTC-direct transport admits,
-sanitizes and classifies message kinds by an explicit list, and pointer requests
-are in none of them. The client's pointer API is therefore native-only rather
-than compiled for a transport that would reject it. Reaching a pointer from a
-browser needs four things, each a deliberate decision at a security boundary:
-admit the two request kinds, let the response sanitizer pass their replies,
-classify a pointer GET as a read and a pointer PUT as paid-exclusive, and give
-the browser client the same quorum and corroboration rules the native one uses.
+**Built: browser clients** (ADR-0015). Each of the four decisions at that
+security boundary is made explicitly:
+
+- **Admission.** The WebRTC-direct listener admits a pointer GET and a paid
+  pointer PUT through `chunk_protocol`, each bounded by the small response size
+  a quote gets. One record is 5,303 bytes, well inside it.
+- **Sanitizing.** Replies pass the sanitizer. A pointer outcome names only an
+  address and a state identifier, and a record is owner-signed public data. An
+  error is redacted as for a chunk, and a refused payment is reported without
+  its detail.
+- **Classification.** A pointer PUT is a paid write: it takes the data lane,
+  holds its connection exclusively as a chunk PUT does, and goes only to nodes
+  on the page's payment network. A pointer GET returns one small record, so it
+  stays on the RPC lane, like a quote, and needs no bulk read slot.
+- **Rules.** The browser runs the native client's own read quorum,
+  corroboration, write quorum and chain resolution. Only the wallet is the
+  page's.
+
+A node advertises `pointer_protocol` in HELLO when it admits pointers. A browser
+client never sends a pointer request to a node that does not, so an older node's
+refusal is never mistaken for a failed peer. The owner key crosses into the page
+as its 32-byte FIPS 204 seed. A pointer payment is one quote and, unlike a file
+upload, keeps no recovery journal: a payment interrupted between broadcast and
+receipt is paid again on retry.
 
 ## Validation
 
@@ -320,6 +339,12 @@ the browser client the same quorum and corroboration rules the native one uses.
   refused; the possession check penalises only the member that dropped the
   record; pruning deletes only once the close group proves it holds the record,
   and a node far outside the group prunes without asking.
+- From a browser: a node admits pointer requests at its WebRTC boundary, bounds
+  a full record inside the small response limit, and passes every pointer reply
+  through the sanitizer with errors redacted. In real Chromium against a live
+  local network with on-chain payment, a pointer is created, updated, pointed
+  at a second pointer, read back by a client that wrote nothing and resolved
+  down the chain to its chunk.
 - Storage audits, through the live responders and judged by the auditor's own
   checks: a node holding committed pointers and chunks passes both rounds; an
   update between the rounds does not fail it; a node that lost a committed

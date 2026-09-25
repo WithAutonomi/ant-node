@@ -40,7 +40,7 @@ use saorsa_core::P2PNode;
 use tokio::sync::mpsc;
 
 use crate::error::{Error, Result};
-use crate::logging::{debug, warn};
+use crate::logging::{debug, info, warn};
 use crate::payment::PaymentVerifier;
 use crate::pointer::store::{Inspected, PointerStore, PutOutcome};
 use crate::replication::admission;
@@ -286,7 +286,13 @@ impl PointerService {
             // charge is taken at the commit; this only avoids paying to find
             // out the disk is full.
             if let Err(e) = chunks.check_capacity_for(POINTER_WIRE_LEN as u64) {
-                debug!("Rejecting pointer PUT for {}: {e}", hex::encode(address));
+                let addr = hex::encode(address);
+                info!(
+                    target: "ant_node::storage::disk_precheck",
+                    addr = %addr,
+                    kind = "pointer",
+                    "Rejecting pointer PUT before payment verification: {e}"
+                );
                 return Some(PointerPutResponse::Error(ProtocolError::StorageFailed(
                     e.to_string(),
                 )));

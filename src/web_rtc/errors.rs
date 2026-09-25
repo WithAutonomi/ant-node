@@ -5,6 +5,7 @@
 
 use super::ServerResult;
 use crate::logging::warn;
+use ant_protocol::chunk::{PointerGetResponse, PointerPutResponse};
 use ant_protocol::{
     ChunkGetResponse, ChunkMessage, ChunkMessageBody, ChunkPutResponse, ChunkQuoteResponse,
     MerkleCandidateQuoteResponse, ProtocolError,
@@ -45,10 +46,13 @@ pub(super) fn sanitize_response(message: &mut ChunkMessage) -> ServerResult<()> 
         | ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(error))
         | ChunkMessageBody::MerkleCandidateQuoteResponse(MerkleCandidateQuoteResponse::Error(
             error,
-        )) => {
+        ))
+        | ChunkMessageBody::PointerPutResponse(PointerPutResponse::Error(error))
+        | ChunkMessageBody::PointerGetResponse(PointerGetResponse::Error(error)) => {
             sanitize_protocol_error(error);
         }
-        ChunkMessageBody::PutResponse(ChunkPutResponse::PaymentRequired { message }) => {
+        ChunkMessageBody::PutResponse(ChunkPutResponse::PaymentRequired { message })
+        | ChunkMessageBody::PointerPutResponse(PointerPutResponse::PaymentRequired { message }) => {
             warn!(detail = %message, "Browser payment verification failed");
             *message = "valid payment is required".to_string();
         }
@@ -61,7 +65,17 @@ pub(super) fn sanitize_response(message: &mut ChunkMessage) -> ServerResult<()> 
         | ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success { .. })
         | ChunkMessageBody::MerkleCandidateQuoteResponse(MerkleCandidateQuoteResponse::Success {
             ..
-        }) => {}
+        })
+        // A pointer outcome names only the address and a state identifier,
+        // and a record is owner-signed public data.
+        | ChunkMessageBody::PointerPutResponse(
+            PointerPutResponse::Success { .. }
+            | PointerPutResponse::Unchanged { .. }
+            | PointerPutResponse::Stale { .. },
+        )
+        | ChunkMessageBody::PointerGetResponse(
+            PointerGetResponse::Success { .. } | PointerGetResponse::NotFound { .. },
+        ) => {}
         // New response variants must explicitly opt into the browser boundary.
         _ => {
             return Err(public_error(
@@ -121,6 +135,8 @@ mod tests {
                 ChunkMessageBody::MerkleCandidateQuoteResponse(
                     MerkleCandidateQuoteResponse::Error(error.clone()),
                 ),
+                ChunkMessageBody::PointerPutResponse(PointerPutResponse::Error(error.clone())),
+                ChunkMessageBody::PointerGetResponse(PointerGetResponse::Error(error.clone())),
             ];
             for body in responses {
                 let original = ChunkMessage {
@@ -139,7 +155,10 @@ mod tests {
                 | ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(sanitized))
                 | ChunkMessageBody::MerkleCandidateQuoteResponse(
                     MerkleCandidateQuoteResponse::Error(sanitized),
-                )) = &decoded.body
+                )
+                | ChunkMessageBody::PointerPutResponse(PointerPutResponse::Error(sanitized))
+                | ChunkMessageBody::PointerGetResponse(PointerGetResponse::Error(sanitized))) =
+                    &decoded.body
                 else {
                     unreachable!();
                 };
@@ -166,6 +185,16 @@ mod tests {
         assert!(
             matches!(decoded.body, ChunkMessageBody::PutResponse(ChunkPutResponse::PaymentRequired { ref message }) if message == "valid payment is required")
         );
+        let pointer = ChunkMessage {
+            request_id: 7,
+            body: ChunkMessageBody::PointerPutResponse(PointerPutResponse::PaymentRequired {
+                message: PRIVATE_DETAIL.into(),
+            }),
+        };
+        let decoded = decode_response(pointer.encode().expect("encode").into()).expect("redact");
+        assert!(
+            matches!(decoded.body, ChunkMessageBody::PointerPutResponse(PointerPutResponse::PaymentRequired { ref message }) if message == "valid payment is required")
+        );
         for code in [
             "storage_error",
             "quote_failed",
@@ -185,6 +214,22 @@ mod tests {
             ChunkMessageBody::GetResponse(ChunkGetResponse::Success {
                 address: [1; 32],
                 content: vec![2; 128],
+            }),
+            ChunkMessageBody::PointerGetResponse(PointerGetResponse::Success {
+                record: vec![3; 64].into(),
+            }),
+            ChunkMessageBody::PointerGetResponse(PointerGetResponse::NotFound { address: [4; 32] }),
+            ChunkMessageBody::PointerPutResponse(PointerPutResponse::Success {
+                address: [5; 32],
+                state_id: [6; 32],
+            }),
+            ChunkMessageBody::PointerPutResponse(PointerPutResponse::Unchanged {
+                address: [5; 32],
+                state_id: [6; 32],
+            }),
+            ChunkMessageBody::PointerPutResponse(PointerPutResponse::Stale {
+                address: [5; 32],
+                state_id: [7; 32],
             }),
             ChunkMessageBody::PutResponse(ChunkPutResponse::Error(
                 ProtocolError::AddressMismatch {

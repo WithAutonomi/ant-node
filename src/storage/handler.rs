@@ -32,7 +32,7 @@ use crate::ant_protocol::{
     settlement_compatibility, ChunkGetRequest, ChunkGetResponse, ChunkMessage, ChunkMessageBody,
     ChunkPutRequest, ChunkPutResponse, ChunkQuoteRequest, ChunkQuoteRequestV2, ChunkQuoteResponse,
     MerkleCandidateQuoteRequest, MerkleCandidateQuoteRequestV2, MerkleCandidateQuoteResponse,
-    ProtocolError, SettlementCompatibility, CHUNK_PROTOCOL_ID, CURRENT_SETTLEMENT_VERSION,
+    ProtocolError, SettlementCompatibility, XorName, CHUNK_PROTOCOL_ID, CURRENT_SETTLEMENT_VERSION,
     MAX_CHUNK_SIZE, MIN_SUPPORTED_SETTLEMENT_VERSION,
 };
 use crate::client::compute_address;
@@ -214,6 +214,46 @@ impl Drop for GetRequestTelemetry {
             self.finished = true;
         }
     }
+}
+
+/// One latency event per pointer PUT, on the target the chunk `put_rpc` uses,
+/// so the same store-latency dashboards cover both kinds.
+fn log_pointer_put_rpc(elapsed: Duration, record_size: usize, response: &PointerPutResponse) {
+    let duration_ms = duration_ms(elapsed);
+    let (outcome, address): (&'static str, Option<&XorName>) = match response {
+        PointerPutResponse::Success { address, .. } => ("success", Some(address)),
+        PointerPutResponse::Unchanged { address, .. } => ("unchanged", Some(address)),
+        PointerPutResponse::Stale { address, .. } => ("stale", Some(address)),
+        PointerPutResponse::PaymentRequired { .. } => ("payment_required", None),
+        PointerPutResponse::Error(_) => ("error", None),
+    };
+    let addr = address.map(hex::encode).unwrap_or_default();
+    info!(
+        target: "ant_node::storage::rpc_latency",
+        duration_ms,
+        record_size,
+        outcome,
+        addr = %addr,
+        "pointer_put_rpc"
+    );
+}
+
+/// One latency event per pointer GET, beside the chunk `get_rpc`.
+fn log_pointer_get_rpc(elapsed: Duration, address: &XorName, response: &PointerGetResponse) {
+    let duration_ms = duration_ms(elapsed);
+    let outcome: &'static str = match response {
+        PointerGetResponse::Success { .. } => "success",
+        PointerGetResponse::NotFound { .. } => "not_found",
+        PointerGetResponse::Error(_) => "error",
+    };
+    let addr = hex::encode(address);
+    info!(
+        target: "ant_node::storage::rpc_latency",
+        duration_ms,
+        outcome,
+        addr = %addr,
+        "pointer_get_rpc"
+    );
 }
 
 /// How many unversioned quote requests to receive between adoption log lines.
@@ -600,22 +640,26 @@ impl AntProtocol {
                 ChunkResponseKey::MerkleQuoteV2,
             ),
             ChunkMessageBody::PointerPutRequest(req) => {
+                let started = Instant::now();
+                let record_size = req.record.len();
                 let response = match &self.pointers {
                     Some(service) => service.handle_put(req).await,
                     None => PointerPutResponse::Error(ProtocolError::StorageFailed(
                         "this node does not store pointers".to_string(),
                     )),
                 };
+                log_pointer_put_rpc(started.elapsed(), record_size, &response);
                 let key = ChunkResponseKey::of_pointer_put(&response);
                 (ChunkMessageBody::PointerPutResponse(response), key)
             }
             ChunkMessageBody::PointerGetRequest(req) => {
+                let started = Instant::now();
+                let address = req.address;
                 let response = match &self.pointers {
                     Some(service) => service.handle_get(req).await,
-                    None => PointerGetResponse::NotFound {
-                        address: req.address,
-                    },
+                    None => PointerGetResponse::NotFound { address },
                 };
+                log_pointer_get_rpc(started.elapsed(), &address, &response);
                 let key = ChunkResponseKey::of_pointer_get(&response);
                 (ChunkMessageBody::PointerGetResponse(response), key)
             }

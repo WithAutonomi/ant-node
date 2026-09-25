@@ -10278,8 +10278,9 @@ async fn rebuild_and_rotate_commitment(
 
     let hash = hex::encode(built.hash());
     let key_count = built.commitment().key_count;
+    let pointer_count = built.tree().pointer_count();
     state.rotate(built);
-    info!("Storage commitment rotated: hash={hash} key_count={key_count}");
+    info!("Storage commitment rotated: hash={hash} key_count={key_count} pointers={pointer_count}");
     // Counted only on the paths where the advertised commitment now genuinely reflects
     // the committable set, never merely on having read it. The retirement gate is what
     // consumes this, and it authorises deleting the legacy store.
