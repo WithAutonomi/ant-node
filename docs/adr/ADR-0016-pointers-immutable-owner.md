@@ -172,25 +172,35 @@ chunks are.
   can fail an honest holder for having taken one mid-audit.
 - **Price.** A quote is priced from the key count of the commitment it pins, so
   every committed pointer counts toward it exactly as a chunk does.
-- **Round 1.** A pointer leaf is reported at its address with that hash and the
-  fixed record length. The auditor accepts that one leaf shape besides
-  `(key, key)`, and only at exactly a pointer's length, so it cannot stand in for
-  a chunk of any other size. A node that has lost a committed pointer refuses
-  round 1, which is a confirmed failure, as a lost chunk is.
+- **Round 1.** A pointer leaf is reported at its address with that hash, the
+  fixed record length, and a nonced root over the bytes of the record the node
+  holds, under the audit's fresh nonce, as a chunk leaf's is. So the node has to
+  read every pointer in the audited subtree before it learns which few will be
+  sampled. The auditor accepts that one leaf shape besides `(key, key)`, and only
+  at exactly a pointer's length, so it cannot stand in for a chunk of any other
+  size. A node that has lost a committed pointer refuses round 1, which is a
+  confirmed failure, as a lost chunk is.
 - **Round 2.** Where a chunk is proved by a Bao slice and a nonced opening, a
   pointer is proved by its whole signed record. The auditor checks the
-  signature and that the record belongs at the committed address. A peer signs
-  its own commitment, so without this step it could commit any key under the
-  hash of cheap bytes it holds; a record the auditor verifies itself cannot be
-  forged that way. Any valid record at the address passes, whatever its state.
-  At most five records are opened, about 26 KB, well under the audit message
-  ceiling.
+  signature, that the record belongs at the committed address, and that its
+  nonced root is the one round 1 gave. A peer signs its own commitment, so
+  without the signature check it could commit any key under the hash of cheap
+  bytes it holds; without the nonced root it could hold nothing and fetch the
+  sampled records on demand. At most five records are opened, a few tens of
+  kilobytes, well under the audit message ceiling.
+- **Updates between the rounds.** The owner may update a pointer after round 1
+  bound it. The store keeps the record an update replaced for five minutes,
+  longer than an audit session lives, and round 2 serves it beside the new one;
+  the auditor accepts whichever matches. Two updates to one pointer inside the
+  same audit would fail an honest holder, and would take the owner two paid
+  updates within seconds of each other.
 - **Retention and pruning.** A retained commitment that still holds a pointer
   vetoes its deletion, as for a chunk, so a peer pinning that commitment can
-  still audit it. The persisted retention records which leaves are pointers, so
-  a restart rebuilds the exact signed root. It is written in format 2 only when
-  some slot holds a pointer, and in the pre-pointer format 1 otherwise, so a node
-  rolled back to an earlier release still reloads its retention.
+  still audit it. The persisted retention keeps which leaves are pointers in a
+  file beside it, keyed by commitment hash, so a restart rebuilds the exact
+  signed root. The retention file itself is unchanged, so a node rolled back to
+  an earlier release still reloads every commitment it can answer for, and
+  drops only those that commit a pointer.
 
 Round 2 carries a new slice item, so the subtree audit's protocol id moves to
 `v2`, as ADR-0009 did before. Nodes on different ids do not audit each other
@@ -222,7 +232,7 @@ verified when it was committed and every read verifies it again.
 | One peer decides what a pointer says | A read returns a state only if two of the answering peers name it, and a write must reach a majority **plus one** so that two always do. Otherwise a single close-group peer serving an owner-signed state nobody paid to store would be believed by every reader: the record verifies, belongs at the address, and wins the merge. It cannot make a second peer agree. The read counts each state separately, so a state one peer names cannot bury the one the rest agree on — that would be denial of service in place of forgery, and it is also what an ordinary read during an update looks like |
 | Two peers decide it | **Not defended against, at the read.** Two colluding close-group peers clear a read's bar, and only the owner can sign, so what this buys is the owner's own updates unpaid. Replication does not spread such a state: the rest of the group adopts only what a quorum of it holds, so the honest members keep the paid state, but a reader that happens to hear from both colluders still sees theirs. Raising the read's bar only raises the number of nodes to grind: both the pointer's address and a node's id are choosable, so an owner determined to sit beside their own pointer can reach any fixed threshold |
 | Commit to pointers it does not hold, for price or audit credit | A committed pointer is proved in round 2 by the whole signed record, which the auditor verifies and checks belongs at the address; the pointer leaf shape is accepted only at the fixed record length |
-| Relay pointers instead of storing them | **Weaker than for a chunk, by nature.** A chunk audit makes a relay expensive: round 1 binds a nonce over the bytes of every chunk in the audited subtree, which a node that does not hold them has to fetch within the deadline. Records are public and 5 KB each, so even a nonced round 1 would cost a relay a few hundred kilobytes, and binding bytes the owner may replace between the rounds would fail honest holders. So round 1 binds no bytes for a pointer, and a node that fetches the few sampled records on demand passes. What it gains is small: it still serves only real, signed records that exist on the network, and it saves 5 KB of disk each |
+| Relay pointers instead of storing them | Round 1 binds a nonced root over the bytes of every pointer in the audited subtree before the sample is drawn, and round 2 must reproduce one. Another replica's copy of the same state does not match: every signature is randomised. Still weaker than for a chunk by nature: a record is 5 KB, so fetching a whole subtree of them on demand costs a relay far less than a subtree of chunks would |
 | Get a group to adopt a state nobody paid for | Repair adopts only a state a quorum of the close group hold exactly, counted over the whole group, and a fresh offer is stored only after the receiver verifies its payment itself |
 | Node claims a record it no longer holds | An index entry is only a claim about a file. Before answering "unchanged" or "stale" the node reads the record back and checks it is still the one the index names; if it is not, the node stops answering for that address and the arrival becomes a repair. It keeps what it lost, so the lost state is taken back and nothing older is: an address nothing is known about admits any record, and a replay could otherwise roll the node back. That check parses the body, so a signature corrupted in place passes it and is caught on the next read instead — verifying there would put ML-DSA in front of the payment gate, which is the one place it must not be |
 
@@ -245,9 +255,11 @@ verified when it was committed and every read verifies it again.
   correctly signed value and cannot tell.
 - Replicas may hold different valid signatures of one state; nothing compares
   record bytes across replicas.
-- A pointer audit opens a whole 5,303-byte record where a chunk audit opens one
-  1 KiB block, so a round 2 over pointers is a few times larger. It stays
-  bounded by the five-leaf cap.
+- A pointer audit opens a whole 5,303-byte record, and up to two of them after
+  an update, where a chunk audit opens one 1 KiB block, so a round 2 over
+  pointers is several times larger. It stays bounded by the five-leaf cap.
+- A node keeps the record each update replaced in memory for five minutes, up
+  to 2,048 of them, about 11 MB.
 - The subtree audit's protocol id moved to `v2`, so across the upgrade the
   old and new releases do not audit each other.
 
@@ -292,7 +304,8 @@ security boundary is made explicitly:
   corroboration, write quorum and chain resolution. Only the wallet is the
   page's.
 
-A node advertises `pointer_protocol` in HELLO when it admits pointers. A browser
+A node advertises `pointer_protocol` in HELLO when it admits pointers and has a
+pointer store to serve them from. A browser
 client never sends a pointer request to a node that does not, so an older node's
 refusal is never mistaken for a failed peer. The owner key crosses into the page
 as its 32-byte FIPS 204 seed. A pointer payment is one quote and, unlike a file
@@ -348,13 +361,17 @@ receipt is paid again on retry.
   down the chain to its chunk.
 - Storage audits, through the live responders and judged by the auditor's own
   checks: a node holding committed pointers and chunks passes both rounds; an
-  update between the rounds does not fail it; a node that lost a committed
-  pointer fails round 1, and one that loses it after round 1 is caught in round
-  2; another owner's valid record is not proof of the committed one; a pointer
-  leaf at any other length is refused. Over a live network, a node holding its
+  update between the rounds does not fail it, and does if the replaced record
+  is not kept; a node that lost a committed pointer fails round 1, and one that
+  loses it after round 1 is caught in round 2; another owner's valid record is
+  not proof of the committed one; a relay that answers round 1 without the
+  bytes fails, as does one serving another replica's copy of the same state; a
+  pointer leaf at any other length is refused. Over a live network, a node holding its
   committed pointers passes the audit and one that dropped them fails it.
-- A commitment holding pointers survives a restart with its exact pin; one
-  without is written in the pre-pointer format, which the old layout reads.
+- A commitment holding pointers survives a restart with its exact pin. An
+  older release reading the same retention keeps the chunk-only commitment a
+  peer pinned before the upgrade, and a pointer-leaves file from another
+  snapshot attaches nothing.
 - Pruning keeps a pointer a retained commitment holds, and drops it once none
   does.
 - Fresh offers, hints, fetches and state queries are covered by the replication

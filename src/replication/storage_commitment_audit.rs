@@ -17,19 +17,20 @@ use crate::logging::{debug, info, warn};
 use rand::Rng;
 
 use crate::ant_protocol::XorName;
-use crate::pointer::store::PointerStore;
+use crate::pointer::store::{PointerStore, SUPERSEDED_RETENTION};
 use crate::replication::commitment::{commitment_hash, pointer_leaf_hash, StorageCommitment};
 use crate::replication::commitment_state::ResponderCommitmentState;
 use crate::replication::config::{
     ReplicationConfig, MAX_SLICE_OPENINGS, SUBTREE_AUDIT_PROTOCOL_ID,
-    SUBTREE_ROUND1_LEAF_WORK_FLOOR_BYTES,
+    SUBTREE_ROUND1_LEAF_WORK_FLOOR_BYTES, SUBTREE_SESSION_TTL,
 };
 use crate::replication::protocol::{
     RejectKind, ReplicationMessage, ReplicationMessageBody, SubtreeAuditChallenge,
     SubtreeAuditResponse, SubtreeSliceChallenge, SubtreeSliceItem, SubtreeSliceOpening,
-    SubtreeSliceResponse,
+    SubtreeSliceResponse, MAX_POINTER_RECORDS_PER_ITEM,
 };
 use crate::replication::recent_provers::RecentProvers;
+use crate::replication::slice::nonced_block_root;
 use crate::replication::subtree::{
     select_subtree_path, subtree_plan, verify_subtree_proof, StructureVerdict, SubtreeLeaf,
     SubtreeProof,
@@ -741,6 +742,12 @@ pub(crate) fn evaluate_subtree_structure(
     Ok(())
 }
 
+// Round 2 may be owed the record an update replaced after round 1 bound it.
+const _: () = assert!(
+    SUPERSEDED_RETENTION.as_secs() > SUBTREE_SESSION_TTL.as_secs(),
+    "a replaced pointer record must outlive the audit session that may be owed it"
+);
+
 /// Whether a round-1 leaf commits a pointer (ADR-0016): committed under
 /// [`pointer_leaf_hash`] of its key, at the fixed record length.
 fn is_pointer_leaf(leaf: &SubtreeLeaf) -> bool {
@@ -748,10 +755,46 @@ fn is_pointer_leaf(leaf: &SubtreeLeaf) -> bool {
         && usize::try_from(leaf.content_len).ok() == Some(POINTER_WIRE_LEN)
 }
 
-/// Whether `record` is a valid pointer record at `key`: its signature verifies
-/// and it belongs at that address.
-fn serves_pointer_at(key: &XorName, record: &[u8]) -> bool {
-    Pointer::from_bytes(record).is_ok_and(|pointer| pointer.address() == *key)
+/// Check the round-2 item for a pointer leaf: one of the records served must
+/// prove it. An admitted absence is `KeyAbsent`; anything else that does not
+/// prove it, including no item at all, is `DigestMismatch`.
+fn verify_pointer_item(
+    nonce: &[u8; 32],
+    challenged_peer_bytes: &[u8; 32],
+    leaf: &SubtreeLeaf,
+    items: &[SubtreeSliceItem],
+) -> Result<(), AuditFailureReason> {
+    let served = items.iter().find_map(|it| match it {
+        SubtreeSliceItem::PointerRecord { key, records } if key == &leaf.key => {
+            Some(Some(records.as_slice()))
+        }
+        SubtreeSliceItem::Absent { key } if key == &leaf.key => Some(None),
+        _ => None,
+    });
+    match served {
+        Some(Some(records))
+            if records
+                .iter()
+                .any(|record| proves_pointer(nonce, challenged_peer_bytes, leaf, record)) =>
+        {
+            Ok(())
+        }
+        Some(None) => Err(AuditFailureReason::KeyAbsent),
+        _ => Err(AuditFailureReason::DigestMismatch),
+    }
+}
+
+/// Whether `record` proves the pointer `leaf` commits: its signature verifies,
+/// it belongs at the leaf's address, and it is the record round 1 bound the
+/// leaf's nonced root over.
+fn proves_pointer(
+    nonce: &[u8; 32],
+    challenged_peer_bytes: &[u8; 32],
+    leaf: &SubtreeLeaf,
+    record: &[u8],
+) -> bool {
+    nonced_block_root(nonce, challenged_peer_bytes, &leaf.key, record) == leaf.nonced_root
+        && Pointer::from_bytes(record).is_ok_and(|pointer| pointer.address() == leaf.key)
 }
 
 /// The auditor's **freshly-randomised** spot-check sample of the round-1 proof:
@@ -912,8 +955,12 @@ pub(crate) fn verify_slice_response(
                     && !present.iter().any(|(k, _)| k == key)
                     && !records.contains(key)
             }
-            SubtreeSliceItem::PointerRecord { key, .. } => {
+            SubtreeSliceItem::PointerRecord {
+                key,
+                records: served,
+            } => {
                 requested_keys.contains(key)
+                    && (1..=MAX_POINTER_RECORDS_PER_ITEM).contains(&served.len())
                     && records.insert(*key)
                     && !absent.contains(key)
                     && !present.iter().any(|(k, _)| k == key)
@@ -926,25 +973,17 @@ pub(crate) fn verify_slice_response(
 
     let mut checked = 0usize;
     for (leaf, block_index) in openings {
-        // A pointer leaf is proved by the whole signed record: it must verify and
-        // belong at the committed address. Any valid record there passes, so an
-        // update between the rounds cannot fail an honest holder.
+        // A pointer leaf is proved by the whole signed record: it must verify,
+        // belong at the committed address, and be the record round 1 bound its
+        // nonced root over, which the responder had to read before it knew what
+        // would be sampled. An update between the rounds does not fail an
+        // honest holder: it serves the record it held then beside the new one.
         if is_pointer_leaf(leaf) {
-            let served = items.iter().find_map(|it| match it {
-                SubtreeSliceItem::PointerRecord { key, record } if key == &leaf.key => {
-                    Some(Some(record.as_slice()))
-                }
-                SubtreeSliceItem::Absent { key } if key == &leaf.key => Some(None),
-                _ => None,
-            });
-            match served {
-                Some(Some(record)) if serves_pointer_at(&leaf.key, record) => {
-                    checked += 1;
-                    continue;
-                }
-                Some(None) => return AuditVerdict::Fail(AuditFailureReason::KeyAbsent),
-                _ => return AuditVerdict::Fail(AuditFailureReason::DigestMismatch),
+            if let Err(reason) = verify_pointer_item(nonce, challenged_peer_bytes, leaf, items) {
+                return AuditVerdict::Fail(reason);
             }
+            checked += 1;
+            continue;
         }
         let block_index = *block_index;
         // Match the responder's item for exactly this (key, block_index). A
@@ -1445,25 +1484,58 @@ async fn subtree_challenge_response(
     // of subtree size, hashing each into its plain + nonced leaf.
     let mut leaves = Vec::with_capacity(plan.leaf_keys.len());
     for (position, key) in plan.leaf_keys.iter().enumerate() {
-        // A pointer leaf (ADR-0016) commits no bytes: round 2 asks for the whole
-        // signed record. Round 1 only says whether it is still held, from the
-        // index, and admits a loss exactly as a missing chunk is admitted.
+        // A pointer leaf (ADR-0016) commits no bytes in the tree, since its
+        // bytes change with every update. Round 1 binds them here instead: the
+        // nonced root over the record held now, which round 2 must reproduce.
+        // So a node answers from records it holds, not ones it could fetch once
+        // it learns which few are sampled. A loss is admitted exactly as a
+        // missing chunk is, and a read error is transient as for a chunk.
         if plan.leaf_is_pointer.get(position).copied().unwrap_or(false) {
             *content_bytes = content_bytes.saturating_add(SUBTREE_ROUND1_LEAF_WORK_FLOOR_BYTES);
-            if pointers.and_then(|store| store.state(key)).is_none() {
-                let key_hex = hex::encode(key);
-                warn!("Subtree audit: committed pointer {key_hex} is not held");
-                return SubtreeAuditResponse::Rejected {
-                    challenge_id: challenge.challenge_id,
-                    kind: RejectKind::Protocol,
-                    reason: format!("missing bytes for committed key: {key_hex}"),
-                };
-            }
+            let key_hex = hex::encode(key);
+            let read = match pointers {
+                Some(store) => store.record_bytes(key).await,
+                None => Ok(None),
+            };
+            let record = match read {
+                Ok(Some(record)) => record,
+                Ok(None) => {
+                    warn!("Subtree audit: committed pointer {key_hex} is not held");
+                    return SubtreeAuditResponse::Rejected {
+                        challenge_id: challenge.challenge_id,
+                        kind: RejectKind::Protocol,
+                        reason: format!("missing bytes for committed key: {key_hex}"),
+                    };
+                }
+                Err(e) => {
+                    warn!(
+                        "Subtree audit: read error for committed pointer {key_hex}: {e} \
+                         (rejecting as transient, not a confirmed failure)"
+                    );
+                    return SubtreeAuditResponse::Rejected {
+                        challenge_id: challenge.challenge_id,
+                        kind: RejectKind::Transient,
+                        reason: format!("transient storage read error: {e}"),
+                    };
+                }
+            };
+            // Top up to the record read, as for a chunk.
+            let content = i64::try_from(record.len()).unwrap_or(i64::MAX);
+            *content_bytes = content_bytes.saturating_add(
+                content
+                    .saturating_sub(SUBTREE_ROUND1_LEAF_WORK_FLOOR_BYTES)
+                    .max(0),
+            );
             leaves.push(SubtreeLeaf {
                 key: *key,
                 bytes_hash: pointer_leaf_hash(key),
                 content_len: u32::try_from(POINTER_WIRE_LEN).unwrap_or(u32::MAX),
-                nonced_root: [0u8; 32],
+                nonced_root: nonced_block_root(
+                    &challenge.nonce,
+                    &challenge.challenged_peer_id,
+                    key,
+                    &record,
+                ),
             });
             continue;
         }
@@ -1810,18 +1882,16 @@ pub async fn handle_subtree_slice_challenge_with_pointers(
     for key in key_order {
         let indices = indices_by_key.remove(&key).unwrap_or_default();
         if built.tree().commits_pointer(&key) {
-            // `get` verifies the signature before serving, so a record damaged
-            // on this disk is admitted as absent rather than served as proof.
-            let served = match pointers {
-                Some(store) => store.get(&key).await,
-                None => Ok(None),
+            // The bytes held now, exactly as round 1 read them, and the record
+            // an update replaced since, if any: round 1 bound one of the two.
+            // The auditor verifies whichever it checks, so nothing is verified
+            // here.
+            let Some(store) = pointers else {
+                items.push(SubtreeSliceItem::Absent { key });
+                continue;
             };
-            match served {
-                Ok(Some(record)) => items.push(SubtreeSliceItem::PointerRecord {
-                    key,
-                    record: record.to_bytes(),
-                }),
-                Ok(None) => items.push(SubtreeSliceItem::Absent { key }),
+            let current = match store.record_bytes(&key).await {
+                Ok(current) => current,
                 Err(e) => {
                     return SubtreeSliceResponse::Rejected {
                         challenge_id: challenge.challenge_id,
@@ -1829,6 +1899,12 @@ pub async fn handle_subtree_slice_challenge_with_pointers(
                         reason: format!("pointer read error: {e}"),
                     }
                 }
+            };
+            let records: Vec<Vec<u8>> = current.into_iter().chain(store.superseded(&key)).collect();
+            if records.is_empty() {
+                items.push(SubtreeSliceItem::Absent { key });
+            } else {
+                items.push(SubtreeSliceItem::PointerRecord { key, records });
             }
             continue;
         }
@@ -2980,17 +3056,90 @@ mod pointer_audit_tests {
         let target = first_pointer(&openings);
 
         let mut items = responder.round2(nonce, &openings).await;
-        let substitute = pointer(200, 1).to_bytes();
-        for item in &mut items {
-            if let SubtreeSliceItem::PointerRecord { key, record } = item {
-                if *key == target {
-                    *record = substitute.clone();
-                }
-            }
-        }
+        replace_records(&mut items, &target, &[pointer(200, 1).to_bytes()]);
         assert_eq!(
             verify_slice_response(&openings, &nonce, &responder.peer_bytes, &items),
             AuditVerdict::Fail(AuditFailureReason::DigestMismatch)
+        );
+    }
+
+    fn replace_records(items: &mut [SubtreeSliceItem], target: &XorName, with: &[Vec<u8>]) {
+        for item in items {
+            if let SubtreeSliceItem::PointerRecord { key, records } = item {
+                if key == target {
+                    *records = with.to_vec();
+                }
+            }
+        }
+    }
+
+    /// A node that holds no pointers cannot pass by fetching the few sampled
+    /// records once round 2 names them: round 1 had to bind each record's
+    /// bytes under the nonce before anything was sampled, and it had none.
+    #[tokio::test]
+    async fn a_relay_that_fetches_records_only_in_round_two_fails() {
+        let responder = Responder::new(24, 24).await;
+        let nonce = mixed_nonce(responder.committed().tree());
+        let mut leaves = responder.proved_leaves(nonce).await;
+        // What a relay can say in round 1 without the bytes.
+        for leaf in leaves.iter_mut().filter(|leaf| is_pointer_leaf(leaf)) {
+            leaf.nonced_root = [0u8; 32];
+        }
+        let openings = openings(&leaves);
+        // And in round 2 it serves the genuine records, fetched on demand.
+        let items = responder.round2(nonce, &openings).await;
+        assert_eq!(
+            verify_slice_response(&openings, &nonce, &responder.peer_bytes, &items),
+            AuditVerdict::Fail(AuditFailureReason::DigestMismatch)
+        );
+    }
+
+    /// Nor can it pass with another replica's copy of the very state it
+    /// committed: every signature is randomised, so each replica's bytes, and
+    /// the nonced root over them, are its own.
+    #[tokio::test]
+    async fn another_replicas_copy_of_the_same_state_is_not_proof() {
+        let responder = Responder::new(24, 24).await;
+        let nonce = mixed_nonce(responder.committed().tree());
+        let openings = openings(&responder.proved_leaves(nonce).await);
+        let target = first_pointer(&openings);
+        let owner = (0..24u8)
+            .find(|owner| pointer(*owner, 1).address() == target)
+            .expect("the opened pointer is one of ours");
+        let replica = pointer(owner, 1);
+        assert_eq!(
+            replica.state_id(),
+            responder.pointers.state(&target).expect("held").state_id,
+            "the same state"
+        );
+
+        let mut items = responder.round2(nonce, &openings).await;
+        replace_records(&mut items, &target, &[replica.to_bytes()]);
+        assert_eq!(
+            verify_slice_response(&openings, &nonce, &responder.peer_bytes, &items),
+            AuditVerdict::Fail(AuditFailureReason::DigestMismatch)
+        );
+    }
+
+    /// A pointer item may carry the record held now and the one it replaced,
+    /// never more.
+    #[tokio::test]
+    async fn a_pointer_item_with_more_than_two_records_is_malformed() {
+        let responder = Responder::new(24, 24).await;
+        let nonce = mixed_nonce(responder.committed().tree());
+        let openings = openings(&responder.proved_leaves(nonce).await);
+        let target = first_pointer(&openings);
+        let mut items = responder.round2(nonce, &openings).await;
+        let held = responder
+            .pointers
+            .record_bytes(&target)
+            .await
+            .expect("read")
+            .expect("held");
+        replace_records(&mut items, &target, &[held.clone(), held.clone(), held]);
+        assert_eq!(
+            verify_slice_response(&openings, &nonce, &responder.peer_bytes, &items),
+            AuditVerdict::Fail(AuditFailureReason::MalformedResponse)
         );
     }
 

@@ -9996,7 +9996,24 @@ async fn load_commitment_retention(state: &ResponderCommitmentState, path: &Path
             return;
         }
     };
-    if let Some(persisted) = PersistedRetention::from_bytes(&bytes) {
+    if let Some(mut persisted) = PersistedRetention::from_bytes(&bytes) {
+        let sidecar = pointer_leaves_path(path);
+        match tokio::fs::read(&sidecar).await {
+            Ok(leaves) => {
+                if !persisted.attach_pointer_leaves(&leaves) {
+                    warn!(
+                        "Commitment retention: corrupt pointer leaves at {}; \
+                         commitments holding pointers will not be restored",
+                        sidecar.display()
+                    );
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!(
+                "Commitment retention: failed to read {}: {e}",
+                sidecar.display()
+            ),
+        }
         state.restore(&persisted);
         info!(
             "Commitment retention: reloaded {} slot(s) from {}",
@@ -10016,21 +10033,36 @@ async fn load_commitment_retention(state: &ResponderCommitmentState, path: &Path
 /// needless disk writes on idle nodes. On success updates `last` to the bytes
 /// written; on a serialization/write error the existing on-disk snapshot is left
 /// intact (never truncated).
+///
+/// The pointer leaves go to a sidecar written first (ADR-0016), so the
+/// retention file never names a commitment whose pointer leaves are not yet
+/// on disk. A crash between the two leaves a sidecar ahead of the file, which
+/// is harmless: it is keyed by commitment hash.
 async fn persist_retention_if_changed(
     state: &ResponderCommitmentState,
     path: &Path,
     last: &mut Option<Vec<u8>>,
 ) {
-    let Some(bytes) = state.snapshot().to_bytes() else {
+    let snapshot = state.snapshot();
+    let (Some(bytes), Some(leaves)) = (snapshot.to_bytes(), snapshot.pointer_leaves_bytes()) else {
         warn!("Commitment retention: serialization failed; keeping previous snapshot");
         return;
     };
-    if last.as_deref() == Some(bytes.as_slice()) {
+    let mut combined = leaves.clone();
+    combined.extend_from_slice(&bytes);
+    if last.as_deref() == Some(combined.as_slice()) {
         return;
     }
-    if write_retention_atomic(path, bytes.clone()).await {
-        *last = Some(bytes);
+    if write_retention_atomic(&pointer_leaves_path(path), leaves).await
+        && write_retention_atomic(path, bytes).await
+    {
+        *last = Some(combined);
     }
+}
+
+/// Where the pointer leaves of the retention at `path` are kept.
+fn pointer_leaves_path(path: &Path) -> PathBuf {
+    path.with_file_name("commitment_retention_pointers.bin")
 }
 
 /// Durably write `bytes` to `path`: temp file → fsync temp → atomic rename →

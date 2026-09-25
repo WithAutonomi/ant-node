@@ -1790,19 +1790,33 @@ fn hello_response(request_id: u64, state: &ServerState) -> Response {
             max_chunk_size: MAX_CHUNK_SIZE,
             endpoint,
             payment: state.payment.clone(),
-            capabilities: vec![
-                "chunk_protocol".into(),
-                RPC_MULTIPLEX_CAPABILITY.into(),
-                "find_node".into(),
-                ant_protocol::transport::ADDRESS_V2_CAPABILITY.into(),
-                "get_chunk".into(),
-                "quote_chunk".into(),
-                "put_chunk".into(),
-                POINTER_PROTOCOL_CAPABILITY.into(),
-            ],
+            capabilities: hello_capabilities(serves_pointers(state.ant_protocol.as_deref())),
         },
         0,
     )
+}
+
+/// Whether requests reach a pointer store. A node without one refuses pointer
+/// writes and has none to read, so it must not invite them: a browser could
+/// otherwise pay a quote before learning the write goes nowhere.
+fn serves_pointers(protocol: Option<&AntProtocol>) -> bool {
+    protocol.is_some_and(|protocol| protocol.pointer_service().is_some())
+}
+
+fn hello_capabilities(pointers: bool) -> Vec<String> {
+    let mut capabilities: Vec<String> = vec![
+        "chunk_protocol".into(),
+        RPC_MULTIPLEX_CAPABILITY.into(),
+        "find_node".into(),
+        ant_protocol::transport::ADDRESS_V2_CAPABILITY.into(),
+        "get_chunk".into(),
+        "quote_chunk".into(),
+        "put_chunk".into(),
+    ];
+    if pointers {
+        capabilities.push(POINTER_PROTOCOL_CAPABILITY.into());
+    }
+    capabilities
 }
 
 async fn process_find_node(
@@ -2762,6 +2776,15 @@ mod tests {
             assert_eq!(bytes, message.encode().expect("shared wire encoding"));
             assert_eq!(bytes.capacity(), bytes.len());
         }
+    }
+
+    /// Pointers are advertised only by a node that serves them.
+    #[test]
+    fn only_a_node_that_serves_pointers_advertises_them() {
+        let advertises = |caps: &[String]| caps.iter().any(|c| c == POINTER_PROTOCOL_CAPABILITY);
+        assert!(advertises(&hello_capabilities(true)));
+        assert!(!advertises(&hello_capabilities(false)));
+        assert!(!serves_pointers(None), "no storage, no pointers");
     }
 
     /// Pointer reads and paid pointer writes are admitted (ADR-0016), and a

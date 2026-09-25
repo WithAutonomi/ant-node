@@ -51,6 +51,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use fs2::FileExt;
 use parking_lot::Mutex;
@@ -75,6 +76,20 @@ const LOCK_FILE_NAME: &str = ".pointer-store-lock";
 /// How many shard directories records are spread across: one per value of an
 /// address's last byte.
 const SHARD_COUNT: u16 = 256;
+
+/// How long a replaced record is kept after an update, in memory.
+///
+/// A storage audit binds the record a node holds in its first round and asks
+/// for it in the second (ADR-0016). An owner updating the pointer between the
+/// two would otherwise fail the honest node that took the update, so the
+/// record the update replaced stays servable for longer than an audit session
+/// lives.
+pub const SUPERSEDED_RETENTION: Duration = Duration::from_mins(5);
+
+/// Most replaced records kept at once, about 11 MB at the cap. Past it the
+/// oldest goes first; reaching it inside [`SUPERSEDED_RETENTION`] takes that
+/// many paid updates to pointers this node holds.
+const MAX_SUPERSEDED: usize = 2048;
 
 /// The name of the shard directory `address` lives in: its last byte in hex.
 fn shard_name(address: &XorName) -> String {
@@ -243,6 +258,9 @@ struct Inner {
     generation: AtomicU64,
     /// What the store has done, for telemetry.
     counters: Counters,
+    /// The record each recent update replaced, by address, with when (see
+    /// [`SUPERSEDED_RETENTION`]).
+    superseded: Mutex<HashMap<XorName, (Instant, Vec<u8>)>>,
     /// Held for the store's lifetime; releasing it releases the directory.
     _lock_file: File,
 }
@@ -295,6 +313,7 @@ impl PointerStore {
                 write_seq: AtomicU64::new(0),
                 generation: AtomicU64::new(next_generation),
                 counters: Counters::default(),
+                superseded: Mutex::new(HashMap::new()),
                 _lock_file: lock_file,
             }),
         })
@@ -500,6 +519,36 @@ impl PointerStore {
             .map(|entry| entry.state.state_id)
     }
 
+    /// The record an update at `address` replaced within the last
+    /// [`SUPERSEDED_RETENTION`], if any: what a storage audit that bound it
+    /// before the update is still owed.
+    #[must_use]
+    pub fn superseded(&self, address: &XorName) -> Option<Vec<u8>> {
+        self.inner
+            .superseded
+            .lock()
+            .get(address)
+            .filter(|(at, _)| at.elapsed() < SUPERSEDED_RETENTION)
+            .map(|(_, bytes)| bytes.clone())
+    }
+
+    /// The bytes of the record held at `address`, read from disk without
+    /// verifying them.
+    ///
+    /// For a caller that only binds the bytes and has them verified later, by
+    /// whoever they are served to: verifying here would cost a signature check
+    /// per record for nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] if the file exists but cannot be read.
+    pub async fn record_bytes(&self, address: &XorName) -> Result<Option<Vec<u8>>> {
+        let path = self.path_for(address);
+        spawn_blocking(move || read_record_file(&path))
+            .await
+            .map_err(|e| Error::Storage(format!("pointer read panicked: {e}")))?
+    }
+
     /// The state held at `address`, as the index records it, if this node can
     /// serve one.
     ///
@@ -689,6 +738,25 @@ impl PointerStore {
 }
 
 impl Inner {
+    /// Keep `bytes` as the record just replaced at `address`, dropping what
+    /// has aged out and, past the cap, the oldest.
+    fn keep_superseded(&self, address: XorName, bytes: Vec<u8>) {
+        let now = Instant::now();
+        let mut superseded = self.superseded.lock();
+        superseded.retain(|_, (at, _)| now.duration_since(*at) < SUPERSEDED_RETENTION);
+        while superseded.len() >= MAX_SUPERSEDED {
+            let Some(oldest) = superseded
+                .iter()
+                .min_by_key(|(_, (at, _))| *at)
+                .map(|(address, _)| *address)
+            else {
+                break;
+            };
+            superseded.remove(&oldest);
+        }
+        superseded.insert(address, (now, bytes));
+    }
+
     /// Remove the file and the index entry for `address` under one lock, so a
     /// commit can never land between the two and be forgotten on disk.
     fn delete_blocking(&self, address: &XorName) -> Result<bool> {
@@ -775,6 +843,7 @@ impl Inner {
 
             // Re-check: staging is not instantaneous and a newer state may
             // have committed while it ran.
+            let replacing = index.get(&address).is_some_and(|entry| entry.on_disk);
             let outcome = match index.get(&address) {
                 // Nothing held, or a record this node lost: either way the
                 // write must happen, whatever state it carries.
@@ -793,6 +862,16 @@ impl Inner {
                 return Ok(outcome);
             }
 
+            // What this replaces, read under the lock so it is the record the
+            // index names. Kept for an audit that bound it; a record that
+            // cannot be read is not kept, and an audit owed it fails as it
+            // would have on the lost file.
+            let previous = if replacing {
+                read_record_file(&path).ok().flatten()
+            } else {
+                None
+            };
+
             // The rename is the commit point: nothing fallible happens between
             // it and the index update, and both are under this one lock.
             if let Err(e) = rename_with_retry(&temp, &path) {
@@ -807,6 +886,9 @@ impl Inner {
             }
             let generation = self.generation.fetch_add(1, Ordering::Relaxed);
             index.insert(address, IndexEntry::of(record, generation));
+            if let Some(previous) = previous {
+                self.keep_superseded(address, previous);
+            }
             // A file is on the disk now. Charge it whether or not this replaced
             // one: telling those apart would mean trusting an observation taken
             // before the rename, and that observation can be wrong in the one
@@ -1185,6 +1267,40 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = PointerStore::new(dir.path()).await.expect("open store");
         (store, dir)
+    }
+
+    /// The record an update replaces stays servable for a while, byte for
+    /// byte, so an audit that bound it before the update is not failed by it.
+    #[tokio::test]
+    async fn an_update_keeps_the_record_it_replaced_for_a_while() {
+        let (store, _dir) = store().await;
+        let first = signed(1, 1, 1);
+        store.put_bytes(&first.to_bytes()).await.expect("put");
+        assert_eq!(
+            store.superseded(&first.address()),
+            None,
+            "a creation replaces nothing"
+        );
+
+        let second = signed(1, 2, 2);
+        assert_eq!(
+            store.put_bytes(&second.to_bytes()).await.expect("put"),
+            PutOutcome::Changed
+        );
+        assert_eq!(
+            store.superseded(&first.address()),
+            Some(first.to_bytes()),
+            "the replaced record, exactly as it was held"
+        );
+        assert_eq!(
+            store.record_bytes(&first.address()).await.expect("read"),
+            Some(second.to_bytes()),
+            "and the new one is what is held"
+        );
+
+        // A stale arrival replaces nothing, so it keeps nothing.
+        store.put_bytes(&first.to_bytes()).await.expect("put");
+        assert_eq!(store.superseded(&first.address()), Some(first.to_bytes()));
     }
 
     #[tokio::test]
