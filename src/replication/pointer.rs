@@ -386,8 +386,9 @@ impl PointerReplication {
             .spawn(async move { this.push_hints(&peers).await });
     }
 
-    /// Push hints to `peers` and wait until they are sent. What
-    /// [`Self::push_hints_detached`] runs; tests call it to drive a round.
+    /// Push hints to `peers` and wait until they are sent. This is what each
+    /// neighbour-sync round runs in the background; tests call it to drive a
+    /// round.
     pub async fn push_hints(&self, peers: &[PeerId]) {
         let self_id = *self.p2p.peer_id();
         let mut by_peer: HashMap<PeerId, Vec<PointerStateSummary>> =
