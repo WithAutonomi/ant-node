@@ -28,7 +28,7 @@
 //! `2 × (key_count × ~64 bytes + signature_size)` — for 10k keys, ~1.3 MB.
 
 use saorsa_core::identity::PeerId;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -38,8 +38,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::ant_protocol::XorName;
 use crate::replication::commitment::{
-    commitment_hash, sign_commitment, verify_commitment_signature, CommitmentError, MerkleTree,
-    StorageCommitment,
+    commitment_hash, pointer_leaf_hash, sign_commitment, verify_commitment_signature,
+    CommitmentError, MerkleTree, StorageCommitment,
 };
 
 /// Auditor-side per-peer commitment state.
@@ -280,6 +280,12 @@ impl BuiltCommitment {
         self.tree.leaf_keys()
     }
 
+    /// The subset of [`Self::leaf_keys`] committed as pointers (ADR-0016).
+    #[must_use]
+    pub fn pointer_leaf_keys(&self) -> Vec<XorName> {
+        self.tree.pointer_leaf_keys()
+    }
+
     /// Reconstruct a `BuiltCommitment` from a persisted signed commitment and a
     /// `tree` rebuilt from its leaf keys — WITHOUT re-signing, so the pin
     /// (`commitment_hash`) is preserved exactly across a restart (ML-DSA
@@ -362,13 +368,43 @@ struct PersistedSlot {
     /// slot as already expired. `None` if the slot was never gossiped — then it
     /// survives reload only while it is the current slot.
     expires_at_unix: Option<u64>,
+    /// The subset of `leaf_keys` committed as pointers (ADR-0016). A pointer
+    /// leaf is `(key, pointer_leaf_hash(key))`, not `(key, key)`, so without
+    /// this the rebuilt tree would miss the signed root and the slot be lost.
+    ///
+    /// Not part of this file: it is kept in the pointer-leaves sidecar (see
+    /// [`PersistedRetention::pointer_leaves_bytes`]), so the retention file
+    /// stays exactly what a release before pointers reads.
+    #[serde(skip)]
+    pointer_keys: Vec<XorName>,
 }
 
 /// Persisted-format version. Bump on any layout OR semantic change so an
 /// incompatible on-disk snapshot is rejected (→ empty retention, which self-heals
 /// via re-gossip) rather than silently misinterpreted (e.g. an old field read
 /// under new semantics).
+///
+/// Pointers did not change it. Their leaves are persisted beside this file, so
+/// a node rolled back to a release that predates pointers still reloads every
+/// slot it can answer for, and drops only the ones that commit a pointer, which
+/// it could not answer for anyway.
 const RETENTION_FORMAT_VERSION: u32 = 1;
+
+/// Version of the pointer-leaves sidecar.
+const POINTER_LEAVES_FORMAT_VERSION: u32 = 1;
+
+/// The pointer leaves of each retained slot, keyed by the slot's commitment
+/// hash (ADR-0016).
+///
+/// Keyed by hash rather than by position so that a sidecar left behind by a
+/// different snapshot, as after a rollback and upgrade, can only ever describe
+/// the commitment it names: a hash binds the root, and the root binds which
+/// leaves are pointers.
+#[derive(Serialize, Deserialize)]
+struct PersistedPointerLeaves {
+    version: u32,
+    slots: Vec<([u8; 32], Vec<XorName>)>,
+}
 
 /// The persisted responder retention. Slots are newest-first; `has_current`
 /// says whether `slots[0]` was the live advertised commitment.
@@ -396,6 +432,48 @@ impl PersistedRetention {
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let this: Self = postcard::from_bytes(bytes).ok()?;
         (this.version == RETENTION_FORMAT_VERSION).then_some(this)
+    }
+
+    /// Serialize the pointer leaves of every slot, for the sidecar written
+    /// beside the retention file. `None` on a serialization error.
+    #[must_use]
+    pub fn pointer_leaves_bytes(&self) -> Option<Vec<u8>> {
+        let slots = self
+            .slots
+            .iter()
+            .filter(|slot| !slot.pointer_keys.is_empty())
+            .filter_map(|slot| {
+                commitment_hash(&slot.commitment).map(|hash| (hash, slot.pointer_keys.clone()))
+            })
+            .collect();
+        postcard::to_allocvec(&PersistedPointerLeaves {
+            version: POINTER_LEAVES_FORMAT_VERSION,
+            slots,
+        })
+        .ok()
+    }
+
+    /// Give each slot the pointer leaves the sidecar records for its
+    /// commitment. Returns `false`, attaching nothing, on a corrupt sidecar or
+    /// an unknown version; a slot left without its pointer leaves then fails to
+    /// rebuild and is dropped, which fails open locally as a corrupt snapshot
+    /// does.
+    pub fn attach_pointer_leaves(&mut self, bytes: &[u8]) -> bool {
+        let Ok(sidecar) = postcard::from_bytes::<PersistedPointerLeaves>(bytes) else {
+            return false;
+        };
+        if sidecar.version != POINTER_LEAVES_FORMAT_VERSION {
+            return false;
+        }
+        let by_hash: HashMap<[u8; 32], Vec<XorName>> = sidecar.slots.into_iter().collect();
+        for slot in &mut self.slots {
+            if let Some(keys) =
+                commitment_hash(&slot.commitment).and_then(|hash| by_hash.get(&hash))
+            {
+                slot.pointer_keys.clone_from(keys);
+            }
+        }
+        true
     }
 }
 
@@ -769,6 +847,7 @@ impl ResponderCommitmentState {
                     commitment: c.commitment().clone(),
                     leaf_keys: c.leaf_keys(),
                     expires_at_unix,
+                    pointer_keys: c.pointer_leaf_keys(),
                 }
             })
             .collect();
@@ -796,7 +875,18 @@ impl ResponderCommitmentState {
         // else a later slot would be wrongly promoted to current.
         let mut first_slot_restored = false;
         for (i, slot) in persisted.slots.iter().enumerate() {
-            let entries: Vec<_> = slot.leaf_keys.iter().map(|k| (*k, *k)).collect();
+            let pointer_keys: HashSet<&XorName> = slot.pointer_keys.iter().collect();
+            let entries: Vec<_> = slot
+                .leaf_keys
+                .iter()
+                .map(|k| {
+                    if pointer_keys.contains(k) {
+                        (*k, pointer_leaf_hash(k))
+                    } else {
+                        (*k, *k)
+                    }
+                })
+                .collect();
             let Ok(tree) = MerkleTree::build(entries) else {
                 continue;
             };
@@ -1051,6 +1141,114 @@ mod tests {
         );
     }
 
+    /// Build a signed commitment over `chunks` and `pointers`.
+    fn mixed(chunks: &[u8], pointers: &[u8]) -> BuiltCommitment {
+        let (pk, sk) = keypair();
+        let mut entries: Vec<_> = chunks.iter().map(|i| (key(*i), key(*i))).collect();
+        entries.extend(
+            pointers
+                .iter()
+                .map(|i| (key(*i), pointer_leaf_hash(&key(*i)))),
+        );
+        BuiltCommitment::build(entries, &[0xAB; 32], &sk, &pk.to_bytes()).unwrap()
+    }
+
+    /// A commitment holding pointers (ADR-0016) survives a restart like any
+    /// other. A pointer leaf is not `(key, key)`, so a snapshot that kept only
+    /// the key set would rebuild a different root, fail the signature check and
+    /// drop the slot, and every peer pinning it would then fail this node.
+    #[test]
+    fn a_commitment_holding_pointers_survives_a_restart() {
+        let built = mixed(&[1, 2, 3, 4], &[10, 11, 12]);
+        let pin = built.hash();
+        let state = ResponderCommitmentState::new();
+        state.rotate(built);
+        state.mark_gossiped(pin);
+
+        let snapshot = state.snapshot();
+        let bytes = snapshot.to_bytes().expect("serialize");
+        let sidecar = snapshot.pointer_leaves_bytes().expect("serialize sidecar");
+        let mut reloaded = PersistedRetention::from_bytes(&bytes).expect("deserialize");
+        assert!(reloaded.attach_pointer_leaves(&sidecar));
+        let fresh = ResponderCommitmentState::new();
+        fresh.restore(&reloaded);
+
+        let got = fresh.lookup_by_hash(&pin).expect("pin survives restart");
+        assert_eq!(got.hash(), pin);
+        assert!(fresh.is_held(&key(11)), "a committed pointer is still held");
+        assert!(fresh.is_held(&key(2)), "a committed chunk is still held");
+        assert_eq!(
+            got.pointer_leaf_keys(),
+            vec![key(10), key(11), key(12)],
+            "the pointers are still told apart from the chunks"
+        );
+    }
+
+    /// A node rolled back to a release that predates pointers keeps every
+    /// commitment it can still answer for. The retention file is exactly the
+    /// format such a release reads; it just knows nothing of the sidecar, so
+    /// the slot committing pointers is dropped and the chunk-only one a peer
+    /// pinned before the upgrade is not.
+    #[test]
+    fn a_rollback_keeps_every_chunk_only_commitment() {
+        let legacy = mixed(&[1, 2, 3], &[]);
+        let legacy_pin = legacy.hash();
+        let current = mixed(&[1, 2, 3], &[10]);
+        let current_pin = current.hash();
+        let state = ResponderCommitmentState::new();
+        state.rotate(legacy);
+        state.mark_gossiped(legacy_pin);
+        state.rotate(current);
+        state.mark_gossiped(current_pin);
+
+        let bytes = state.snapshot().to_bytes().expect("serialize");
+        assert_eq!(
+            postcard::take_from_bytes::<u32>(&bytes)
+                .map(|(v, _)| v)
+                .ok(),
+            Some(RETENTION_FORMAT_VERSION)
+        );
+        // What an older release does: read the file and nothing beside it.
+        let older = ResponderCommitmentState::new();
+        older.restore(&PersistedRetention::from_bytes(&bytes).expect("deserialize"));
+        assert!(
+            older.lookup_by_hash(&legacy_pin).is_some(),
+            "the chunk-only commitment is still answerable"
+        );
+        assert!(
+            older.lookup_by_hash(&current_pin).is_none(),
+            "the one committing a pointer cannot be rebuilt without the sidecar"
+        );
+    }
+
+    /// A sidecar that describes other commitments, as one left by a snapshot
+    /// from before a rollback might, attaches nothing to these.
+    #[test]
+    fn a_sidecar_only_describes_the_commitments_it_names() {
+        let other = ResponderCommitmentState::new();
+        other.rotate(mixed(&[1], &[10]));
+        let sidecar = other.snapshot().pointer_leaves_bytes().expect("sidecar");
+
+        let built = mixed(&[1], &[10]);
+        let pin = built.hash();
+        let state = ResponderCommitmentState::new();
+        state.rotate(built);
+        let mut reloaded =
+            PersistedRetention::from_bytes(&state.snapshot().to_bytes().expect("bytes"))
+                .expect("deserialize");
+        assert!(reloaded.attach_pointer_leaves(&sidecar));
+        let fresh = ResponderCommitmentState::new();
+        fresh.restore(&reloaded);
+        assert!(
+            fresh.lookup_by_hash(&pin).is_none(),
+            "another commitment's pointer leaves were applied to this one"
+        );
+        assert!(
+            !reloaded.attach_pointer_leaves(&[0xff; 7]),
+            "garbage is refused"
+        );
+    }
+
     /// A corrupt snapshot blob decodes to `None`, so the caller fails open with
     /// empty retention rather than trusting garbage.
     #[test]
@@ -1071,6 +1269,7 @@ mod tests {
                 commitment: built.commitment().clone(),
                 leaf_keys: vec![key(1)],
                 expires_at_unix: None,
+                pointer_keys: Vec::new(),
             }],
             has_current: true,
         };
@@ -1102,6 +1301,7 @@ mod tests {
                 commitment: built.commitment().clone(),
                 leaf_keys: leaf_keys.clone(),
                 expires_at_unix,
+                pointer_keys: Vec::new(),
             }],
             has_current: false, // not current -> retention depends on the stamp
         };

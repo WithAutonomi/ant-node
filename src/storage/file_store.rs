@@ -347,6 +347,14 @@ impl CapacityGuard {
         })
     }
 
+    /// The two accounting counters, for tests that need to prove a charge was
+    /// settled one way rather than the other.
+    #[cfg(test)]
+    fn counters(&self) -> (u64, u64) {
+        let snapshot = self.snapshot.lock();
+        (snapshot.written_since, snapshot.in_flight)
+    }
+
     /// Give back a reservation whose write did not happen.
     fn release(&self, needed: u64) {
         let mut snapshot = self.snapshot.lock();
@@ -372,7 +380,7 @@ impl CapacityGuard {
 ///
 /// Held by whatever is actually doing the write, so the charge is released even if the
 /// caller's future is dropped and only the blocking closure survives.
-struct Reservation {
+pub(crate) struct Reservation {
     /// The guard this was taken from.
     capacity: Arc<CapacityGuard>,
     /// Payload size, before rounding.
@@ -383,7 +391,7 @@ struct Reservation {
 
 impl Reservation {
     /// The write landed: move the charge from in-flight to written.
-    fn commit(mut self) {
+    pub(crate) fn commit(mut self) {
         self.capacity.commit_reservation(self.bytes);
         self.settled = true;
     }
@@ -1505,6 +1513,12 @@ impl FileStore {
         }
     }
 
+    /// Credit `len` bytes that were deleted outside this store back to the
+    /// cached measurement. The pointer store keeps its own files on this disk.
+    pub(crate) fn release_bytes(&self, len: u64) {
+        self.capacity.record_removed(len);
+    }
+
     /// Reject work early when the disk cannot take `bytes` more.
     ///
     /// # Errors
@@ -1512,6 +1526,32 @@ impl FileStore {
     /// Returns [`Error::Storage`] when the write would not fit above the reserve.
     pub fn check_capacity_for(&self, bytes: u64) -> Result<()> {
         self.capacity.check(bytes)
+    }
+
+    /// Charge `bytes` against the disk before writing them, releasing the charge if the
+    /// write does not happen.
+    ///
+    /// For stores that share this disk but keep their own files — the pointer store does.
+    /// They must not check and then write: that is the race [`CapacityGuard::reserve`]
+    /// exists to close.
+    pub(crate) fn reserve_bytes(&self, bytes: u64) -> Result<Reservation> {
+        self.capacity.reserve(bytes)
+    }
+
+    /// `(written_since, in_flight)` from the capacity guard. Tests only: it is
+    /// how a released charge is told apart from a stranded one.
+    #[cfg(test)]
+    pub(crate) fn capacity_counters(&self) -> (u64, u64) {
+        self.capacity.counters()
+    }
+
+    /// What a payload of `bytes` actually costs the disk, rounded to the
+    /// allocation unit. Tests only, so they can assert exact counter deltas
+    /// rather than "it went up" — which a charge of one allocation unit would
+    /// satisfy for several payloads at once.
+    #[cfg(test)]
+    pub(crate) fn capacity_charge_for(bytes: u64) -> u64 {
+        CapacityGuard::charge(bytes)
     }
 
     /// Force the next capacity question to re-measure the filesystem.
@@ -2449,7 +2489,7 @@ fn is_windows_sharing_violation(e: &std::io::Error) -> bool {
 /// file for a few milliseconds after it is created, and `MoveFileEx` fails outright
 /// rather than queueing. Retrying a bounded number of times turns that from a failed
 /// write into a short pause. Every other error returns immediately.
-fn rename_with_retry(temp_path: &Path, final_path: &Path) -> std::io::Result<()> {
+pub(crate) fn rename_with_retry(temp_path: &Path, final_path: &Path) -> std::io::Result<()> {
     let mut last = match std::fs::rename(temp_path, final_path) {
         Ok(()) => return Ok(()),
         Err(e) => e,

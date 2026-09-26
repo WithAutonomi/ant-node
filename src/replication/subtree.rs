@@ -499,6 +499,9 @@ pub fn build_subtree_proof(
 pub struct SubtreePlan {
     /// The selected leaves' keys, in ascending leaf-index order.
     pub leaf_keys: Vec<XorName>,
+    /// For each of `leaf_keys`, whether it is committed as a pointer
+    /// (ADR-0016) rather than a chunk.
+    pub leaf_is_pointer: Vec<bool>,
     /// One sibling cut-hash per level on the path to the subtree root,
     /// root-first.
     pub sibling_cut_hashes: Vec<[u8; 32]>,
@@ -528,11 +531,13 @@ pub fn subtree_plan(
     }
 
     let mut leaf_keys = Vec::with_capacity(path.real_leaf_count() as usize);
+    let mut leaf_is_pointer = Vec::with_capacity(path.real_leaf_count() as usize);
     for idx in path.leaf_start..path.leaf_end {
         let key = tree
             .key_at(idx as usize)
             .ok_or(BuildProofError::MissingKey { leaf_index: idx })?;
         leaf_keys.push(key);
+        leaf_is_pointer.push(tree.is_pointer_leaf(idx as usize));
     }
 
     // Sibling cut-hashes, root-first. The fixed-depth slot selection no longer
@@ -557,6 +562,7 @@ pub fn subtree_plan(
 
     Ok(SubtreePlan {
         leaf_keys,
+        leaf_is_pointer,
         sibling_cut_hashes,
     })
 }

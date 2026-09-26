@@ -60,6 +60,9 @@ mod merkle_payment;
 #[cfg(test)]
 mod replication;
 
+// Pointer replication across real nodes (ADR-0016).
+mod pointer_replication;
+
 #[cfg(test)]
 mod security_attacks;
 

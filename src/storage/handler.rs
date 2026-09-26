@@ -27,24 +27,25 @@
 //! └─────────────────────────────────────────────────────────┘
 //! ```
 
-#[cfg(test)]
 use crate::ant_protocol::DATA_TYPE_CHUNK;
 use crate::ant_protocol::{
     settlement_compatibility, ChunkGetRequest, ChunkGetResponse, ChunkMessage, ChunkMessageBody,
     ChunkPutRequest, ChunkPutResponse, ChunkQuoteRequest, ChunkQuoteRequestV2, ChunkQuoteResponse,
     MerkleCandidateQuoteRequest, MerkleCandidateQuoteRequestV2, MerkleCandidateQuoteResponse,
-    ProtocolError, SettlementCompatibility, CHUNK_PROTOCOL_ID, CURRENT_SETTLEMENT_VERSION,
+    ProtocolError, SettlementCompatibility, XorName, CHUNK_PROTOCOL_ID, CURRENT_SETTLEMENT_VERSION,
     MAX_CHUNK_SIZE, MIN_SUPPORTED_SETTLEMENT_VERSION,
 };
 use crate::client::compute_address;
 use crate::error::{Error, Result};
 use crate::logging::{debug, info, warn};
 use crate::payment::{PaymentVerifier, QuoteGenerator, VerificationContext};
+use crate::pointer::PointerService;
 use crate::replication::admission;
 use crate::replication::config::K_BUCKET_SIZE;
 use crate::replication::fresh::FreshWriteEvent;
 use crate::storage::traffic::{self, ChunkRequestKind, ChunkResponseKey};
 use crate::storage::ChunkStore;
+use ant_protocol::chunk::{PointerGetResponse, PointerPutResponse};
 use bytes::Bytes;
 use parking_lot::RwLock;
 use saorsa_core::P2PNode;
@@ -62,7 +63,7 @@ use tokio::sync::mpsc;
 /// onto further peers (ADR-0002) is still accepted here, while a genuinely far
 /// node — which could only mis-attribute fresh-replication failures — is
 /// turned away.
-const SELF_CLOSENESS_GATE_WIDTH: usize = K_BUCKET_SIZE;
+pub const SELF_CLOSENESS_GATE_WIDTH: usize = K_BUCKET_SIZE;
 
 fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
@@ -215,6 +216,46 @@ impl Drop for GetRequestTelemetry {
     }
 }
 
+/// One latency event per pointer PUT, on the target the chunk `put_rpc` uses,
+/// so the same store-latency dashboards cover both kinds.
+fn log_pointer_put_rpc(elapsed: Duration, record_size: usize, response: &PointerPutResponse) {
+    let duration_ms = duration_ms(elapsed);
+    let (outcome, address): (&'static str, Option<&XorName>) = match response {
+        PointerPutResponse::Success { address, .. } => ("success", Some(address)),
+        PointerPutResponse::Unchanged { address, .. } => ("unchanged", Some(address)),
+        PointerPutResponse::Stale { address, .. } => ("stale", Some(address)),
+        PointerPutResponse::PaymentRequired { .. } => ("payment_required", None),
+        PointerPutResponse::Error(_) => ("error", None),
+    };
+    let addr = address.map(hex::encode).unwrap_or_default();
+    info!(
+        target: "ant_node::storage::rpc_latency",
+        duration_ms,
+        record_size,
+        outcome,
+        addr = %addr,
+        "pointer_put_rpc"
+    );
+}
+
+/// One latency event per pointer GET, beside the chunk `get_rpc`.
+fn log_pointer_get_rpc(elapsed: Duration, address: &XorName, response: &PointerGetResponse) {
+    let duration_ms = duration_ms(elapsed);
+    let outcome: &'static str = match response {
+        PointerGetResponse::Success { .. } => "success",
+        PointerGetResponse::NotFound { .. } => "not_found",
+        PointerGetResponse::Error(_) => "error",
+    };
+    let addr = hex::encode(address);
+    info!(
+        target: "ant_node::storage::rpc_latency",
+        duration_ms,
+        outcome,
+        addr = %addr,
+        "pointer_get_rpc"
+    );
+}
+
 /// How many unversioned quote requests to receive between adoption log lines.
 ///
 /// One line per request would drown the log at production quote rates, and one
@@ -302,6 +343,12 @@ pub struct AntProtocol {
     /// `attach_p2p_node`. Drives the self-closeness gate on client PUTs;
     /// `None` in unit tests that never attach a node.
     p2p_node: RwLock<Option<Arc<P2PNode>>>,
+    /// Serves pointer requests, when the node has a pointer store.
+    ///
+    /// `None` on a node built without one, so a peer that sends a pointer
+    /// message to a node that does not keep pointers gets a clean refusal
+    /// rather than a silent drop.
+    pointers: Option<PointerService>,
 }
 
 impl AntProtocol {
@@ -339,7 +386,24 @@ impl AntProtocol {
             quote_generator,
             fresh_write_tx: None,
             p2p_node: RwLock::new(None),
+            pointers: None,
         }
+    }
+
+    /// Serve pointer requests from `pointers`.
+    ///
+    /// Opt-in rather than built in: a node with no pointer store refuses
+    /// pointer messages cleanly instead of pretending to hold them.
+    #[must_use]
+    pub fn with_pointer_service(mut self, pointers: PointerService) -> Self {
+        self.pointers = Some(pointers);
+        self
+    }
+
+    /// The pointer service, if this node serves pointers.
+    #[must_use]
+    pub const fn pointer_service(&self) -> Option<&PointerService> {
+        self.pointers.as_ref()
     }
 
     /// Attach the node's P2P handle for payment live-DHT checks.
@@ -349,6 +413,11 @@ impl AntProtocol {
     /// replaces the verifier handle.
     pub fn attach_p2p_node(&self, node: Arc<P2PNode>) {
         *self.p2p_node.write() = Some(Arc::clone(&node));
+        if let Some(pointers) = &self.pointers {
+            // Pointers take the same self-closeness gate as chunks, judged at
+            // the pointer address because that is what the network routes on.
+            pointers.attach_p2p_node(Arc::clone(&node));
+        }
         self.payment_verifier.attach_p2p_node(node);
         debug!("AntProtocol: P2PNode attached for payment live-DHT checks and self-closeness gate");
     }
@@ -570,6 +639,30 @@ impl AntProtocol {
                 ),
                 ChunkResponseKey::MerkleQuoteV2,
             ),
+            ChunkMessageBody::PointerPutRequest(req) => {
+                let started = Instant::now();
+                let record_size = req.record.len();
+                let response = match &self.pointers {
+                    Some(service) => service.handle_put(req).await,
+                    None => PointerPutResponse::Error(ProtocolError::StorageFailed(
+                        "this node does not store pointers".to_string(),
+                    )),
+                };
+                log_pointer_put_rpc(started.elapsed(), record_size, &response);
+                let key = ChunkResponseKey::of_pointer_put(&response);
+                (ChunkMessageBody::PointerPutResponse(response), key)
+            }
+            ChunkMessageBody::PointerGetRequest(req) => {
+                let started = Instant::now();
+                let address = req.address;
+                let response = match &self.pointers {
+                    Some(service) => service.handle_get(req).await,
+                    None => PointerGetResponse::NotFound { address },
+                };
+                log_pointer_get_rpc(started.elapsed(), &address, &response);
+                let key = ChunkResponseKey::of_pointer_get(&response);
+                (ChunkMessageBody::PointerGetResponse(response), key)
+            }
             // Anything else — response messages are handled by client
             // subscribers (e.g. send_and_await_chunk_response), not by the
             // protocol handler. Returning None prevents the caller from
@@ -648,6 +741,22 @@ impl AntProtocol {
                 expected: address,
                 actual: computed,
             });
+        }
+
+        // 2b. Refuse a chunk whose address a pointer already occupies.
+        //
+        // The mirror of the check the pointer path makes. Both kinds draw
+        // addresses from the same 32-byte range, and a collision — however
+        // infeasible — must not be resolved by whichever kind arrived second,
+        // because that silently destroys the other's data.
+        if let Some(pointers) = &self.pointers {
+            if pointers.store().contains(&address) {
+                warn!("Refusing chunk {addr_hex}: a pointer already occupies that address");
+                return ChunkPutResponse::Error(ProtocolError::StorageFailed(format!(
+                    "address {addr_hex} is already occupied by a pointer; refusing to \
+                     store a chunk over it"
+                )));
+            }
         }
 
         // 3. Check if already exists (idempotent success)
@@ -852,17 +961,24 @@ impl AntProtocol {
 
         // Check if the chunk is already stored so we can tell the client
         // to skip payment (already_stored = true).
+        //
+        // Only chunks: this reads the chunk store, so asking it about any other
+        // kind answers a question about the wrong address space. A pointer
+        // quote names a state, not content, and every pointer state — creation
+        // or update — is paid for, so it is never already stored.
+        //
         // The match intentionally logs the error when the `logging` feature is
         // active. Clippy suggests `unwrap_or_default()` when logging is compiled
         // out, but keeping the explicit match preserves the diagnostic intent.
         #[allow(clippy::manual_unwrap_or_default)]
-        let already_stored = match self.storage.exists(&request.address) {
-            Ok(exists) => exists,
-            Err(e) => {
-                warn!("Storage check failed for {addr_hex}: {e}");
-                false // Assume not stored on error — generate a normal quote.
-            }
-        };
+        let already_stored = request.data_type == DATA_TYPE_CHUNK
+            && match self.storage.exists(&request.address) {
+                Ok(exists) => exists,
+                Err(e) => {
+                    warn!("Storage check failed for {addr_hex}: {e}");
+                    false // Assume not stored on error — generate a normal quote.
+                }
+            };
 
         if already_stored {
             debug!("Chunk {addr_hex} already stored — returning quote with already_stored=true");
@@ -1090,6 +1206,7 @@ mod tests {
     use super::*;
     use crate::payment::metrics::QuotingMetricsTracker;
     use crate::payment::{EvmVerifierConfig, PaymentVerifierConfig};
+    use crate::pointer::{DATA_TYPE_POINTER, POINTER_WIRE_LEN};
     use crate::storage::ChunkStoreConfig;
     use evmlib::RewardsAddress;
     use saorsa_core::identity::NodeIdentity;
@@ -1943,6 +2060,56 @@ mod tests {
             result.is_none(),
             "expected None for response message, got: {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_stored_chunk_does_not_suppress_a_pointer_quote() {
+        // A pointer quote names a state, not content. If a chunk sitting at
+        // that address could set `already_stored`, a majority of nodes would
+        // tell the client to skip payment and the write would then be refused
+        // as unpaid. Only chunks may answer from the chunk store.
+        let (protocol, _temp) = create_test_protocol().await;
+
+        let content = b"a chunk that shares a pointer state address";
+        let address = ChunkStore::compute_address(content);
+        protocol.payment_verifier().cache_insert(address);
+        let put_msg = ChunkMessage {
+            request_id: 320,
+            body: ChunkMessageBody::PutRequest(ChunkPutRequest::new(
+                address,
+                Bytes::copy_from_slice(content),
+            )),
+        };
+        let put_bytes = put_msg.encode().expect("encode put");
+        let _ = protocol
+            .try_handle_request(&put_bytes)
+            .await
+            .expect("handle put");
+
+        let quote_msg = ChunkMessage {
+            request_id: 321,
+            body: ChunkMessageBody::QuoteRequest(ChunkQuoteRequest {
+                address,
+                data_size: POINTER_WIRE_LEN as u64,
+                data_type: DATA_TYPE_POINTER,
+            }),
+        };
+        let quote_bytes = quote_msg.encode().expect("encode quote");
+        let response_bytes = protocol
+            .try_handle_request(&quote_bytes)
+            .await
+            .expect("handle quote")
+            .expect("expected response");
+
+        match ChunkMessage::decode(&response_bytes).expect("decode").body {
+            ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success {
+                already_stored, ..
+            }) => assert!(
+                !already_stored,
+                "a chunk must not answer for a pointer state"
+            ),
+            other => panic!("expected a quote, got: {other:?}"),
+        }
     }
 
     #[tokio::test]

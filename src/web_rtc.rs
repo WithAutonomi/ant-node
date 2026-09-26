@@ -58,6 +58,11 @@ const MAX_FIND_NODE_RESULTS: usize = 20;
 // target; clients still obey their global memory/CPU admission budgets.
 const MAX_CHANNEL_REQUESTS: usize = 4;
 const RPC_MULTIPLEX_CAPABILITY: &str = "rpc-multiplex-4";
+
+/// Advertised when `chunk_protocol` admits pointer reads and paid pointer
+/// writes (ADR-0016), so a browser client can tell a node that would refuse
+/// them from one that failed.
+const POINTER_PROTOCOL_CAPABILITY: &str = "pointer_protocol";
 // Browser dials use a 10-second channel-open timeout. Give successful clients
 // modest server-side headroom while bounding associations that never open one.
 const FIRST_DATA_CHANNEL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -1732,7 +1737,14 @@ async fn process_request(
 // PUT acknowledgements and signed quotes contain no chunk payload. 64 KiB
 // covers the ML-DSA public key/signature, quote and signed commitment, including
 // worst-case MessagePack integer encoding. GET alone needs a full wire buffer.
+//
+// A pointer read returns one record of `POINTER_WIRE_LEN` bytes, so it is small
+// too and needs no bulk slot (see `request_is_get`).
 const SMALL_BINARY_RESPONSE_BYTES: usize = 64 * 1024;
+const _: () = assert!(
+    ant_protocol::pointer::POINTER_WIRE_LEN < SMALL_BINARY_RESPONSE_BYTES / 2,
+    "a pointer read must fit the small response bound with room for its envelope"
+);
 
 fn binary_response_limit(body: &ChunkMessageBody) -> ServerResult<usize> {
     match body {
@@ -1741,7 +1753,9 @@ fn binary_response_limit(body: &ChunkMessageBody) -> ServerResult<usize> {
         | ChunkMessageBody::QuoteRequest(_)
         | ChunkMessageBody::QuoteRequestV2(_)
         | ChunkMessageBody::MerkleCandidateQuoteRequest(_)
-        | ChunkMessageBody::MerkleCandidateQuoteRequestV2(_) => Ok(SMALL_BINARY_RESPONSE_BYTES),
+        | ChunkMessageBody::MerkleCandidateQuoteRequestV2(_)
+        | ChunkMessageBody::PointerGetRequest(_)
+        | ChunkMessageBody::PointerPutRequest(_) => Ok(SMALL_BINARY_RESPONSE_BYTES),
         _ => Err("unsupported chunk protocol request".to_string()),
     }
 }
@@ -1776,18 +1790,33 @@ fn hello_response(request_id: u64, state: &ServerState) -> Response {
             max_chunk_size: MAX_CHUNK_SIZE,
             endpoint,
             payment: state.payment.clone(),
-            capabilities: vec![
-                "chunk_protocol".into(),
-                RPC_MULTIPLEX_CAPABILITY.into(),
-                "find_node".into(),
-                ant_protocol::transport::ADDRESS_V2_CAPABILITY.into(),
-                "get_chunk".into(),
-                "quote_chunk".into(),
-                "put_chunk".into(),
-            ],
+            capabilities: hello_capabilities(serves_pointers(state.ant_protocol.as_deref())),
         },
         0,
     )
+}
+
+/// Whether requests reach a pointer store. A node without one refuses pointer
+/// writes and has none to read, so it must not invite them: a browser could
+/// otherwise pay a quote before learning the write goes nowhere.
+fn serves_pointers(protocol: Option<&AntProtocol>) -> bool {
+    protocol.is_some_and(|protocol| protocol.pointer_service().is_some())
+}
+
+fn hello_capabilities(pointers: bool) -> Vec<String> {
+    let mut capabilities: Vec<String> = vec![
+        "chunk_protocol".into(),
+        RPC_MULTIPLEX_CAPABILITY.into(),
+        "find_node".into(),
+        ant_protocol::transport::ADDRESS_V2_CAPABILITY.into(),
+        "get_chunk".into(),
+        "quote_chunk".into(),
+        "put_chunk".into(),
+    ];
+    if pointers {
+        capabilities.push(POINTER_PROTOCOL_CAPABILITY.into());
+    }
+    capabilities
 }
 
 async fn process_find_node(
@@ -2257,6 +2286,10 @@ struct ServerState {
 )]
 mod tests {
     use super::*;
+    use ant_protocol::chunk::{
+        PointerGetRequest, PointerGetResponse, PointerPutRequest, PointerPutResponse,
+    };
+    use ant_protocol::pointer::POINTER_WIRE_LEN;
     use std::net::Ipv4Addr;
 
     #[test]
@@ -2743,6 +2776,57 @@ mod tests {
             assert_eq!(bytes, message.encode().expect("shared wire encoding"));
             assert_eq!(bytes.capacity(), bytes.len());
         }
+    }
+
+    /// Pointers are advertised only by a node that serves them.
+    #[test]
+    fn only_a_node_that_serves_pointers_advertises_them() {
+        let advertises = |caps: &[String]| caps.iter().any(|c| c == POINTER_PROTOCOL_CAPABILITY);
+        assert!(advertises(&hello_capabilities(true)));
+        assert!(!advertises(&hello_capabilities(false)));
+        assert!(!serves_pointers(None), "no storage, no pointers");
+    }
+
+    /// Pointer reads and paid pointer writes are admitted (ADR-0016), and a
+    /// full record fits the small bound they are given.
+    #[test]
+    fn pointer_requests_are_admitted_and_a_full_record_fits() {
+        let get = ChunkMessageBody::PointerGetRequest(PointerGetRequest::new([0xff; 32]));
+        let put = ChunkMessageBody::PointerPutRequest(PointerPutRequest::with_payment(
+            vec![0xff; POINTER_WIRE_LEN].into(),
+            vec![0xff; 16 * 1024],
+        ));
+        assert_eq!(
+            binary_response_limit(&get).expect("pointer GET admitted"),
+            SMALL_BINARY_RESPONSE_BYTES
+        );
+        assert_eq!(
+            binary_response_limit(&put).expect("pointer PUT admitted"),
+            SMALL_BINARY_RESPONSE_BYTES
+        );
+
+        let record = ChunkMessage {
+            request_id: u64::MAX,
+            body: ChunkMessageBody::PointerGetResponse(PointerGetResponse::Success {
+                record: vec![0xff; POINTER_WIRE_LEN].into(),
+            }),
+        };
+        let bytes = encode_binary_response(&record, SMALL_BINARY_RESPONSE_BYTES)
+            .expect("a full record fits");
+        assert_eq!(bytes, record.encode().expect("shared wire encoding"));
+
+        let stored = ChunkMessage {
+            request_id: u64::MAX,
+            body: ChunkMessageBody::PointerPutResponse(PointerPutResponse::Success {
+                address: [0xff; 32],
+                state_id: [0xff; 32],
+            }),
+        };
+        assert!(encode_binary_response(&stored, SMALL_BINARY_RESPONSE_BYTES).is_ok());
+
+        // Replies are never admitted as requests.
+        assert!(binary_response_limit(&record.body).is_err());
+        assert!(binary_response_limit(&stored.body).is_err());
     }
 
     #[test]

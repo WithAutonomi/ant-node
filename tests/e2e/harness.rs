@@ -4,13 +4,50 @@
 //! both the ant node network and optional Anvil EVM testnet.
 
 use super::anvil::TestAnvil;
-use super::testnet::{TestNetwork, TestNetworkConfig, TestNode};
+use super::testnet::{TestNetwork, TestNetworkConfig, TestNode, TestnetError};
 use ant_node::client::XorName;
 use evmlib::common::TxHash;
 use saorsa_core::P2PNode;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tracing::info;
+use tracing::{info, warn};
+
+/// How many port ranges a network is brought up on before its bind failure
+/// is reported.
+///
+/// A node retries its own port, which clears a socket still being released.
+/// It cannot clear a port the host will not hand out at all, as happens on
+/// Windows runners whose reserved port ranges move between runs, so a network
+/// that cannot create a node moves to a fresh random range instead.
+const NETWORK_START_ATTEMPTS: u32 = 3;
+
+/// Create and start a network from `config`, moving it to a fresh port range
+/// if a node cannot be created.
+async fn start_network(mut config: TestNetworkConfig) -> Result<TestNetwork> {
+    let mut attempt = 1;
+    loop {
+        let mut network = TestNetwork::new(config.clone()).await?;
+        match network.start().await {
+            Ok(()) => return Ok(network),
+            Err(TestnetError::Startup(reason))
+                if attempt < NETWORK_START_ATTEMPTS
+                    && reason.starts_with("Failed to create node ") =>
+            {
+                let base_port = config.base_port;
+                warn!(
+                    "Test network on base port {base_port} could not create a node \
+                     ({reason}); retrying on a fresh port range"
+                );
+                if let Err(e) = network.shutdown().await {
+                    warn!("Cleanup after a failed bring-up failed: {e}");
+                }
+                config = config.with_fresh_ports();
+                attempt += 1;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
 
 /// Error type for test harness operations.
 #[derive(Debug, thiserror::Error)]
@@ -192,8 +229,7 @@ impl TestHarness {
     pub async fn setup_with_config(config: TestNetworkConfig) -> Result<Self> {
         info!("Setting up test harness with {} nodes", config.node_count);
 
-        let mut network = TestNetwork::new(config).await?;
-        network.start().await?;
+        let network = start_network(config).await?;
 
         Ok(Self {
             network,
@@ -257,8 +293,7 @@ impl TestHarness {
             config.node_count
         );
 
-        let mut network = TestNetwork::new(config).await?;
-        network.start().await?;
+        let network = start_network(config).await?;
 
         // Warm up DHT routing tables (essential for quote collection)
         info!("Warming up DHT routing tables...");

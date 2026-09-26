@@ -25,6 +25,7 @@ pub mod config;
 pub mod fresh;
 pub mod neighbor_sync;
 pub mod paid_list;
+pub mod pointer;
 pub mod possession;
 pub mod protocol;
 pub mod pruning;
@@ -66,6 +67,7 @@ use crate::payment::{
     PaymentVerifier, VerificationContext, MAX_PAYMENT_PROOF_SIZE_BYTES,
     MIN_PAYMENT_PROOF_SIZE_BYTES,
 };
+use crate::pointer::store::PointerStore;
 use crate::replication::audit::AuditTickResult;
 use crate::replication::audit_coordinator::AuditChallengeCoordinator;
 use crate::replication::audit_metrics::{
@@ -1815,6 +1817,10 @@ pub struct ReplicationEngine {
     /// When present, `start()` spawns a drainer task that calls
     /// `replicate_fresh` for each event.
     fresh_write_rx: Option<mpsc::UnboundedReceiver<fresh::FreshWriteEvent>>,
+    /// Pointer replication (ADR-0016), when this node stores pointers.
+    pointers: Option<Arc<pointer::PointerReplication>>,
+    /// Receiver for fresh pointer writes, taken by `start()`.
+    pointer_fresh_rx: Option<mpsc::UnboundedReceiver<pointer::PointerFreshWrite>>,
     /// Sender for delayed possession-check events (ADR-0003). The fresh-write
     /// drainer pushes the responsible close-group peers here after each fresh
     /// replication; the possession-check scheduler drains the paired receiver.
@@ -1948,6 +1954,8 @@ impl ReplicationEngine {
                 config.subtree_round1_max_concurrent,
             ),
             fresh_write_rx: Some(fresh_write_rx),
+            pointers: None,
+            pointer_fresh_rx: None,
             possession_check_tx,
             possession_check_rx: Some(possession_check_rx),
             monetized_pin_tx,
@@ -2031,6 +2039,7 @@ impl ReplicationEngine {
     pub async fn rebuild_commitment_now(&self) -> Result<()> {
         rebuild_and_rotate_commitment(
             &self.storage,
+            self.pointers.as_ref().map(|p| p.store()),
             &self.identity,
             &self.commitment_state,
             &self.p2p_node,
@@ -2205,6 +2214,36 @@ impl ReplicationEngine {
         })
     }
 
+    /// Replicate pointers too (ADR-0016): the records in `store`, and the
+    /// fresh writes the pointer PUT handler sends on `fresh_writes`.
+    ///
+    /// Call before [`Self::start`].
+    pub fn with_pointers(
+        &mut self,
+        store: PointerStore,
+        fresh_writes: mpsc::UnboundedReceiver<pointer::PointerFreshWrite>,
+    ) {
+        self.pointers = Some(Arc::new(pointer::PointerReplication::new(
+            store,
+            Arc::clone(&self.storage),
+            Arc::clone(&self.p2p_node),
+            Arc::clone(&self.payment_verifier),
+            Arc::clone(&self.config),
+            Arc::clone(&self.is_bootstrapping),
+            Arc::clone(&self.send_semaphore),
+            self.shutdown.clone(),
+            self.detached_task_tracker.clone(),
+        )));
+        self.pointer_fresh_rx = Some(fresh_writes);
+    }
+
+    /// The pointer replication, when enabled. Tests use it to drive rounds.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn pointer_replication(&self) -> Option<&Arc<pointer::PointerReplication>> {
+        self.pointers.as_ref()
+    }
+
     /// Start all background tasks.
     ///
     /// `dht_events` must be subscribed **before** `P2PNode::start()` so that
@@ -2232,6 +2271,12 @@ impl ReplicationEngine {
         self.start_bootstrap_sync(dht_events);
         self.start_fresh_write_drainer();
         self.start_possession_check_scheduler();
+        if let Some(pointers) = &self.pointers {
+            self.task_handles.push(pointers.start_verification_loop());
+            if let Some(writes) = self.pointer_fresh_rx.take() {
+                self.task_handles.push(pointers.start_fresh_drainer(writes));
+            }
+        }
         // ADR-0004: deterministic first audit of commitments that backed a
         // payment (surfaced by the verifier cross-check).
         self.start_first_audit_drainer();
@@ -2870,6 +2915,7 @@ impl ReplicationEngine {
             paid_notify_worker_semaphore,
             paid_notify_admission_semaphore,
             paid_notify_responder_inflight,
+            pointers: self.pointers.clone(),
             shutdown: shutdown.clone(),
             detached_task_tracker,
         };
@@ -3101,6 +3147,9 @@ impl ReplicationEngine {
                             DhtNetworkEvent::PeerRemoved { peer_id } => {
                                 sync_state.write().await.remove_peer(&peer_id);
                                 repair_proofs.write().await.remove_peer(&peer_id);
+                                if let Some(pointers) = &handler_context.pointers {
+                                    pointers.forget_peer(&peer_id);
+                                }
                                 update_bootstrap_after_peer_removed(
                                     &peer_id,
                                     &handler_context.bootstrap_state,
@@ -3140,6 +3189,7 @@ impl ReplicationEngine {
     }
 
     fn start_neighbor_sync_loop(&mut self) {
+        let pointers = self.pointers.clone();
         let p2p = Arc::clone(&self.p2p_node);
         let storage = Arc::clone(&self.storage);
         let paid_list = Arc::clone(&self.paid_list);
@@ -3216,6 +3266,7 @@ impl ReplicationEngine {
                         &sig_verify_attempts,
                         &audit_challenge_coordinator,
                         &gossip_audit,
+                        pointers.as_ref(),
                     ) => {}
                 }
             }
@@ -3355,6 +3406,7 @@ impl ReplicationEngine {
         let config = Arc::clone(&self.config);
         let sync_trigger = Arc::clone(&self.sync_trigger);
         let recent_provers = Arc::clone(&self.recent_provers);
+        let pointer_store = self.pointers.as_ref().map(|p| p.store().clone());
 
         let handle = tokio::spawn(async move {
             // Build the first commitment immediately on startup so a
@@ -3377,9 +3429,15 @@ impl ReplicationEngine {
             // unchanged — preserving the reloaded current pin; otherwise the
             // reloaded roots stay answerable as retained slots until their gossip
             // TTL lapses. Persistence is handled by the retention-persist loop.
-            if let Err(e) =
-                rebuild_and_rotate_commitment(&storage, &identity, &commitment_state, &p2p, &config)
-                    .await
+            if let Err(e) = rebuild_and_rotate_commitment(
+                &storage,
+                pointer_store.as_ref(),
+                &identity,
+                &commitment_state,
+                &p2p,
+                &config,
+            )
+            .await
             {
                 warn!("Initial commitment build failed: {e}");
             } else {
@@ -3393,6 +3451,7 @@ impl ReplicationEngine {
                     ) => {
                         if let Err(e) = rebuild_and_rotate_commitment(
                             &storage,
+                            pointer_store.as_ref(),
                             &identity,
                             &commitment_state,
                             &p2p,
@@ -4310,6 +4369,8 @@ struct ReplicationMessageHandlerContext {
     paid_notify_worker_semaphore: Arc<Semaphore>,
     paid_notify_admission_semaphore: Arc<Semaphore>,
     paid_notify_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    /// Pointer replication, when this node stores pointers.
+    pointers: Option<Arc<pointer::PointerReplication>>,
     /// The engine's shutdown token, for detached responder work.
     ///
     /// Workers on [`Self::detached_task_tracker`] race this around their
@@ -4399,6 +4460,12 @@ const fn replication_message_class(body: &ReplicationMessageBody) -> &'static st
         ReplicationMessageBody::SubtreeSliceResponse(_) => "subtree_slice_response",
         ReplicationMessageBody::GetCommitmentByPin(_) => "commitment_pin_request",
         ReplicationMessageBody::GetCommitmentByPinResponse(_) => "commitment_pin_response",
+        ReplicationMessageBody::PointerFreshOffer(_) => "pointer_fresh_offer",
+        ReplicationMessageBody::PointerHints(_) => "pointer_hints",
+        ReplicationMessageBody::PointerFetchRequest(_) => "pointer_fetch_request",
+        ReplicationMessageBody::PointerFetchResponse(_) => "pointer_fetch_response",
+        ReplicationMessageBody::PointerStateRequest(_) => "pointer_state_request",
+        ReplicationMessageBody::PointerStateResponse(_) => "pointer_state_response",
     }
 }
 
@@ -5126,6 +5193,7 @@ async fn handle_replication_message(
             let storage = Arc::clone(&ctx.storage);
             let p2p_node = Arc::clone(&ctx.p2p_node);
             let my_commitment_state = Arc::clone(&ctx.my_commitment_state);
+            let pointer_store = ctx.pointers.as_ref().map(|p| p.store().clone());
             let source = *source;
             let request_id = msg.request_id;
             let rr_message_id = rr_message_id.map(ToOwned::to_owned);
@@ -5138,9 +5206,10 @@ async fn handle_replication_message(
                 let storage_commitment_audit::Round1Work {
                     response,
                     content_bytes,
-                } = storage_commitment_audit::handle_subtree_challenge_measured(
+                } = storage_commitment_audit::handle_subtree_challenge_measured_with_pointers(
                     &challenge,
                     &storage,
+                    pointer_store.as_ref(),
                     p2p_node.peer_id(),
                     bootstrapping,
                     Some(&my_commitment_state),
@@ -5312,6 +5381,7 @@ async fn handle_replication_message(
             let storage = Arc::clone(&ctx.storage);
             let p2p_node = Arc::clone(&ctx.p2p_node);
             let my_commitment_state = Arc::clone(&ctx.my_commitment_state);
+            let pointer_store = ctx.pointers.as_ref().map(|p| p.store().clone());
             let source = *source;
             let request_id = msg.request_id;
             let rr_message_id = rr_message_id.map(ToOwned::to_owned);
@@ -5320,14 +5390,16 @@ async fn handle_replication_message(
                 let _guard = guard; // global permit + per-peer slot, held until done
                 let worker_started = Instant::now();
                 let processing_started = Instant::now();
-                let response = storage_commitment_audit::handle_subtree_slice_challenge(
-                    &challenge,
-                    &storage,
-                    p2p_node.peer_id(),
-                    bootstrapping,
-                    Some(&my_commitment_state),
-                )
-                .await;
+                let response =
+                    storage_commitment_audit::handle_subtree_slice_challenge_with_pointers(
+                        &challenge,
+                        &storage,
+                        pointer_store.as_ref(),
+                        p2p_node.peer_id(),
+                        bootstrapping,
+                        Some(&my_commitment_state),
+                    )
+                    .await;
                 let processing = processing_started.elapsed();
                 let response_kind = subtree_slice_response_kind(&response);
                 let response_send_started = Instant::now();
@@ -5461,6 +5533,42 @@ async fn handle_replication_message(
             drop(guard);
             Ok(())
         }
+        // Pointers (ADR-0016). A node that does not store pointers ignores
+        // them, and so is never marked capable and never asked anything.
+        ReplicationMessageBody::PointerFreshOffer(offer) => {
+            if let Some(pointers) = &ctx.pointers {
+                pointers.accept_offer_detached(*source, offer);
+            }
+            Ok(())
+        }
+        ReplicationMessageBody::PointerHints(hints) => {
+            if let Some(pointers) = &ctx.pointers {
+                pointers.handle_hints(*source, hints.hints).await;
+            }
+            Ok(())
+        }
+        ReplicationMessageBody::PointerFetchRequest(request) => {
+            if let Some(pointers) = &ctx.pointers {
+                pointers.serve_fetch_detached(
+                    *source,
+                    request,
+                    msg.request_id,
+                    rr_message_id.map(ToOwned::to_owned),
+                );
+            }
+            Ok(())
+        }
+        ReplicationMessageBody::PointerStateRequest(request) => {
+            if let Some(pointers) = &ctx.pointers {
+                pointers.serve_state_detached(
+                    *source,
+                    request,
+                    msg.request_id,
+                    rr_message_id.map(ToOwned::to_owned),
+                );
+            }
+            Ok(())
+        }
         // Response messages are handled by their respective request initiators.
         ReplicationMessageBody::FreshReplicationResponse(_)
         | ReplicationMessageBody::NeighborSyncResponse(_)
@@ -5469,7 +5577,9 @@ async fn handle_replication_message(
         | ReplicationMessageBody::AuditResponse(_)
         | ReplicationMessageBody::SubtreeAuditResponse(_)
         | ReplicationMessageBody::SubtreeSliceResponse(_)
-        | ReplicationMessageBody::GetCommitmentByPinResponse(_) => Ok(()),
+        | ReplicationMessageBody::GetCommitmentByPinResponse(_)
+        | ReplicationMessageBody::PointerFetchResponse(_)
+        | ReplicationMessageBody::PointerStateResponse(_) => Ok(()),
     }
 }
 
@@ -6426,6 +6536,12 @@ async fn dispatch_neighbor_sync_request(
     received_at: Instant,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
+    // A peer syncing with us gets our pointer hints as well — including a
+    // node that is bootstrapping, which is how it learns the pointers it
+    // should hold.
+    if let Some(pointers) = &ctx.pointers {
+        pointers.push_hints_detached(vec![source]);
+    }
     let guard = match admit_bounded_responder(
         &ctx.neighbor_sync_responder_admission_semaphore,
         &ctx.neighbor_sync_responder_inflight,
@@ -7390,6 +7506,7 @@ async fn run_neighbor_sync_round(
     sig_verify_attempts: &Arc<RwLock<HashMap<PeerId, Instant>>>,
     audit_challenge_coordinator: &Arc<AuditChallengeCoordinator>,
     gossip_audit: &GossipAuditTrigger,
+    pointers: Option<&Arc<pointer::PointerReplication>>,
 ) {
     let self_id = *p2p_node.peer_id();
     let bootstrapping = *is_bootstrapping.read().await;
@@ -7431,6 +7548,11 @@ async fn run_neighbor_sync_round(
             audit_challenge_coordinator,
         })
         .await;
+        if let Some(pointers) = pointers {
+            pointers
+                .prune_pass(allow_remote_prune_audits, Some(commitment_state))
+                .await;
+        }
 
         // Take fresh close-neighbor snapshot (DHT query, no lock held).
         let neighbors =
@@ -7470,6 +7592,9 @@ async fn run_neighbor_sync_round(
     }
 
     debug!("Neighbor sync: syncing with {} peers", batch.len());
+    if let Some(pointers) = pointers {
+        pointers.push_hints_detached(batch.clone());
+    }
 
     // Snapshot our current commitment once per round so all peers in
     // this batch see the same thing (gossip is the responder's attestation;
@@ -9871,7 +9996,24 @@ async fn load_commitment_retention(state: &ResponderCommitmentState, path: &Path
             return;
         }
     };
-    if let Some(persisted) = PersistedRetention::from_bytes(&bytes) {
+    if let Some(mut persisted) = PersistedRetention::from_bytes(&bytes) {
+        let sidecar = pointer_leaves_path(path);
+        match tokio::fs::read(&sidecar).await {
+            Ok(leaves) => {
+                if !persisted.attach_pointer_leaves(&leaves) {
+                    warn!(
+                        "Commitment retention: corrupt pointer leaves at {}; \
+                         commitments holding pointers will not be restored",
+                        sidecar.display()
+                    );
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!(
+                "Commitment retention: failed to read {}: {e}",
+                sidecar.display()
+            ),
+        }
         state.restore(&persisted);
         info!(
             "Commitment retention: reloaded {} slot(s) from {}",
@@ -9891,21 +10033,36 @@ async fn load_commitment_retention(state: &ResponderCommitmentState, path: &Path
 /// needless disk writes on idle nodes. On success updates `last` to the bytes
 /// written; on a serialization/write error the existing on-disk snapshot is left
 /// intact (never truncated).
+///
+/// The pointer leaves go to a sidecar written first (ADR-0016), so the
+/// retention file never names a commitment whose pointer leaves are not yet
+/// on disk. A crash between the two leaves a sidecar ahead of the file, which
+/// is harmless: it is keyed by commitment hash.
 async fn persist_retention_if_changed(
     state: &ResponderCommitmentState,
     path: &Path,
     last: &mut Option<Vec<u8>>,
 ) {
-    let Some(bytes) = state.snapshot().to_bytes() else {
+    let snapshot = state.snapshot();
+    let (Some(bytes), Some(leaves)) = (snapshot.to_bytes(), snapshot.pointer_leaves_bytes()) else {
         warn!("Commitment retention: serialization failed; keeping previous snapshot");
         return;
     };
-    if last.as_deref() == Some(bytes.as_slice()) {
+    let mut combined = leaves.clone();
+    combined.extend_from_slice(&bytes);
+    if last.as_deref() == Some(combined.as_slice()) {
         return;
     }
-    if write_retention_atomic(path, bytes.clone()).await {
-        *last = Some(bytes);
+    if write_retention_atomic(&pointer_leaves_path(path), leaves).await
+        && write_retention_atomic(path, bytes).await
+    {
+        *last = Some(combined);
     }
+}
+
+/// Where the pointer leaves of the retention at `path` are kept.
+fn pointer_leaves_path(path: &Path) -> PathBuf {
+    path.with_file_name("commitment_retention_pointers.bin")
 }
 
 /// Durably write `bytes` to `path`: temp file → fsync temp → atomic rename →
@@ -9952,11 +10109,16 @@ async fn write_retention_atomic(path: &Path, bytes: Vec<u8>) -> bool {
 /// BLAKE3(content)`, so `bytes_hash := key` and we don't have to
 /// re-read each chunk's bytes to compute the leaf hash.
 ///
+/// The pointers this node is responsible for are committed alongside, each as
+/// `(address, pointer_leaf_hash(address))` (ADR-0016), so they are audited and
+/// priced exactly as chunks are.
+///
 /// Skips (returns `Ok(())`) if the key set is empty — no commitment to
 /// rotate. The auditor side handles "no commitment for this peer" by
 /// falling back to the legacy plain-digest audit path.
 async fn rebuild_and_rotate_commitment(
     storage: &Arc<ChunkStore>,
+    pointers: Option<&PointerStore>,
     identity: &Arc<NodeIdentity>,
     state: &Arc<ResponderCommitmentState>,
     p2p: &Arc<P2PNode>,
@@ -9989,8 +10151,16 @@ async fn rebuild_and_rotate_commitment(
             keys.push(k);
         }
     }
+    // The same rule for pointers: an out-of-range pointer leaves the next
+    // commitment, and the pruner reclaims it once no retained slot holds it.
+    let mut pointer_keys = Vec::new();
+    for state in pointers.map(PointerStore::held_states).unwrap_or_default() {
+        if admission::is_responsible(&self_id, &state.address, p2p, config.close_group_size).await {
+            pointer_keys.push(state.address);
+        }
+    }
 
-    if keys.is_empty() {
+    if keys.is_empty() && pointer_keys.is_empty() {
         // There used to be a second branch here that dropped every retained root outright
         // when the node looked empty. It is gone, and the reason is worth keeping.
         //
@@ -10038,12 +10208,11 @@ async fn rebuild_and_rotate_commitment(
     // to more than the protocol limit; auditor would reject the
     // commitment otherwise).
     let cap = commitment::MAX_COMMITMENT_KEY_COUNT as usize;
-    if keys.len() > cap {
+    let total = keys.len().saturating_add(pointer_keys.len());
+    if total > cap {
         warn!(
-            "Commitment rotation: key set ({}) exceeds MAX_COMMITMENT_KEY_COUNT ({}); \
-             truncating — investigate as this likely means a misconfiguration",
-            keys.len(),
-            cap
+            "Commitment rotation: key set ({total}) exceeds MAX_COMMITMENT_KEY_COUNT ({cap}); \
+             truncating — investigate as this likely means a misconfiguration"
         );
     }
 
@@ -10065,7 +10234,28 @@ async fn rebuild_and_rotate_commitment(
     // earn credit for `key`. If this module is ever reused for
     // non-content-addressed records, that `(k, k)` shortcut AND the verifier
     // gate must be replaced with `(key, BLAKE3(bytes))` computed from real bytes.
-    let entries: Vec<_> = keys.into_iter().take(cap).map(|k| (k, k)).collect();
+    //
+    // Pointers are that case, and are handled by being told apart rather than
+    // hashed: a pointer leaf is `(address, pointer_leaf_hash(address))`, which
+    // the verifier accepts only for a leaf of exactly a pointer's size, and
+    // round 2 then demands the whole signed record in place of a Bao slice.
+    // The root binds which pointers are held, never their current state, so an
+    // update does not move it.
+    //
+    // A pointer address that is also a chunk key would need a BLAKE3 preimage;
+    // the dedup only keeps such a collision from failing the whole build.
+    let mut entries: Vec<_> = keys
+        .into_iter()
+        .map(|k| (k, k))
+        .chain(
+            pointer_keys
+                .into_iter()
+                .map(|address| (address, commitment::pointer_leaf_hash(&address))),
+        )
+        .collect();
+    entries.sort_by_key(|(k, _)| *k);
+    entries.dedup_by_key(|(k, _)| *k);
+    entries.truncate(cap);
 
     // No-op-rotation guard: compute just the Merkle root from `entries`
     // and compare against the currently-advertised commitment's root.
@@ -10120,8 +10310,9 @@ async fn rebuild_and_rotate_commitment(
 
     let hash = hex::encode(built.hash());
     let key_count = built.commitment().key_count;
+    let pointer_count = built.tree().pointer_count();
     state.rotate(built);
-    info!("Storage commitment rotated: hash={hash} key_count={key_count}");
+    info!("Storage commitment rotated: hash={hash} key_count={key_count} pointers={pointer_count}");
     // Counted only on the paths where the advertised commitment now genuinely reflects
     // the committable set, never merely on having read it. The retirement gate is what
     // consumes this, and it authorises deleting the legacy store.

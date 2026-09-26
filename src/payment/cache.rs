@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub use super::quote::XorName;
+pub use super::verifier::PaymentTarget as PaidKey;
 
 /// Default cache capacity (100,000 entries = 3.2MB memory).
 const DEFAULT_CACHE_CAPACITY: usize = 100_000;
@@ -25,7 +26,7 @@ const DEFAULT_CACHE_CAPACITY: usize = 100_000;
 /// entries satisfy weaker lookups.
 #[derive(Clone)]
 pub struct VerifiedCache {
-    inner: Arc<Mutex<LruCache<XorName, VerificationLevel>>>,
+    inner: Arc<Mutex<LruCache<PaidKey, VerificationLevel>>>,
     hits: Arc<AtomicU64>,
     misses: Arc<AtomicU64>,
     additions: Arc<AtomicU64>,
@@ -101,8 +102,8 @@ impl VerifiedCache {
     /// Returns `true` if the `XorName` is cached (verified to exist on autonomi).
     /// Paid-list and client-PUT lookups must use their stricter helpers.
     #[must_use]
-    pub fn contains(&self, xorname: &XorName) -> bool {
-        let found = self.inner.lock().get(xorname).is_some();
+    pub fn contains_key(&self, key: &PaidKey) -> bool {
+        let found = self.inner.lock().get(key).is_some();
 
         if found {
             self.hits.fetch_add(1, Ordering::Relaxed);
@@ -119,11 +120,11 @@ impl VerifiedCache {
     /// A client-PUT entry returns `true` here because it passed the stricter
     /// store-admission path at the caller.
     #[must_use]
-    pub fn contains_paid_list_verified(&self, xorname: &XorName) -> bool {
+    pub fn contains_paid_list_verified_key(&self, key: &PaidKey) -> bool {
         let found = self
             .inner
             .lock()
-            .get(xorname)
+            .get(key)
             .copied()
             .is_some_and(|level| level.satisfies(VerificationLevel::PaidList));
 
@@ -142,11 +143,11 @@ impl VerifiedCache {
     /// Paid-list entries return `false` here because they did not pass the
     /// client-PUT store-admission path.
     #[must_use]
-    pub fn contains_client_put_verified(&self, xorname: &XorName) -> bool {
+    pub fn contains_client_put_verified_key(&self, key: &PaidKey) -> bool {
         let found = self
             .inner
             .lock()
-            .get(xorname)
+            .get(key)
             .copied()
             .is_some_and(|level| level.satisfies(VerificationLevel::ClientPut));
 
@@ -163,36 +164,64 @@ impl VerifiedCache {
     ///
     /// This should be called after verifying that data exists on the autonomi network.
     /// Also upgrades an existing paid-list-verified entry.
-    pub fn insert(&self, xorname: XorName) {
-        self.insert_with_level(xorname, VerificationLevel::ClientPut);
+    pub fn insert_key(&self, key: PaidKey) {
+        self.insert_with_level(key, VerificationLevel::ClientPut);
     }
 
     /// Add a `XorName` verified under paid-list admission checks.
     ///
     /// Never downgrades an existing client-PUT-verified entry.
-    pub fn insert_paid_list_verified(&self, xorname: XorName) {
-        self.insert_with_level(xorname, VerificationLevel::PaidList);
+    pub fn insert_paid_list_verified_key(&self, key: PaidKey) {
+        self.insert_with_level(key, VerificationLevel::PaidList);
     }
 
-    fn insert_with_level(&self, xorname: XorName, level: VerificationLevel) {
+    fn insert_with_level(&self, key: PaidKey, level: VerificationLevel) {
         let added = {
             let mut inner = self.inner.lock();
             // `get_mut` refreshes LRU recency for existing entries of either kind.
-            if inner.get(&xorname).is_some() {
-                if let Some(existing) = inner.get_mut(&xorname) {
+            if inner.get(&key).is_some() {
+                if let Some(existing) = inner.get_mut(&key) {
                     if !existing.satisfies(level) {
                         *existing = level;
                     }
                 }
                 false
             } else {
-                inner.put(xorname, level);
+                inner.put(key, level);
                 true
             }
         };
         if added {
             self.additions.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// As [`Self::contains_key`], for a chunk at `address`.
+    #[must_use]
+    pub fn contains(&self, address: &XorName) -> bool {
+        self.contains_key(&PaidKey::Chunk(*address))
+    }
+
+    /// As [`Self::contains_paid_list_verified_key`], for a chunk at `address`.
+    #[must_use]
+    pub fn contains_paid_list_verified(&self, address: &XorName) -> bool {
+        self.contains_paid_list_verified_key(&PaidKey::Chunk(*address))
+    }
+
+    /// As [`Self::contains_client_put_verified_key`], for a chunk at `address`.
+    #[must_use]
+    pub fn contains_client_put_verified(&self, address: &XorName) -> bool {
+        self.contains_client_put_verified_key(&PaidKey::Chunk(*address))
+    }
+
+    /// As [`Self::insert_key`], for a chunk at `address`.
+    pub fn insert(&self, address: XorName) {
+        self.insert_key(PaidKey::Chunk(address));
+    }
+
+    /// As [`Self::insert_paid_list_verified_key`], for a chunk at `address`.
+    pub fn insert_paid_list_verified(&self, address: XorName) {
+        self.insert_paid_list_verified_key(PaidKey::Chunk(address));
     }
 
     /// Get current cache statistics.
@@ -238,23 +267,23 @@ mod tests {
     fn test_cache_basic_operations() {
         let cache = VerifiedCache::new();
 
-        let xorname1 = [1u8; 32];
-        let xorname2 = [2u8; 32];
+        let key1 = [1u8; 32];
+        let key2 = [2u8; 32];
 
         // Initially empty
         assert!(cache.is_empty());
-        assert!(!cache.contains(&xorname1));
+        assert!(!cache.contains(&key1));
 
         // Insert and check
-        cache.insert(xorname1);
-        assert!(cache.contains(&xorname1));
-        assert!(!cache.contains(&xorname2));
+        cache.insert(key1);
+        assert!(cache.contains(&key1));
+        assert!(!cache.contains(&key2));
         assert_eq!(cache.len(), 1);
 
         // Insert another
-        cache.insert(xorname2);
-        assert!(cache.contains(&xorname1));
-        assert!(cache.contains(&xorname2));
+        cache.insert(key2);
+        assert!(cache.contains(&key1));
+        assert!(cache.contains(&key2));
         assert_eq!(cache.len(), 2);
     }
 
@@ -284,21 +313,21 @@ mod tests {
     #[test]
     fn test_cache_stats() {
         let cache = VerifiedCache::new();
-        let xorname = [1u8; 32];
+        let key = [1u8; 32];
 
         // Miss
-        assert!(!cache.contains(&xorname));
+        assert!(!cache.contains(&key));
         let stats = cache.stats();
         assert_eq!(stats.misses, 1);
         assert_eq!(stats.hits, 0);
 
         // Add
-        cache.insert(xorname);
+        cache.insert(key);
         let stats = cache.stats();
         assert_eq!(stats.additions, 1);
 
         // Hit
-        assert!(cache.contains(&xorname));
+        assert!(cache.contains(&key));
         let stats = cache.stats();
         assert_eq!(stats.hits, 1);
         assert_eq!(stats.misses, 1);
@@ -312,19 +341,19 @@ mod tests {
         // Small cache for testing eviction
         let cache = VerifiedCache::with_capacity(2);
 
-        let xorname1 = [1u8; 32];
-        let xorname2 = [2u8; 32];
-        let xorname3 = [3u8; 32];
+        let key1 = [1u8; 32];
+        let key2 = [2u8; 32];
+        let key3 = [3u8; 32];
 
-        cache.insert(xorname1);
-        cache.insert(xorname2);
+        cache.insert(key1);
+        cache.insert(key2);
         assert_eq!(cache.len(), 2);
 
-        // Insert third, should evict xorname1 (least recently used)
-        cache.insert(xorname3);
+        // Insert third, should evict key1 (least recently used)
+        cache.insert(key3);
         assert_eq!(cache.len(), 2);
-        assert!(!cache.contains(&xorname1)); // evicted
-                                             // Note: after contains call on evicted item, stats will show a miss
+        assert!(!cache.contains(&key1)); // evicted
+                                         // Note: after contains call on evicted item, stats will show a miss
     }
 
     #[test]
@@ -409,8 +438,8 @@ mod tests {
         for i in 0..10u8 {
             let c = cache.clone();
             handles.push(thread::spawn(move || {
-                let xorname = [i; 32];
-                c.insert(xorname);
+                let key = [i; 32];
+                c.insert(key);
             }));
         }
 
@@ -418,8 +447,8 @@ mod tests {
         for i in 0..10u8 {
             let c = cache.clone();
             handles.push(thread::spawn(move || {
-                let xorname = [i; 32];
-                let _ = c.contains(&xorname);
+                let key = [i; 32];
+                let _ = c.contains(&key);
             }));
         }
 

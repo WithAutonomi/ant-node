@@ -11,6 +11,7 @@ use super::testnet::{
 use super::{NetworkState, TestHarness, TestNetwork, TestNetworkConfig};
 use saorsa_core::P2PEvent;
 use serial_test::serial;
+use std::net::UdpSocket;
 use std::time::Duration;
 
 /// Test that a minimal network (5 nodes) can form and stabilize.
@@ -272,4 +273,25 @@ async fn test_node_to_node_messaging() {
         .teardown()
         .await
         .expect("Failed to teardown test harness");
+}
+
+/// A network whose first node cannot bind its port is brought up on a fresh
+/// port range rather than failing the test that asked for it.
+#[tokio::test]
+#[serial]
+async fn a_network_whose_port_is_taken_moves_to_a_fresh_range() {
+    let config = TestNetworkConfig::minimal();
+    let taken = config.base_port;
+    let _holder = UdpSocket::bind(("127.0.0.1", taken)).expect("hold the first node's port");
+
+    let harness = TestHarness::setup_with_config(config)
+        .await
+        .expect("the network comes up on another range");
+    assert_ne!(
+        harness.network().config().base_port,
+        taken,
+        "the network moved off the port it could not bind"
+    );
+
+    harness.teardown().await.expect("teardown");
 }
