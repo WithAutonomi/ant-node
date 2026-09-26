@@ -52,7 +52,7 @@ use tracing::{debug, info, warn};
 //
 // NOTE: E2E tests use a SEPARATE port range from production ant-node.
 //
-// - Production ant-node: 10000-10999 (see CLAUDE.md)
+// - Production ant-node: 10000-10999 (see AGENTS.md)
 // - E2E tests: 20000-60000 (this file)
 //
 // This separation prevents test conflicts with:

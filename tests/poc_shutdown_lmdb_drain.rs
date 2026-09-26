@@ -43,7 +43,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-/// E2E test port range (CLAUDE.md): tests must stay inside 20000-60000,
+/// E2E test port range (AGENTS.md): tests must stay inside 20000-60000,
 /// away from production ant-node's 10000-10999.
 const TEST_PORT_RANGE_MIN: u16 = 20_000;
 /// Upper bound (exclusive) of the E2E test port range.
