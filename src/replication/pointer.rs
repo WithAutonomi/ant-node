@@ -580,7 +580,7 @@ impl PointerReplication {
                     }
                     Verdict::Undecided => (address, false),
                     Verdict::Refused => {
-                        debug!(
+                        info!(
                             "No quorum backs a newer state for pointer {}",
                             hex::encode(address)
                         );
@@ -877,7 +877,7 @@ impl PointerReplication {
     ) {
         self.mark_capable(&source);
         let Ok(permit) = Arc::clone(&self.offer_permits).try_acquire_owned() else {
-            debug!("Dropping a fresh pointer offer from {source}: too many in flight");
+            info!("Dropping a fresh pointer offer from {source}: too many in flight");
             return;
         };
         let this = Arc::clone(self);
@@ -947,7 +947,7 @@ impl PointerReplication {
             )
             .await
         {
-            debug!(
+            info!(
                 "Fresh pointer offer for {} from {source} is not paid for: {e}",
                 hex::encode(state.address)
             );

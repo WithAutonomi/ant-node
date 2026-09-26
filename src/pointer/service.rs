@@ -264,7 +264,7 @@ impl PointerService {
         // covers a record the node lost, which that comparison cannot see, so
         // a replay cannot roll it back.
         if !self.store.admits(state) {
-            debug!(
+            info!(
                 "Rejecting pointer PUT for {}: counter {} does not beat the state this node knows",
                 hex::encode(address),
                 state.counter
