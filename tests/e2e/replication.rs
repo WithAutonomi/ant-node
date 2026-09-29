@@ -290,6 +290,7 @@ async fn test_fresh_replication_propagates_to_close_group() {
 /// being offered, without stalling the pipeline and without keeping its
 /// pending-offer permit.
 #[tokio::test]
+#[serial]
 async fn fresh_write_pipeline_replicates_a_put_and_skips_missing_chunks() {
     let harness = TestHarness::setup_minimal().await.expect("setup");
     harness.warmup_dht().await.expect("warmup");
@@ -352,6 +353,7 @@ async fn fresh_write_pipeline_replicates_a_put_and_skips_missing_chunks() {
 /// write is offered — none is lost to back-pressure — and every permit comes
 /// back.
 #[tokio::test]
+#[serial]
 async fn fresh_write_pipeline_holds_a_burst_at_the_offer_budget() {
     let harness = TestHarness::setup_minimal().await.expect("setup");
     harness.warmup_dht().await.expect("warmup");
@@ -422,6 +424,7 @@ async fn fresh_write_pipeline_holds_a_burst_at_the_offer_budget() {
 /// standing where the chunk file should be, which the store refuses to read
 /// whatever the platform or user.
 #[tokio::test]
+#[serial]
 async fn fresh_write_pipeline_retries_a_failed_read_off_the_dispatcher() {
     let harness = TestHarness::setup_minimal().await.expect("setup");
     harness.warmup_dht().await.expect("warmup");
@@ -525,6 +528,7 @@ async fn fresh_write_pipeline_retries_a_failed_read_off_the_dispatcher() {
 /// verifies the chunk, quarantines it on the mismatch, and the retry finds it
 /// gone and skips it.
 #[tokio::test]
+#[serial]
 async fn fresh_write_pipeline_never_offers_a_corrupt_chunk() {
     let harness = TestHarness::setup_minimal().await.expect("setup");
     harness.warmup_dht().await.expect("warmup");
