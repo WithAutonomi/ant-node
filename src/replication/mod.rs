@@ -2562,9 +2562,13 @@ impl ReplicationEngine {
                     }
                 };
                 let key_hex = hex::encode(event.key);
-                // The chunk was content-checked when it was stored; the
-                // receiver validates the offer against its address anyway.
-                let data = match storage.get_raw(&event.key).await {
+                // The same verified read the fetch path serves from. The bytes
+                // were content-checked when they were stored, but they come
+                // off disk now, possibly long after, and every receiver
+                // charges the sender for an offer that does not hash to its
+                // key. A chunk that fails verification is quarantined by this
+                // read, so its retry finds it gone and skips it.
+                let data = match storage.get(&event.key).await {
                     Ok(Some(data)) => data,
                     Ok(None) => {
                         debug!("Chunk {key_hex} no longer stored, skipping fresh replication");
