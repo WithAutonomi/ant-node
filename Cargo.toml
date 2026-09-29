@@ -239,6 +239,11 @@ webrtc-direct = [
 # streams without copying. Drop both once releases include them.
 saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core", rev = "c0022b871961c7f373f2ccde815385816962de98" }
 saorsa-transport = { git = "https://github.com/WithAutonomi/saorsa-transport", rev = "1e6eb1a3bc5b8b7f51c6773b11a152ae50d87320" }
+# The published 3.1.0 carries pointers (ADR-0016) but not the final state this
+# change relies on (ADR-0018). A rev, not a branch, so the pin is immutable.
+# Drop it once a release includes the companion change. Versions are bumped at
+# release.
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "7aab0772aed9931ce7912eeda23b1f8482d6d116" }
 
 [profile.release]
 lto = true

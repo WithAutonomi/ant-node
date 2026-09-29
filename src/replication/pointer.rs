@@ -24,7 +24,13 @@
 //!   they hold that state or a newer one by returning a valid record.
 //! - **Possession.** Some minutes after offering a fresh state, the node asks
 //!   each close-group member for the record. A member that is still responsible
-//!   and cannot produce that state or a newer one is penalised.
+//!   and cannot produce that state or a newer one is penalised — unless it holds
+//!   a *different final* state, which is a fork its owner made and not a failure
+//!   to store.
+//! - **Finality.** Before taking a final state it does not hold, from a client
+//!   or a fresh offer, a node asks the close group whether a different final
+//!   state is already held, and refuses if a peer proves one with the signed
+//!   record (ADR-0018). See [`PointerReplication::conflicting_final`].
 //!
 //! Requests go only to peers that have sent a pointer message themselves (see
 //! [`PointerReplication::is_capable`]). A peer built before pointers cannot
@@ -38,6 +44,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ant_protocol::pointer::{Pointer, PointerState, POINTER_WIRE_LEN};
+use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt};
 use parking_lot::Mutex;
 use rand::Rng;
@@ -55,6 +62,7 @@ use crate::payment::{
     MIN_PAYMENT_PROOF_SIZE_BYTES,
 };
 use crate::pointer::store::{Inspected, PointerStore};
+use crate::pointer::FinalStateWitness;
 use crate::replication::admission;
 use crate::replication::commitment_state::ResponderCommitmentState;
 use crate::replication::config::{
@@ -101,6 +109,15 @@ const UNDECIDED_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Most prune candidates examined per pass.
 const MAX_PRUNE_CANDIDATES_PER_PASS: usize = 256;
+
+/// How long a node spends asking its close group for a conflicting final
+/// state before taking one (ADR-0018).
+///
+/// It runs inside a client's PUT, after payment has been verified, so it has
+/// to leave that PUT well inside the client's ten-second store timeout. A
+/// group that has not answered by then is taken to hold nothing that
+/// conflicts: silence is never a vote, here as anywhere else.
+pub(crate) const FINAL_STATE_CHECK_BUDGET: Duration = Duration::from_secs(4);
 
 /// One peer's answer about one address: the state it holds there, if any.
 type StateAnswer = ((PeerId, XorName), Option<PointerState>);
@@ -171,13 +188,22 @@ pub(crate) fn evaluate(
     }
     let beats_held = |state: &PointerState| held.is_none_or(|held| state.replaces(held));
 
+    // The merge winner, and between two final states — which the merge rule
+    // leaves unordered — the one more of the group holds. Only a group wider
+    // than twice the quorum can back two at once, and then arrival order must
+    // not be what decides.
+    let prefer = |candidate: &(PointerState, Vec<PeerId>),
+                  current: &(PointerState, Vec<PeerId>)| {
+        candidate.0.replaces(&current.0)
+            || (!current.0.replaces(&candidate.0) && candidate.1.len() > current.1.len())
+    };
     let best = by_state
         .iter()
         .filter(|(state, holders)| holders.len() >= quorum_needed && beats_held(state))
         .fold(
             None::<&(PointerState, Vec<PeerId>)>,
             |best, candidate| match best {
-                Some(current) if !candidate.0.replaces(&current.0) => Some(current),
+                Some(current) if !prefer(candidate, current) => Some(current),
                 _ => Some(candidate),
             },
         );
@@ -953,6 +979,26 @@ impl PointerReplication {
             );
             return;
         }
+        // A final state held nowhere here yet is looked for in the group
+        // first, exactly as a client PUT of one is: the peer offering it may
+        // simply be the side of a race this node has not heard the other
+        // side of.
+        let holds_final = self
+            .store
+            .state(&state.address)
+            .is_some_and(|held| held.is_terminal());
+        if state.is_terminal() && !holds_final {
+            if let Some(conflict) = self.conflicting_final(&state).await {
+                info!(
+                    "Refusing fresh final pointer state {} at {} from {source}: the close \
+                     group already holds final state {}",
+                    hex::encode(state.state_id),
+                    hex::encode(state.address),
+                    hex::encode(conflict.state_id())
+                );
+                return;
+            }
+        }
         match self
             .store_verified(record, Some(self.config.paid_list_close_group_size))
             .await
@@ -967,6 +1013,104 @@ impl PointerReplication {
                 hex::encode(state.address)
             ),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Finality
+    // -----------------------------------------------------------------------
+
+    /// A final state at `state.address`, other than `state`, that a peer in
+    /// the close group holds and proves by serving the signed record.
+    ///
+    /// Asked before this node takes a final state it does not hold. A final
+    /// state is replaced by nothing, so a node that took a second one would
+    /// hold it for good; asking first is what keeps a former owner from
+    /// finalizing an address again on nodes that had not yet heard it was
+    /// final — one that joined the group since, or lost its copy.
+    ///
+    /// A peer's word is not enough to refuse: a state summary is a claim
+    /// anyone can make, and one dishonest peer could otherwise block every
+    /// handover. A signed record is not a claim. Only the owner can sign a
+    /// final state, so one that verifies is the owner's own proof that it
+    /// finalized the pointer before.
+    ///
+    /// Bounded by [`FINAL_STATE_CHECK_BUDGET`], and only peers that have sent
+    /// a pointer message are asked. A group that cannot be asked in time finds
+    /// nothing, and the write goes ahead on the merge rule alone: a race is a
+    /// fork the client detects, not one this can prevent.
+    pub async fn conflicting_final(&self, state: &PointerState) -> Option<Pointer> {
+        if !state.is_terminal() {
+            return None;
+        }
+        tokio::time::timeout(FINAL_STATE_CHECK_BUDGET, self.find_conflicting_final(state))
+            .await
+            .unwrap_or_else(|_| {
+                debug!(
+                    "Close group of pointer {} did not answer the finality check in time",
+                    hex::encode(state.address)
+                );
+                None
+            })
+    }
+
+    /// The body of [`Self::conflicting_final`], without its time bound.
+    ///
+    /// Answers are taken as they arrive, and a claim is checked the moment it
+    /// is made, so one slow peer cannot hide a quick one's proof behind the
+    /// budget.
+    async fn find_conflicting_final(&self, state: &PointerState) -> Option<Pointer> {
+        let self_id = *self.p2p.peer_id();
+        let address = state.address;
+        let peers: Vec<PeerId> = self
+            .p2p
+            .dht_manager()
+            .find_closest_nodes_local(&address, self.config.close_group_size)
+            .await
+            .into_iter()
+            .map(|node| node.peer_id)
+            .filter(|peer| *peer != self_id && self.is_capable(peer))
+            .collect();
+
+        let mut claims = stream::iter(peers)
+            .map(|peer| async move {
+                let held = self.ask_state(&peer, &address).await?;
+                (held.is_terminal() && held.state_id != state.state_id).then_some(peer)
+            })
+            .buffer_unordered(VERIFICATION_CONCURRENCY);
+        while let Some(claim) = claims.next().await {
+            let Some(peer) = claim else { continue };
+            let Some(record) = self.fetch_record(&peer, &address).await else {
+                continue;
+            };
+            if record.is_terminal() && record.state_id() != state.state_id {
+                return Some(record);
+            }
+        }
+        None
+    }
+
+    /// Ask one peer which state it holds at `address`.
+    async fn ask_state(&self, peer: &PeerId, address: &XorName) -> Option<PointerState> {
+        let body = self
+            .request(
+                peer,
+                ReplicationMessageBody::PointerStateRequest(PointerStateRequest {
+                    addresses: vec![*address],
+                }),
+                FINAL_STATE_CHECK_BUDGET,
+            )
+            .await?;
+        let ReplicationMessageBody::PointerStateResponse(response) = body else {
+            return None;
+        };
+        // An answer about a different address is no answer.
+        response
+            .states
+            .into_iter()
+            .next()
+            .flatten()
+            .filter(|summary| summary.address == *address)
+            .map(PointerState::from)
     }
 
     // -----------------------------------------------------------------------
@@ -1012,19 +1156,32 @@ impl PointerReplication {
             if *peer == self_id || !group.contains(peer) || !self.is_capable(peer) {
                 continue;
             }
-            let holds = self
+            let held = self
                 .fetch_record(peer, &fresh.address)
                 .await
-                .is_some_and(|record| {
-                    let state = record.state();
-                    state.state_id == fresh.state_id || state.replaces(&fresh)
-                });
-            if !holds {
-                warn!(
-                    "Peer {peer} does not hold pointer {} it was offered",
-                    hex::encode(fresh.address)
-                );
-                self.penalise(peer).await;
+                .map(|record| record.state());
+            match held {
+                Some(state) if state.state_id == fresh.state_id || state.replaces(&fresh) => {}
+                // Two different final states: the owner signed both and each
+                // node kept the one it took first, as this one did. The peer
+                // is holding what the merge rule told it to hold, so it is not
+                // penalised for the owner's fork. Said loudly, because a read
+                // of this pointer now depends on which side most of the group
+                // is on.
+                Some(state) if state.is_terminal() && fresh.is_terminal() => warn!(
+                    "Pointer {} is forked: peer {peer} holds final state {}, this node \
+                     offered final state {}",
+                    hex::encode(fresh.address),
+                    hex::encode(state.state_id),
+                    hex::encode(fresh.state_id)
+                ),
+                _ => {
+                    warn!(
+                        "Peer {peer} does not hold pointer {} it was offered",
+                        hex::encode(fresh.address)
+                    );
+                    self.penalise(peer).await;
+                }
             }
         }
     }
@@ -1163,6 +1320,12 @@ impl PointerReplication {
     }
 }
 
+impl FinalStateWitness for PointerReplication {
+    fn conflicting_final<'a>(&'a self, state: &'a PointerState) -> BoxFuture<'a, Option<Pointer>> {
+        Box::pin(Self::conflicting_final(self, state))
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -1297,6 +1460,58 @@ mod tests {
         match got {
             Verdict::Adopt { state, .. } => assert_eq!(state.state_id, winner.state_id),
             other => panic!("expected the winner, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_node_holding_a_final_state_adopts_nothing_else() {
+        // Not even another final state the whole group holds: the merge rule
+        // replaces a final state with nothing, and repair is the merge rule
+        // applied to what the group says.
+        let held = state(u64::MAX, 9, 90);
+        let other = state(u64::MAX, 1, 91);
+        let got = evaluate(
+            Some(&held),
+            7,
+            &answers(&[
+                (1, Some(other)),
+                (2, Some(other)),
+                (3, Some(other)),
+                (4, Some(other)),
+                (5, Some(other)),
+            ]),
+            4,
+        );
+        assert_eq!(got, Verdict::Refused);
+    }
+
+    #[test]
+    fn of_two_final_states_with_quorum_the_one_more_hold_is_adopted() {
+        // Two final states are unordered, so only a group wide enough to back
+        // both can get here. Arrival order must not pick; the larger side does.
+        let fewer = state(u64::MAX, 1, 70);
+        let more = state(u64::MAX, 9, 71);
+        for order in [[fewer, more], [more, fewer]] {
+            let mut list = Vec::new();
+            let mut next = 1u8;
+            for candidate in order {
+                let holders = if candidate.state_id == more.state_id {
+                    5
+                } else {
+                    4
+                };
+                for _ in 0..holders {
+                    list.push((next, Some(candidate)));
+                    next += 1;
+                }
+            }
+            match evaluate(None, 20, &answers(&list), 4) {
+                Verdict::Adopt { state, holders } => {
+                    assert_eq!(state.state_id, more.state_id);
+                    assert_eq!(holders.len(), 5);
+                }
+                other => panic!("expected the larger side, got {other:?}"),
+            }
         }
     }
 

@@ -272,11 +272,10 @@ impl NodeBuilder {
         };
 
         // ADR-0016: pointers replicate through the same engine. The PUT handler
-        // hands each newly stored paid state to it on this channel.
+        // hands each newly stored paid state to it, and asks it before taking
+        // a final state (ADR-0018).
         if let Some(service) = protocol.pointer_service() {
-            let (writes, fresh_writes) = tokio::sync::mpsc::unbounded_channel();
-            service.attach_fresh_writes(writes);
-            engine.with_pointers(service.store().clone(), fresh_writes);
+            engine.with_pointers(service);
         }
 
         // ADR-0004: wire the engine's commitment state as the quote generator's
