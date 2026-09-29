@@ -26,6 +26,7 @@
 
 use super::TestHarness;
 use ant_node::client::compute_address;
+use ant_node::replication::fresh::FreshWriteEvent;
 use ant_node::replication::{
     fresh_offer_admission_refusals, fresh_offer_refusals_global_pool,
     fresh_offer_refusals_per_peer_share, paid_notify_admission_refusals,
@@ -102,15 +103,11 @@ async fn normal_upload_never_reaches_fresh_offer_capacity() {
     }
 
     let source = harness.test_node(UPLOAD_SOURCE_INDEX).expect("source node");
-    let source_storage = source
-        .ant_protocol
-        .as_ref()
-        .expect("source protocol")
-        .storage();
-    let engine = source
-        .replication_engine
-        .as_ref()
-        .expect("source replication engine");
+    let source_protocol = source.ant_protocol.as_ref().expect("source protocol");
+    let source_storage = source_protocol.storage();
+    let fresh_writes = source_protocol
+        .fresh_write_sender()
+        .expect("fresh-write sender wired by the harness");
 
     // Counters are process-global and cumulative, and other tests share this
     // binary, so measure a delta rather than an absolute.
@@ -119,14 +116,21 @@ async fn normal_upload_never_reaches_fresh_offer_capacity() {
     let global_before = fresh_offer_refusals_global_pool();
     let share_before = fresh_offer_refusals_per_peer_share();
 
-    // Drive the upload the way the fresh-write drainer does: store, then hand
-    // off to replication, moving to the next chunk immediately. No pacing —
-    // pacing here would be the test quietly avoiding the very pressure it
-    // exists to apply.
+    // Drive the upload through the fresh-write channel, exactly as the PUT
+    // handler does: store, then hand the write to the drainer, moving to the
+    // next chunk immediately. The drainer announces every write at arrival
+    // rate and only the offers wait for pending-offer permits, as in
+    // production. No pacing here — pacing would be the test quietly avoiding
+    // the very pressure it exists to apply.
     let started = Instant::now();
     for (content, address) in &chunks {
         source_storage.put(address, content).await.expect("put");
-        engine.replicate_fresh(address, content, &DUMMY_POP).await;
+        fresh_writes
+            .send(FreshWriteEvent {
+                key: *address,
+                payment_proof: DUMMY_POP.to_vec(),
+            })
+            .expect("queue fresh write");
     }
     let dispatch_elapsed = started.elapsed();
 
