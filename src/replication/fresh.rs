@@ -52,9 +52,8 @@ pub(crate) struct FreshOfferEvent {
     pub(crate) read_attempts: u32,
 }
 
-/// Handles shared by everything that dispatches fresh offers, so the offer
+/// Handles shared by everything that sends fresh offers, so the offer
 /// dispatcher task and the direct entry point run one pipeline.
-#[derive(Clone)]
 pub(crate) struct FreshOfferContext {
     pub(crate) p2p_node: Arc<P2PNode>,
     pub(crate) config: Arc<ReplicationConfig>,
@@ -68,16 +67,21 @@ pub(crate) struct FreshOfferContext {
     pub(crate) dispatched: Arc<AtomicU64>,
 }
 
-/// An encoded fresh offer shared by the per-peer send tasks.
+/// An encoded fresh offer and the pending-offer permit it holds.
 ///
-/// The pending-offer permit is released together with the buffer, once the
-/// last send task drops its reference, which caps how many encoded offers
-/// can wait behind the send permits at `MAX_PENDING_FRESH_OFFERS`. The bytes
-/// are shared with the transport as well: each send attempt hands out a
-/// reference-counted handle rather than a copy.
+/// Wrapped with [`Bytes::from_owner`], so the per-peer send tasks and the
+/// transport share the one buffer through reference-counted handles, and the
+/// permit is released only when the last handle anywhere is dropped. That is
+/// what caps the encoded offers alive at once at `MAX_PENDING_FRESH_OFFERS`.
 struct EncodedOffer {
-    bytes: Bytes,
+    bytes: Vec<u8>,
     _pending: OwnedSemaphorePermit,
+}
+
+impl AsRef<[u8]> for EncodedOffer {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 /// Rules 6-8: record the paid key locally and announce it to
@@ -105,14 +109,14 @@ pub(crate) async fn announce_paid_write(
 /// possession check (ADR-0003) for the responsible peers.
 ///
 /// `pending_offer` is the caller's permit from the pending-offer semaphore;
-/// it is held with the encoded offer until the last per-peer send finishes.
-/// `data` is taken by value so the chunk moves into the offer instead of
-/// being copied.
-pub(crate) async fn dispatch_fresh_offer(
+/// it is held with the encoded offer until the last handle to it is dropped.
+/// `data` and `proof_of_payment` are taken by value so they move into the
+/// offer instead of being copied.
+pub(crate) async fn send_fresh_offers(
     ctx: &FreshOfferContext,
     key: &XorName,
     data: Vec<u8>,
-    proof_of_payment: &[u8],
+    proof_of_payment: Vec<u8>,
     pending_offer: OwnedSemaphorePermit,
 ) {
     let self_id = *ctx.p2p_node.peer_id();
@@ -133,7 +137,7 @@ pub(crate) async fn dispatch_fresh_offer(
     let offer = FreshReplicationOffer {
         key: *key,
         data,
-        proof_of_payment: proof_of_payment.to_vec(),
+        proof_of_payment,
     };
     let request_id = rand::thread_rng().gen::<u64>();
     let offer_msg = ReplicationMessage {
@@ -141,11 +145,7 @@ pub(crate) async fn dispatch_fresh_offer(
         body: ReplicationMessageBody::FreshReplicationOffer(offer),
     };
 
-    let encoded = offer_msg.encode();
-    // Only the encoded bytes are needed from here on; release the chunk now
-    // rather than holding it alongside the encoding while sends are queued.
-    drop(offer_msg);
-    let Ok(encoded) = encoded else {
+    let Ok(encoded) = offer_msg.encode() else {
         warn!(
             "Failed to encode FreshReplicationOffer for {}",
             hex::encode(key),
@@ -155,13 +155,13 @@ pub(crate) async fn dispatch_fresh_offer(
     // One encoded copy serves every per-peer send task and every retry; the
     // transport borrows it through `Bytes` instead of taking a copy. The
     // pending-offer permit travels with the buffer.
-    let encoded = Arc::new(EncodedOffer {
-        bytes: Bytes::from(encoded),
+    let encoded = Bytes::from_owner(EncodedOffer {
+        bytes: encoded,
         _pending: pending_offer,
     });
     for peer in &target_peers {
         let p2p = Arc::clone(&ctx.p2p_node);
-        let offer = Arc::clone(&encoded);
+        let offer = encoded.clone();
         let peer_id = *peer;
         let sem = Arc::clone(&ctx.send_semaphore);
         tokio::spawn(async move {
@@ -179,7 +179,7 @@ pub(crate) async fn dispatch_fresh_offer(
             let mut attempt = 0u32;
             loop {
                 match p2p
-                    .send_message(&peer_id, REPLICATION_PROTOCOL_ID, offer.bytes.clone(), &[])
+                    .send_message(&peer_id, REPLICATION_PROTOCOL_ID, offer.clone(), &[])
                     .await
                 {
                     Ok(()) => break,
@@ -224,7 +224,7 @@ pub(crate) async fn dispatch_fresh_offer(
 /// Per Invariant 16: sender MUST attempt delivery to every member. The
 /// message is small metadata (no chunk data), so it is neither gated by the
 /// send semaphore nor by the pending-offer permit.
-pub(crate) async fn send_paid_notify(
+async fn send_paid_notify(
     key: &XorName,
     proof_of_payment: &[u8],
     p2p_node: &Arc<P2PNode>,
@@ -267,5 +267,31 @@ pub(crate) async fn send_paid_notify(
                 debug!("Failed to send PaidNotify to {peer_id}: {e}");
             }
         });
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    /// The permit is released with the last handle to the encoded offer, not
+    /// the first: a slice the transport still holds keeps the offer counted.
+    #[test]
+    fn the_pending_offer_permit_outlives_every_handle() {
+        let permits = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&permits)
+            .try_acquire_owned()
+            .expect("free permit");
+        let offer = Bytes::from_owner(EncodedOffer {
+            bytes: vec![7; 16],
+            _pending: permit,
+        });
+        let held_elsewhere = offer.slice(4..8);
+
+        drop(offer);
+        assert_eq!(permits.available_permits(), 0);
+        drop(held_elsewhere);
+        assert_eq!(permits.available_permits(), 1);
     }
 }

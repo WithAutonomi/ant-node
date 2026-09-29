@@ -2478,11 +2478,11 @@ impl ReplicationEngine {
         else {
             return;
         };
-        fresh::dispatch_fresh_offer(
+        fresh::send_fresh_offers(
             &self.fresh_offer_context(),
             key,
             data.to_vec(),
-            proof_of_payment,
+            proof_of_payment.to_vec(),
             pending_offer,
         )
         .await;
@@ -2645,11 +2645,11 @@ impl ReplicationEngine {
                         continue;
                     }
                 };
-                fresh::dispatch_fresh_offer(
+                fresh::send_fresh_offers(
                     &ctx,
                     &event.key,
                     data,
-                    &event.payment_proof,
+                    event.payment_proof,
                     pending_offer,
                 )
                 .await;
