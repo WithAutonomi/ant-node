@@ -79,7 +79,7 @@ use crate::replication::commitment_state::{
     PeerCommitmentRecord, PersistedRetention, ResponderCommitmentState, GOSSIP_ANSWERABILITY_TTL,
 };
 use crate::replication::config::{
-    max_parallel_fetch, storage_admission_width, ReplicationConfig, FRESH_READ_RETRY_DELAY,
+    fresh_read_retry_delay, max_parallel_fetch, storage_admission_width, ReplicationConfig,
     MAX_AUDIT_RESPONSES_PER_PEER, MAX_CONCURRENT_AUDIT_RESPONSES, MAX_CONCURRENT_REPLICATION_SENDS,
     MAX_DIGEST_AUDIT_RESPONSES_PER_PEER, MAX_FRESH_READ_ATTEMPTS, MAX_INCOMING_VERIFICATION_KEYS,
     MAX_PENDING_FRESH_OFFERS, MAX_SUBTREE_ROUND1_PER_PEER, MAX_SUBTREE_SESSIONS,
@@ -2556,10 +2556,10 @@ impl ReplicationEngine {
     ///
     /// For each forwarded write it acquires a permit, reads the chunk back
     /// from storage and dispatches the offers. A missing chunk is skipped; a
-    /// failed read is retried up to `MAX_FRESH_READ_ATTEMPTS` times with the
-    /// permit released in between, so a transient I/O fault does not lose the
-    /// write's replication. The retry waits on its own task, never on the
-    /// dispatcher.
+    /// failed read is retried up to `MAX_FRESH_READ_ATTEMPTS` times, backing
+    /// off over about a minute with the permit released in between, so a
+    /// transient I/O fault does not lose the write's replication. The retry
+    /// waits on its own task, never on the dispatcher.
     fn start_fresh_offer_dispatcher(&mut self) {
         let Some(mut rx) = self.fresh_offer_rx.take() else {
             return;
@@ -2611,19 +2611,30 @@ impl ReplicationEngine {
                             );
                             continue;
                         }
-                        warn!(
-                            "Failed to read chunk {key_hex} for fresh replication (attempt {attempts}): {e}"
-                        );
+                        // One warning per write: a store-wide fault fails the
+                        // whole backlog, once per retry.
+                        if attempts == 1 {
+                            warn!(
+                                "Failed to read chunk {key_hex} for fresh replication; will retry: {e}"
+                            );
+                        } else {
+                            debug!(
+                                "Failed to read chunk {key_hex} for fresh replication (attempt {attempts}): {e}"
+                            );
+                        }
                         // Wait on a task of its own: a read fault is often
                         // shared (exhausted descriptors), and sleeping here
                         // would hold every healthy write queued behind this
-                        // one for the whole delay, once per failed read.
+                        // one for the whole delay, once per failed read. The
+                        // delay grows, so a store-wide fault spends a write's
+                        // attempts over about a minute rather than seconds.
                         let retry_tx = offer_tx.clone();
                         let retry_shutdown = shutdown.clone();
+                        let delay = fresh_read_retry_delay(attempts);
                         retries.spawn(async move {
                             tokio::select! {
                                 () = retry_shutdown.cancelled() => {}
-                                () = tokio::time::sleep(FRESH_READ_RETRY_DELAY) => {
+                                () = tokio::time::sleep(delay) => {
                                     let _ = retry_tx.send(fresh::FreshOfferEvent {
                                         read_attempts: attempts,
                                         ..event

@@ -89,12 +89,17 @@ make the send path hand a single owned buffer down to the QUIC stream:
   read, as on any serve, so the node stops advertising it and ordinary
   repair replaces it; it is never offered. Like every serve, verification
   follows the store's `verify_on_read` setting (on by default).
-- A failed read-back is retried up to `MAX_FRESH_READ_ATTEMPTS` times,
-  `FRESH_READ_RETRY_DELAY` apart, with the permit released in between. The
-  delay runs on a task of its own, never on the dispatcher: read faults tend
-  to be shared (exhausted descriptors), and a dispatcher that slept them out
-  would hold every healthy write queued behind them. Only a chunk that is no
-  longer stored is skipped without retry.
+- A failed read-back is retried up to `MAX_FRESH_READ_ATTEMPTS` (7) times
+  with the permit released in between, the pause doubling from
+  `FRESH_READ_RETRY_DELAY` (1, 2, 4, 8, 16 and 32 s). The delay runs on a
+  task of its own, never on the dispatcher, so a chunk that alone cannot be
+  read does not hold the healthy writes queued behind it. Read faults tend
+  to be store-wide (exhausted descriptors), though, and then every queued
+  write fails together: each failure frees its permit for the next write at
+  once, so a fixed short retry window would spend the whole backlog's
+  attempts within seconds. The backoff spreads them over about a minute, and
+  a store-wide fault shorter than that costs no offers. Only a chunk that is
+  no longer stored is skipped without retry.
 - The chunk moves into the offer rather than being copied, and
   `ReplicationMessage::encode` serializes into an exactly-sized buffer. The
   chunk-carrying fields — the offer's data and proof, `PaidNotify`'s proof,
@@ -156,11 +161,15 @@ make the send path hand a single owned buffer down to the QUIC stream:
 - `MAX_PENDING_FRESH_OFFERS` and `MAX_CONCURRENT_REPLICATION_SENDS` are
   the two knobs; raising the first trades memory for burst absorption.
 - A write whose read-back fails `MAX_FRESH_READ_ATTEMPTS` times is not
-  offered, and the failed read leaves the key marked suspect, so the node
-  stops advertising it. That is self-correcting: the store clears the mark
-  on the next read that succeeds (a peer's fetch, or a duplicate PUT or
-  offer checking what it holds), and on a repair or re-put. The paid-list evidence
-  went out before the read was attempted, and the client stored the chunk
+  offered, and neither is its possession check scheduled. A store-wide
+  fault lasting longer than the retry window does this to every write
+  queued at the time. Each failed read also leaves the key marked suspect,
+  so the node stops advertising it. That is self-correcting: the store
+  clears the mark on the next read that succeeds — another holder's
+  possession probe, a late duplicate offer or client PUT checking what it
+  holds, a client GET, or this node's own neighbor sync re-fetching a key it
+  no longer claims — and on a repair or re-put. The paid-list evidence went
+  out before the read was attempted, and the client stored the chunk
   directly on a majority of the close group, each of which fans it out, so
   one node's lost offers cost a replica for a while, not the data.
 - The signing step still serializes the payload once to produce the signed
