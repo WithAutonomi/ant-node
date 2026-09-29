@@ -85,7 +85,8 @@ rmp-serde = "1"
 hex = "0.4"
 
 # Utilities
-bytes = "1"
+# 1.10.1: `Bytes::from_owner` (1.9) without its `to_vec` leak (fixed in 1.10.1).
+bytes = "1.10.1"
 chrono = { version = "0.4", features = ["serde"] }
 tempfile = "3"
 rand = "0.8"
