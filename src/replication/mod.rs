@@ -2532,7 +2532,8 @@ impl ReplicationEngine {
     /// from storage and dispatches the offers. A missing chunk is skipped; a
     /// failed read is retried up to `MAX_FRESH_READ_ATTEMPTS` times with the
     /// permit released in between, so a transient I/O fault does not lose the
-    /// write's replication.
+    /// write's replication. The retry waits on its own task, never on the
+    /// dispatcher.
     fn start_fresh_offer_dispatcher(&mut self) {
         let Some(mut rx) = self.fresh_offer_rx.take() else {
             return;
@@ -2542,6 +2543,7 @@ impl ReplicationEngine {
         let offer_tx = self.fresh_offer_tx.clone();
         let ctx = self.fresh_offer_context();
         let shutdown = self.shutdown.clone();
+        let retries = self.detached_task_tracker.clone();
 
         let handle = tokio::spawn(async move {
             loop {
@@ -2586,13 +2588,22 @@ impl ReplicationEngine {
                         warn!(
                             "Failed to read chunk {key_hex} for fresh replication (attempt {attempts}): {e}"
                         );
-                        tokio::select! {
-                            () = shutdown.cancelled() => break,
-                            () = tokio::time::sleep(FRESH_READ_RETRY_DELAY) => {}
-                        }
-                        let _ = offer_tx.send(fresh::FreshOfferEvent {
-                            read_attempts: attempts,
-                            ..event
+                        // Wait on a task of its own: a read fault is often
+                        // shared (exhausted descriptors), and sleeping here
+                        // would hold every healthy write queued behind this
+                        // one for the whole delay, once per failed read.
+                        let retry_tx = offer_tx.clone();
+                        let retry_shutdown = shutdown.clone();
+                        retries.spawn(async move {
+                            tokio::select! {
+                                () = retry_shutdown.cancelled() => {}
+                                () = tokio::time::sleep(FRESH_READ_RETRY_DELAY) => {
+                                    let _ = retry_tx.send(fresh::FreshOfferEvent {
+                                        read_attempts: attempts,
+                                        ..event
+                                    });
+                                }
+                            }
                         });
                         continue;
                     }
