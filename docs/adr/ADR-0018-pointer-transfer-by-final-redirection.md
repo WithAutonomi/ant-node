@@ -6,7 +6,7 @@
 - **Reviewers:** TBD
 - **Supersedes:** none. Amends ADR-0016's merge rule at the final counter.
 - **Superseded by:** none
-- **Related:** ADR-0016 (pointers), ADR-0005 (repair quorum); WithAutonomi/ant-protocol `feat/pointer-ownership-transfer`, WithAutonomi/ant-client `feat/pointer-ownership-transfer`
+- **Related:** ADR-0016 (pointers), ADR-0005 (repair quorum); V2-1354; WithAutonomi/ant-protocol#40, WithAutonomi/ant-node#239, WithAutonomi/ant-client#210
 
 ## Context
 
