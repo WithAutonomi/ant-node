@@ -17,6 +17,7 @@
 
 use std::collections::BTreeSet;
 
+use ant_node::pointer::store::{PointerStore, PutOutcome};
 use ant_protocol::pointer::{Pointer, PointerTarget, PointerTargetKind};
 use proptest::prelude::*;
 use saorsa_pqc::api::sig::{
@@ -444,8 +445,6 @@ fn the_wire_format_is_what_the_adr_says() {
 /// layer does, which is where the cost would actually have been paid.
 #[tokio::test]
 async fn sixty_four_signatures_buy_exactly_one_write() {
-    use ant_node::pointer::store::{PointerStore, PutOutcome};
-
     let dir = tempfile::tempdir().expect("tempdir");
     let store = PointerStore::new(dir.path()).await.expect("open store");
 
@@ -596,10 +595,6 @@ fn a_final_state_is_out_ranked_by_nothing() {
 /// would have let displace it.
 #[tokio::test]
 async fn a_stored_transfer_cannot_be_taken_back() {
-    use ant_node::pointer::store::{PointerStore, PutOutcome};
-    use ant_protocol::pointer::PointerTarget;
-    use saorsa_pqc::api::sig::ml_dsa_65;
-
     let dir = tempfile::tempdir().expect("tempdir");
     let store = PointerStore::new(dir.path()).await.expect("store");
 
