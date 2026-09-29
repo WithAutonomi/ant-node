@@ -102,7 +102,7 @@ const SMALL_STABILIZATION_TIMEOUT_SECS: u64 = 60;
 /// conservative; the happy path completes in well under a second on
 /// loopback, so the larger budget only shows up on flakes. Test-only —
 /// no production code path reads this constant.
-const DEFAULT_CHUNK_OPERATION_TIMEOUT_SECS: u64 = 90;
+pub const DEFAULT_CHUNK_OPERATION_TIMEOUT_SECS: u64 = 90;
 
 /// Short node-level network timeout for E2E test harness.
 ///

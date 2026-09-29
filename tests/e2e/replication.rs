@@ -5,15 +5,15 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use super::testnet::TestNetworkConfig;
+use super::testnet::{TestNetworkConfig, DEFAULT_CHUNK_OPERATION_TIMEOUT_SECS};
 use super::TestHarness;
 use ant_node::ant_protocol::{ChunkMessage, ChunkMessageBody, ChunkPutRequest, ChunkPutResponse};
 use ant_node::client::compute_address;
 use ant_node::replication::audit_coordinator::AuditChallengeCoordinator;
 use ant_node::replication::commitment_state::{BuiltCommitment, ResponderCommitmentState};
 use ant_node::replication::config::{
-    storage_admission_width, FRESH_READ_RETRY_DELAY, K_BUCKET_SIZE, MAX_FRESH_READ_ATTEMPTS,
-    MAX_PENDING_FRESH_OFFERS, REPLICATION_PROTOCOL_ID,
+    storage_admission_width, FRESH_READ_RETRY_DELAY, K_BUCKET_SIZE, MAX_PENDING_FRESH_OFFERS,
+    REPLICATION_PROTOCOL_ID,
 };
 use ant_node::replication::fresh::FreshWriteEvent;
 use ant_node::replication::protocol::{
@@ -419,7 +419,8 @@ async fn fresh_write_pipeline_holds_a_burst_at_the_offer_budget() {
 
 /// Retry: a chunk whose read-back fails is retried after
 /// `FRESH_READ_RETRY_DELAY` without holding its permit or the dispatcher. A
-/// healthy write queued behind it is offered well inside the delay, and once
+/// healthy write queued behind it is offered within half the delay of the
+/// failed read, which a dispatcher sleeping the delay out cannot do, and once
 /// the fault clears the failed write is offered too. The fault is a directory
 /// standing where the chunk file should be, which the store refuses to read
 /// whatever the platform or user.
@@ -444,6 +445,13 @@ async fn fresh_write_pipeline_retries_a_failed_read_off_the_dispatcher() {
         b"chunk whose first read-back fails",
     )
     .await;
+    // Stored up front, so queueing it later takes no time out of the window.
+    let healthy = store_paid_chunk(
+        &harness,
+        FRESH_PIPELINE_SOURCE_INDEX,
+        b"healthy write queued behind a failed read",
+    )
+    .await;
 
     let chunk_file = chunk_file_path(storage.root_dir(), &faulty).expect("chunk file on disk");
     let set_aside = chunk_file.with_extension(FAULT_SET_ASIDE_EXTENSION);
@@ -458,40 +466,44 @@ async fn fresh_write_pipeline_retries_a_failed_read_off_the_dispatcher() {
         .expect("queue write");
     // A failed read marks the chunk suspect, which hides it from `exists`:
     // the observable proof that the dispatcher's first attempt hit the fault.
+    // Polled finely, so the window below starts within a poll of the fault.
     assert!(
-        wait_until(
+        wait_until_every(
             || !storage.exists(&faulty).unwrap_or(true),
-            PROPAGATION_TIMEOUT
+            PROPAGATION_TIMEOUT,
+            DISPATCH_POLL_INTERVAL
         )
         .await,
         "the dispatcher never attempted the faulty read"
     );
+    let fault_seen = tokio::time::Instant::now();
     assert!(
-        wait_until(
+        wait_until_every(
             || engine.pending_offer_permits_available() == MAX_PENDING_FRESH_OFFERS,
-            PERMIT_RELEASE_TIMEOUT
+            PERMIT_RELEASE_TIMEOUT,
+            DISPATCH_POLL_INTERVAL
         )
         .await,
         "the failed read kept its pending-offer permit while waiting to retry"
     );
 
     // A dispatcher sleeping out the retry delay would hold this write until
-    // the delay ended; one that is not offers it straight away.
-    put_paid_chunk(
-        &harness,
-        FRESH_PIPELINE_SOURCE_INDEX,
-        b"healthy write queued behind a failed read",
-    )
-    .await;
-    let offered_in_time = tokio::time::timeout(FRESH_READ_RETRY_DELAY / 2, async {
-        while engine.fresh_offers_dispatched() == 0 {
-            tokio::time::sleep(DISPATCH_POLL_INTERVAL).await;
-        }
-    })
-    .await
-    .is_ok();
+    // the delay ended; one that is not offers it straight away. The window is
+    // half the delay, counted from the failed read.
+    fresh_tx
+        .send(FreshWriteEvent {
+            key: healthy,
+            payment_proof: dummy_payment_proof(),
+        })
+        .expect("queue healthy write");
+    let window = (FRESH_READ_RETRY_DELAY / 2).saturating_sub(fault_seen.elapsed());
     assert!(
-        offered_in_time,
+        wait_until_every(
+            || engine.fresh_offers_dispatched() > 0,
+            window,
+            DISPATCH_POLL_INTERVAL
+        )
+        .await,
         "a healthy write waited behind the failed read's retry delay"
     );
 
@@ -500,7 +512,7 @@ async fn fresh_write_pipeline_retries_a_failed_read_off_the_dispatcher() {
     assert!(
         wait_until(
             || engine.fresh_offers_dispatched() == 2,
-            FRESH_READ_RETRY_DELAY * MAX_FRESH_READ_ATTEMPTS + PROPAGATION_TIMEOUT
+            FRESH_READ_RETRY_DELAY + PROPAGATION_TIMEOUT
         )
         .await,
         "the failed write was not offered once its read succeeded"
@@ -525,8 +537,8 @@ async fn fresh_write_pipeline_retries_a_failed_read_off_the_dispatcher() {
 
 /// A chunk whose bytes rotted on disk after it was stored is never offered:
 /// every receiver would reject it and charge the sender. The read-back
-/// verifies the chunk, quarantines it on the mismatch, and the retry finds it
-/// gone and skips it.
+/// verifies the chunk and quarantines it on the mismatch, and nothing is
+/// offered for it by the time its first retry is due.
 #[tokio::test]
 #[serial]
 async fn fresh_write_pipeline_never_offers_a_corrupt_chunk() {
@@ -564,7 +576,7 @@ async fn fresh_write_pipeline_never_offers_a_corrupt_chunk() {
         .await,
         "the read-back never quarantined the corrupt chunk"
     );
-    // Long enough for the retry to have run and skipped the vanished chunk.
+    // Past the first retry, which must not offer anything either.
     tokio::time::sleep(FRESH_READ_RETRY_DELAY + FRESH_BURST_SETTLE).await;
     assert_eq!(
         engine.fresh_offers_dispatched(),
@@ -630,16 +642,20 @@ async fn put_paid_chunk(harness: &TestHarness, source_idx: usize, content: &[u8]
             dummy_payment_proof(),
         )),
     };
-    let response = harness
+    let protocol = harness
         .test_node(source_idx)
         .expect("source node")
         .ant_protocol
         .as_ref()
-        .expect("protocol")
-        .try_handle_request(&request.encode().expect("encode PUT"))
-        .await
-        .expect("handle PUT")
-        .expect("PUT response");
+        .expect("protocol");
+    let response = tokio::time::timeout(
+        Duration::from_secs(DEFAULT_CHUNK_OPERATION_TIMEOUT_SECS),
+        protocol.try_handle_request(&request.encode().expect("encode PUT")),
+    )
+    .await
+    .expect("PUT through the handler timed out")
+    .expect("handle PUT")
+    .expect("PUT response");
     match ChunkMessage::decode(&response)
         .expect("decode PUT response")
         .body
@@ -691,13 +707,22 @@ async fn wait_until_replicated(
 
 /// Poll `condition` every `PROPAGATION_POLL_INTERVAL` until it holds or
 /// `budget` runs out.
-async fn wait_until(mut condition: impl FnMut() -> bool, budget: Duration) -> bool {
+async fn wait_until(condition: impl FnMut() -> bool, budget: Duration) -> bool {
+    wait_until_every(condition, budget, PROPAGATION_POLL_INTERVAL).await
+}
+
+/// Poll `condition` every `interval` until it holds or `budget` runs out.
+async fn wait_until_every(
+    mut condition: impl FnMut() -> bool,
+    budget: Duration,
+    interval: Duration,
+) -> bool {
     let deadline = tokio::time::Instant::now() + budget;
     while tokio::time::Instant::now() < deadline {
         if condition() {
             return true;
         }
-        tokio::time::sleep(PROPAGATION_POLL_INTERVAL).await;
+        tokio::time::sleep(interval).await;
     }
     false
 }
