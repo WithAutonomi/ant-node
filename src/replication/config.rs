@@ -176,7 +176,7 @@ pub const MAX_CONCURRENT_REPLICATION_SENDS: usize = 3;
 /// that buffer stays alive until the last of its per-peer sends completes.
 /// With only `MAX_CONCURRENT_REPLICATION_SENDS` transfers in flight, a write
 /// rate above the network's send rate would otherwise queue an unbounded
-/// number of encoded offers behind the send permits. The fresh-write drainer
+/// number of encoded offers behind the send permits. The offer dispatcher
 /// takes one of these permits before it reads and encodes a chunk, so the
 /// backlog waits as small queued events instead of chunk-sized buffers.
 pub const MAX_PENDING_FRESH_OFFERS: usize = 8;
