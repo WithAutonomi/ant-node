@@ -1622,7 +1622,7 @@ impl FileStore {
     }
 
     /// Absolute path of a chunk file.
-    fn chunk_path(&self, address: &XorName) -> PathBuf {
+    pub(crate) fn chunk_path(&self, address: &XorName) -> PathBuf {
         self.chunks_dir
             .join(shard_name(address))
             .join(hex::encode(address))

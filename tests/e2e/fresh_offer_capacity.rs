@@ -93,13 +93,7 @@ async fn normal_upload_never_reaches_fresh_offer_capacity() {
     // Every node must accept the offers without an on-chain proof; Anvil is not
     // running in this suite.
     for (_, address) in &chunks {
-        for index in 0..harness.node_count() {
-            if let Some(node) = harness.test_node(index) {
-                if let Some(protocol) = node.ant_protocol.as_ref() {
-                    protocol.payment_verifier().cache_insert(*address);
-                }
-            }
-        }
+        harness.prepopulate_payment_cache_everywhere(address);
     }
 
     let source = harness.test_node(UPLOAD_SOURCE_INDEX).expect("source node");

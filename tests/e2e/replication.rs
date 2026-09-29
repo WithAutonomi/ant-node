@@ -24,7 +24,6 @@ use ant_node::replication::protocol::{
 use ant_node::replication::pruning;
 use ant_node::replication::scheduling::ReplicationQueues;
 use ant_node::replication::types::{NeighborSyncState, RepairProofs};
-use ant_node::storage::file_store::CHUNKS_DIR_NAME;
 use ant_node::storage::XorName;
 use ant_node::ReplicationConfig;
 use bytes::Bytes;
@@ -33,7 +32,6 @@ use saorsa_core::{P2PNode, TrustEvent};
 use serial_test::serial;
 use std::collections::HashSet;
 use std::fs;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -56,8 +54,8 @@ const FULL_NODE_SHUN_POSSESSION_DELAY_MAX: Duration = Duration::from_millis(500)
 const DUMMY_PAYMENT_PROOF_LEN: usize = 64;
 /// Dummy proof byte used when a test only needs to reach pre-payment gates.
 const DUMMY_PAYMENT_PROOF_BYTE: u8 = 0x01;
-/// First regular (non-bootstrap) node of the minimal harness; source of the
-/// fresh-write pipeline tests.
+/// A regular (non-bootstrap) node of the minimal harness; source of the fresh
+/// replication tests.
 const FRESH_PIPELINE_SOURCE_INDEX: usize = 3;
 /// Writes queued at once by the saturation test: three times the pending-offer
 /// budget, so the dispatcher must block on and recycle permits to drain it.
@@ -228,56 +226,19 @@ async fn test_fresh_replication_propagates_to_close_group() {
     let harness = TestHarness::setup_minimal().await.expect("setup");
     harness.warmup_dht().await.expect("warmup");
 
-    // Pick a non-bootstrap node with replication engine
-    let source_idx = 3; // first regular node
-    let source = harness.test_node(source_idx).expect("source node");
-    let source_protocol = source.ant_protocol.as_ref().expect("protocol");
-    let source_storage = source_protocol.storage();
-
-    // Create and store a chunk
+    let source_idx = FRESH_PIPELINE_SOURCE_INDEX;
     let content = b"hello replication world";
-    let address = compute_address(content);
-    source_storage.put(&address, content).await.expect("put");
+    // Paid on every node, so receivers accept the offer without Anvil.
+    let address = store_paid_chunk(&harness, source_idx, content).await;
+    harness
+        .test_node(source_idx)
+        .and_then(|node| node.replication_engine.as_ref())
+        .expect("source replication engine")
+        .replicate_fresh(&address, content, &dummy_payment_proof())
+        .await;
 
-    // Pre-populate payment cache on ALL nodes so receivers accept the offer
-    // (bypasses EVM verification, which is unavailable without Anvil).
-    for i in 0..harness.node_count() {
-        if let Some(node) = harness.test_node(i) {
-            if let Some(protocol) = &node.ant_protocol {
-                protocol.payment_verifier().cache_insert(address);
-            }
-        }
-    }
-
-    // Trigger fresh replication with a dummy PoP
-    let dummy_pop = [0x01u8; 64];
-    if let Some(ref engine) = source.replication_engine {
-        engine.replicate_fresh(&address, content, &dummy_pop).await;
-    }
-
-    // Poll until replication propagates (or timeout).
-    let deadline = tokio::time::Instant::now() + PROPAGATION_TIMEOUT;
-    let mut found_on_other = false;
-    while tokio::time::Instant::now() < deadline {
-        for i in 0..harness.node_count() {
-            if i == source_idx {
-                continue;
-            }
-            if let Some(node) = harness.test_node(i) {
-                if let Some(protocol) = &node.ant_protocol {
-                    if protocol.storage().exists(&address).unwrap_or(false) {
-                        found_on_other = true;
-                    }
-                }
-            }
-        }
-        if found_on_other {
-            break;
-        }
-        tokio::time::sleep(PROPAGATION_POLL_INTERVAL).await;
-    }
     assert!(
-        found_on_other,
+        wait_until_replicated(&harness, source_idx, &address, PROPAGATION_TIMEOUT).await,
         "Chunk should have replicated to at least one other node"
     );
 
@@ -453,7 +414,8 @@ async fn fresh_write_pipeline_retries_a_failed_read_off_the_dispatcher() {
     )
     .await;
 
-    let chunk_file = chunk_file_path(storage.root_dir(), &faulty).expect("chunk file on disk");
+    let chunk_file = storage.test_chunk_path(&faulty);
+    assert!(chunk_file.is_file(), "chunk file on disk");
     let set_aside = chunk_file.with_extension(FAULT_SET_ASIDE_EXTENSION);
     fs::rename(&chunk_file, &set_aside).expect("move the chunk file aside");
     fs::create_dir(&chunk_file).expect("put a directory in its place");
@@ -557,7 +519,8 @@ async fn fresh_write_pipeline_never_offers_a_corrupt_chunk() {
     let content = b"chunk that rots on disk before its offer";
     let address = store_paid_chunk(&harness, FRESH_PIPELINE_SOURCE_INDEX, content).await;
 
-    let chunk_file = chunk_file_path(storage.root_dir(), &address).expect("chunk file on disk");
+    let chunk_file = storage.test_chunk_path(&address);
+    assert!(chunk_file.is_file(), "chunk file on disk");
     let mut rotted = content.to_vec();
     rotted.reverse();
     fs::write(&chunk_file, &rotted).expect("corrupt the chunk file");
@@ -569,11 +532,7 @@ async fn fresh_write_pipeline_never_offers_a_corrupt_chunk() {
         })
         .expect("queue write");
     assert!(
-        wait_until(
-            || chunk_file_path(storage.root_dir(), &address).is_none(),
-            PROPAGATION_TIMEOUT
-        )
-        .await,
+        wait_until(|| !chunk_file.is_file(), PROPAGATION_TIMEOUT).await,
         "the read-back never quarantined the corrupt chunk"
     );
     // Past the first retry, which must not offer anything either.
@@ -597,19 +556,6 @@ fn dummy_payment_proof() -> Vec<u8> {
     vec![DUMMY_PAYMENT_PROOF_BYTE; DUMMY_PAYMENT_PROOF_LEN]
 }
 
-/// Pre-populate the payment cache on every node, so the source's handler and
-/// the receivers of its offers accept a dummy proof for `address`.
-fn cache_payment_everywhere(harness: &TestHarness, address: &XorName) {
-    for i in 0..harness.node_count() {
-        if let Some(protocol) = harness
-            .test_node(i)
-            .and_then(|node| node.ant_protocol.as_ref())
-        {
-            protocol.payment_verifier().cache_insert(*address);
-        }
-    }
-}
-
 /// Store a chunk on the source directly, bypassing the handler, so no
 /// fresh-write event is emitted for it.
 async fn store_paid_chunk(harness: &TestHarness, source_idx: usize, content: &[u8]) -> XorName {
@@ -624,7 +570,7 @@ async fn store_paid_chunk(harness: &TestHarness, source_idx: usize, content: &[u
         .put(&address, content)
         .await
         .expect("put");
-    cache_payment_everywhere(harness, &address);
+    harness.prepopulate_payment_cache_everywhere(&address);
     address
 }
 
@@ -633,7 +579,7 @@ async fn store_paid_chunk(harness: &TestHarness, source_idx: usize, content: &[u
 /// dummy proof it was paid with.
 async fn put_paid_chunk(harness: &TestHarness, source_idx: usize, content: &[u8]) -> XorName {
     let address = compute_address(content);
-    cache_payment_everywhere(harness, &address);
+    harness.prepopulate_payment_cache_everywhere(&address);
     let request = ChunkMessage {
         request_id: rand::random(),
         body: ChunkMessageBody::PutRequest(ChunkPutRequest::with_payment(
@@ -725,17 +671,6 @@ async fn wait_until_every(
         tokio::time::sleep(interval).await;
     }
     false
-}
-
-/// On-disk file of a stored chunk: the store shards `root/chunks/` into
-/// subdirectories, so look through them for the file named after the address.
-fn chunk_file_path(root_dir: &Path, address: &XorName) -> Option<PathBuf> {
-    let file_name = hex::encode(address);
-    fs::read_dir(root_dir.join(CHUNKS_DIR_NAME))
-        .ok()?
-        .filter_map(Result::ok)
-        .map(|shard| shard.path().join(&file_name))
-        .find(|candidate| candidate.is_file())
 }
 
 /// ADR-0003: the delayed possession check penalises a responsible peer that
@@ -916,7 +851,7 @@ async fn possession_scheduler_penalises_absent_close_peer_after_delay() {
 
     // Trigger fresh replication; the engine enqueues the possession check, which
     // fires ~200-500 ms later and penalises the absent close peers.
-    let dummy_pop = [0x01u8; 64];
+    let dummy_pop = dummy_payment_proof();
     engine_a
         .replicate_fresh(&address, content, &dummy_pop)
         .await;
@@ -1008,20 +943,13 @@ async fn full_close_group_node_rejects_replica_and_is_penalised_as_absent() {
     let (content, address) =
         candidate.expect("find key where full node is a responsible close-group peer");
 
-    for idx in 0..harness.node_count() {
-        if let Some(protocol) = harness
-            .test_node(idx)
-            .and_then(|node| node.ant_protocol.as_ref())
-        {
-            protocol.payment_verifier().cache_insert(address);
-        }
-    }
+    harness.prepopulate_payment_cache_everywhere(&address);
 
-    let dummy_payment_proof = vec![DUMMY_PAYMENT_PROOF_BYTE; DUMMY_PAYMENT_PROOF_LEN];
+    let dummy_proof = dummy_payment_proof();
     let offer = FreshReplicationOffer {
         key: address,
         data: content.clone(),
-        proof_of_payment: dummy_payment_proof.clone(),
+        proof_of_payment: dummy_proof.clone(),
     };
     let response = send_replication_request(
         checker_p2p,
@@ -1077,7 +1005,7 @@ async fn full_close_group_node_rejects_replica_and_is_penalised_as_absent() {
 
     let trust_before = checker_p2p.peer_trust(&full_peer);
     checker_engine
-        .replicate_fresh(&address, &content, &dummy_payment_proof)
+        .replicate_fresh(&address, &content, &dummy_proof)
         .await;
 
     let deadline = tokio::time::Instant::now() + PROPAGATION_TIMEOUT;
@@ -2289,7 +2217,7 @@ async fn test_fresh_offer_with_mismatched_content_address_rejected() {
     let offer = FreshReplicationOffer {
         key: wrong_address,
         data: content.to_vec(),
-        proof_of_payment: vec![0x01; 64],
+        proof_of_payment: dummy_payment_proof(),
     };
     let msg = ReplicationMessage {
         request_id: 1001,
@@ -2515,16 +2443,10 @@ async fn scenario_1_and_24_fresh_replication_stores_and_propagates_paid_list() {
 
     // Pre-populate payment cache on ALL nodes so receivers accept the offer
     // (bypasses EVM verification, which is unavailable without Anvil).
-    for i in 0..harness.node_count() {
-        if let Some(node) = harness.test_node(i) {
-            if let Some(p) = &node.ant_protocol {
-                p.payment_verifier().cache_insert(address);
-            }
-        }
-    }
+    harness.prepopulate_payment_cache_everywhere(&address);
 
     // Trigger fresh replication (sends FreshReplicationOffer + PaidNotify)
-    let dummy_pop = [0x01u8; 64];
+    let dummy_pop = dummy_payment_proof();
     if let Some(ref engine) = source.replication_engine {
         engine.replicate_fresh(&address, content, &dummy_pop).await;
     }
@@ -3077,16 +2999,10 @@ async fn scenario_24_fresh_replication_propagates_paid_notify() {
 
     // Pre-populate payment cache on ALL nodes so receivers accept the offer
     // and PaidNotify (bypasses EVM verification, unavailable without Anvil).
-    for i in 0..harness.node_count() {
-        if let Some(node) = harness.test_node(i) {
-            if let Some(p) = &node.ant_protocol {
-                p.payment_verifier().cache_insert(address);
-            }
-        }
-    }
+    harness.prepopulate_payment_cache_everywhere(&address);
 
     // Trigger fresh replication (includes PaidNotify to PaidCloseGroup)
-    let dummy_pop = [0x01u8; 64];
+    let dummy_pop = dummy_payment_proof();
     if let Some(ref engine) = source.replication_engine {
         engine.replicate_fresh(&address, content, &dummy_pop).await;
     }
@@ -3265,14 +3181,7 @@ async fn scenario_26_paid_list_majority_repairs_missing_replica_below_storage_qu
         .await
         .expect("put source record");
 
-    for idx in 0..harness.node_count() {
-        if let Some(protocol) = harness
-            .test_node(idx)
-            .and_then(|node| node.ant_protocol.as_ref())
-        {
-            protocol.payment_verifier().cache_insert(address);
-        }
-    }
+    harness.prepopulate_payment_cache_everywhere(&address);
 
     for idx in 0..PAID_REPAIR_CONFIRMING_NODES {
         let engine = harness
@@ -3511,17 +3420,11 @@ async fn test_late_joiner_replicates_responsible_chunks() {
     }
 
     for (address, _) in &chunks {
-        for i in 0..harness.node_count() {
-            if let Some(node) = harness.test_node(i) {
-                if let Some(protocol) = &node.ant_protocol {
-                    protocol.payment_verifier().cache_insert(*address);
-                }
-            }
-        }
+        harness.prepopulate_payment_cache_everywhere(address);
     }
 
     // Trigger fresh replication for each chunk so they spread to close groups.
-    let dummy_pop = [0x01u8; 64];
+    let dummy_pop = dummy_payment_proof();
     {
         let source = harness.test_node(source_idx).expect("source node");
         if let Some(ref engine) = source.replication_engine {
