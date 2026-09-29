@@ -2462,7 +2462,12 @@ fn open_regular(path: &Path) -> Result<Option<File>> {
 /// during an ordinary GET or an audit response.
 fn read_bounded(file: File, path: &Path) -> Result<Vec<u8>> {
     let ceiling = MAX_CHUNK_SIZE as u64;
-    let mut buf = Vec::new();
+    // Sized from the file, so a chunk lands in an exactly-sized buffer: grown from
+    // empty, a full chunk ended in twice its size, held for as long as the bytes are
+    // served or offered. Capped at the ceiling, so a planted oversized file still
+    // cannot make this allocate more than a chunk up front.
+    let expected = file.metadata().map_or(0, |m| m.len()).min(ceiling);
+    let mut buf = Vec::with_capacity(usize::try_from(expected).unwrap_or(0));
     let read = file.take(ceiling + 1).read_to_end(&mut buf).map_err(|e| {
         Error::Storage(format!("Failed to read chunk file {}: {e}", path.display()))
     })?;
@@ -3187,6 +3192,21 @@ mod tests {
 
         let raw = store.get_raw(&addr).await.expect("get_raw").expect("bytes");
         assert_eq!(raw, b"tampered");
+    }
+
+    /// A full-size chunk reads into an exactly-sized buffer, verified or raw.
+    #[tokio::test]
+    async fn reads_allocate_exactly_the_chunk() {
+        let (store, _dir) = test_store().await;
+        let content: Vec<u8> = (0..=u8::MAX).cycle().take(MAX_CHUNK_SIZE).collect();
+        let addr = crate::client::compute_address(&content);
+        store.put(&addr, &content).await.expect("put");
+
+        let verified = store.get(&addr).await.expect("get").expect("bytes");
+        assert_eq!(verified, content);
+        assert_eq!(verified.capacity(), MAX_CHUNK_SIZE);
+        let raw = store.get_raw(&addr).await.expect("get_raw").expect("bytes");
+        assert_eq!(raw.capacity(), MAX_CHUNK_SIZE);
     }
 
     /// A put whose caller goes away does not admit a key on bytes nothing has read.
