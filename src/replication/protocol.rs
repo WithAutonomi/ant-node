@@ -10,6 +10,7 @@ use saorsa_core::identity::PeerId;
 use serde::{Deserialize, Serialize};
 
 use crate::ant_protocol::XorName;
+use crate::codec::{encode_exact, ExactEncodeError};
 
 use super::types::AuditFailureReason;
 
@@ -46,21 +47,6 @@ impl ReplicationMessage {
     /// Returns [`ReplicationProtocolError::SerializationFailed`] if postcard
     /// serialization fails.
     pub fn encode(&self) -> Result<Vec<u8>, ReplicationProtocolError> {
-        // Size the buffer exactly up front. Chunk-carrying bodies run to
-        // several MiB, and a growing `Vec` would otherwise end up with up to
-        // twice the needed capacity, retained for as long as the encoded
-        // message is queued for sending.
-        let size = postcard::experimental::serialized_size(self)
-            .map_err(|e| ReplicationProtocolError::SerializationFailed(e.to_string()))?;
-        // The size is known before anything is allocated, so an oversized body
-        // is refused without serializing it first.
-        let max_size = ceiling_for(family_of_variant(self.body.variant_index()));
-        if size > max_size {
-            return Err(ReplicationProtocolError::MessageTooLarge { size, max_size });
-        }
-        let bytes = postcard::to_extend(self, Vec::with_capacity(size))
-            .map_err(|e| ReplicationProtocolError::SerializationFailed(e.to_string()))?;
-
         // The same family ceiling the decoder applies, from the same table and
         // with the same arms, including the unclassified case. Every receiver
         // drops a subtree-audit body over that ceiling before decoding it, so
@@ -78,6 +64,22 @@ impl ReplicationMessage {
         // the largest is a round-1 proof at the commitment
         // key-count cap, pinned under it with headroom by
         // `max_round1_proof_fits_the_audit_family_ceiling`.
+        //
+        // The buffer is sized exactly, and an oversized body is refused
+        // before anything is allocated. Chunk-carrying bodies run to several
+        // MiB and are held while they are sent.
+        let max_size = ceiling_for(family_of_variant(self.body.variant_index()));
+        let bytes = encode_exact(self, max_size).map_err(|e| match e {
+            ExactEncodeError::Serialize(e) => {
+                ReplicationProtocolError::SerializationFailed(e.to_string())
+            }
+            ExactEncodeError::TooLarge { size, limit } => {
+                ReplicationProtocolError::MessageTooLarge {
+                    size,
+                    max_size: limit,
+                }
+            }
+        })?;
 
         // V2-623: cumulative per-variant tx accounting. Every replication send
         // funnels through here, so this is the single tx choke point.
