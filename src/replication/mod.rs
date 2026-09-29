@@ -1751,6 +1751,8 @@ pub struct ReplicationEngine {
     /// Bounds how many encoded fresh offers can wait behind `send_semaphore`;
     /// see [`MAX_PENDING_FRESH_OFFERS`].
     pending_offer_semaphore: Arc<Semaphore>,
+    /// Fresh offers encoded and handed to their per-peer sends.
+    fresh_offers_dispatched: Arc<AtomicU64>,
     /// Bounds concurrent IN-FLIGHT LIGHT audit-responder tasks (responsible-chunk
     /// audits + subtree slice round 2). The heavy subtree round 1 has its own
     /// tighter pool ([`SubtreeRound1Limiter`]). Those are spawned off the serial
@@ -1928,6 +1930,7 @@ impl ReplicationEngine {
             sig_verify_attempts: Arc::new(RwLock::new(HashMap::new())),
             send_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_REPLICATION_SENDS)),
             pending_offer_semaphore: Arc::new(Semaphore::new(MAX_PENDING_FRESH_OFFERS)),
+            fresh_offers_dispatched: Arc::new(AtomicU64::new(0)),
             audit_responder_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_AUDIT_RESPONSES)),
             audit_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
             audit_responder_metrics: Arc::new(AuditResponderMetrics::default()),
@@ -2267,6 +2270,28 @@ impl ReplicationEngine {
         self.pending_offer_semaphore.available_permits()
     }
 
+    /// Test-only: fresh offers encoded and handed to their per-peer sends
+    /// since the engine was created. A write skipped because its chunk is gone
+    /// is not counted.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn fresh_offers_dispatched(&self) -> u64 {
+        self.fresh_offers_dispatched.load(Ordering::Relaxed)
+    }
+
+    /// Test-only: take every outbound replication send permit. Until the
+    /// returned permit is dropped, encoded fresh offers wait behind the send
+    /// stage, so a test can fill the pending-offer budget deterministically.
+    /// `None` only if the engine is shutting down.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn hold_replication_sends(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let all = u32::try_from(MAX_CONCURRENT_REPLICATION_SENDS).ok()?;
+        Arc::clone(&self.send_semaphore)
+            .acquire_many_owned(all)
+            .await
+            .ok()
+    }
+
     /// Start all background tasks.
     ///
     /// `dht_events` must be subscribed **before** `P2PNode::start()` so that
@@ -2470,6 +2495,7 @@ impl ReplicationEngine {
             config: Arc::clone(&self.config),
             send_semaphore: Arc::clone(&self.send_semaphore),
             possession_check_tx: self.possession_check_tx.clone(),
+            dispatched: Arc::clone(&self.fresh_offers_dispatched),
         }
     }
 
