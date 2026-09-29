@@ -8,6 +8,7 @@
 //!    bounded by the pending-offer permits so a write burst cannot pile up
 //!    chunk-sized buffers.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::logging::{debug, warn};
@@ -62,6 +63,9 @@ pub(crate) struct FreshOfferContext {
     /// Delayed possession checks (ADR-0003) are scheduled here once an
     /// offer's sends are dispatched.
     pub(crate) possession_check_tx: mpsc::UnboundedSender<PossessionCheckEvent>,
+    /// Offers encoded and handed to at least one per-peer send, so tests can
+    /// tell a write that went out from one lost to back-pressure.
+    pub(crate) dispatched: Arc<AtomicU64>,
 }
 
 /// An encoded fresh offer shared by the per-peer send tasks.
@@ -207,6 +211,7 @@ pub(crate) async fn dispatch_fresh_offer(
     // Schedule the delayed possession check (ADR-0003) for the responsible
     // close-group peers. A closed receiver (engine shutting down) is ignored.
     if !target_peers.is_empty() {
+        ctx.dispatched.fetch_add(1, Ordering::Relaxed);
         let _ = ctx.possession_check_tx.send(PossessionCheckEvent {
             key: *key,
             peers: target_peers,

@@ -441,9 +441,10 @@ pub struct TestNode {
     /// Shutdown token for the replication engine.
     pub replication_shutdown: Option<CancellationToken>,
 
-    /// Sender feeding the replication engine's fresh-write pipeline, kept so
-    /// tests can queue writes exactly as the PUT handler does.
-    pub fresh_write_tx: Option<tokio::sync::mpsc::UnboundedSender<FreshWriteEvent>>,
+    /// Fresh-write events from this node's PUT handler, waiting for the
+    /// replication engine that `start_node` creates to take them. The sender
+    /// half lives in `ant_protocol`, as it does in a real node.
+    pub fresh_write_rx: Option<tokio::sync::mpsc::UnboundedReceiver<FreshWriteEvent>>,
 }
 
 impl TestNode {
@@ -1087,13 +1088,17 @@ impl TestNetwork {
             .get(&index)
             .copied()
             .unwrap_or_default();
-        let ant_protocol = Self::create_ant_protocol_with_disk_reserve(
+        let mut ant_protocol = Self::create_ant_protocol_with_disk_reserve(
             &data_dir,
             self.config.evm_network.clone(),
             storage_disk_reserve,
             &identity,
         )
         .await?;
+        // Wired as a real node wires it, so a PUT through the handler feeds
+        // the replication engine's fresh-write pipeline.
+        let (fresh_write_tx, fresh_write_rx) = tokio::sync::mpsc::unbounded_channel();
+        ant_protocol.set_fresh_write_sender(fresh_write_tx);
 
         Ok(TestNode {
             index,
@@ -1109,7 +1114,7 @@ impl TestNetwork {
             protocol_task: None,
             replication_engine: None,
             replication_shutdown: None,
-            fresh_write_tx: None,
+            fresh_write_rx: Some(fresh_write_rx),
         })
     }
 
@@ -1362,8 +1367,12 @@ impl TestNetwork {
         {
             let shutdown = CancellationToken::new();
             let repl_config = self.config.replication_config.clone().unwrap_or_default();
-            let (fresh_tx, fresh_rx) = tokio::sync::mpsc::unbounded_channel();
-            node.fresh_write_tx = Some(fresh_tx);
+            // `create_node` fills this and each node is started once, so it
+            // is always there; a closed channel would only idle the drainer.
+            let fresh_rx = node
+                .fresh_write_rx
+                .take()
+                .unwrap_or_else(|| tokio::sync::mpsc::unbounded_channel().1);
             let node_identity = Arc::clone(id);
             match ReplicationEngine::new(
                 repl_config,
