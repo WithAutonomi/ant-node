@@ -1359,20 +1359,21 @@ impl TestNetwork {
         }
 
         // Start replication engine for this node. A node without an identity
-        // skips ONLY the engine (no early return — the node must still be
-        // tracked in `self.nodes` below, or its already-started P2P/protocol
-        // tasks would keep running untracked by the harness).
-        if let (Some(ref p2p), Some(ref protocol), Some(ref id)) =
-            (&node.p2p_node, &node.ant_protocol, &node.node_identity)
-        {
+        // or a fresh-write channel skips ONLY the engine (no early return —
+        // the node must still be tracked in `self.nodes` below, or its
+        // already-started P2P/protocol tasks would keep running untracked by
+        // the harness). `create_node` fills the channel and each node is
+        // started once, so it is missing only if that invariant breaks.
+        let fresh_write_rx = node.fresh_write_rx.take();
+        let has_fresh_writes = fresh_write_rx.is_some();
+        if let (Some(ref p2p), Some(ref protocol), Some(ref id), Some(fresh_rx)) = (
+            &node.p2p_node,
+            &node.ant_protocol,
+            &node.node_identity,
+            fresh_write_rx,
+        ) {
             let shutdown = CancellationToken::new();
             let repl_config = self.config.replication_config.clone().unwrap_or_default();
-            // `create_node` fills this and each node is started once, so it
-            // is always there; a closed channel would only idle the drainer.
-            let fresh_rx = node
-                .fresh_write_rx
-                .take()
-                .unwrap_or_else(|| tokio::sync::mpsc::unbounded_channel().1);
             let node_identity = Arc::clone(id);
             match ReplicationEngine::new(
                 repl_config,
@@ -1409,6 +1410,12 @@ impl TestNetwork {
         } else if node.node_identity.is_none() {
             warn!(
                 "Node {} has no identity; skipping replication engine",
+                node.index
+            );
+        } else if !has_fresh_writes {
+            warn!(
+                "Node {} has no fresh-write channel (started twice?); skipping \
+                 replication engine",
                 node.index
             );
         }

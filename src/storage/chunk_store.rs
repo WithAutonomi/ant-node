@@ -1104,6 +1104,14 @@ impl ChunkStore {
         std::fs::metadata(self.legacy_env_dir.join(LEGACY_DATA_FILE)).map_or(0, |m| m.len())
     }
 
+    /// Test-only path of the file a chunk is (or would be) stored in, so tests
+    /// can damage or remove it without re-deriving the store's layout.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn test_chunk_path(&self, address: &XorName) -> PathBuf {
+        self.files.chunk_path(address)
+    }
+
     /// Test-only handle to the file store's put gate.
     #[cfg(any(test, feature = "test-utils"))]
     #[must_use]
