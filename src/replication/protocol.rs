@@ -967,7 +967,10 @@ pub enum FetchResponse {
     Success {
         /// The record key.
         key: XorName,
-        /// The record data.
+        /// The record data. Encoded as a byte string, which postcard lays out
+        /// exactly like a `u8` sequence: one copy of the chunk each way instead
+        /// of a per-byte loop, and an exactly-sized buffer on decode.
+        #[serde(with = "serde_bytes")]
         data: Vec<u8>,
     },
     /// Record not found on this peer.
@@ -1360,7 +1363,9 @@ pub enum SubtreeSliceItem {
         block_index: u32,
         /// Bao verified slice: the block bytes plus the BLAKE3 parent hashes that
         /// authenticate them against the chunk address. The auditor decodes this
-        /// to recover the verified block bytes.
+        /// to recover the verified block bytes. Encoded as a byte string, laid
+        /// out exactly like a `u8` sequence on the wire.
+        #[serde(with = "serde_bytes")]
         bao_slice: Vec<u8>,
         /// Sibling hashes on the path from this block up to the committed
         /// `nonced_root`, bottom-up. The auditor folds the block leaf with these
@@ -1519,6 +1524,17 @@ impl std::error::Error for ReplicationProtocolError {}
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// Payload lengths on either side of postcard's one- and two-byte varint
+    /// length boundaries, plus one past 64 KiB.
+    const BYTE_STRING_WIRE_LENGTHS: [usize; 6] = [0, 127, 128, 16_383, 16_384, 70_000];
+    /// Proof length used alongside each payload in the byte-string wire checks.
+    const BYTE_STRING_WIRE_PROOF_LEN: usize = 300;
+    /// Block index carried by the subtree-slice item in the byte-string checks.
+    const BYTE_STRING_WIRE_BLOCK_INDEX: u32 = 7;
+    /// A payload that is not a power of two, so a doubling buffer would show
+    /// slack: three MiB and change.
+    const CHUNK_SIZED_TEST_PAYLOAD_LEN: usize = 3 * 1024 * 1024 + 123;
 
     // === Audit outcome counters ===
 
@@ -2605,55 +2621,129 @@ mod tests {
         assert_eq!(decoded.request_id, 7);
     }
 
+    /// Two types that must be interchangeable on the wire: identical bytes, and
+    /// each decodes what the other encodes.
+    fn assert_same_wire<A, P>(annotated: &A, plain: &P)
+    where
+        A: Serialize + serde::de::DeserializeOwned,
+        P: Serialize + serde::de::DeserializeOwned,
+    {
+        let wire = postcard::to_stdvec(annotated).unwrap();
+        assert_eq!(wire, postcard::to_stdvec(plain).unwrap());
+        let as_plain: P = postcard::from_bytes(&wire).unwrap();
+        assert_eq!(postcard::to_stdvec(&as_plain).unwrap(), wire);
+        let as_annotated: A = postcard::from_bytes(&wire).unwrap();
+        assert_eq!(postcard::to_stdvec(&as_annotated).unwrap(), wire);
+    }
+
     /// `serde_bytes` must not change the wire layout: postcard encodes a byte
-    /// string and a `u8` sequence identically (varint length + raw bytes).
+    /// string and a `u8` sequence identically (varint length + raw bytes). Each
+    /// annotated field is checked against its pre-annotation layout in both
+    /// directions, on either side of the varint length boundaries.
     #[test]
     fn byte_string_fields_encode_like_u8_sequences() {
-        #[derive(Serialize)]
+        #[derive(Serialize, Deserialize)]
         struct PlainOffer {
             key: XorName,
             data: Vec<u8>,
             proof_of_payment: Vec<u8>,
         }
-        #[derive(Serialize)]
+        #[derive(Serialize, Deserialize)]
         struct PlainNotify {
             key: XorName,
             proof_of_payment: Vec<u8>,
         }
-        let data: Vec<u8> = (0..=255u8).cycle().take(70_000).collect();
-        let proof = vec![9u8; 300];
+        // Only the first variant is mirrored: postcard tags it 0 in both.
+        #[derive(Serialize, Deserialize)]
+        enum PlainFetchResponse {
+            Success { key: XorName, data: Vec<u8> },
+        }
+        #[derive(Serialize, Deserialize)]
+        enum PlainSliceItem {
+            Present {
+                key: XorName,
+                block_index: u32,
+                bao_slice: Vec<u8>,
+                nonced_siblings: Vec<[u8; 32]>,
+            },
+        }
 
-        let offer = FreshReplicationOffer {
-            key: [5; 32],
-            data: data.clone(),
-            proof_of_payment: proof.clone(),
-        };
-        let plain_offer = PlainOffer {
-            key: [5; 32],
-            data: data.clone(),
-            proof_of_payment: proof.clone(),
-        };
-        assert_eq!(
-            postcard::to_stdvec(&offer).unwrap(),
-            postcard::to_stdvec(&plain_offer).unwrap()
-        );
-        let decoded: FreshReplicationOffer =
-            postcard::from_bytes(&postcard::to_stdvec(&plain_offer).unwrap()).unwrap();
-        assert_eq!(decoded.data, data);
-        assert_eq!(decoded.proof_of_payment, proof);
+        let key = [5; 32];
+        let proof = vec![9u8; BYTE_STRING_WIRE_PROOF_LEN];
+        let siblings = vec![[1u8; 32]];
+        for len in BYTE_STRING_WIRE_LENGTHS {
+            let data: Vec<u8> = (0..=u8::MAX).cycle().take(len).collect();
+            assert_same_wire(
+                &FreshReplicationOffer {
+                    key,
+                    data: data.clone(),
+                    proof_of_payment: proof.clone(),
+                },
+                &PlainOffer {
+                    key,
+                    data: data.clone(),
+                    proof_of_payment: proof.clone(),
+                },
+            );
+            assert_same_wire(
+                &PaidNotify {
+                    key,
+                    proof_of_payment: data.clone(),
+                },
+                &PlainNotify {
+                    key,
+                    proof_of_payment: data.clone(),
+                },
+            );
+            assert_same_wire(
+                &FetchResponse::Success {
+                    key,
+                    data: data.clone(),
+                },
+                &PlainFetchResponse::Success {
+                    key,
+                    data: data.clone(),
+                },
+            );
+            assert_same_wire(
+                &SubtreeSliceItem::Present {
+                    key,
+                    block_index: BYTE_STRING_WIRE_BLOCK_INDEX,
+                    bao_slice: data.clone(),
+                    nonced_siblings: siblings.clone(),
+                },
+                &PlainSliceItem::Present {
+                    key,
+                    block_index: BYTE_STRING_WIRE_BLOCK_INDEX,
+                    bao_slice: data,
+                    nonced_siblings: siblings.clone(),
+                },
+            );
+        }
+    }
 
-        let notify = PaidNotify {
-            key: [6; 32],
-            proof_of_payment: proof.clone(),
+    #[test]
+    fn fetch_response_decodes_into_an_exactly_sized_buffer() {
+        // A fetched chunk is held by the receiver until it is stored; a
+        // byte-string field decodes in one copy with no growth slack.
+        let data = vec![0xCD; CHUNK_SIZED_TEST_PAYLOAD_LEN];
+        let msg = ReplicationMessage {
+            request_id: 11,
+            body: ReplicationMessageBody::FetchResponse(FetchResponse::Success {
+                key: [4; 32],
+                data,
+            }),
         };
-        let plain_notify = PlainNotify {
-            key: [6; 32],
-            proof_of_payment: proof,
+        let encoded = msg.encode().unwrap();
+        assert_eq!(encoded.capacity(), encoded.len());
+        let decoded = ReplicationMessage::decode(&encoded).unwrap();
+        let ReplicationMessageBody::FetchResponse(FetchResponse::Success { data, .. }) =
+            decoded.body
+        else {
+            panic!("decoded a different body");
         };
-        assert_eq!(
-            postcard::to_stdvec(&notify).unwrap(),
-            postcard::to_stdvec(&plain_notify).unwrap()
-        );
+        assert_eq!(data.len(), CHUNK_SIZED_TEST_PAYLOAD_LEN);
+        assert_eq!(data.capacity(), CHUNK_SIZED_TEST_PAYLOAD_LEN);
     }
 
     #[test]
@@ -2664,7 +2754,7 @@ mod tests {
             request_id: 7,
             body: ReplicationMessageBody::FreshReplicationOffer(FreshReplicationOffer {
                 key: [3; 32],
-                data: vec![0xAB; 3 * 1024 * 1024 + 123],
+                data: vec![0xAB; CHUNK_SIZED_TEST_PAYLOAD_LEN],
                 proof_of_payment: vec![1, 2, 3],
             }),
         };
