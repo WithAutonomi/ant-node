@@ -879,7 +879,7 @@ impl AntProtocol {
                     // replication entirely.
                     let proof = Self::strip_commitment_sidecars(proof);
                     // Storage has already accepted the chunk on this path, so
-                    // the event carries only the key; the replication drainer
+                    // the event carries only the key; the offer dispatcher
                     // reads the chunk back when it is ready to send it.
                     let event = FreshWriteEvent {
                         key: address,
