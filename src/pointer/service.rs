@@ -471,8 +471,9 @@ fn cross_kind_refusal(address: XorName, chunk_present: Result<bool>) -> Option<P
 mod tests {
     use super::*;
     use crate::payment::{EvmVerifierConfig, PriceFloorConfig};
-    use ant_protocol::pointer::{Pointer, PointerTarget, PointerTargetKind};
+    use ant_protocol::pointer::{Pointer, PointerTarget, PointerTargetKind, FINAL_COUNTER};
     use saorsa_pqc::api::sig::{ml_dsa_65, MlDsaPublicKey, MlDsaSecretKey};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn keypair(seed: u8) -> (MlDsaPublicKey, MlDsaSecretKey) {
         ml_dsa_65().generate_keypair_from_seed(&[seed; 32])
@@ -857,19 +858,19 @@ mod tests {
     /// which counts how often it was asked.
     struct StubWitness {
         conflict: Option<Pointer>,
-        asked: std::sync::atomic::AtomicUsize,
+        asked: AtomicUsize,
     }
 
     impl StubWitness {
         fn new(conflict: Option<Pointer>) -> Arc<Self> {
             Arc::new(Self {
                 conflict,
-                asked: std::sync::atomic::AtomicUsize::new(0),
+                asked: AtomicUsize::new(0),
             })
         }
 
         fn asked(&self) -> usize {
-            self.asked.load(std::sync::atomic::Ordering::SeqCst)
+            self.asked.load(Ordering::SeqCst)
         }
     }
 
@@ -878,7 +879,7 @@ mod tests {
             &'a self,
             _state: &'a PointerState,
         ) -> BoxFuture<'a, Option<Pointer>> {
-            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.asked.fetch_add(1, Ordering::SeqCst);
             let conflict = self.conflict.clone();
             Box::pin(async move { conflict })
         }
@@ -887,7 +888,7 @@ mod tests {
     fn final_state(seed: u8, target_byte: u8) -> Pointer {
         let (pk, sk) = keypair(seed);
         let target = PointerTarget::new(PointerTargetKind::Pointer, [target_byte; 32]);
-        Pointer::sign(&sk, &pk, ant_protocol::pointer::FINAL_COUNTER, target).expect("sign")
+        Pointer::sign(&sk, &pk, FINAL_COUNTER, target).expect("sign")
     }
 
     #[tokio::test]
