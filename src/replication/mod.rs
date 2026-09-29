@@ -2282,7 +2282,7 @@ impl ReplicationEngine {
     /// Test-only: take every outbound replication send permit. Until the
     /// returned permit is dropped, encoded fresh offers wait behind the send
     /// stage, so a test can fill the pending-offer budget deterministically.
-    /// `None` only if the engine is shutting down.
+    /// The send semaphore is never closed, so this returns `Some`.
     #[cfg(any(test, feature = "test-utils"))]
     pub async fn hold_replication_sends(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
         let all = u32::try_from(MAX_CONCURRENT_REPLICATION_SENDS).ok()?;
@@ -2471,7 +2471,7 @@ impl ReplicationEngine {
             &self.config,
         )
         .await;
-        // The semaphore is never closed, so this only fails at shutdown.
+        // Never closed, so this cannot fail; the arm keeps the call panic-free.
         let Ok(pending_offer) = Arc::clone(&self.pending_offer_semaphore)
             .acquire_owned()
             .await
