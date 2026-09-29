@@ -76,7 +76,8 @@ make the send path hand a single owned buffer down to the QUIC stream:
   offer dispatcher. The dispatcher is the only permit-gated stage: it
   acquires a `MAX_PENDING_FRESH_OFFERS` (8) permit before it reads the
   chunk back from storage and encodes it; the permit lives with the encoded
-  offer until the last per-peer send drops it. A backlog therefore waits as
+  offer until the last handle to its bytes is dropped, whether a per-peer
+  send's or the transport's. A backlog therefore waits as
   small queued events, and at most ~40 MiB of encoded offers exist per node.
   Nothing is dropped by back-pressure: both queues are unbounded and FIFO,
   and every offer is dispatched with the same fan-out, retries and delayed
@@ -100,14 +101,18 @@ make the send path hand a single owned buffer down to the QUIC stream:
   attempts within seconds. The backoff spreads them over about a minute, and
   a store-wide fault shorter than that costs no offers. Only a chunk that is
   no longer stored is skipped without retry.
-- The chunk moves into the offer rather than being copied, and
-  `ReplicationMessage::encode` serializes into an exactly-sized buffer. The
+- The chunk and its proof move into the offer rather than being copied, and
+  `ReplicationMessage::encode` serializes into an exactly-sized buffer
+  (shared with the WebRTC browser path as `codec::encode_exact`). A chunk is
+  read from disk into a buffer sized from its file, not grown to twice its
+  size. The
   chunk-carrying fields — the offer's data and proof, `PaidNotify`'s proof,
   `FetchResponse::Success::data` and a subtree slice's `bao_slice` — are
   byte strings (`serde_bytes`), which postcard lays out exactly like a `u8`
   sequence: one copy each way instead of a per-byte loop, and an
   exactly-sized buffer on decode.
-- The encoded offer is shared as `Bytes`; saorsa-core's `send_message`
+- The encoded offer is shared as `Bytes` (`Bytes::from_owner`, owning the
+  buffer and the permit); saorsa-core's `send_message`
   accepts `impl Into<Bytes>`, frames the payload through a borrowing
   `WireMessageRef` (byte-identical to `WireMessage` on the wire) into an
   exactly-sized frame, and passes that frame as `Bytes` to
@@ -124,8 +129,13 @@ make the send path hand a single owned buffer down to the QUIC stream:
   298 MiB (mimalloc build) and from 674 MiB to 262 MiB (jemalloc build)
   after the backpressure change alone.
 - Every large send node-wide (chunk GET responses included) stops paying
-  for a second copy of its frame during the transfer, and a fetched chunk is
-  encoded and decoded in one copy each.
+  for a second copy of its frame during the transfer, and a client GET
+  response is handed to the transport without being copied first. A
+  replication fetch response's own encoding and decoding are one copy each;
+  when it is answered over request/response, saorsa-core's envelope around
+  it still serializes the payload per byte into a growing buffer and
+  decodes it the same way (a `serde_bytes` payload there would be
+  wire-identical, and is left for saorsa-core).
 - No wire, storage or API break: `send(&[u8])` remains and copies once as
   before; `Vec<u8>` callers of `send_message` convert without copying.
 
@@ -178,18 +188,23 @@ make the send path hand a single owned buffer down to the QUIC stream:
 ## Validation
 
 - Unit tests: exact-capacity encoding of chunk-sized offers and
-  exact-capacity decoding of fetched chunks; wire equivalence of every
-  byte-string field with its `u8`-sequence layout, both directions, across
-  the varint length boundaries (ant-node); byte-for-byte equivalence of
-  `WireMessageRef` with `WireMessage` (saorsa-core).
+  exact-capacity decoding of fetched chunks; exact-capacity chunk reads;
+  the read-back retry schedule; the pending-offer permit outliving every
+  handle to the offer; wire equivalence of every byte-string field with its
+  `u8`-sequence layout, both directions, across the varint length
+  boundaries (ant-node); byte-for-byte equivalence of `WireMessageRef` with
+  `WireMessage` (saorsa-core).
 - E2E tests over the real harness, whose nodes wire the PUT handler to the
   fresh-write pipeline as a node does: a PUT through the handler replicates
   and a missing chunk queued ahead of it is skipped; with the send stage
   held, a burst three times the budget encodes exactly
   `MAX_PENDING_FRESH_OFFERS` offers, then all of them once sends resume,
   and returns every permit; a failed read-back releases its permit, does
-  not delay a healthy write behind it, and is offered once the fault
-  clears; a chunk corrupted on disk is quarantined and never offered.
+  not delay a healthy write queued behind it (timed from the fault), and is
+  offered once the fault clears; a chunk corrupted on disk is quarantined
+  and never offered. The capacity driver feeds the same fresh-write channel,
+  so it measures receiver admission under the production drainer's pacing.
+  Each pipeline test fails against a build with its fix reverted.
 - Testnet evidence (2026-09-21): with the backpressure change, the node
   that had reached 1051 MiB live memory stayed flat at 0.0 MiB/min with a
   150 MiB peak, and the worst bootstrap's queued offers dropped from 101
