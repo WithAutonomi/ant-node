@@ -17,7 +17,13 @@ use ant_node::pointer::PointerStore;
 use ant_node::replication::audit::AuditTickResult;
 use ant_node::replication::commitment::pointer_leaf_hash;
 use ant_node::replication::commitment_state::{BuiltCommitment, ResponderCommitmentState};
+use ant_node::replication::config::SUBTREE_AUDIT_PROTOCOL_ID;
 use ant_node::replication::pointer::{PointerFreshWrite, PointerReplication};
+use ant_node::replication::protocol::{
+    ReplicationMessage, ReplicationMessageBody, SubtreeAuditChallenge, SubtreeAuditResponse,
+    SubtreeSliceChallenge, SubtreeSliceItem, SubtreeSliceOpening, SubtreeSliceResponse,
+};
+use ant_node::replication::slice::nonced_block_root;
 use ant_node::ReplicationConfig;
 use ant_protocol::pointer::{Pointer, PointerState, PointerTarget, PointerTargetKind};
 use bytes::Bytes;
@@ -32,6 +38,9 @@ const SETTLE: Duration = Duration::from_secs(30);
 
 /// How often to look while waiting.
 const POLL: Duration = Duration::from_millis(200);
+
+/// The id a hand-driven storage audit uses for both of its rounds.
+const CHALLENGE_ID: u64 = 0x5EED;
 
 /// A proof the receivers never parse: the state is pre-marked as paid in each
 /// verifier's cache, so verification answers from the cache.
@@ -632,13 +641,23 @@ async fn commit_pointers(
     auditor: usize,
     count: usize,
 ) -> Vec<Pointer> {
-    let holder_node = harness.test_node(holder).expect("holder");
     let records: Vec<Pointer> = (0..count)
         .map(|_| {
             let (pk, sk) = owner();
             signed(&pk, &sk, 1, 1)
         })
         .collect();
+    commit_records(harness, holder, auditor, records).await
+}
+
+/// [`commit_pointers`] over records the caller signed.
+async fn commit_records(
+    harness: &TestHarness,
+    holder: usize,
+    auditor: usize,
+    records: Vec<Pointer>,
+) -> Vec<Pointer> {
+    let holder_node = harness.test_node(holder).expect("holder");
     for record in &records {
         store(holder_node)
             .put_bytes(&record.to_bytes())
@@ -700,6 +719,144 @@ async fn a_node_holding_its_committed_pointers_passes_the_storage_audit() {
         matches!(result, AuditTickResult::Passed { keys_checked, .. } if keys_checked >= 1),
         "an honest pointer holder must pass, got {result:?}"
     );
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// Several paid updates between the two rounds of a storage audit do not fail
+/// the node holding the pointer: round 2 serves the record round 1 read, found
+/// by the root round 1 reported over it (ADR-0017). Driven one round at a time
+/// against the holder's live engine, so it is the round-1 session that carries
+/// what round 1 bound across to round 2.
+#[tokio::test]
+#[serial]
+async fn round_two_serves_the_record_round_one_read_across_several_updates() {
+    let harness = TestHarness::setup_small().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+    let (holder, auditor) = (7, 8);
+    let owners: Vec<(MlDsaPublicKey, MlDsaSecretKey)> = (0..24).map(|_| owner()).collect();
+    let records = owners.iter().map(|(pk, sk)| signed(pk, sk, 1, 1)).collect();
+    commit_records(&harness, holder, auditor, records).await;
+
+    let holder_node = harness.test_node(holder).expect("holder");
+    let holder_peer = peer(holder_node);
+    let committed = commitments(holder_node)
+        .current()
+        .expect("a current commitment");
+    let pointer_keys = committed.pointer_leaf_keys();
+    let auditor_p2p = harness
+        .test_node(auditor)
+        .expect("auditor")
+        .p2p_node
+        .as_ref()
+        .expect("p2p")
+        .clone();
+    let ask = |body: ReplicationMessageBody| {
+        let auditor_p2p = Arc::clone(&auditor_p2p);
+        async move {
+            let request = ReplicationMessage {
+                request_id: CHALLENGE_ID,
+                body,
+            }
+            .encode()
+            .expect("encode");
+            let response = auditor_p2p
+                .send_request(
+                    &holder_peer,
+                    SUBTREE_AUDIT_PROTOCOL_ID,
+                    request,
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect("a response");
+            ReplicationMessage::decode_subtree_audit_response(&response.data)
+                .expect("decode")
+                .body
+        }
+    };
+
+    // Round 1: the holder binds the record it holds for each pointer.
+    let nonce = [0x5A; 32];
+    let round1 = ask(ReplicationMessageBody::SubtreeAuditChallenge(
+        SubtreeAuditChallenge {
+            challenge_id: CHALLENGE_ID,
+            nonce,
+            challenged_peer_id: *holder_peer.as_bytes(),
+            expected_commitment_hash: committed.hash(),
+        },
+    ))
+    .await;
+    let ReplicationMessageBody::SubtreeAuditResponse(SubtreeAuditResponse::Proof { proof, .. }) =
+        round1
+    else {
+        panic!("expected a round-1 proof, got {round1:?}");
+    };
+    let opened: Vec<_> = proof
+        .leaves
+        .iter()
+        .filter(|leaf| pointer_keys.contains(&leaf.key))
+        .take(5)
+        .cloned()
+        .collect();
+    assert!(!opened.is_empty(), "round 1 proved a pointer");
+
+    // Between the rounds, the owner of every pointer about to be opened
+    // updates it three times, each a state the holder accepts.
+    let holder_store = store(holder_node);
+    for leaf in &opened {
+        let (pk, sk) = owners
+            .iter()
+            .find(|(pk, sk)| signed(pk, sk, 1, 1).address() == leaf.key)
+            .expect("an owner for every committed pointer");
+        for counter in 2..=4 {
+            holder_store
+                .put_bytes(&signed(pk, sk, counter, 2).to_bytes())
+                .await
+                .expect("update");
+        }
+    }
+
+    // Round 2: each opened pointer is proved by the record round 1 read.
+    let round2 = ask(ReplicationMessageBody::SubtreeSliceChallenge(
+        SubtreeSliceChallenge {
+            challenge_id: CHALLENGE_ID,
+            nonce,
+            challenged_peer_id: *holder_peer.as_bytes(),
+            expected_commitment_hash: committed.hash(),
+            openings: opened
+                .iter()
+                .map(|leaf| SubtreeSliceOpening {
+                    key: leaf.key,
+                    block_index: 0,
+                })
+                .collect(),
+        },
+    ))
+    .await;
+    let ReplicationMessageBody::SubtreeSliceResponse(SubtreeSliceResponse::Items { items, .. }) =
+        round2
+    else {
+        panic!("expected round-2 items, got {round2:?}");
+    };
+    for leaf in &opened {
+        let served = items
+            .iter()
+            .find_map(|item| match item {
+                SubtreeSliceItem::PointerRecord { key, records } if *key == leaf.key => {
+                    Some(records.as_slice())
+                }
+                _ => None,
+            })
+            .expect("a record for every opened pointer");
+        assert!(
+            served.iter().any(|record| {
+                nonced_block_root(&nonce, holder_peer.as_bytes(), &leaf.key, record)
+                    == leaf.nonced_root
+                    && Pointer::from_bytes(record).is_ok_and(|p| p.address() == leaf.key)
+            }),
+            "round 2 must serve the record round 1 bound, after three updates"
+        );
+    }
 
     harness.teardown().await.expect("teardown");
 }
