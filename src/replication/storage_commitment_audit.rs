@@ -1972,9 +1972,10 @@ enum PointerServe {
     /// Nothing at all is held for it, which is a lost pointer.
     Absent,
     /// The pointer is held, but this node cannot serve the record round 1
-    /// read: it has aged out or been evicted to keep memory bounded, or the
-    /// session gave round 1's root up to stay in budget. A local limit, not a
-    /// lost pointer, so it is reported as one rather than proved wrong.
+    /// read: it has aged out or been evicted to keep memory bounded, or no
+    /// root for it was kept, which a session this node opened never lacks. A
+    /// local limit, not a lost pointer, so it is reported as one rather than
+    /// proved wrong.
     Unavailable,
 }
 
@@ -3103,7 +3104,7 @@ mod pointer_audit_tests {
     /// which may have read the pointer at its start, then the session its
     /// round 2 must arrive within.
     #[test]
-    fn a_replaced_record_outlives_the_slowest_audit() {
+    fn a_replaced_record_outlives_the_slowest_audit_by_default() {
         let largest =
             usize::try_from(max_subtree_leaves(MAX_COMMITMENT_KEY_COUNT)).expect("fits a usize");
         let slowest =
@@ -3140,10 +3141,11 @@ mod pointer_audit_tests {
         );
     }
 
-    /// Without the root round 1 reported, as when its session gave it up to
-    /// stay in budget, a pointer still held is reported as a transient
-    /// failure, updated or not: the node cannot show which record round 1
-    /// read, and guessing would risk a confirmed failure it did not earn.
+    /// Without the root round 1 reported, which a session this node opened
+    /// never lacks but a direct caller can, a pointer still held is reported
+    /// as a transient failure, updated or not: the node cannot show which
+    /// record round 1 read, and guessing would risk a confirmed failure it did
+    /// not earn.
     #[tokio::test]
     async fn without_the_bound_root_a_pointer_is_unavailable_not_failed() {
         let responder = Responder::new(24, 24).await;

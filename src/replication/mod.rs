@@ -4980,11 +4980,10 @@ impl SubtreeRound1Limiter {
     ///
     /// The session keeps what round 1 bound for each pointer it proved, while
     /// every live session together holds no more than
-    /// [`MAX_SESSION_POINTER_BINDINGS`] of them. An honest round 2 follows its
-    /// round 1 within seconds, so to make room the oldest sessions give theirs
-    /// up first. A session left without them still opens, and its round 2
-    /// reports each pointer it opens as a transient failure rather than
-    /// guessing which record round 1 read (ADR-0017).
+    /// [`MAX_SESSION_POINTER_BINDINGS`] of them. A session whose bindings do
+    /// not fit is not opened and `false` is returned, so its proof is not
+    /// sent: the bindings of sessions already answered are never given up,
+    /// because their round 2 is owed them (ADR-0017).
     async fn open_session(
         &self,
         source: PeerId,
@@ -4992,10 +4991,16 @@ impl SubtreeRound1Limiter {
         commitment_hash: [u8; 32],
         nonce: [u8; 32],
         pointer_bindings: PointerBindings,
-    ) {
+    ) -> bool {
         let now = Instant::now();
         let mut sessions = self.sessions.write().await;
         sessions.retain(|_, e| now.duration_since(e.inserted) < SUBTREE_SESSION_TTL);
+        // Checked before anything is evicted, so a session refused here costs
+        // no other session its place.
+        let held: usize = sessions.values().map(|e| e.pointer_bindings.len()).sum();
+        if held.saturating_add(pointer_bindings.len()) > MAX_SESSION_POINTER_BINDINGS {
+            return false;
+        }
         if sessions.len() >= MAX_SUBTREE_SESSIONS {
             if let Some(oldest) = sessions
                 .iter()
@@ -5005,32 +5010,6 @@ impl SubtreeRound1Limiter {
                 sessions.remove(&oldest);
             }
         }
-        let mut held: usize = sessions.values().map(|e| e.pointer_bindings.len()).sum();
-        if pointer_bindings.len() <= MAX_SESSION_POINTER_BINDINGS
-            && held.saturating_add(pointer_bindings.len()) > MAX_SESSION_POINTER_BINDINGS
-        {
-            let mut oldest_first: Vec<_> = sessions
-                .iter()
-                .filter(|(_, e)| !e.pointer_bindings.is_empty())
-                .map(|(k, e)| (e.inserted, *k))
-                .collect();
-            oldest_first.sort_unstable();
-            for (_, k) in oldest_first {
-                if held.saturating_add(pointer_bindings.len()) <= MAX_SESSION_POINTER_BINDINGS {
-                    break;
-                }
-                if let Some(e) = sessions.get_mut(&k) {
-                    held = held.saturating_sub(e.pointer_bindings.len());
-                    e.pointer_bindings = PointerBindings::new();
-                }
-            }
-        }
-        let pointer_bindings =
-            if held.saturating_add(pointer_bindings.len()) > MAX_SESSION_POINTER_BINDINGS {
-                PointerBindings::new()
-            } else {
-                pointer_bindings
-            };
         sessions.insert(
             (source, challenge_id),
             SubtreeSession {
@@ -5040,6 +5019,7 @@ impl SubtreeRound1Limiter {
                 pointer_bindings,
             },
         );
+        true
     }
 
     /// Atomically consume the round-2 session for this exchange. `Some` iff a
@@ -5467,7 +5447,7 @@ async fn handle_replication_message(
                 // a live round-1 exchange.
                 if let crate::replication::protocol::SubtreeAuditResponse::Proof { .. } = &response
                 {
-                    subtree_round1
+                    let opened = subtree_round1
                         .open_session(
                             source,
                             challenge.challenge_id,
@@ -5476,6 +5456,24 @@ async fn handle_replication_message(
                             storage_commitment_audit::pointer_bindings(&response),
                         )
                         .await;
+                    // A proof round 2 could not be answered for is not sent.
+                    // Withholding it is the round-1 capacity drop the auditor
+                    // already treats as a timeout (ADR-0017).
+                    if !opened {
+                        protocol::record_audit_drop(protocol::AuditDropKind::Subtree);
+                        warn!(
+                            target: "ant_node::replication::audit_responder",
+                            event = "admission_dropped",
+                            kind = "subtree",
+                            responder_class = class.as_str(),
+                            source = %source,
+                            challenge_id = challenge.challenge_id,
+                            request_response = rr_message_id.is_some(),
+                            reason = "pointer_binding_budget",
+                            "Audit responder admission dropped"
+                        );
+                        return;
+                    }
                 }
                 let response_kind = subtree_audit_response_kind(&response);
                 let work_items = subtree_audit_response_work_items(&response);
@@ -10956,9 +10954,11 @@ mod tests {
         // Session: opened by round 1, consumed exactly once by the matching round 2.
         let hash = [7u8; 32];
         let nonce = [9u8; 32];
-        limiter
-            .open_session(peer, 42, hash, nonce, PointerBindings::new())
-            .await;
+        assert!(
+            limiter
+                .open_session(peer, 42, hash, nonce, PointerBindings::new())
+                .await
+        );
         // Wrong nonce / commitment does not match.
         assert!(limiter
             .consume_session(&peer, 42, &hash, &[0u8; 32])
@@ -10985,10 +10985,10 @@ mod tests {
     }
 
     // A session carries what its round 1 bound for each pointer to round 2,
-    // and every live session together stays under the binding budget: to make
-    // room the oldest sessions give theirs up, and a session larger than the
-    // whole budget keeps none rather than being refused.
-    #[tokio::test(start_paused = true)]
+    // and every live session together stays under the binding budget. A
+    // session that does not fit is refused, and no session already opened
+    // gives up its bindings or its place for it.
+    #[tokio::test]
     async fn subtree_session_carries_pointer_bindings_within_the_budget() {
         let limiter = SubtreeRound1Limiter::new(Duration::ZERO, 1);
         let (hash, nonce) = ([1u8; 32], [2u8; 32]);
@@ -11002,47 +11002,107 @@ mod tests {
                 })
                 .collect()
         };
-        let open = |peer: u8, id: u64, kept: PointerBindings| {
-            let limiter = limiter.clone();
-            async move {
-                limiter
-                    .open_session(test_peer(peer), id, hash, nonce, kept)
-                    .await;
-                // Sessions are ordered by when they opened.
-                tokio::time::advance(Duration::from_millis(1)).await;
-            }
-        };
-        let kept = |peer: u8, id: u64| {
-            let limiter = limiter.clone();
-            async move {
-                limiter
-                    .consume_session(&test_peer(peer), id, &hash, &nonce)
-                    .await
-                    .map(|b| b.len())
-            }
-        };
 
         let half = MAX_SESSION_POINTER_BINDINGS / 2;
         let first = bindings(0, half);
-        open(1, 1, first.clone()).await;
-        open(2, 2, bindings(1 << 40, half)).await;
-        // The budget is full. The next session takes the oldest one's room.
-        open(3, 3, bindings(1 << 41, 1)).await;
-        // One larger than the whole budget keeps nothing, and costs no one.
-        open(4, 4, bindings(1 << 42, MAX_SESSION_POINTER_BINDINGS + 1)).await;
+        assert!(
+            limiter
+                .open_session(test_peer(1), 1, hash, nonce, first.clone())
+                .await
+        );
+        assert!(
+            limiter
+                .open_session(test_peer(2), 2, hash, nonce, bindings(1 << 40, half))
+                .await
+        );
+        // The budget is full: one more binding is refused, but a round 1 with
+        // no pointers in it still opens.
+        assert!(
+            !limiter
+                .open_session(test_peer(3), 3, hash, nonce, bindings(1 << 41, 1))
+                .await
+        );
+        assert!(
+            limiter
+                .open_session(test_peer(4), 4, hash, nonce, PointerBindings::new())
+                .await
+        );
 
-        assert_eq!(kept(1, 1).await, Some(0), "the oldest gave its bindings up");
-        assert_eq!(kept(2, 2).await, Some(half));
-        assert_eq!(kept(3, 3).await, Some(1));
-        assert_eq!(kept(4, 4).await, Some(0), "still opened, with none kept");
-
-        // With room, round 2 gets exactly what round 1 bound.
-        open(5, 5, first.clone()).await;
         assert_eq!(
             limiter
-                .consume_session(&test_peer(5), 5, &hash, &nonce)
+                .consume_session(&test_peer(1), 1, &hash, &nonce)
                 .await,
-            Some(first)
+            Some(first.clone()),
+            "an opened session keeps every binding it was given"
+        );
+        assert!(
+            limiter
+                .consume_session(&test_peer(3), 3, &hash, &nonce)
+                .await
+                .is_none(),
+            "a refused session was never opened"
+        );
+        assert_eq!(
+            limiter
+                .consume_session(&test_peer(2), 2, &hash, &nonce)
+                .await
+                .map(|b| b.len()),
+            Some(half)
+        );
+
+        // Consumed sessions free their room.
+        assert!(
+            limiter
+                .open_session(test_peer(5), 5, hash, nonce, bindings(1 << 42, half))
+                .await
+        );
+    }
+
+    // A session refused for the binding budget is refused before the session
+    // cap evicts anything: with both full, the refusal costs no session its
+    // place.
+    #[tokio::test]
+    async fn a_session_refused_for_bindings_evicts_no_other_session() {
+        let limiter = SubtreeRound1Limiter::new(Duration::ZERO, 1);
+        let (hash, nonce) = ([1u8; 32], [2u8; 32]);
+        let full: PointerBindings = (0u64..)
+            .take(MAX_SESSION_POINTER_BINDINGS)
+            .map(|i| {
+                let mut key = [0u8; 32];
+                key[..8].copy_from_slice(&i.to_le_bytes());
+                (key, [0xCD; 32])
+            })
+            .collect();
+        assert!(
+            limiter
+                .open_session(test_peer(0), 0, hash, nonce, full)
+                .await
+        );
+        for id in 1..MAX_SUBTREE_SESSIONS as u64 {
+            assert!(
+                limiter
+                    .open_session(test_peer(1), id, hash, nonce, PointerBindings::new())
+                    .await
+            );
+        }
+
+        let one: PointerBindings = std::iter::once(([0xEE; 32], [0xEE; 32])).collect();
+        assert!(
+            !limiter
+                .open_session(test_peer(2), u64::MAX, hash, nonce, one)
+                .await
+        );
+        assert_eq!(
+            limiter.sessions.read().await.len(),
+            MAX_SUBTREE_SESSIONS,
+            "every session is still there"
+        );
+        assert!(
+            limiter
+                .consume_session(&test_peer(0), 0, &hash, &nonce)
+                .await
+                .is_some(),
+            "including the oldest"
         );
     }
 
@@ -11257,9 +11317,11 @@ mod tests {
         let (id, hash, nonce) = (77u64, [3u8; 32], [4u8; 32]);
         let challenge = slice_challenge(id, hash, nonce);
 
-        round1
-            .open_session(peer, id, hash, nonce, PointerBindings::new())
-            .await;
+        assert!(
+            round1
+                .open_session(peer, id, hash, nonce, PointerBindings::new())
+                .await
+        );
 
         // Saturate this peer's share so the next admission must be refused.
         let mut hold = Vec::new();

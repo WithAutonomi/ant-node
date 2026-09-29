@@ -74,46 +74,55 @@ We will take option 3.
 - **The store keeps every replaced record, for longer.** Every record an update
   replaces is kept in memory, not only the last one, for ten minutes rather
   than five. A round 1 can read a pointer at its start and take as long as the
-  auditor waits for the largest subtree (1,024 leaves), about seven minutes by
-  default, before its session even opens, and round 2 then has the session's
-  two minutes. A test ties the ten minutes to those two figures. The overall
-  cap stays 2,048 records, about 11 MB, oldest first wherever it is.
+  auditor waits for the largest subtree (1,024 leaves), about seven minutes
+  with the default configuration, before its session even opens, and round 2
+  then has the session's two minutes. A test ties the ten minutes to those two
+  figures for the default configuration; an auditor configured to wait longer
+  than that can outlast the record. The overall cap stays 2,048 records, about
+  11 MB, oldest first wherever it is.
 - **Round 2 serves the record that matches.** Among the record held now and the
   replaced records kept for that address, it serves the one whose nonced root,
   under the audit's own nonce, is the root round 1 reported. That is a single
   record, so the auditor's check and the item cap are unchanged.
 - **When it cannot, it says so.** If the root matches nothing kept, because the
-  record aged out or was evicted, round 2 is rejected as `Transient`: no trust
-  penalty, and the holder loses the credit this audit would have given it, as
-  for a local read error. A node that holds nothing at all for the pointer
-  still reports it absent, which is a confirmed failure, as before.
-- **The roots are bounded.** Every live session together keeps at most
-  `MAX_SESSION_POINTER_BINDINGS` (65,536) roots, 4 MiB of payload before the
-  maps' own overhead. An honest round 2 follows its round 1 within seconds, so
-  to make room the oldest sessions give theirs up first. A session left without
-  roots rejects round 2 as `Transient` for any pointer it opens. It cannot show
-  that no update came since round 1 read the record: the replaced records kept
-  are capped, so an empty history proves nothing, and serving the record held
-  now would be a guess that fails an honest node when it is wrong.
+  record aged out or was evicted, round 2 is rejected as `Transient`, as for a
+  local read error. That is the auditor's timeout lane: no trust penalty, but
+  the auditor forgets the holder's standing as a proven holder of every key
+  under the pinned commitment, until the holder passes again. A node that
+  holds nothing at all for the pointer still reports it absent, which is a
+  confirmed failure, as before.
+- **The roots are bounded, by admission.** Every live session together keeps
+  at most `MAX_SESSION_POINTER_BINDINGS` (65,536) roots, 4 MiB of payload
+  before the maps' own overhead. A round 1 whose roots would not fit withholds
+  its proof, exactly as a round 1 refused for capacity does, so the auditor
+  sees a timeout. Roots are never stripped from a live session to make room:
+  its round 2 is owed them. A whole session can still be evicted when the
+  session count reaches `MAX_SUBTREE_SESSIONS`, as before this change, and its
+  round 2 then goes to the timeout lane. Without a root for a pointer, round 2
+  would reject it
+  as `Transient` rather than guess, since the replaced records kept are capped
+  and an empty history proves nothing, but a session this node opened always
+  holds a root for every pointer it proved.
 
 ## Consequences
 
 ### Positive
 
 - Updates between the rounds no longer fail an honest holder, however many.
-  What remains are local limits, and each is reported as `Transient`, never as
-  a confirmed failure: the bound record evicted by more than 2,048 paid updates
-  across the node's pointers inside ten minutes, or the session's roots given up
-  because newer sessions filled the budget.
+  What remains are local limits, and none is a confirmed failure: the bound
+  record evicted by more than 2,048 paid updates across the node's pointers
+  inside ten minutes is reported as `Transient`, and a round 1 over the roots
+  budget goes unanswered, as one over the round-1 capacity already does.
 - Round 2 serves one pointer record where it could serve two, so it is smaller.
 - The auditor, the wire format and the subtree-audit protocol id are unchanged.
 
 ### Negative / Trade-offs
 
 - Round-1 sessions carry state they did not before, bounded by the budget above.
-  An auditor that opens sessions faster than honest ones complete can make an
-  honest holder's round 2 go `Transient` for any pointer it opens: that costs
-  the holder the credit of one audit, not trust.
+  Auditors that open pointer-heavy sessions faster than they complete can fill
+  it, and later round 1s then go unanswered until it drains. That costs the
+  holder those audits' credit, not trust, and is the same exposure the round-1
+  concurrency and work budgets already have.
 - A responder that returns `Transient` is not proved wrong. That was already
   so, since any responder can report a local read error, so this gives a
   dishonest node no answer it did not have.
