@@ -117,7 +117,7 @@ const MAX_PRUNE_CANDIDATES_PER_PASS: usize = 256;
 /// to leave that PUT well inside the client's ten-second store timeout. A
 /// group that has not answered by then is taken to hold nothing that
 /// conflicts: silence is never a vote, here as anywhere else.
-pub(crate) const FINAL_STATE_CHECK_BUDGET: Duration = Duration::from_secs(4);
+pub const FINAL_STATE_CHECK_BUDGET: Duration = Duration::from_secs(4);
 
 /// One peer's answer about one address: the state it holds there, if any.
 type StateAnswer = ((PeerId, XorName), Option<PointerState>);
