@@ -36,3 +36,4 @@ See [`TOOLING.md`](./TOOLING.md) for `adrs`, `adr-kit`, and AI harness setup.
 - [ADR-0013: Settlement version and pre-payment compatibility](./ADR-0013-settlement-version-and-pre-payment-compatibility.md)
 - [ADR-0015: Direct browser clients over WebRTC Direct](./ADR-0015-direct-browser-clients-over-webrtc-direct.md)
 - [ADR-0016: Pointers — paid mutable references with an immutable owner](./ADR-0016-pointers-immutable-owner.md)
+- [ADR-0018: Pointer ownership transfer by final redirection](./ADR-0018-pointer-transfer-by-final-redirection.md)

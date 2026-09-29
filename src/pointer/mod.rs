@@ -3,10 +3,18 @@
 //! Implements `docs/adr/ADR-0016-pointers-immutable-owner.md`.
 //!
 //! A pointer is a mutable, owner-signed reference stored at an address derived
-//! from the owner's public key. Ownership is fixed at creation: there is no
-//! transfer, no lineage, no certificates and no key rotation. That choice is
-//! what lets the design be this small — the owner key is inlined in the
-//! record, so validating a pointer needs nothing but the pointer.
+//! from the owner's public key. The owner key is fixed at creation: there is no
+//! lineage, no certificates and no key rotation. That choice is what lets the
+//! design be this small — the owner key is inlined in the record, so
+//! validating a pointer needs nothing but the pointer.
+//!
+//! What the address resolves to can still be handed over for good
+//! (`docs/adr/ADR-0018-pointer-transfer-by-final-redirection.md`): a state at
+//! the final counter is replaced by nothing, so an owner who signs one pointing
+//! at the new owner's pointer has no move left. The store gets that from the
+//! merge rule; the service adds one look at the close group before taking a
+//! final state, so a second one cannot land on a node that had not heard of
+//! the first.
 //!
 //! # What lives here
 //!
@@ -53,8 +61,8 @@ pub mod store;
 
 pub use ant_protocol::pointer::{
     pointer_address, state_id_for_body, ParsedPointer, Pointer, PointerError, PointerState,
-    PointerTarget, PointerTargetKind, DATA_TYPE_POINTER, POINTER_BODY_LEN, POINTER_FORMAT_VERSION,
-    POINTER_WIRE_LEN, TARGET_WIRE_LEN,
+    PointerTarget, PointerTargetKind, DATA_TYPE_POINTER, FINAL_COUNTER, POINTER_BODY_LEN,
+    POINTER_FORMAT_VERSION, POINTER_WIRE_LEN, TARGET_WIRE_LEN,
 };
-pub use service::PointerService;
+pub use service::{FinalStateWitness, PointerService};
 pub use store::{PointerStore, PutOutcome};
