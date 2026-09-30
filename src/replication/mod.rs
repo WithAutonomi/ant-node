@@ -6563,14 +6563,7 @@ async fn dispatch_neighbor_sync_request(
             return Ok(());
         }
     };
-    // A peer whose sync request is admitted gets our pointer hints as well,
-    // including a node that is bootstrapping, which is how it learns the
-    // pointers it should hold. Only an admitted request: each answer scans
-    // every pointer held, and a refused one must cost nothing.
-    if let Some(pointers) = &ctx.pointers {
-        pointers.answer_sync_with_hints(source);
-    }
-
+    let pointers = ctx.pointers.clone();
     let worker_semaphore = Arc::clone(&ctx.neighbor_sync_responder_worker_semaphore);
     let p2p_node = Arc::clone(&ctx.p2p_node);
     let storage = Arc::clone(&ctx.storage);
@@ -6602,6 +6595,14 @@ async fn dispatch_neighbor_sync_request(
                 "Stale neighbor-sync request shed at dequeue"
             );
             return;
+        }
+        // A peer whose sync request is admitted and fresh gets our pointer
+        // hints as well, including a node that is bootstrapping, which is how
+        // it learns the pointers it should hold. Only such a request: each
+        // answer scans every pointer held, and a refused or stale one must
+        // cost nothing.
+        if let Some(pointers) = &pointers {
+            pointers.answer_sync_with_hints(source);
         }
         if let Err(e) = handle_neighbor_sync_request(
             &source,

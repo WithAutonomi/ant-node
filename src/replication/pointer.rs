@@ -116,9 +116,10 @@ const MAX_CAPABLE_PEERS: usize = 4096;
 /// running gets no hints this time, and the next sync round delivers them.
 const MAX_CONCURRENT_SYNC_ANSWERS: usize = 8;
 
-/// Most peers remembered as having been answered with hints. An honest peer
-/// syncs once per interval, so this only bounds what a flood of identities
-/// could leave behind.
+/// Most peers remembered as having been answered with hints. Only routing-table
+/// peers are answered, so this only bounds what a lagging table could leave
+/// behind; past it the peer answered longest ago is forgotten, never a new one
+/// refused.
 const MAX_ANSWERED_SYNC_PEERS: usize = 4096;
 
 /// How often the pending hints are looked at.
@@ -345,17 +346,24 @@ struct AnsweredSyncs {
 
 impl AnsweredSyncs {
     /// Whether `peer` may be answered at `now`, and if so note it: not if it
-    /// was answered less than `spacing` ago, nor while the map is full of
-    /// peers answered that recently.
+    /// was answered less than `spacing` ago. A full map forgets the peers
+    /// answered longest ago rather than refuse anyone new.
     fn admit(&mut self, peer: PeerId, now: Instant, spacing: Duration) -> bool {
         let recent = |at: &Instant| now.saturating_duration_since(*at) < spacing;
         if self.at.get(&peer).is_some_and(recent) {
             return false;
         }
-        if self.at.len() >= MAX_ANSWERED_SYNC_PEERS {
+        if self.at.len() >= MAX_ANSWERED_SYNC_PEERS && !self.at.contains_key(&peer) {
             self.at.retain(|_, at| recent(at));
-            if self.at.len() >= MAX_ANSWERED_SYNC_PEERS {
-                return false;
+        }
+        if self.at.len() >= MAX_ANSWERED_SYNC_PEERS && !self.at.contains_key(&peer) {
+            let oldest = self
+                .at
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(peer, _)| *peer);
+            if let Some(oldest) = oldest {
+                self.at.remove(&oldest);
             }
         }
         self.at.insert(peer, now);
@@ -588,31 +596,35 @@ impl PointerReplication {
             .spawn(async move { this.push_hints(&peers).await });
     }
 
-    /// Answer a peer's admitted sync request with this node's pointer hints,
-    /// in the background: how a peer, including one still bootstrapping,
-    /// learns the pointers it should hold.
+    /// Answer a peer's sync request, admitted and still fresh, with this
+    /// node's pointer hints, in the background: how a peer, including one
+    /// still bootstrapping, learns the pointers it should hold.
     ///
-    /// Each answer scans every pointer held, so a peer is answered at most
-    /// once per shortest sync interval, which an honest peer never syncs
-    /// faster than, and at most [`MAX_CONCURRENT_SYNC_ANSWERS`] answers run at
-    /// once. A request that finds them all busy gets no hints this time; the
-    /// next sync round sends them anyway.
+    /// Each answer scans every pointer held, so only a routing-table peer is
+    /// answered, at most once per shortest sync interval, which an honest
+    /// peer never syncs faster than, and at most
+    /// [`MAX_CONCURRENT_SYNC_ANSWERS`] answers run at once. A request that
+    /// finds them all busy gets no hints this time; the next sync round sends
+    /// them anyway.
     pub(crate) fn answer_sync_with_hints(self: &Arc<Self>, peer: PeerId) {
         let Ok(permit) = Arc::clone(&self.sync_answers).try_acquire_owned() else {
             debug!("Not answering {peer}'s sync with pointer hints: too many answers running");
             return;
         };
-        if !self.answered_syncs.lock().admit(
-            peer,
-            Instant::now(),
-            self.config.neighbor_sync_interval_min,
-        ) {
-            return;
-        }
         let this = Arc::clone(self);
         self.tracker.spawn(async move {
             let _permit = permit;
-            this.push_hints(&[peer]).await;
+            if !this.p2p.dht_manager().is_in_routing_table(&peer).await {
+                return;
+            }
+            let admitted = this.answered_syncs.lock().admit(
+                peer,
+                Instant::now(),
+                this.config.neighbor_sync_interval_min,
+            );
+            if admitted {
+                this.push_hints(&[peer]).await;
+            }
         });
     }
 
@@ -1521,24 +1533,29 @@ mod tests {
         );
         assert!(answered.admit(peer(1), start + spacing, spacing));
 
-        // A flood of identities fills the map, and then no one new is
-        // answered until the oldest are old enough to forget.
+        // A full map forgets the peer answered longest ago; a new peer is
+        // never refused for it.
         let mut full = AnsweredSyncs::default();
+        let mut first = None;
         for i in 0..MAX_ANSWERED_SYNC_PEERS {
             let id = u32::try_from(i).expect("fits");
             let mut bytes = [0u8; 32];
             if let Some(prefix) = bytes.get_mut(..4) {
                 prefix.copy_from_slice(&id.to_be_bytes());
             }
-            assert!(full.admit(PeerId::from_bytes(bytes), start, spacing));
+            let at = start + Duration::from_millis(u64::from(id));
+            let each = PeerId::from_bytes(bytes);
+            first.get_or_insert(each);
+            assert!(full.admit(each, at, spacing));
         }
-        assert!(!full.admit(peer(0xEE), start, spacing));
-        assert!(full.admit(peer(0xEE), start + spacing, spacing));
-        assert_eq!(
-            full.at.len(),
-            1,
-            "everyone older than the interval was forgotten"
+        let late = start + Duration::from_secs(10);
+        assert!(
+            full.admit(peer(0xEE), late, spacing),
+            "a new peer is answered"
         );
+        assert_eq!(full.at.len(), MAX_ANSWERED_SYNC_PEERS);
+        let first = first.expect("one was admitted");
+        assert!(!full.at.contains_key(&first), "the oldest was forgotten");
     }
 
     #[tokio::test]
