@@ -234,6 +234,16 @@ pub(crate) fn evaluate(
     }
 }
 
+/// What asking a peer for a pointer record came to.
+enum Fetched {
+    /// A record that verifies and belongs at the address.
+    Record(Pointer),
+    /// A record that does not, which the peer has already been penalised for.
+    Invalid,
+    /// No record: no answer, an empty one, or one about another address.
+    Nothing,
+}
+
 /// Whether nothing but the map holds a peer's outbound permits.
 ///
 /// Every holder, a request waiting for a permit or one holding it, has a
@@ -433,7 +443,16 @@ impl PointerReplication {
     /// back: a valid signature and the right address. Anything else counts
     /// against the peer.
     async fn fetch_record(&self, peer: &PeerId, address: &XorName) -> Option<Pointer> {
-        let body = self
+        match self.fetch_outcome(peer, address).await {
+            Fetched::Record(record) => Some(record),
+            Fetched::Invalid | Fetched::Nothing => None,
+        }
+    }
+
+    /// [`Self::fetch_record`], saying whether a failure was a record that did
+    /// not verify, which has already cost the peer, or no record at all.
+    async fn fetch_outcome(&self, peer: &PeerId, address: &XorName) -> Fetched {
+        let Some(body) = self
             .request(
                 peer,
                 ReplicationMessageBody::PointerFetchRequest(PointerFetchRequest {
@@ -441,29 +460,34 @@ impl PointerReplication {
                 }),
                 self.config.fetch_request_timeout,
             )
-            .await?;
+            .await
+        else {
+            return Fetched::Nothing;
+        };
         let ReplicationMessageBody::PointerFetchResponse(response) = body else {
-            return None;
+            return Fetched::Nothing;
         };
         if response.address != *address {
-            return None;
+            return Fetched::Nothing;
         }
-        let bytes = response.record?;
+        let Some(bytes) = response.record else {
+            return Fetched::Nothing;
+        };
         // Parsing verifies the ML-DSA signature, milliseconds of CPU a peer
         // can demand once per record it serves: off the async executor, as
         // every other pointer signature check is (ADR-0016).
-        let parsed = spawn_blocking(move || Pointer::from_bytes(&bytes))
-            .await
-            .ok()?;
+        let Ok(parsed) = spawn_blocking(move || Pointer::from_bytes(&bytes)).await else {
+            return Fetched::Nothing;
+        };
         match parsed {
-            Ok(record) if record.address() == *address => Some(record),
+            Ok(record) if record.address() == *address => Fetched::Record(record),
             Ok(_) | Err(_) => {
                 debug!(
                     "Peer {peer} served an invalid pointer record for {}",
                     hex::encode(address)
                 );
                 self.penalise(peer).await;
-                None
+                Fetched::Invalid
             }
         }
     }
@@ -1170,13 +1194,16 @@ impl PointerReplication {
             if *peer == self_id || !group.contains(peer) || !self.is_capable(peer) {
                 continue;
             }
-            let holds = self
-                .fetch_record(peer, &fresh.address)
-                .await
-                .is_some_and(|record| {
+            let holds = match self.fetch_outcome(peer, &fresh.address).await {
+                Fetched::Record(record) => {
                     let state = record.state();
                     state.state_id == fresh.state_id || state.replaces(&fresh)
-                });
+                }
+                // Serving a record that does not verify has already been
+                // charged to the peer, once; it is not charged again here.
+                Fetched::Invalid => continue,
+                Fetched::Nothing => false,
+            };
             if !holds {
                 warn!(
                     "Peer {peer} does not hold pointer {} it was offered",
