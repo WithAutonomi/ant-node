@@ -131,7 +131,8 @@ try. What it guarantees instead:
 - **Nodes look before a final state.** Before taking a final state it does not
   hold, from a client or from a fresh offer, a node asks its close group which
   state each holds. A peer claiming a *different* final state is asked for the
-  record, and if it verifies — only the owner could have signed it — the node
+  record, and if it is the state claimed and verifies — only the owner could
+  have signed it — the node
   refuses, answering `Stale` with the state the group proved. A claim alone
   refuses nothing, so one dishonest peer cannot block a transfer. Each peer's
   question and fetch run as one pipeline, all at once, so a peer that claims a
@@ -186,8 +187,10 @@ try. What it guarantees instead:
   final state adopts nothing else, and a node holding none adopts the final
   state a quorum holds. Between two final states a group wide enough to back
   both at quorum — never a seven-node group at four — the larger side is
-  adopted, not whichever answered first, and a tie adopts neither until the
-  group settles.
+  adopted, not whichever answered first. It must be strictly larger even
+  counting every peer that did not answer for its rival, so a tie, seen or
+  possibly hidden behind silent peers, adopts neither until the group
+  settles.
 - **Hints** for a different final state are dropped by a node holding one,
   since the hint cannot replace it. No refetch loop.
 - **Possession.** A member holding a *different final* state is not penalised
@@ -284,14 +287,16 @@ try. What it guarantees instead:
 - Node, the look: a peer that claims a rival and stalls its fetch does not hide
   another peer's proof; a claim the served record does not back is no proof;
   proven final states refuse others, not themselves, and the oldest is
-  forgotten first past the cap; a second proof at an address never replaces
+  forgotten first past the cap; a peer that serves a different rival than it
+  claimed proves nothing; a second proof at an address never replaces
   the first; replays queued behind a look reuse its answer, and a proof
   answers every replay of the loser; a clear answer is dropped when the write
   it cleared fails; looks for addresses sharing their leading bits run side by
   side.
 - Node, repair: a node holding a final state adopts nothing else; of two final
   states with quorum, the larger side is adopted in either answer order, and
-  a tie adopts neither in either order.
+  a tie adopts neither in either order, nor does a side that silent peers
+  could still tie.
 - Node, live network: a transfer written to one node reaches the group and no
   node takes a second final state; a node that missed the transfer refuses a
   different one because a peer serves the one it holds, and still takes the

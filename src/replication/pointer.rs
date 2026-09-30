@@ -249,20 +249,24 @@ pub(crate) fn evaluate(
                 _ => Some(candidate),
             },
         );
+    let unanswered = group_size.saturating_sub(answers.len());
     if let Some((state, holders)) = best {
-        // Two final states backed by as many peers each: neither replaces the
-        // other and neither is the larger side, so only answer order would
-        // pick one, and two repairing nodes could pick differently. Neither
-        // is adopted until the group settles.
-        let tied = by_state.iter().any(|(other, others)| {
-            other.state_id != state.state_id
-                && others.len() == holders.len()
-                && beats_held(other)
-                && !other.replaces(state)
-                && !state.replaces(other)
-        });
-        if tied {
-            return Verdict::Undecided;
+        // A final state is adopted only as the strictly larger side, counting
+        // every peer that did not answer for its rival: a final state is
+        // never replaced, so two repairing nodes that each saw part of a tie
+        // would otherwise adopt opposite sides for good. That covers a rival
+        // seen among the answers and one only silent peers could hold.
+        if state.is_terminal() {
+            let rival_could_match = by_state.iter().any(|(other, others)| {
+                other.state_id != state.state_id
+                    && beats_held(other)
+                    && !other.replaces(state)
+                    && !state.replaces(other)
+                    && others.len().saturating_add(unanswered) >= holders.len()
+            });
+            if rival_could_match || unanswered >= holders.len() {
+                return Verdict::Undecided;
+            }
         }
         return Verdict::Adopt {
             state: *state,
@@ -270,7 +274,6 @@ pub(crate) fn evaluate(
         };
     }
 
-    let unanswered = group_size.saturating_sub(answers.len());
     let largest = by_state
         .iter()
         .filter(|(state, _)| beats_held(state))
@@ -1587,7 +1590,10 @@ where
                 return None;
             }
             let record = fetch(peer).await?;
-            rival(&record.state()).then_some(record)
+            // The record must be the state the peer claimed: a claim the
+            // served record does not back is no proof, even if what it serves
+            // is some other rival.
+            (record.state_id() == held.state_id && rival(&record.state())).then_some(record)
         })
         .buffer_unordered(width);
     while let Some(proof) = proofs.next().await {
@@ -1779,7 +1785,8 @@ mod tests {
                     next += 1;
                 }
             }
-            match evaluate(None, 20, &answers(&list), 4) {
+            // Everyone answered, so the four cannot become five.
+            match evaluate(None, 9, &answers(&list), 4) {
                 Verdict::Adopt { state, holders } => {
                     assert_eq!(state.state_id, more.state_id);
                     assert_eq!(holders.len(), 5);
@@ -1787,6 +1794,42 @@ mod tests {
                 other => panic!("expected the larger side, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn a_silent_peer_that_could_tie_two_final_states_blocks_adoption() {
+        // Eight peers, quorum four: four hold one final state, three another,
+        // one is silent. The silent one could hold the second, making a tie,
+        // so neither side is adopted, whichever answered first.
+        let four = state(u64::MAX, 1, 90);
+        let three = state(u64::MAX, 9, 91);
+        for order in [[four, three], [three, four]] {
+            let mut list = Vec::new();
+            let mut next = 1u8;
+            for candidate in order {
+                let count = if candidate.state_id == four.state_id {
+                    4
+                } else {
+                    3
+                };
+                for _ in 0..count {
+                    list.push((next, Some(candidate)));
+                    next += 1;
+                }
+            }
+            assert_eq!(evaluate(None, 8, &answers(&list), 4), Verdict::Undecided);
+        }
+
+        // A lone final state with quorum, and as many silent peers as hold
+        // it, could meet an unseen rival: undecided too. One fewer silent
+        // peer and it is adopted.
+        let alone = state(u64::MAX, 5, 92);
+        let held: Vec<(u8, Option<PointerState>)> = (1..=4).map(|p| (p, Some(alone))).collect();
+        assert_eq!(evaluate(None, 8, &answers(&held), 4), Verdict::Undecided);
+        assert!(matches!(
+            evaluate(None, 7, &answers(&held), 4),
+            Verdict::Adopt { .. }
+        ));
     }
 
     #[test]
@@ -1889,6 +1932,27 @@ mod tests {
             found.is_none(),
             "a claim the record does not back is no proof"
         );
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_serves_a_different_rival_than_it_claimed_proves_nothing() {
+        let taking = final_record(16, 0x01);
+        let claimed = final_record(16, 0xAA);
+        let served = final_record(16, 0xBB);
+        let found = first_proven_final(
+            vec![peer(1)],
+            &taking.state(),
+            |_| {
+                let claim = claimed.state();
+                async move { Some(claim) }
+            },
+            |_| {
+                let record = served.clone();
+                async move { Some(record) }
+            },
+        )
+        .await;
+        assert!(found.is_none());
     }
 
     #[test]
