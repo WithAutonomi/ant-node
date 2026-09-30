@@ -1751,11 +1751,11 @@ pub async fn handle_subtree_slice_challenge(
     is_bootstrapping: bool,
     commitment_state: Option<&Arc<ResponderCommitmentState>>,
 ) -> SubtreeSliceResponse {
-    handle_subtree_slice_challenge_with_pointer_bindings(
+    serve_slice_challenge(
         challenge,
         storage,
         None,
-        &PointerBindings::new(),
+        None,
         self_peer_id,
         is_bootstrapping,
         commitment_state,
@@ -1766,9 +1766,10 @@ pub async fn handle_subtree_slice_challenge(
 /// [`handle_subtree_slice_challenge`] for a node that also commits pointers
 /// (ADR-0016), without what round 1 bound for them.
 ///
-/// Kept for callers of the earlier signature. With no binding a pointer still
-/// held cannot be proved to be the record round 1 read, so it is reported
-/// `Transient` (ADR-0019); the engine uses
+/// Kept for callers of the earlier signature, and answering as it always did:
+/// a committed pointer is served as the record held now and the newest one
+/// an update replaced. That fails an honest holder after two updates between
+/// the rounds, which is what ADR-0019 fixes; the engine uses
 /// [`handle_subtree_slice_challenge_with_pointer_bindings`].
 pub async fn handle_subtree_slice_challenge_with_pointers(
     challenge: &SubtreeSliceChallenge,
@@ -1778,11 +1779,11 @@ pub async fn handle_subtree_slice_challenge_with_pointers(
     is_bootstrapping: bool,
     commitment_state: Option<&Arc<ResponderCommitmentState>>,
 ) -> SubtreeSliceResponse {
-    handle_subtree_slice_challenge_with_pointer_bindings(
+    serve_slice_challenge(
         challenge,
         storage,
         pointers,
-        &PointerBindings::new(),
+        None,
         self_peer_id,
         is_bootstrapping,
         commitment_state,
@@ -1793,12 +1794,35 @@ pub async fn handle_subtree_slice_challenge_with_pointers(
 /// [`handle_subtree_slice_challenge`] for a node that also commits pointers
 /// (ADR-0016): a committed pointer is answered with its whole signed record,
 /// the one `bound` says round 1 read (ADR-0019).
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn handle_subtree_slice_challenge_with_pointer_bindings(
     challenge: &SubtreeSliceChallenge,
     storage: &ChunkStore,
     pointers: Option<&PointerStore>,
     bound: &PointerBindings,
+    self_peer_id: &PeerId,
+    is_bootstrapping: bool,
+    commitment_state: Option<&Arc<ResponderCommitmentState>>,
+) -> SubtreeSliceResponse {
+    serve_slice_challenge(
+        challenge,
+        storage,
+        pointers,
+        Some(bound),
+        self_peer_id,
+        is_bootstrapping,
+        commitment_state,
+    )
+    .await
+}
+
+/// The body of the slice-challenge handlers. `bound` is `None` for the
+/// earlier entry point, which serves pointers as it did before ADR-0019.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+async fn serve_slice_challenge(
+    challenge: &SubtreeSliceChallenge,
+    storage: &ChunkStore,
+    pointers: Option<&PointerStore>,
+    bound: Option<&PointerBindings>,
     self_peer_id: &PeerId,
     is_bootstrapping: bool,
     commitment_state: Option<&Arc<ResponderCommitmentState>>,
@@ -1951,6 +1975,16 @@ pub async fn handle_subtree_slice_challenge_with_pointer_bindings(
                         reason: format!("pointer read error: {e}"),
                     }
                 }
+            };
+            let Some(bound) = bound else {
+                let records: Vec<Vec<u8>> =
+                    current.into_iter().chain(store.superseded(&key)).collect();
+                if records.is_empty() {
+                    items.push(SubtreeSliceItem::Absent { key });
+                } else {
+                    items.push(SubtreeSliceItem::PointerRecord { key, records });
+                }
+                continue;
             };
             match pointer_records(
                 challenge,
@@ -3140,6 +3174,48 @@ mod pointer_audit_tests {
             SUPERSEDED_RETENTION > slowest,
             "{SUPERSEDED_RETENTION:?} must outlive {slowest:?}"
         );
+    }
+
+    /// The earlier entry point knows nothing of round 1's roots, and answers
+    /// as it did before them: an unchanged pointer is served, and passes,
+    /// rather than reported as a transient failure.
+    #[tokio::test]
+    async fn the_earlier_entry_point_still_serves_an_unchanged_pointer() {
+        let responder = Responder::new(24, 24).await;
+        let nonce = mixed_nonce(responder.committed().tree());
+        let openings = openings(&responder.proved_leaves(nonce).await);
+        let challenge = SubtreeSliceChallenge {
+            challenge_id: CHALLENGE_ID,
+            nonce,
+            challenged_peer_id: responder.peer_bytes,
+            expected_commitment_hash: responder.committed().hash(),
+            openings: openings
+                .iter()
+                .map(|(leaf, block_index)| SubtreeSliceOpening {
+                    key: leaf.key,
+                    block_index: *block_index,
+                })
+                .collect(),
+        };
+        let response = handle_subtree_slice_challenge_with_pointers(
+            &challenge,
+            &responder.storage,
+            Some(&responder.pointers),
+            &responder.peer,
+            false,
+            Some(&responder.state),
+        )
+        .await;
+        let SubtreeSliceResponse::Items { items, .. } = response else {
+            panic!("expected items, got {response:?}");
+        };
+        assert!(items
+            .iter()
+            .any(|item| matches!(item, SubtreeSliceItem::PointerRecord { .. })));
+        assert!(matches!(
+            verify_slice_response(&openings, &nonce, &responder.peer_bytes, &items),
+            AuditVerdict::Pass { .. }
+        ));
     }
 
     /// Round 1 binds each pointer it proves, and nothing else.
