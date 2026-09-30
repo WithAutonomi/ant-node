@@ -43,7 +43,7 @@ use parking_lot::Mutex;
 use rand::Rng;
 use saorsa_core::identity::PeerId;
 use saorsa_core::{P2PNode, TrustEvent};
-use tokio::sync::{mpsc, RwLock, Semaphore};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::{spawn_blocking, JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -253,8 +253,33 @@ enum Fetched {
     Invalid,
     /// No record: no answer, an empty one, or one about another address.
     Nothing,
-    /// A record this node could not check, for a reason of its own.
+    /// A record this node could not check, or a request it never sent, for a
+    /// reason of its own.
     LocalFailure,
+}
+
+/// What asking a peer came to (see [`PointerReplication::ask`]).
+enum Asked {
+    /// The peer's answer.
+    Answered(ReplicationMessageBody),
+    /// Sent, and no usable answer came back.
+    Silent,
+    /// Never sent: this node is shutting down, or its own requests to the
+    /// peer stayed busy for the whole timeout.
+    NotSent,
+}
+
+/// One of `permits`, if one comes free within `timeout` and before
+/// `shutdown`.
+async fn acquire_or_give_up(
+    permits: Arc<Semaphore>,
+    timeout: Duration,
+    shutdown: &CancellationToken,
+) -> Option<OwnedSemaphorePermit> {
+    tokio::select! {
+        permit = tokio::time::timeout(timeout, permits.acquire_owned()) => permit.ok()?.ok(),
+        () = shutdown.cancelled() => None,
+    }
 }
 
 /// What a possession check makes of one peer's answer about `fresh`.
@@ -495,20 +520,41 @@ impl PointerReplication {
         body: ReplicationMessageBody,
         timeout: Duration,
     ) -> Option<ReplicationMessageBody> {
-        let _permit = self.outbound_permits(peer).acquire_owned().await.ok()?;
+        match self.ask(peer, body, timeout).await {
+            Asked::Answered(body) => Some(body),
+            Asked::Silent | Asked::NotSent => None,
+        }
+    }
+
+    /// Ask `peer`, saying whether a missing answer was the peer's silence or
+    /// this node never sending the request at all.
+    ///
+    /// The request waits for one of this node's own permits for `peer` first,
+    /// but no longer than `timeout` and not past shutdown: a request that
+    /// could not be sent in that time is dropped as not sent, never left
+    /// waiting, and never held against the peer.
+    async fn ask(&self, peer: &PeerId, body: ReplicationMessageBody, timeout: Duration) -> Asked {
+        let Some(_permit) =
+            acquire_or_give_up(self.outbound_permits(peer), timeout, &self.shutdown).await
+        else {
+            return Asked::NotSent;
+        };
         let msg = ReplicationMessage {
             request_id: rand::thread_rng().gen::<u64>(),
             body,
         };
-        let bytes = msg.encode().ok()?;
-        let response = self
+        let Ok(bytes) = msg.encode() else {
+            return Asked::NotSent;
+        };
+        let Ok(response) = self
             .p2p
             .send_request(peer, REPLICATION_PROTOCOL_ID, bytes, timeout)
             .await
-            .ok()?;
+        else {
+            return Asked::Silent;
+        };
         ReplicationMessage::decode(&response.data)
-            .ok()
-            .map(|msg| msg.body)
+            .map_or(Asked::Silent, |msg| Asked::Answered(msg.body))
     }
 
     async fn penalise(&self, peer: &PeerId) {
@@ -533,8 +579,8 @@ impl PointerReplication {
     /// [`Self::fetch_record`], saying whether a failure was a record that did
     /// not verify, which has already cost the peer, or no record at all.
     async fn fetch_outcome(&self, peer: &PeerId, address: &XorName) -> Fetched {
-        let Some(body) = self
-            .request(
+        let body = match self
+            .ask(
                 peer,
                 ReplicationMessageBody::PointerFetchRequest(PointerFetchRequest {
                     address: *address,
@@ -542,8 +588,11 @@ impl PointerReplication {
                 self.config.fetch_request_timeout,
             )
             .await
-        else {
-            return Fetched::Nothing;
+        {
+            Asked::Answered(body) => body,
+            Asked::Silent => return Fetched::Nothing,
+            // Never asked: nothing to judge the peer on.
+            Asked::NotSent => return Fetched::LocalFailure,
         };
         let ReplicationMessageBody::PointerFetchResponse(response) = body else {
             return Fetched::Nothing;
@@ -1012,7 +1061,12 @@ impl PointerReplication {
         let this = Arc::clone(self);
         self.tracker.spawn(async move {
             let _guard = guard;
-            let Ok(_permit) = this.serve_permits.acquire().await else {
+            // Shutting down ends the wait, and the work behind it.
+            let permit = tokio::select! {
+                permit = this.serve_permits.acquire() => permit,
+                () = this.shutdown.cancelled() => return,
+            };
+            let Ok(_permit) = permit else {
                 return;
             };
             this.mark_capable(&source).await;
@@ -1060,7 +1114,11 @@ impl PointerReplication {
         let this = Arc::clone(self);
         self.tracker.spawn(async move {
             let _guard = guard;
-            let Ok(_permit) = this.serve_permits.acquire().await else {
+            let permit = tokio::select! {
+                permit = this.serve_permits.acquire() => permit,
+                () = this.shutdown.cancelled() => return,
+            };
+            let Ok(_permit) = permit else {
                 return;
             };
             this.mark_capable(&source).await;
@@ -1496,6 +1554,33 @@ mod tests {
         let (pk, sk) = ml_dsa_65().generate_keypair_from_seed(&[3; 32]);
         let target = PointerTarget::new(PointerTargetKind::Chunk, [target; 32]);
         Pointer::sign(&sk, &pk, counter, target).expect("sign")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_that_cannot_be_sent_in_time_is_given_up_not_queued() {
+        let permits = Arc::new(Semaphore::new(1));
+        let shutdown = CancellationToken::new();
+        let held = acquire_or_give_up(Arc::clone(&permits), Duration::from_secs(1), &shutdown)
+            .await
+            .expect("a free permit is taken");
+
+        // Busy past the timeout: given up, not left waiting.
+        assert!(
+            acquire_or_give_up(Arc::clone(&permits), Duration::from_secs(1), &shutdown)
+                .await
+                .is_none()
+        );
+
+        // Shutdown ends a wait at once, however long it could still run.
+        shutdown.cancel();
+        let waited = tokio::time::Instant::now();
+        assert!(
+            acquire_or_give_up(Arc::clone(&permits), Duration::from_secs(3600), &shutdown)
+                .await
+                .is_none()
+        );
+        assert!(waited.elapsed() < Duration::from_secs(1));
+        drop(held);
     }
 
     #[test]
