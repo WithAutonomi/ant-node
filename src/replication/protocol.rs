@@ -1185,7 +1185,7 @@ pub enum AuditResponse {
 /// commitment, or a [`SubtreeAuditResponse::Rejected`] if it genuinely cannot
 /// (for a recently gossiped pinned commitment a rejection is a confirmed
 /// failure, since the responder retains its recently gossiped commitments for a
-/// bounded TTL window).
+/// bounded TTL window, unless it is [`RejectKind::Transient`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubtreeAuditChallenge {
     /// Unique challenge identifier.
@@ -1272,9 +1272,11 @@ pub enum RejectKind {
     /// retention and in-window auditing this is provable repudiation of a root
     /// the node published → CONFIRMED failure.
     UnknownCommitment,
-    /// A transient, recoverable local condition (e.g. a storage read error),
-    /// emitted only after the responder's read retries failed. Routed to the
-    /// timeout lane (holder credit revoked, no trust penalty).
+    /// A transient, recoverable local condition: a storage read error the
+    /// responder's read retries did not clear, a round 1 refused because its
+    /// pointer roots would not fit the session budget, or a pointer record
+    /// round 1 bound that is no longer kept (ADR-0019). Routed to the timeout
+    /// lane (holder credit revoked, no trust penalty).
     Transient,
     /// Any other rejection (wrong target peer, no commitment state, malformed
     /// proof plan, oversized slice challenge, …). CONFIRMED failure.
