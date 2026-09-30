@@ -149,9 +149,12 @@ const MAX_PROVEN_FINALS: usize = 16_384;
 const MAX_PROOFS_PER_ADDRESS: usize = 2;
 
 /// How long a look that found no conflict answers again for the same final
-/// state without asking anyone: long enough to cover replays queued behind
-/// it, short against how fast a close group changes.
-pub const FINAL_STATE_CLEAR_REUSE: Duration = Duration::from_secs(10);
+/// state without asking anyone.
+///
+/// As long as a replay queued behind it can have waited for its turn, and no
+/// longer, since a rival could reach the group after it. The answer is also
+/// forgotten as soon as the write it cleared fails.
+pub const FINAL_STATE_CLEAR_REUSE: Duration = FINAL_STATE_CHECK_WAIT;
 
 /// Most clear looks remembered for reuse. Each is at most
 /// [`FINAL_STATE_CLEAR_REUSE`] old, so this only bounds a burst.
@@ -373,6 +376,12 @@ impl FinalityLooks {
             .is_some_and(|at| now.saturating_duration_since(*at) < FINAL_STATE_CLEAR_REUSE)
     }
 
+    /// Forget a clear look for `state`: the write it cleared did not land, so
+    /// a retry must look again.
+    fn forget_clear(&self, state: &PointerState) {
+        self.clear.lock().remove(&(state.address, state.state_id));
+    }
+
     fn note_clear(&self, state: &PointerState, now: TokioInstant) {
         let mut clear = self.clear.lock();
         if clear.len() >= MAX_CLEAR_LOOKS {
@@ -396,7 +405,9 @@ impl FinalityLooks {
         if let Some(conflict) = self.proven_conflict(state) {
             return FinalityCheck::Conflict(conflict);
         }
-        let stripe = usize::from(state.address.first().copied().unwrap_or_default())
+        // By the last byte: the addresses one node is responsible for share
+        // their leading bits, so the first byte would put them all on one turn.
+        let stripe = usize::from(state.address.last().copied().unwrap_or_default())
             % FINAL_STATE_CHECK_STRIPES;
         let Some(turn) = self.turns.get(stripe) else {
             return FinalityCheck::Busy;
@@ -1182,10 +1193,13 @@ impl PointerReplication {
         if needs_final_check && !self.offered_final_is_clear(&source, &state).await {
             return;
         }
-        match self
+        let stored = self
             .store_verified(record, Some(self.config.paid_list_close_group_size))
-            .await
-        {
+            .await;
+        if !matches!(stored, Ok(true)) && needs_final_check {
+            self.finality.forget_clear(&state);
+        }
+        match stored {
             Ok(true) => debug!(
                 "Stored fresh pointer {} from {source}",
                 hex::encode(state.address)
@@ -1519,6 +1533,10 @@ impl FinalStateWitness for PointerReplication {
 
     fn proven_conflict(&self, state: &PointerState) -> Option<PointerState> {
         self.finality.proven_conflict(state)
+    }
+
+    fn forget_clear(&self, state: &PointerState) {
+        self.finality.forget_clear(state);
     }
 }
 
@@ -1886,6 +1904,28 @@ mod tests {
             proven.by_address.get(&a.address).map(Vec::len),
             Some(MAX_PROOFS_PER_ADDRESS)
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn looks_for_addresses_sharing_leading_bits_run_side_by_side() {
+        // The addresses a node is responsible for share their leading bits.
+        // Two such looks, each longer than a check waits for its turn, must
+        // both run rather than one wait and come back Busy.
+        let looks = FinalityLooks::new();
+        let mut first = final_record(14, 0x01).state();
+        let mut second = final_record(15, 0x01).state();
+        first.address = [0xAB; 32];
+        second.address = [0xAB; 32];
+        if let Some(last) = second.address.last_mut() {
+            *last = 0xAC;
+        }
+        let slow = || async {
+            tokio::time::sleep(FINAL_STATE_CHECK_WAIT + Duration::from_secs(1)).await;
+            None
+        };
+        let (a, b) = tokio::join!(looks.check(&first, slow), looks.check(&second, slow));
+        assert_eq!(a, FinalityCheck::Clear);
+        assert_eq!(b, FinalityCheck::Clear, "the second look was held up");
     }
 
     #[tokio::test(start_paused = true)]

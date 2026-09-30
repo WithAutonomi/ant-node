@@ -147,12 +147,16 @@ try. What it guarantees instead:
   per address and 16,384 addresses, oldest forgotten first, and never lets a
   later proof replace an earlier one; it refuses a replayed loser from that
   memory, ahead of the signature check and without asking anyone. A look that
-  found nothing answers the same state again for ten seconds without asking.
+  found nothing answers the same state again for two seconds without asking,
+  enough for replays queued behind it, and not at all once the write it
+  cleared has failed.
   Looks for one address wait their turn, so replays queued behind a look find
   its answer, and a burst costs one round; at most 64 run at once, and one
   that cannot start within two seconds answers the PUT with an error and
-  drops the fresh offer, neither taking nor refusing the state for good, so
-  the write can be tried again.
+  drops the fresh offer, neither taking nor refusing the state for good; the
+  client retries such an error with the proof it already paid for. Looks are
+  spread over the address's last byte, since the addresses one node holds
+  share their leading bits.
   Two seconds of waiting and four of looking stay inside the client's
   ten-second store timeout. Flooding past that needs a new paid final state
   per round.
@@ -231,9 +235,9 @@ try. What it guarantees instead:
   second final state on the merge rule alone. Reads still return the majority
   side; the residual risk is a minority fork that `pointer_finality` reports.
 - Under a flood of distinct paid final states a node answers some honest final
-  PUTs with an error rather than look for them late. A client retries one such
-  refusal as a shortfall; several make the write fail, and the owner tries
-  again.
+  PUTs with an error rather than look for them late. The client retries them
+  with the proof it already paid for; a write that still falls short fails,
+  and the owner tries again.
 - A final PUT costs its node one state query per capable close-group peer, and
   a fetch per claimed rival, before it commits.
 - **Mixed fleets.** A node on ADR-0016's rule still lets a smaller-target final
@@ -279,7 +283,9 @@ try. What it guarantees instead:
   proven final states refuse others, not themselves, and the oldest is
   forgotten first past the cap; a second proof at an address never replaces
   the first; replays queued behind a look reuse its answer, and a proof
-  answers every replay of the loser.
+  answers every replay of the loser; a clear answer is dropped when the write
+  it cleared fails; looks for addresses sharing their leading bits run side by
+  side.
 - Node, repair: a node holding a final state adopts nothing else; of two final
   states with quorum, the larger side is adopted in either answer order.
 - Node, live network: a transfer written to one node reaches the group and no
