@@ -1,4 +1,4 @@
-# ADR-0017: Pointer audits serve the record round 1 bound
+# ADR-0019: Pointer audits serve the record round 1 bound
 
 - **Status:** Proposed
 - **Date:** 2026-09-29

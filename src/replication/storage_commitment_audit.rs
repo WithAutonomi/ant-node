@@ -752,7 +752,7 @@ const _: () = assert!(
 /// What round 1 bound for each committed pointer it proved, by address.
 ///
 /// Each is the nonced root round 1 reported over the record it read
-/// (ADR-0017). Round 2 is owed that record, whatever the pointer holds by the
+/// (ADR-0019). Round 2 is owed that record, whatever the pointer holds by the
 /// time it asks.
 pub type PointerBindings = HashMap<XorName, [u8; 32]>;
 
@@ -999,7 +999,7 @@ pub(crate) fn verify_slice_response(
         // belong at the committed address, and be the record round 1 bound its
         // nonced root over, which the responder had to read before it knew what
         // would be sampled. An update between the rounds does not fail an
-        // honest holder: it serves the record round 1 read (ADR-0017).
+        // honest holder: it serves the record round 1 read (ADR-0019).
         if is_pointer_leaf(leaf) {
             if let Err(reason) = verify_pointer_item(nonce, challenged_peer_bytes, leaf, items) {
                 return AuditVerdict::Fail(reason);
@@ -1765,7 +1765,7 @@ pub async fn handle_subtree_slice_challenge(
 
 /// [`handle_subtree_slice_challenge`] for a node that also commits pointers
 /// (ADR-0016): a committed pointer is answered with its whole signed record,
-/// the one `bound` says round 1 read (ADR-0017).
+/// the one `bound` says round 1 read (ADR-0019).
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn handle_subtree_slice_challenge_with_pointers(
     challenge: &SubtreeSliceChallenge,
@@ -1979,7 +1979,7 @@ enum PointerServe {
     Unavailable,
 }
 
-/// Choose what round 2 serves for the pointer at `key` (ADR-0017), from the
+/// Choose what round 2 serves for the pointer at `key` (ADR-0019), from the
 /// record held now and the records updates replaced: the one that reproduces
 /// the root round 1 reported.
 ///
