@@ -143,15 +143,19 @@ try. What it guarantees instead:
   otherwise take a second final state on the merge rule alone.
 - **A look costs one round, once.** A payment proof, once verified, is cached,
   so replaying one paid final state costs its sender nothing after the first
-  time. A node therefore remembers each final state a look proved (up to
-  16,384 addresses, oldest forgotten first) and refuses a replayed loser from
-  that memory, ahead of the signature check and without asking anyone. Looks
-  for one address wait their turn, so a burst of replays costs one round; at
-  most 64 run at once, and one that cannot start within two seconds answers
-  the PUT with a retryable error and drops the fresh offer, neither taking nor
-  refusing the state for good. Two seconds of waiting and four of looking stay
-  inside the client's ten-second store timeout. Flooding past that needs a
-  new paid final state per round.
+  time. A node therefore remembers each final state a look proved, up to two
+  per address and 16,384 addresses, oldest forgotten first, and never lets a
+  later proof replace an earlier one; it refuses a replayed loser from that
+  memory, ahead of the signature check and without asking anyone. A look that
+  found nothing answers the same state again for ten seconds without asking.
+  Looks for one address wait their turn, so replays queued behind a look find
+  its answer, and a burst costs one round; at most 64 run at once, and one
+  that cannot start within two seconds answers the PUT with an error and
+  drops the fresh offer, neither taking nor refusing the state for good, so
+  the write can be tried again.
+  Two seconds of waiting and four of looking stay inside the client's
+  ten-second store timeout. Flooding past that needs a new paid final state
+  per round.
 - **A node restores its own final state without looking.** A node that lost
   the file of a final state it held is admitted that exact state again and
   nothing else (ADR-0016's lost-record rule), so taking it back is a restore,
@@ -227,8 +231,9 @@ try. What it guarantees instead:
   second final state on the merge rule alone. Reads still return the majority
   side; the residual risk is a minority fork that `pointer_finality` reports.
 - Under a flood of distinct paid final states a node answers some honest final
-  PUTs with a retryable error rather than look for them late. The client
-  retries, as for any refused store.
+  PUTs with an error rather than look for them late. A client retries one such
+  refusal as a shortfall; several make the write fail, and the owner tries
+  again.
 - A final PUT costs its node one state query per capable close-group peer, and
   a fetch per claimed rival, before it commits.
 - **Mixed fleets.** A node on ADR-0016's rule still lets a smaller-target final
@@ -272,7 +277,9 @@ try. What it guarantees instead:
 - Node, the look: a peer that claims a rival and stalls its fetch does not hide
   another peer's proof; a claim the served record does not back is no proof;
   proven final states refuse others, not themselves, and the oldest is
-  forgotten first past the cap.
+  forgotten first past the cap; a second proof at an address never replaces
+  the first; replays queued behind a look reuse its answer, and a proof
+  answers every replay of the loser.
 - Node, repair: a node holding a final state adopts nothing else; of two final
   states with quorum, the larger side is adopted in either answer order.
 - Node, live network: a transfer written to one node reaches the group and no
