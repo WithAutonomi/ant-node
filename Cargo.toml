@@ -243,7 +243,7 @@ saorsa-transport = { git = "https://github.com/WithAutonomi/saorsa-transport", r
 # change relies on (ADR-0018). A rev, not a branch, so the pin is immutable.
 # Drop it once a release includes the companion change. Versions are bumped at
 # release.
-ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "9ad7fce38aa2b79ea6c532985930a3f347ab529b" }
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "7218b60533fad8e3ffe357a89f163a38b6dc100d" }
 
 [profile.release]
 lto = true

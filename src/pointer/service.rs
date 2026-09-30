@@ -78,6 +78,10 @@ pub trait FinalStateWitness: Send + Sync {
     /// that lost once is refused again for nothing, however often the same
     /// paid record is replayed.
     fn proven_conflict(&self, state: &PointerState) -> Option<PointerState>;
+
+    /// Forget that a look found `state` clear: the write it cleared did not
+    /// land, so a retry must look again rather than reuse the answer.
+    fn forget_clear(&self, state: &PointerState);
 }
 
 /// What a close group said about a final state a node is about to take.
@@ -267,6 +271,7 @@ impl PointerService {
                 Ok(reservation) => Some(reservation),
                 Err(e) => {
                     debug!("Rejecting pointer PUT for {}: {e}", hex::encode(address));
+                    self.forget_clear(&state);
                     return PointerPutResponse::Error(ProtocolError::StorageFailed(e.to_string()));
                 }
             },
@@ -276,7 +281,7 @@ impl PointerService {
         // release it the moment this future is dropped, while the blocking
         // transaction it started runs on and publishes the file.
         let record_bytes = request.record.to_vec();
-        match self.store.commit(record, reservation).await {
+        let response = match self.store.commit(record, reservation).await {
             Ok(PutOutcome::Changed) => {
                 // Offer it to the rest of the close group, proof included, so
                 // every member holds it whichever of them the client reached.
@@ -307,6 +312,24 @@ impl PointerService {
             Err(e) => {
                 warn!("Pointer commit failed for {}: {e}", hex::encode(address));
                 PointerPutResponse::Error(ProtocolError::StorageFailed(e.to_string()))
+            }
+        };
+        // A look that cleared a final state is reused briefly for replays of
+        // it; a write that did not land must not leave that answer behind.
+        if !matches!(
+            response,
+            PointerPutResponse::Success { .. } | PointerPutResponse::Unchanged { .. }
+        ) {
+            self.forget_clear(&state);
+        }
+        response
+    }
+
+    /// Forget a clear look for `state`, if a witness took one.
+    fn forget_clear(&self, state: &PointerState) {
+        if state.is_terminal() {
+            if let Some(witness) = self.final_witness.read().as_ref() {
+                witness.forget_clear(state);
             }
         }
     }
@@ -922,6 +945,7 @@ mod tests {
         answer: FinalityCheck,
         proven: Option<PointerState>,
         asked: AtomicUsize,
+        forgotten: AtomicUsize,
     }
 
     impl StubWitness {
@@ -930,6 +954,7 @@ mod tests {
                 answer,
                 proven: None,
                 asked: AtomicUsize::new(0),
+                forgotten: AtomicUsize::new(0),
             })
         }
 
@@ -939,6 +964,7 @@ mod tests {
                 answer: FinalityCheck::Clear,
                 proven: Some(conflict),
                 asked: AtomicUsize::new(0),
+                forgotten: AtomicUsize::new(0),
             })
         }
 
@@ -957,6 +983,10 @@ mod tests {
         fn proven_conflict(&self, state: &PointerState) -> Option<PointerState> {
             self.proven
                 .filter(|proven| proven.state_id != state.state_id)
+        }
+
+        fn forget_clear(&self, _state: &PointerState) {
+            self.forgotten.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -1096,6 +1126,63 @@ mod tests {
             service.handle_put(put(&rival)).await,
             PointerPutResponse::Stale { .. }
         ));
+    }
+
+    /// A group that answers clear while, meanwhile, a rival final state
+    /// lands on this node: the race a clear look can lose.
+    struct RacingWitness {
+        store: PointerStore,
+        rival: Pointer,
+        forgotten: AtomicUsize,
+    }
+
+    impl FinalStateWitness for RacingWitness {
+        fn check_final<'a>(&'a self, _state: &'a PointerState) -> BoxFuture<'a, FinalityCheck> {
+            Box::pin(async move {
+                self.store
+                    .put_bytes(&self.rival.to_bytes())
+                    .await
+                    .expect("the rival lands");
+                FinalityCheck::Clear
+            })
+        }
+
+        fn proven_conflict(&self, _state: &PointerState) -> Option<PointerState> {
+            None
+        }
+
+        fn forget_clear(&self, _state: &PointerState) {
+            self.forgotten.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cleared_final_state_whose_write_fails_is_looked_for_again() {
+        // The look found nothing, but a rival final state landed while it
+        // looked, so the write it cleared comes back stale. The clear answer
+        // must not outlive that write: a retry has to look again.
+        let (landing, _other) = service().await;
+        let (service, _dir) = service().await;
+        let witness = Arc::new(RacingWitness {
+            store: service.store().clone(),
+            rival: final_state(8, 0x01),
+            forgotten: AtomicUsize::new(0),
+        });
+        service.attach_final_state_witness(witness.clone());
+        assert!(matches!(
+            service.handle_put(put(&final_state(8, 0x42))).await,
+            PointerPutResponse::Stale { .. }
+        ));
+        assert_eq!(witness.forgotten.load(Ordering::SeqCst), 1);
+
+        // A write that lands keeps its answer.
+        let witness = StubWitness::answering(FinalityCheck::Clear);
+        landing.attach_final_state_witness(witness.clone());
+        assert!(matches!(
+            landing.handle_put(put(&final_state(9, 0x42))).await,
+            PointerPutResponse::Success { .. }
+        ));
+        assert_eq!(witness.forgotten.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
