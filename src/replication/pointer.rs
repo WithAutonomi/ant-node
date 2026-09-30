@@ -270,16 +270,18 @@ enum Asked {
 }
 
 /// One of `permits`, if one comes free within `timeout` and before
-/// `shutdown`.
+/// `shutdown`. Shutdown wins when both are ready at once.
 async fn acquire_or_give_up(
     permits: Arc<Semaphore>,
     timeout: Duration,
     shutdown: &CancellationToken,
 ) -> Option<OwnedSemaphorePermit> {
-    tokio::select! {
-        permit = tokio::time::timeout(timeout, permits.acquire_owned()) => permit.ok()?.ok(),
+    let permit = tokio::select! {
+        biased;
         () = shutdown.cancelled() => None,
-    }
+        permit = tokio::time::timeout(timeout, permits.acquire_owned()) => permit.ok()?.ok(),
+    }?;
+    (!shutdown.is_cancelled()).then_some(permit)
 }
 
 /// What a possession check makes of one peer's answer about `fresh`.
@@ -1063,12 +1065,16 @@ impl PointerReplication {
             let _guard = guard;
             // Shutting down ends the wait, and the work behind it.
             let permit = tokio::select! {
-                permit = this.serve_permits.acquire() => permit,
+                biased;
                 () = this.shutdown.cancelled() => return,
+                permit = this.serve_permits.acquire() => permit,
             };
             let Ok(_permit) = permit else {
                 return;
             };
+            if this.shutdown.is_cancelled() {
+                return;
+            }
             this.mark_capable(&source).await;
             // `get` verifies the signature before serving, so a record damaged
             // on this disk is never handed on.
@@ -1115,12 +1121,16 @@ impl PointerReplication {
         self.tracker.spawn(async move {
             let _guard = guard;
             let permit = tokio::select! {
-                permit = this.serve_permits.acquire() => permit,
+                biased;
                 () = this.shutdown.cancelled() => return,
+                permit = this.serve_permits.acquire() => permit,
             };
             let Ok(_permit) = permit else {
                 return;
             };
+            if this.shutdown.is_cancelled() {
+                return;
+            }
             this.mark_capable(&source).await;
             let states = request
                 .addresses
@@ -1581,6 +1591,16 @@ mod tests {
         );
         assert!(waited.elapsed() < Duration::from_secs(1));
         drop(held);
+
+        // With a permit free and shutdown already under way, nothing is sent,
+        // every time.
+        for _ in 0..64 {
+            assert!(
+                acquire_or_give_up(Arc::clone(&permits), Duration::from_secs(1), &shutdown)
+                    .await
+                    .is_none()
+            );
+        }
     }
 
     #[test]
