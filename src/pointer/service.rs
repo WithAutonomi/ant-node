@@ -354,9 +354,15 @@ impl PointerService {
                 hex::encode(address),
                 state.counter
             );
+            // Named as the state this node knows, even one whose file it
+            // lost, so the sender can see what it must catch up to.
             return Some(PointerPutResponse::Stale {
                 address,
-                state_id: self.store.state_id(&address).unwrap_or_default(),
+                state_id: self
+                    .store
+                    .remembered(&address)
+                    .map(|known| known.state_id)
+                    .unwrap_or_default(),
             });
         }
 
@@ -1122,10 +1128,23 @@ mod tests {
             service.store().state_id(&own.address()),
             Some(own.state_id())
         );
-        assert!(matches!(
-            service.handle_put(put(&rival)).await,
-            PointerPutResponse::Stale { .. }
-        ));
+        std::fs::remove_file(service.store().file_for(&own.address())).expect("remove");
+        assert!(service
+            .store()
+            .get(&own.address())
+            .await
+            .expect("get")
+            .is_none());
+        match service.handle_put(put(&rival)).await {
+            PointerPutResponse::Stale { state_id, .. } => {
+                assert_eq!(
+                    state_id,
+                    own.state_id(),
+                    "the rival is told which state won"
+                );
+            }
+            other => panic!("the rival must be stale, got {other:?}"),
+        }
     }
 
     /// A group that answers clear while, meanwhile, a rival final state

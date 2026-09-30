@@ -238,8 +238,11 @@ try. What it guarantees instead:
   and bounded in time, and it only runs when a node has learned which peers
   understand pointers, which takes a sync round after joining. A node asked in
   that first round, or one whose group cannot answer in four seconds, takes a
-  second final state on the merge rule alone. Reads still return the majority
-  side; the residual risk is a minority fork that `pointer_finality` reports.
+  second final state on the merge rule alone, and so does a node running with
+  no replication, a local devnet or one whose replication engine failed to
+  start, since there is nothing to ask the group with. Reads still return the
+  majority side; the residual risk is a minority fork that `pointer_finality`
+  reports.
 - Under a flood of distinct paid final states a node answers some honest final
   PUTs with an error rather than look for them late. The client retries them
   with the proof it already paid for; a write that still falls short fails,

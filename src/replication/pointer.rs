@@ -164,6 +164,15 @@ const MAX_CLEAR_LOOKS: usize = 4096;
 /// One peer's answer about one address: the state it holds there, if any.
 type StateAnswer = ((PeerId, XorName), Option<PointerState>);
 
+/// Whether `record` is exactly the state a quorum backed.
+///
+/// The whole state, not only its identifier: the backed state is built from
+/// peers' unauthenticated summaries, and a summary can pair a real state's
+/// identifier with some other counter or target.
+fn backs(record: &Pointer, wanted: &PointerState) -> bool {
+    record.state() == *wanted
+}
+
 /// One peer's state response, read against the addresses it was asked about.
 ///
 /// An explicit "nothing held" is an answer. A summary about some other
@@ -927,7 +936,7 @@ impl PointerReplication {
             // The quorum backed this state, exactly. A holder that has moved
             // on since serves a different one, which that quorum says nothing
             // about.
-            if record.state() != wanted {
+            if !backs(&record, &wanted) {
                 continue;
             }
             match self.store_verified(record, None).await {
@@ -1886,6 +1895,20 @@ mod tests {
             evaluate(None, 8, &answers(&list), 4),
             Verdict::Adopt { .. }
         ));
+    }
+
+    #[test]
+    fn a_record_backs_only_the_whole_state_a_quorum_named() {
+        let record = final_record(17, 0x01);
+        assert!(backs(&record, &record.state()));
+        let forged = PointerState {
+            counter: 7,
+            ..record.state()
+        };
+        assert!(
+            !backs(&record, &forged),
+            "a summary pairing the record's identifier with another counter is not backed"
+        );
     }
 
     #[test]
