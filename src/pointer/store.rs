@@ -103,6 +103,15 @@ const MAX_SUPERSEDED: usize = 2048;
 /// handing them out copies nothing.
 type Superseded = HashMap<XorName, VecDeque<(Instant, Bytes)>>;
 
+/// Drop every kept record older than [`SUPERSEDED_RETENTION`] at `now`, and
+/// every address left with none.
+fn drop_expired(superseded: &mut Superseded, now: Instant) {
+    superseded.retain(|_, kept| {
+        kept.retain(|(at, _)| now.saturating_duration_since(*at) < SUPERSEDED_RETENTION);
+        !kept.is_empty()
+    });
+}
+
 /// The name of the shard directory `address` lives in: its last byte in hex.
 fn shard_name(address: &XorName) -> String {
     let last = address.last().copied().unwrap_or_default();
@@ -560,6 +569,15 @@ impl PointerStore {
             .unwrap_or_default()
     }
 
+    /// Forget every replaced record older than [`SUPERSEDED_RETENTION`].
+    ///
+    /// Updates do this as they keep a record; this is for when none come, so
+    /// memory goes back within a pass of the retention running out rather
+    /// than at the next update, which may never come.
+    pub fn drop_expired_superseded(&self) {
+        drop_expired(&mut self.inner.superseded.lock(), Instant::now());
+    }
+
     /// The bytes of the record held at `address`, read from disk without
     /// verifying them.
     ///
@@ -775,10 +793,7 @@ impl Inner {
     fn keep_superseded(&self, address: XorName, bytes: Vec<u8>) {
         let now = Instant::now();
         let mut superseded = self.superseded.lock();
-        superseded.retain(|_, kept| {
-            kept.retain(|(at, _)| now.duration_since(*at) < SUPERSEDED_RETENTION);
-            !kept.is_empty()
-        });
+        drop_expired(&mut superseded, now);
         superseded
             .entry(address)
             .or_default()
@@ -1421,6 +1436,32 @@ mod tests {
             "the record an audit may be owed is still kept"
         );
         assert_eq!(store.superseded_all(&failing).len(), MAX_SUPERSEDED - 1);
+    }
+
+    /// A replaced record past its retention is forgotten even if no update
+    /// comes to do it.
+    #[tokio::test]
+    async fn expired_replaced_records_are_dropped_without_another_update() {
+        let (store, _dir) = store().await;
+        let old = Instant::now()
+            .checked_sub(SUPERSEDED_RETENTION + Duration::from_secs(1))
+            .expect("the clock is past one retention");
+        store
+            .inner
+            .superseded
+            .lock()
+            .insert([3u8; 32], VecDeque::from([(old, Bytes::from(vec![3]))]));
+        store.inner.keep_superseded([4u8; 32], vec![4]);
+        store.drop_expired_superseded();
+        assert!(
+            store.superseded_all(&[3u8; 32]).is_empty()
+                && !store.inner.superseded.lock().contains_key(&[3u8; 32]),
+            "the expired record is gone"
+        );
+        assert!(
+            store.inner.superseded.lock().contains_key(&[4u8; 32]),
+            "a fresh one stays"
+        );
     }
 
     #[tokio::test]
