@@ -1619,7 +1619,7 @@ where
             // The record must be the state the peer claimed: a claim the
             // served record does not back is no proof, even if what it serves
             // is some other rival.
-            (record.state_id() == held.state_id && rival(&record.state())).then_some(record)
+            (backs(&record, &held) && rival(&record.state())).then_some(record)
         })
         .buffer_unordered(width);
     while let Some(proof) = proofs.next().await {
@@ -1895,6 +1895,28 @@ mod tests {
             evaluate(None, 8, &answers(&list), 4),
             Verdict::Adopt { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn a_claim_that_names_a_rival_with_another_target_proves_nothing() {
+        // The claim reuses a real rival's identifier with some other target;
+        // the peer then serves the real rival. The record is not what was
+        // claimed, so it is no proof.
+        let taking = final_record(18, 0x01);
+        let rival = final_record(18, 0xAA);
+        let mut claim = rival.state();
+        claim.target = PointerTarget::new(PointerTargetKind::Chunk, [0xCC; 32]);
+        let found = first_proven_final(
+            vec![peer(1)],
+            &taking.state(),
+            |_| async move { Some(claim) },
+            |_| {
+                let record = rival.clone();
+                async move { Some(record) }
+            },
+        )
+        .await;
+        assert!(found.is_none());
     }
 
     #[test]
