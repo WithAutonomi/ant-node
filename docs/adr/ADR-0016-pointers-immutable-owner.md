@@ -3,7 +3,7 @@
 - **Status:** Proposed
 - **Date:** 2026-09-18
 - **Decision owners:** Anselme (@grumbach)
-- **Related:** ADR-0002 (audit), ADR-0004 (commitment-bound pricing), ADR-0008 (per-record pricing), ADR-0009 (audit families), ADR-0011 (capacity-gated discovery), ADR-0014 (file store), ADR-0015 (browser clients), ADR-0018 (a final state is final, and transfer by final redirection — amends the merge rule below)
+- **Related:** ADR-0002 (audit), ADR-0004 (commitment-bound pricing), ADR-0008 (per-record pricing), ADR-0009 (audit families), ADR-0011 (capacity-gated discovery), ADR-0014 (file store), ADR-0015 (browser clients)
 
 ## Context
 
@@ -85,8 +85,8 @@ rule either would refuse every later update for good, and three such peers
 would leave no write able to reach its quorum. Under the merge rule each takes
 the next update, however far ahead of it that is.
 
-An owner who jumps straight to `u64::MAX` limits only themself: the state is
-final (ADR-0018), so it is the last one that pointer will ever hold.
+An owner who jumps straight to `u64::MAX` limits only themself, and does not
+even freeze the pointer: equal counters still resolve by target, below.
 
 ### Merge
 
@@ -94,10 +94,6 @@ final (ADR-0018), so it is the last one that pointer will ever hold.
 1. larger counter
 2. smaller target bytes
 ```
-
-ADR-0018 puts one rule ahead of these: a state at `u64::MAX` is replaced by
-nothing, so two different final states are unordered and a node keeps the
-first it took. Below the final counter what follows holds unchanged.
 
 A total order on the states of **one address**. Records of different owners are
 not comparable and never contend. **Equal state never replaces**: ML-DSA signing
@@ -249,10 +245,9 @@ verified when it was committed and every read verifies it again.
   self-proving, so one copy settles it; a pointer read has to decide which of
   several signed states is current, and that answer has to come from more than
   one peer.
-- **The owner key cannot change.** Handover is indirection: point at a new
-  pointer the recipient owns. Below the final counter the old owner can take
-  that back, so it is a revocable forwarding; ADR-0018 makes it stick by
-  signing it at the final counter.
+- **Ownership cannot change.** Handover is indirection: point at a new pointer
+  the recipient owns. The old owner keeps write access forever, so it is a
+  revocable forwarding state, not a sale.
 - **Key compromise is permanent.** No rotation, no recovery.
 - The inlined key costs 1,952 bytes on every read, forever — a deliberate trade
   for self-contained validation.
