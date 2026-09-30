@@ -38,9 +38,10 @@ to* can.
 - The address readers use must not change.
 - No new record type, field, message or storage format; nothing a node has to
   interpret beyond the counter it already compares.
-- Once the network holds a transfer, the former owner must have no move left.
-- Forks the owner can still make must be detectable by any reader, and must be
-  impossible to make once a transfer is established.
+- Once a node holds a transfer, no arrival may move it off, the former
+  owner's included.
+- Forks the owner can still make must be detectable by any reader, and must
+  not be able to take a transfer back from the nodes that hold it.
 - Below the final counter nothing changes: ADR-0016's convergence argument
   still holds there.
 
@@ -82,6 +83,20 @@ This lives in `ant_protocol::pointer::PointerState::replaces`, so the node's
 store, its admission gate, fresh offers, repair and hints all take it without a
 line of their own.
 
+### What this changes in ADR-0016
+
+ADR-0016 is left as written. Where the two disagree, this ADR holds, at the
+final counter only:
+
+- ADR-0016's merge rule gains rule 0 above.
+- "An owner who jumps straight to `u64::MAX` ... does not even freeze the
+  pointer" no longer holds: a state at `u64::MAX` is the last one the pointer
+  holds on every node that takes it.
+- "Ownership cannot change ... a revocable forwarding state, not a sale" no
+  longer holds for a forwarding signed at the final counter: no node that holds
+  it gives it up. The owner key still cannot change, and a forwarding below the
+  final counter is still revocable.
+
 ### Transfer
 
 A transfer is the final state whose target is another pointer:
@@ -104,8 +119,9 @@ pointer.
 
 ### The fork that remains
 
-Only the owner can sign a final state, so only the owner can fork one: sign two
-and send them to different nodes before either has heard of the other. Each
+Only the owner can sign a final state, so only the owner can fork one. It
+keeps the earlier record and its key, so it can sign a second final state at
+once or much later, and any node the first has not reached will take it. Each
 node keeps its first. Nothing local can settle that, and this design does not
 try. What it guarantees instead:
 
@@ -117,14 +133,30 @@ try. What it guarantees instead:
   state each holds. A peer claiming a *different* final state is asked for the
   record, and if it verifies — only the owner could have signed it — the node
   refuses, answering `Stale` with the state the group proved. A claim alone
-  refuses nothing, so one dishonest peer cannot block a transfer. The look runs
-  after payment is verified (an owner flooding its own finals pays for each
-  round trip it causes), asks only peers that have sent a pointer message, and
-  is bounded at four seconds inside the client's ten-second store timeout;
-  silence proves nothing and the write goes ahead. This is what closes the gap
-  the merge rule leaves: a node that joined the group after the transfer, or
-  lost its copy, would otherwise take a second final state on the merge rule
-  alone.
+  refuses nothing, so one dishonest peer cannot block a transfer. Each peer's
+  question and fetch run as one pipeline, all at once, so a peer that claims a
+  rival and then stalls its fetch cannot hide another peer's proof until the
+  budget runs out. The look runs after payment is verified, asks only peers
+  that have sent a pointer message, and is bounded at four seconds; silence
+  proves nothing and the write goes ahead. This is what closes the gap the
+  merge rule leaves: a node that joined the group after the transfer would
+  otherwise take a second final state on the merge rule alone.
+- **A look costs one round, once.** A payment proof, once verified, is cached,
+  so replaying one paid final state costs its sender nothing after the first
+  time. A node therefore remembers each final state a look proved (up to
+  16,384 addresses, oldest forgotten first) and refuses a replayed loser from
+  that memory, ahead of the signature check and without asking anyone. Looks
+  for one address wait their turn, so a burst of replays costs one round; at
+  most 64 run at once, and one that cannot start within two seconds answers
+  the PUT with a retryable error and drops the fresh offer, neither taking nor
+  refusing the state for good. Two seconds of waiting and four of looking stay
+  inside the client's ten-second store timeout. Flooding past that needs a
+  new paid final state per round.
+- **A node restores its own final state without looking.** A node that lost
+  the file of a final state it held is admitted that exact state again and
+  nothing else (ADR-0016's lost-record rule), so taking it back is a restore,
+  not a new final state. It asks nobody: a peer on the other side of a fork
+  would otherwise keep it from restoring its own copy for good.
 - **Readers see the majority, and see forks.** A client read that meets a final
   state is settled only once one final state is held by a majority of the close
   group, and returns that one. If two different final states are seen and
@@ -171,8 +203,8 @@ try. What it guarantees instead:
   changes.
 - No new record, field, message or storage format. The wire is untouched; the
   only protocol change is one comparison.
-- After the handover lands the former owner has no move at all: no larger
-  counter exists and no equal one replaces.
+- Once the handover lands on a node, the former owner has no move there: no
+  larger counter exists and no equal one replaces.
 - A handover can be chained: the recipient can transfer its own pointer on.
 - ADR-0016's "revocable forwarding" and "migrate before the final counter"
   caveats are gone: migration *is* the final update.
@@ -194,13 +226,18 @@ try. What it guarantees instead:
   that first round, or one whose group cannot answer in four seconds, takes a
   second final state on the merge rule alone. Reads still return the majority
   side; the residual risk is a minority fork that `pointer_finality` reports.
+- Under a flood of distinct paid final states a node answers some honest final
+  PUTs with a retryable error rather than look for them late. The client
+  retries, as for any refused store.
 - A final PUT costs its node one state query per capable close-group peer, and
   a fetch per claimed rival, before it commits.
 - **Mixed fleets.** A node on ADR-0016's rule still lets a smaller-target final
   state displace the first. Until a close group's majority runs this rule a
   former owner can win back the nodes that do not. Reads follow the majority, so
   the handover holds wherever most of the group has upgraded; recipients should
-  wait for the upgrade before relying on a transfer.
+  wait for the upgrade before relying on a transfer. Nothing on the wire tells
+  the two rules apart: the pointer format version is unchanged, so no node can
+  refuse to replicate with a peer on the old rule.
 - Transferred reads take one extra hop, and a chain of transfers one per hop,
   bounded by the client's resolve depth.
 
@@ -228,7 +265,14 @@ try. What it guarantees instead:
 - Node, request handler: a final state the group proves already superseded is
   refused and named, and nothing is written; one nobody contradicts is taken;
   the group is asked only about a final state the node lacks; two final states
-  raced to two nodes leave each on its first.
+  raced to two nodes leave each on its first; a node restores its own lost
+  final state without asking, and still refuses the rival; a busy look neither
+  takes nor refuses a final state for good; a proven loser is refused again
+  before its signature is checked, and without asking.
+- Node, the look: a peer that claims a rival and stalls its fetch does not hide
+  another peer's proof; a claim the served record does not back is no proof;
+  proven final states refuse others, not themselves, and the oldest is
+  forgotten first past the cap.
 - Node, repair: a node holding a final state adopts nothing else; of two final
   states with quorum, the larger side is adopted in either answer order.
 - Node, live network: a transfer written to one node reaches the group and no
