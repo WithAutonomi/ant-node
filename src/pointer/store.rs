@@ -608,6 +608,16 @@ impl PointerStore {
             .map(|entry| entry.state)
     }
 
+    /// The state this node holds at `address`, or held until it lost the
+    /// file.
+    ///
+    /// Unlike [`Self::state`], a lost record still answers: it is the one
+    /// state, besides a newer one, that [`Self::admits`] lets restore it.
+    #[must_use]
+    pub fn remembered(&self, address: &XorName) -> Option<PointerState> {
+        self.snapshot(address).map(|entry| entry.state)
+    }
+
     /// Whether a paid PUT of `state` may be taken.
     ///
     /// Any state the merge rule prefers to what is held, whatever its counter.

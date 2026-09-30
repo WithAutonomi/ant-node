@@ -1392,7 +1392,7 @@ impl TestNetwork {
                     // which the service also asks before a final state
                     // (ADR-0018).
                     if let Some(service) = protocol.pointer_service() {
-                        engine.with_pointers(service);
+                        engine.with_pointer_service(service);
                     }
                     let dht_events = p2p.dht_manager().subscribe_events();
                     engine.start(dht_events);

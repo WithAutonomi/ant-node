@@ -275,7 +275,7 @@ impl NodeBuilder {
         // hands each newly stored paid state to it, and asks it before taking
         // a final state (ADR-0018).
         if let Some(service) = protocol.pointer_service() {
-            engine.with_pointers(service);
+            engine.with_pointer_service(service);
         }
 
         // ADR-0004: wire the engine's commitment state as the quote generator's

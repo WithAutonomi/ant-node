@@ -2226,17 +2226,21 @@ impl ReplicationEngine {
         })
     }
 
-    /// Replicate the pointers `service` stores (ADR-0016), and wire the
-    /// service to this engine both ways: it hands each newly stored paid
-    /// state here to be offered on, and asks here before it takes a final
-    /// state (ADR-0018).
+    /// Replicate pointers too (ADR-0016): the records in `store`, and the
+    /// fresh writes the pointer PUT handler sends on `fresh_writes`.
+    ///
+    /// The PUT handler is not wired to ask this engine anything before it
+    /// takes a final state (ADR-0018); [`Self::with_pointer_service`] wires
+    /// both.
     ///
     /// Call before [`Self::start`].
-    pub fn with_pointers(&mut self, service: &PointerService) {
-        let (writes, fresh_writes) = mpsc::unbounded_channel();
-        service.attach_fresh_writes(writes);
-        let replication = Arc::new(pointer::PointerReplication::new(
-            service.store().clone(),
+    pub fn with_pointers(
+        &mut self,
+        store: PointerStore,
+        fresh_writes: mpsc::UnboundedReceiver<pointer::PointerFreshWrite>,
+    ) {
+        self.pointers = Some(Arc::new(pointer::PointerReplication::new(
+            store,
             Arc::clone(&self.storage),
             Arc::clone(&self.p2p_node),
             Arc::clone(&self.payment_verifier),
@@ -2245,11 +2249,24 @@ impl ReplicationEngine {
             Arc::clone(&self.send_semaphore),
             self.shutdown.clone(),
             self.detached_task_tracker.clone(),
-        ));
-        let witness: Arc<dyn FinalStateWitness> = replication.clone();
-        service.attach_final_state_witness(witness);
-        self.pointers = Some(replication);
+        )));
         self.pointer_fresh_rx = Some(fresh_writes);
+    }
+
+    /// Replicate the pointers `service` stores (ADR-0016), and wire the
+    /// service to this engine both ways: it hands each newly stored paid
+    /// state here to be offered on, and asks here before it takes a final
+    /// state (ADR-0018).
+    ///
+    /// Call before [`Self::start`].
+    pub fn with_pointer_service(&mut self, service: &PointerService) {
+        let (writes, fresh_writes) = mpsc::unbounded_channel();
+        service.attach_fresh_writes(writes);
+        self.with_pointers(service.store().clone(), fresh_writes);
+        if let Some(replication) = &self.pointers {
+            let witness: Arc<dyn FinalStateWitness> = replication.clone();
+            service.attach_final_state_witness(witness);
+        }
     }
 
     /// The pointer replication, when enabled. Tests use it to drive rounds.
