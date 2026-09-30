@@ -30,7 +30,7 @@
 //! - **Finality.** Before taking a final state it does not hold, from a client
 //!   or a fresh offer, a node asks the close group whether a different final
 //!   state is already held, and refuses if a peer proves one with the signed
-//!   record (ADR-0018). See [`PointerReplication::conflicting_final`].
+//!   record (ADR-0018). See [`PointerReplication::check_final`].
 //!
 //! Requests go only to peers that have sent a pointer message themselves (see
 //! [`PointerReplication::is_capable`]). A peer built before pointers cannot
@@ -39,7 +39,8 @@
 //! neighbour-sync round pushes hints, empty or not, so capability is learned
 //! within a cycle.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -62,7 +63,7 @@ use crate::payment::{
     MIN_PAYMENT_PROOF_SIZE_BYTES,
 };
 use crate::pointer::store::{Inspected, PointerStore};
-use crate::pointer::FinalStateWitness;
+use crate::pointer::{FinalStateWitness, FinalityCheck};
 use crate::replication::admission;
 use crate::replication::commitment_state::ResponderCommitmentState;
 use crate::replication::config::{
@@ -118,6 +119,26 @@ const MAX_PRUNE_CANDIDATES_PER_PASS: usize = 256;
 /// group that has not answered by then is taken to hold nothing that
 /// conflicts: silence is never a vote, here as anywhere else.
 pub const FINAL_STATE_CHECK_BUDGET: Duration = Duration::from_secs(4);
+
+/// How long a finality check waits for its turn before it gives up and
+/// answers [`FinalityCheck::Busy`].
+///
+/// With [`FINAL_STATE_CHECK_BUDGET`] after it, a check still ends well inside
+/// a client's ten-second store timeout.
+pub const FINAL_STATE_CHECK_WAIT: Duration = Duration::from_secs(2);
+
+/// How many finality checks run at once.
+///
+/// Each runs on its own share of the address space. Two checks for one
+/// address never run together, so a burst of replays of one final state
+/// costs the group one round of questions.
+pub const FINAL_STATE_CHECK_STRIPES: usize = 64;
+
+/// How many proven conflicts a node remembers, oldest forgotten first.
+///
+/// A conflict is a final state the close group proved, so it never goes
+/// stale; the cap only bounds memory, at about 200 bytes an entry.
+const MAX_PROVEN_FINALS: usize = 16_384;
 
 /// One peer's answer about one address: the state it holds there, if any.
 type StateAnswer = ((PeerId, XorName), Option<PointerState>);
@@ -246,8 +267,45 @@ pub struct PointerReplication {
     pending: Mutex<HashMap<XorName, Pending>>,
     /// When each held address was first seen continuously out of range.
     out_of_range: Mutex<HashMap<XorName, Instant>>,
+    /// Final states the close group proved, by address (ADR-0018).
+    proven_finals: Mutex<ProvenFinals>,
+    /// One turn per share of the address space for a finality check.
+    final_check_turns: Vec<tokio::sync::Mutex<()>>,
     shutdown: CancellationToken,
     tracker: TaskTracker,
+}
+
+/// Final states a finality check proved the close group holds, remembered so
+/// that a paid final state which lost to one is refused again without asking
+/// anyone.
+#[derive(Default)]
+struct ProvenFinals {
+    by_address: HashMap<XorName, PointerState>,
+    /// Addresses in the order they were first proven, oldest first.
+    order: VecDeque<XorName>,
+}
+
+impl ProvenFinals {
+    /// The proven final state at `state.address`, if it is not `state`.
+    fn conflict(&self, state: &PointerState) -> Option<PointerState> {
+        self.by_address
+            .get(&state.address)
+            .filter(|proven| proven.state_id != state.state_id)
+            .copied()
+    }
+
+    /// Remember `proven`, forgetting the oldest entries past the cap.
+    fn remember(&mut self, proven: PointerState) {
+        if self.by_address.insert(proven.address, proven).is_none() {
+            self.order.push_back(proven.address);
+        }
+        while self.by_address.len() > MAX_PROVEN_FINALS {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.by_address.remove(&oldest);
+        }
+    }
 }
 
 impl PointerReplication {
@@ -277,6 +335,10 @@ impl PointerReplication {
             capable: Mutex::new(HashSet::new()),
             pending: Mutex::new(HashMap::new()),
             out_of_range: Mutex::new(HashMap::new()),
+            proven_finals: Mutex::new(ProvenFinals::default()),
+            final_check_turns: (0..FINAL_STATE_CHECK_STRIPES)
+                .map(|_| tokio::sync::Mutex::new(()))
+                .collect(),
             shutdown,
             tracker,
         }
@@ -955,6 +1017,16 @@ impl PointerReplication {
         {
             return;
         }
+        // A final state already proven to have lost is dropped before it
+        // buys a signature check.
+        let needs_final_check = state.is_terminal()
+            && !self
+                .store
+                .remembered(&state.address)
+                .is_some_and(|known| known.is_terminal());
+        if needs_final_check && self.proven_finals.lock().conflict(&state).is_some() {
+            return;
+        }
         let record = match self.store.verify(parsed).await {
             Ok(record) => record,
             Err(e) => {
@@ -979,25 +1051,13 @@ impl PointerReplication {
             );
             return;
         }
-        // A final state held nowhere here yet is looked for in the group
-        // first, exactly as a client PUT of one is: the peer offering it may
-        // simply be the side of a race this node has not heard the other
-        // side of.
-        let holds_final = self
-            .store
-            .state(&state.address)
-            .is_some_and(|held| held.is_terminal());
-        if state.is_terminal() && !holds_final {
-            if let Some(conflict) = self.conflicting_final(&state).await {
-                info!(
-                    "Refusing fresh final pointer state {} at {} from {source}: the close \
-                     group already holds final state {}",
-                    hex::encode(state.state_id),
-                    hex::encode(state.address),
-                    hex::encode(conflict.state_id())
-                );
-                return;
-            }
+        // A final state this node neither holds nor remembers is looked for
+        // in the group first, exactly as a client PUT of one is: the peer
+        // offering it may simply be the side of a race this node has not
+        // heard the other side of. A node that lost its own final state is
+        // admitted only that state, so restoring it asks nobody.
+        if needs_final_check && !self.offered_final_is_clear(&source, &state).await {
+            return;
         }
         match self
             .store_verified(record, Some(self.config.paid_list_close_group_size))
@@ -1019,14 +1079,42 @@ impl PointerReplication {
     // Finality
     // -----------------------------------------------------------------------
 
-    /// A final state at `state.address`, other than `state`, that a peer in
-    /// the close group holds and proves by serving the signed record.
+    /// Whether a freshly offered final state may be taken: no peer proved a
+    /// different one, and the look was not too busy to run.
+    async fn offered_final_is_clear(&self, source: &PeerId, state: &PointerState) -> bool {
+        match self.check_final(state).await {
+            FinalityCheck::Clear => true,
+            FinalityCheck::Conflict(conflict) => {
+                info!(
+                    "Refusing fresh final pointer state {} at {} from {source}: the close \
+                     group already holds final state {}",
+                    hex::encode(state.state_id),
+                    hex::encode(state.address),
+                    hex::encode(conflict.state_id)
+                );
+                false
+            }
+            FinalityCheck::Busy => {
+                debug!(
+                    "Dropping fresh final pointer state {} at {} from {source}: too many \
+                     finality checks running",
+                    hex::encode(state.state_id),
+                    hex::encode(state.address)
+                );
+                false
+            }
+        }
+    }
+
+    /// Ask the close group whether a final state at `state.address`, other
+    /// than `state`, is already held, and have a peer that says so prove it
+    /// by serving the signed record.
     ///
     /// Asked before this node takes a final state it does not hold. A final
     /// state is replaced by nothing, so a node that took a second one would
     /// hold it for good; asking first is what keeps a former owner from
-    /// finalizing an address again on nodes that had not yet heard it was
-    /// final — one that joined the group since, or lost its copy.
+    /// finalizing an address again on a node that had not yet heard it was
+    /// final, such as one that joined the group since.
     ///
     /// A peer's word is not enough to refuse: a state summary is a claim
     /// anyone can make, and one dishonest peer could otherwise block every
@@ -1034,30 +1122,56 @@ impl PointerReplication {
     /// final state, so one that verifies is the owner's own proof that it
     /// finalized the pointer before.
     ///
-    /// Bounded by [`FINAL_STATE_CHECK_BUDGET`], and only peers that have sent
-    /// a pointer message are asked. A group that cannot be asked in time finds
-    /// nothing, and the write goes ahead on the merge rule alone: a race is a
-    /// fork the client detects, not one this can prevent.
-    pub async fn conflicting_final(&self, state: &PointerState) -> Option<Pointer> {
+    /// A proof is remembered, so the same loser is refused again without a
+    /// question. Checks for one address wait their turn, so a burst of replays
+    /// costs one round, and at most [`FINAL_STATE_CHECK_STRIPES`] run at once;
+    /// one that cannot start within [`FINAL_STATE_CHECK_WAIT`] answers `Busy`.
+    /// Once started it is bounded by [`FINAL_STATE_CHECK_BUDGET`], and only
+    /// peers that have sent a pointer message are asked. A group that cannot
+    /// be asked in time finds nothing, and the write goes ahead on the merge
+    /// rule alone: a race is a fork the client detects, not one this can
+    /// prevent.
+    pub async fn check_final(&self, state: &PointerState) -> FinalityCheck {
         if !state.is_terminal() {
-            return None;
+            return FinalityCheck::Clear;
         }
-        tokio::time::timeout(FINAL_STATE_CHECK_BUDGET, self.find_conflicting_final(state))
+        let proven = self.proven_finals.lock().conflict(state);
+        if let Some(conflict) = proven {
+            return FinalityCheck::Conflict(conflict);
+        }
+        let stripe = usize::from(state.address.first().copied().unwrap_or_default())
+            % FINAL_STATE_CHECK_STRIPES;
+        let Some(turn) = self.final_check_turns.get(stripe) else {
+            return FinalityCheck::Busy;
+        };
+        let Ok(_turn) = tokio::time::timeout(FINAL_STATE_CHECK_WAIT, turn.lock()).await else {
+            return FinalityCheck::Busy;
+        };
+        // A check that held the turn may have proven it meanwhile.
+        let proven = self.proven_finals.lock().conflict(state);
+        if let Some(conflict) = proven {
+            return FinalityCheck::Conflict(conflict);
+        }
+        match tokio::time::timeout(FINAL_STATE_CHECK_BUDGET, self.find_conflicting_final(state))
             .await
-            .unwrap_or_else(|_| {
+        {
+            Ok(Some(record)) => {
+                let conflict = record.state();
+                self.proven_finals.lock().remember(conflict);
+                FinalityCheck::Conflict(conflict)
+            }
+            Ok(None) => FinalityCheck::Clear,
+            Err(_) => {
                 debug!(
                     "Close group of pointer {} did not answer the finality check in time",
                     hex::encode(state.address)
                 );
-                None
-            })
+                FinalityCheck::Clear
+            }
+        }
     }
 
-    /// The body of [`Self::conflicting_final`], without its time bound.
-    ///
-    /// Answers are taken as they arrive, and a claim is checked the moment it
-    /// is made, so one slow peer cannot hide a quick one's proof behind the
-    /// budget.
+    /// The body of [`Self::check_final`], without its bounds.
     async fn find_conflicting_final(&self, state: &PointerState) -> Option<Pointer> {
         let self_id = *self.p2p.peer_id();
         let address = state.address;
@@ -1070,23 +1184,13 @@ impl PointerReplication {
             .map(|node| node.peer_id)
             .filter(|peer| *peer != self_id && self.is_capable(peer))
             .collect();
-
-        let mut claims = stream::iter(peers)
-            .map(|peer| async move {
-                let held = self.ask_state(&peer, &address).await?;
-                (held.is_terminal() && held.state_id != state.state_id).then_some(peer)
-            })
-            .buffer_unordered(VERIFICATION_CONCURRENCY);
-        while let Some(claim) = claims.next().await {
-            let Some(peer) = claim else { continue };
-            let Some(record) = self.fetch_record(&peer, &address).await else {
-                continue;
-            };
-            if record.is_terminal() && record.state_id() != state.state_id {
-                return Some(record);
-            }
-        }
-        None
+        first_proven_final(
+            peers,
+            state,
+            |peer| async move { self.ask_state(&peer, &address).await },
+            |peer| async move { self.fetch_record(&peer, &address).await },
+        )
+        .await
     }
 
     /// Ask one peer which state it holds at `address`.
@@ -1318,16 +1422,62 @@ impl PointerReplication {
 }
 
 impl FinalStateWitness for PointerReplication {
-    fn conflicting_final<'a>(&'a self, state: &'a PointerState) -> BoxFuture<'a, Option<Pointer>> {
-        Box::pin(Self::conflicting_final(self, state))
+    fn check_final<'a>(&'a self, state: &'a PointerState) -> BoxFuture<'a, FinalityCheck> {
+        Box::pin(Self::check_final(self, state))
     }
+
+    fn proven_conflict(&self, state: &PointerState) -> Option<PointerState> {
+        self.proven_finals.lock().conflict(state)
+    }
+}
+
+/// The first final state other than `state` that one of `peers` claims with
+/// `ask` and then proves with `fetch`.
+///
+/// Each peer's question and fetch run as one pipeline, all of them at once,
+/// and the first proof wins. A peer that claims a rival and then stalls its
+/// fetch holds up nobody else's proof: were the fetches made one at a time
+/// after the claims, that one peer would hold the check until its budget ran
+/// out, and a finality check that runs out finds nothing.
+async fn first_proven_final<Ask, AskFut, Fetch, FetchFut>(
+    peers: Vec<PeerId>,
+    state: &PointerState,
+    ask: Ask,
+    fetch: Fetch,
+) -> Option<Pointer>
+where
+    Ask: Fn(PeerId) -> AskFut + Sync,
+    AskFut: Future<Output = Option<PointerState>> + Send,
+    Fetch: Fn(PeerId) -> FetchFut + Sync,
+    FetchFut: Future<Output = Option<Pointer>> + Send,
+{
+    let rival = |held: &PointerState| held.is_terminal() && held.state_id != state.state_id;
+    let (ask, fetch, rival) = (&ask, &fetch, &rival);
+    let width = peers.len().max(1);
+    let mut proofs = stream::iter(peers)
+        .map(|peer| async move {
+            let held = ask(peer).await?;
+            if !rival(&held) {
+                return None;
+            }
+            let record = fetch(peer).await?;
+            rival(&record.state()).then_some(record)
+        })
+        .buffer_unordered(width);
+    while let Some(proof) = proofs.next().await {
+        if proof.is_some() {
+            return proof;
+        }
+    }
+    None
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use ant_protocol::pointer::{PointerTarget, PointerTargetKind};
+    use ant_protocol::pointer::{PointerTarget, PointerTargetKind, FINAL_COUNTER};
+    use saorsa_pqc::api::sig::ml_dsa_65;
 
     fn state(counter: u64, target: u8, id: u8) -> PointerState {
         PointerState {
@@ -1515,5 +1665,113 @@ mod tests {
     #[test]
     fn a_group_nobody_can_be_asked_in_is_undecided() {
         assert_eq!(evaluate(None, 0, &[], 0), Verdict::Undecided);
+    }
+
+    fn final_record(seed: u8, target: u8) -> Pointer {
+        let (pk, sk) = ml_dsa_65().generate_keypair_from_seed(&[seed; 32]);
+        let target = PointerTarget::new(PointerTargetKind::Pointer, [target; 32]);
+        Pointer::sign(&sk, &pk, FINAL_COUNTER, target).expect("sign")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_claimant_that_stalls_its_fetch_does_not_hide_a_rival_another_peer_proves() {
+        // One peer claims a rival final state first and then never serves
+        // it; an honest peer claims the same rival a moment later and serves
+        // it at once. The honest proof must land inside the budget.
+        let taking = final_record(9, 0x01);
+        let rival = final_record(9, 0xAA);
+        let (staller, honest) = (peer(1), peer(2));
+        let found = tokio::time::timeout(
+            FINAL_STATE_CHECK_BUDGET,
+            first_proven_final(
+                vec![staller, honest],
+                &taking.state(),
+                |asked| {
+                    let claim = rival.state();
+                    async move {
+                        if asked == honest {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        Some(claim)
+                    }
+                },
+                |asked| {
+                    let record = rival.clone();
+                    async move {
+                        if asked == staller {
+                            std::future::pending::<()>().await;
+                        }
+                        Some(record)
+                    }
+                },
+            ),
+        )
+        .await;
+        assert_eq!(
+            found.ok().flatten().map(|record| record.state_id()),
+            Some(rival.state_id()),
+            "the honest peer's proof was hidden behind the stalled fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_different_final_state_that_is_served_is_a_proof() {
+        let taking = final_record(10, 0x01);
+        let rival = final_record(10, 0xAA);
+        let (same, unbacked, open) = (peer(1), peer(2), peer(3));
+        let found = first_proven_final(
+            vec![same, unbacked, open],
+            &taking.state(),
+            |asked| {
+                let claim = if asked == same {
+                    taking.state()
+                } else if asked == unbacked {
+                    rival.state()
+                } else {
+                    state(3, 1, 1)
+                };
+                async move { Some(claim) }
+            },
+            // The peer claiming a rival serves the state being taken instead.
+            |_| {
+                let record = taking.clone();
+                async move { Some(record) }
+            },
+        )
+        .await;
+        assert!(
+            found.is_none(),
+            "a claim the record does not back is no proof"
+        );
+    }
+
+    #[test]
+    fn a_proven_final_state_refuses_others_and_forgets_the_oldest_past_the_cap() {
+        let mut proven = ProvenFinals::default();
+        let held = final_record(11, 0xAA).state();
+        let other = final_record(11, 0x01).state();
+        proven.remember(held);
+        assert_eq!(proven.conflict(&other), Some(held));
+        assert_eq!(
+            proven.conflict(&held),
+            None,
+            "a proof is no conflict with itself"
+        );
+
+        for i in 0..MAX_PROVEN_FINALS {
+            let mut filler = held;
+            filler.address = [0; 32];
+            if let Some(slot) = filler.address.get_mut(..8) {
+                slot.copy_from_slice(&(i as u64 + 1).to_be_bytes());
+            }
+            proven.remember(filler);
+        }
+        assert_eq!(proven.by_address.len(), MAX_PROVEN_FINALS);
+        assert_eq!(proven.order.len(), MAX_PROVEN_FINALS);
+        assert_eq!(
+            proven.conflict(&other),
+            None,
+            "the oldest proof is forgotten first"
+        );
     }
 }

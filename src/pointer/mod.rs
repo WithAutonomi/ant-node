@@ -10,11 +10,11 @@
 //!
 //! What the address resolves to can still be handed over for good
 //! (`docs/adr/ADR-0018-pointer-transfer-by-final-redirection.md`): a state at
-//! the final counter is replaced by nothing, so an owner who signs one pointing
-//! at the new owner's pointer has no move left. The store gets that from the
-//! merge rule; the service adds one look at the close group before taking a
-//! final state, so a second one cannot land on a node that had not heard of
-//! the first.
+//! the final counter is replaced by nothing, so once a node holds one pointing
+//! at the new owner's pointer, the former owner cannot take it back there. The
+//! store gets that from the merge rule; the service adds one look at the close
+//! group before taking a final state, so a node that had not heard of the
+//! first refuses a second one when a peer proves the first in time.
 //!
 //! # What lives here
 //!
@@ -64,5 +64,5 @@ pub use ant_protocol::pointer::{
     PointerTarget, PointerTargetKind, DATA_TYPE_POINTER, FINAL_COUNTER, POINTER_BODY_LEN,
     POINTER_FORMAT_VERSION, POINTER_WIRE_LEN, TARGET_WIRE_LEN,
 };
-pub use service::{FinalStateWitness, PointerService};
+pub use service::{FinalStateWitness, FinalityCheck, PointerService};
 pub use store::{PointerStore, PutOutcome};
