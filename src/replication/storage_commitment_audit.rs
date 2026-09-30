@@ -1766,9 +1766,9 @@ pub async fn handle_subtree_slice_challenge(
 /// [`handle_subtree_slice_challenge`] for a node that also commits pointers
 /// (ADR-0016), without what round 1 bound for them.
 ///
-/// Kept for callers of the earlier signature, and answering as it always did:
-/// a committed pointer is served as the record held now and the newest one
-/// an update replaced. That fails an honest holder after two updates between
+/// Kept for callers of the earlier signature, and answering as it did: a
+/// committed pointer is served as the record held now and the newest one an
+/// update replaced, and one no longer held is absent. That fails an honest holder after two updates between
 /// the rounds, which is what ADR-0019 fixes; the engine uses
 /// [`handle_subtree_slice_challenge_with_pointer_bindings`].
 pub async fn handle_subtree_slice_challenge_with_pointers(
@@ -1977,12 +1977,16 @@ async fn serve_slice_challenge(
                 }
             };
             let Some(bound) = bound else {
-                let records: Vec<Vec<u8>> =
-                    current.into_iter().chain(store.superseded(&key)).collect();
-                if records.is_empty() {
-                    items.push(SubtreeSliceItem::Absent { key });
-                } else {
-                    items.push(SubtreeSliceItem::PointerRecord { key, records });
+                // As before ADR-0019, the record held and the newest one an
+                // update replaced; but a node that no longer holds the pointer
+                // is absent, whatever replaced records it still keeps.
+                match current {
+                    Some(current) => {
+                        let mut records = vec![current];
+                        records.extend(store.superseded(&key));
+                        items.push(SubtreeSliceItem::PointerRecord { key, records });
+                    }
+                    None => items.push(SubtreeSliceItem::Absent { key }),
                 }
                 continue;
             };
@@ -3234,6 +3238,34 @@ mod pointer_audit_tests {
             verify_slice_response(&openings, &nonce, &responder.peer_bytes, &items),
             AuditVerdict::Pass { .. }
         ));
+    }
+
+    /// Through the earlier entry point too, a pointer updated and then lost
+    /// is absent, not proved by the record the update replaced.
+    #[tokio::test]
+    async fn the_earlier_entry_point_reports_a_lost_pointer_absent() {
+        let responder = Responder::new(24, 24).await;
+        let nonce = mixed_nonce(responder.committed().tree());
+        let openings = openings(&responder.proved_leaves(nonce).await);
+        let lost = first_pointer(&openings);
+        let owner = (0..24u8)
+            .find(|owner| pointer(*owner, 1).address() == lost)
+            .expect("the opened pointer is one of ours");
+        responder
+            .pointers
+            .put_bytes(&pointer(owner, 2).to_bytes())
+            .await
+            .expect("update");
+        assert!(responder.pointers.delete(&lost).await.expect("delete"));
+
+        let items = legacy_round2(&responder, nonce, &openings).await;
+        assert!(items
+            .iter()
+            .any(|item| matches!(item, SubtreeSliceItem::Absent { key } if *key == lost)));
+        assert_eq!(
+            verify_slice_response(&openings, &nonce, &responder.peer_bytes, &items),
+            AuditVerdict::Fail(AuditFailureReason::KeyAbsent)
+        );
     }
 
     /// Round 2 through the earlier entry point, which takes no bindings.
