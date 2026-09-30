@@ -94,15 +94,15 @@ We will take option 3.
 - **The roots are bounded, by admission.** Every live session together keeps
   at most `MAX_SESSION_POINTER_BINDINGS` (65,536) roots, 4 MiB of payload
   before the maps' own overhead. A round 1 whose roots would not fit withholds
-  its proof, exactly as a round 1 refused for capacity does, so the auditor
-  sees a timeout. Roots are never stripped from a live session to make room:
+  its proof and answers `Transient` instead, which puts it in the auditor's
+  timeout lane with no trust penalty; staying silent would read as a peer that
+  did not answer. Roots are never stripped from a live session to make room:
   its round 2 is owed them. A whole session can still be evicted when the
   session count reaches `MAX_SUBTREE_SESSIONS`, as before this change, and its
   round 2 then goes to the timeout lane. Without a root for a pointer, round 2
-  would reject it
-  as `Transient` rather than guess, since the replaced records kept are capped
-  and an empty history proves nothing, but a session this node opened always
-  holds a root for every pointer it proved.
+  would reject it as `Transient` rather than guess, since the replaced records
+  kept are capped and an empty history proves nothing, but a session this node
+  opened always holds a root for every pointer it proved.
 
 ## Consequences
 
@@ -111,18 +111,18 @@ We will take option 3.
 - Updates between the rounds no longer fail an honest holder, however many.
   What remains are local limits, and none is a confirmed failure: the bound
   record evicted by more than 2,048 paid updates across the node's pointers
-  inside ten minutes is reported as `Transient`, and a round 1 over the roots
-  budget goes unanswered, as one over the round-1 capacity already does.
+  inside ten minutes is reported as `Transient`, and so is a round 1 over the
+  roots budget.
 - Round 2 serves one pointer record where it could serve two, so it is smaller.
 - The auditor, the wire format and the subtree-audit protocol id are unchanged.
 
 ### Negative / Trade-offs
 
-- Round-1 sessions carry state they did not before, bounded by the budget above.
-  Auditors that open pointer-heavy sessions faster than they complete can fill
-  it, and later round 1s then go unanswered until it drains. That costs the
-  holder those audits' credit, not trust, and is the same exposure the round-1
-  concurrency and work budgets already have.
+- Round-1 sessions carry state they did not before, bounded by the budget
+  above. Auditors that open pointer-heavy sessions faster than they complete
+  can fill it, and later round 1s are then answered `Transient` until it
+  drains. That costs the holder those audits' credit, not trust, much as the
+  round-1 concurrency and work budgets already can.
 - A responder that returns `Transient` is not proved wrong. That was already
   so, since any responder can report a local read error, so this gives a
   dishonest node no answer it did not have.

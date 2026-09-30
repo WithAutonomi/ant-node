@@ -4796,8 +4796,9 @@ impl SubtreeRound1Limiter {
     /// every live session together holds no more than
     /// [`MAX_SESSION_POINTER_BINDINGS`] of them. A session whose bindings do
     /// not fit is not opened and `false` is returned, so its proof is not
-    /// sent: the bindings of sessions already answered are never given up,
-    /// because their round 2 is owed them (ADR-0019).
+    /// sent and round 1 is answered `Transient` instead: the bindings of
+    /// sessions already answered are never given up, because their round 2 is
+    /// owed them (ADR-0019).
     async fn open_session(
         &self,
         source: PeerId,
@@ -5259,6 +5260,7 @@ async fn handle_replication_message(
                 // A round-1 proof authorizes exactly one matching round 2: open a
                 // single-use session so a slice challenge cannot be served without
                 // a live round-1 exchange.
+                let mut response = response;
                 if let crate::replication::protocol::SubtreeAuditResponse::Proof { .. } = &response
                 {
                     let opened = subtree_round1
@@ -5271,8 +5273,10 @@ async fn handle_replication_message(
                         )
                         .await;
                     // A proof round 2 could not be answered for is not sent.
-                    // Withholding it is the round-1 capacity drop the auditor
-                    // already treats as a timeout (ADR-0019).
+                    // The node says so instead, as for a local read error: the
+                    // auditor's timeout lane, with no trust penalty, where
+                    // silence would read as a peer that did not answer
+                    // (ADR-0019).
                     if !opened {
                         protocol::record_audit_drop(protocol::AuditDropKind::Subtree);
                         warn!(
@@ -5286,7 +5290,11 @@ async fn handle_replication_message(
                             reason = "pointer_binding_budget",
                             "Audit responder admission dropped"
                         );
-                        return;
+                        response = crate::replication::protocol::SubtreeAuditResponse::Rejected {
+                            challenge_id: challenge.challenge_id,
+                            kind: protocol::RejectKind::Transient,
+                            reason: "pointer binding budget full".to_string(),
+                        };
                     }
                 }
                 let response_kind = subtree_audit_response_kind(&response);
@@ -5435,7 +5443,7 @@ async fn handle_replication_message(
                 let worker_started = Instant::now();
                 let processing_started = Instant::now();
                 let response =
-                    storage_commitment_audit::handle_subtree_slice_challenge_with_pointers(
+                    storage_commitment_audit::handle_subtree_slice_challenge_with_pointer_bindings(
                         &challenge,
                         &storage,
                         pointer_store.as_ref(),

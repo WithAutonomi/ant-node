@@ -1751,7 +1751,7 @@ pub async fn handle_subtree_slice_challenge(
     is_bootstrapping: bool,
     commitment_state: Option<&Arc<ResponderCommitmentState>>,
 ) -> SubtreeSliceResponse {
-    handle_subtree_slice_challenge_with_pointers(
+    handle_subtree_slice_challenge_with_pointer_bindings(
         challenge,
         storage,
         None,
@@ -1764,10 +1764,37 @@ pub async fn handle_subtree_slice_challenge(
 }
 
 /// [`handle_subtree_slice_challenge`] for a node that also commits pointers
+/// (ADR-0016), without what round 1 bound for them.
+///
+/// Kept for callers of the earlier signature. With no binding a pointer still
+/// held cannot be proved to be the record round 1 read, so it is reported
+/// `Transient` (ADR-0019); the engine uses
+/// [`handle_subtree_slice_challenge_with_pointer_bindings`].
+pub async fn handle_subtree_slice_challenge_with_pointers(
+    challenge: &SubtreeSliceChallenge,
+    storage: &ChunkStore,
+    pointers: Option<&PointerStore>,
+    self_peer_id: &PeerId,
+    is_bootstrapping: bool,
+    commitment_state: Option<&Arc<ResponderCommitmentState>>,
+) -> SubtreeSliceResponse {
+    handle_subtree_slice_challenge_with_pointer_bindings(
+        challenge,
+        storage,
+        pointers,
+        &PointerBindings::new(),
+        self_peer_id,
+        is_bootstrapping,
+        commitment_state,
+    )
+    .await
+}
+
+/// [`handle_subtree_slice_challenge`] for a node that also commits pointers
 /// (ADR-0016): a committed pointer is answered with its whole signed record,
 /// the one `bound` says round 1 read (ADR-0019).
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-pub async fn handle_subtree_slice_challenge_with_pointers(
+pub async fn handle_subtree_slice_challenge_with_pointer_bindings(
     challenge: &SubtreeSliceChallenge,
     storage: &ChunkStore,
     pointers: Option<&PointerStore>,
@@ -1930,7 +1957,7 @@ pub async fn handle_subtree_slice_challenge_with_pointers(
                 &key,
                 bound.get(&key),
                 current,
-                store.superseded(&key),
+                store.superseded_all(&key),
             ) {
                 PointerServe::Record(record) => {
                     items.push(SubtreeSliceItem::PointerRecord {
@@ -2991,7 +3018,7 @@ mod pointer_audit_tests {
                     })
                     .collect(),
             };
-            handle_subtree_slice_challenge_with_pointers(
+            handle_subtree_slice_challenge_with_pointer_bindings(
                 &challenge,
                 &self.storage,
                 Some(&self.pointers),
@@ -3294,7 +3321,7 @@ mod pointer_audit_tests {
         let address = pointer(owner, 1).address();
         responder
             .pointers
-            .superseded(&address)
+            .superseded_all(&address)
             .last()
             .map(|record| record.to_vec())
             .expect("the first record is kept")

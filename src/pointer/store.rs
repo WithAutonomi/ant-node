@@ -530,11 +530,22 @@ impl PointerStore {
             .map(|entry| entry.state.state_id)
     }
 
+    /// The record the last update at `address` replaced, within the last
+    /// [`SUPERSEDED_RETENTION`], if any. See [`Self::superseded_all`] for
+    /// every one kept.
+    #[must_use]
+    pub fn superseded(&self, address: &XorName) -> Option<Vec<u8>> {
+        self.superseded_all(address)
+            .into_iter()
+            .next()
+            .map(|bytes| bytes.to_vec())
+    }
+
     /// Every record updates at `address` replaced within the last
     /// [`SUPERSEDED_RETENTION`], newest first: what a storage audit that bound
-    /// one of them before the updates is still owed.
+    /// one of them before the updates is still owed (ADR-0019).
     #[must_use]
-    pub fn superseded(&self, address: &XorName) -> Vec<Bytes> {
+    pub fn superseded_all(&self, address: &XorName) -> Vec<Bytes> {
         self.inner
             .superseded
             .lock()
@@ -1341,7 +1352,7 @@ mod tests {
         let first = signed(1, 1, 1);
         store.put_bytes(&first.to_bytes()).await.expect("put");
         assert!(
-            store.superseded(&first.address()).is_empty(),
+            store.superseded_all(&first.address()).is_empty(),
             "a creation replaces nothing"
         );
 
@@ -1351,7 +1362,7 @@ mod tests {
             PutOutcome::Changed
         );
         assert_eq!(
-            store.superseded(&first.address()),
+            store.superseded_all(&first.address()),
             vec![Bytes::from(first.to_bytes())],
             "the replaced record, exactly as it was held"
         );
@@ -1364,7 +1375,7 @@ mod tests {
         // A stale arrival replaces nothing, so it keeps nothing.
         store.put_bytes(&first.to_bytes()).await.expect("put");
         assert_eq!(
-            store.superseded(&first.address()),
+            store.superseded_all(&first.address()),
             vec![Bytes::from(first.to_bytes())]
         );
 
@@ -1373,11 +1384,16 @@ mod tests {
         let third = signed(1, 3, 3);
         store.put_bytes(&third.to_bytes()).await.expect("put");
         assert_eq!(
-            store.superseded(&first.address()),
+            store.superseded_all(&first.address()),
             vec![
                 Bytes::from(second.to_bytes()),
                 Bytes::from(first.to_bytes())
             ]
+        );
+        assert_eq!(
+            store.superseded(&first.address()),
+            Some(second.to_bytes()),
+            "the earlier accessor still answers with the record last replaced"
         );
     }
 
@@ -1400,11 +1416,11 @@ mod tests {
         // ... and its rename fails, so it takes that record back.
         store.inner.unkeep_superseded(&failing);
         assert_eq!(
-            store.superseded(&owed),
+            store.superseded_all(&owed),
             vec![Bytes::from(vec![1])],
             "the record an audit may be owed is still kept"
         );
-        assert_eq!(store.superseded(&failing).len(), MAX_SUPERSEDED - 1);
+        assert_eq!(store.superseded_all(&failing).len(), MAX_SUPERSEDED - 1);
     }
 
     #[tokio::test]
@@ -1419,18 +1435,18 @@ mod tests {
         for i in 0..MAX_SUPERSEDED - 1 {
             keep(second, (i as u64).to_le_bytes().to_vec());
         }
-        assert_eq!(store.superseded(&first), vec![Bytes::from(vec![1])]);
-        assert_eq!(store.superseded(&second).len(), MAX_SUPERSEDED - 1);
+        assert_eq!(store.superseded_all(&first), vec![Bytes::from(vec![1])]);
+        assert_eq!(store.superseded_all(&second).len(), MAX_SUPERSEDED - 1);
 
         // One more: the first address held the oldest record, so it goes.
         keep(second, vec![0xFF]);
-        assert!(store.superseded(&first).is_empty());
+        assert!(store.superseded_all(&first).is_empty());
         assert!(!store.inner.superseded.lock().contains_key(&first));
-        assert_eq!(store.superseded(&second).len(), MAX_SUPERSEDED);
+        assert_eq!(store.superseded_all(&second).len(), MAX_SUPERSEDED);
 
         // And the next goes from the front of the second address's history.
         keep(first, vec![2]);
-        let kept = store.superseded(&second);
+        let kept = store.superseded_all(&second);
         assert_eq!(kept.len(), MAX_SUPERSEDED - 1);
         assert_eq!(kept.first(), Some(&Bytes::from(vec![0xFF])), "newest first");
         assert_eq!(
