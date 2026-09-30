@@ -85,7 +85,7 @@ const SHARD_COUNT: u16 = 256;
 /// for it in the second (ADR-0016). An owner updating the pointer between the
 /// two would otherwise fail the honest node that took the update, so every
 /// record an update replaces stays servable, however many updates follow it
-/// (ADR-0017), for longer than the slowest audit takes with the default
+/// (ADR-0019), for longer than the slowest audit takes with the default
 /// configuration: a round 1 over the largest subtree an auditor will wait
 /// for, then the session its round 2 must arrive within. Round 1 can read a
 /// pointer at its very start and take that long to finish, so the time counts

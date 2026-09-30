@@ -725,7 +725,7 @@ async fn a_node_holding_its_committed_pointers_passes_the_storage_audit() {
 
 /// Several paid updates between the two rounds of a storage audit do not fail
 /// the node holding the pointer: round 2 serves the record round 1 read, found
-/// by the root round 1 reported over it (ADR-0017). Driven one round at a time
+/// by the root round 1 reported over it (ADR-0019). Driven one round at a time
 /// against the holder's live engine, so it is the round-1 session that carries
 /// what round 1 bound across to round 2.
 #[tokio::test]

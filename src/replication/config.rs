@@ -259,7 +259,7 @@ pub const SUBTREE_SESSION_TTL: Duration = Duration::from_mins(2);
 pub const MAX_SUBTREE_SESSIONS: usize = 4 * MAX_CONCURRENT_SUBTREE_ROUND1 * 256;
 
 /// Most pointer bindings every live round-1 session holds together
-/// (ADR-0017): 4 MiB of keys and roots at the cap, before the maps' own
+/// (ADR-0019): 4 MiB of keys and roots at the cap, before the maps' own
 /// overhead.
 ///
 /// A session keeps one per pointer its round 1 proved, and a round-1 subtree

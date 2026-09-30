@@ -1375,7 +1375,7 @@ pub enum SubtreeSliceItem {
         /// The requested key: the pointer's address.
         key: XorName,
         /// The record round 1 read, in its canonical encoding, found by the
-        /// nonced root round 1 reported over it (ADR-0017). At most
+        /// nonced root round 1 reported over it (ADR-0019). At most
         /// [`MAX_POINTER_RECORDS_PER_ITEM`], and the auditor accepts whichever
         /// reproduces that root.
         records: Vec<Vec<u8>>,

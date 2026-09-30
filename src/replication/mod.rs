@@ -4626,7 +4626,7 @@ struct SubtreeSession {
     nonce: [u8; 32],
     inserted: Instant,
     /// What round 1 bound for each pointer it proved, so round 2 serves that
-    /// record however many updates land in between (ADR-0017).
+    /// record however many updates land in between (ADR-0019).
     pointer_bindings: PointerBindings,
 }
 
@@ -4797,7 +4797,7 @@ impl SubtreeRound1Limiter {
     /// [`MAX_SESSION_POINTER_BINDINGS`] of them. A session whose bindings do
     /// not fit is not opened and `false` is returned, so its proof is not
     /// sent: the bindings of sessions already answered are never given up,
-    /// because their round 2 is owed them (ADR-0017).
+    /// because their round 2 is owed them (ADR-0019).
     async fn open_session(
         &self,
         source: PeerId,
@@ -5272,7 +5272,7 @@ async fn handle_replication_message(
                         .await;
                     // A proof round 2 could not be answered for is not sent.
                     // Withholding it is the round-1 capacity drop the auditor
-                    // already treats as a timeout (ADR-0017).
+                    // already treats as a timeout (ADR-0019).
                     if !opened {
                         protocol::record_audit_drop(protocol::AuditDropKind::Subtree);
                         warn!(
