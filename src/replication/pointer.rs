@@ -242,6 +242,37 @@ enum Fetched {
     Invalid,
     /// No record: no answer, an empty one, or one about another address.
     Nothing,
+    /// A record this node could not check, for a reason of its own.
+    LocalFailure,
+}
+
+/// What a possession check makes of one peer's answer about `fresh`.
+#[derive(Debug, PartialEq, Eq)]
+enum Possession {
+    /// The peer served `fresh` or a state that replaces it.
+    Holds,
+    /// The peer could not produce `fresh` or anything newer.
+    Missing,
+    /// Nothing to judge the peer on: it served a record that does not verify,
+    /// which the fetch has already charged it for, or this node could not
+    /// check what it served.
+    NotJudged,
+}
+
+/// Judge one peer's answer in a possession check for `fresh`.
+fn judge_possession(fetched: Fetched, fresh: &PointerState) -> Possession {
+    match fetched {
+        Fetched::Record(record) => {
+            let state = record.state();
+            if state.state_id == fresh.state_id || state.replaces(fresh) {
+                Possession::Holds
+            } else {
+                Possession::Missing
+            }
+        }
+        Fetched::Nothing => Possession::Missing,
+        Fetched::Invalid | Fetched::LocalFailure => Possession::NotJudged,
+    }
 }
 
 /// Whether nothing but the map holds a peer's outbound permits.
@@ -445,7 +476,7 @@ impl PointerReplication {
     async fn fetch_record(&self, peer: &PeerId, address: &XorName) -> Option<Pointer> {
         match self.fetch_outcome(peer, address).await {
             Fetched::Record(record) => Some(record),
-            Fetched::Invalid | Fetched::Nothing => None,
+            Fetched::Invalid | Fetched::Nothing | Fetched::LocalFailure => None,
         }
     }
 
@@ -477,7 +508,12 @@ impl PointerReplication {
         // can demand once per record it serves: off the async executor, as
         // every other pointer signature check is (ADR-0016).
         let Ok(parsed) = spawn_blocking(move || Pointer::from_bytes(&bytes)).await else {
-            return Fetched::Nothing;
+            // The check itself failed here, which says nothing about the peer.
+            warn!(
+                "Could not verify the pointer record {peer} served for {}",
+                hex::encode(address)
+            );
+            return Fetched::LocalFailure;
         };
         match parsed {
             Ok(record) if record.address() == *address => Fetched::Record(record),
@@ -1180,38 +1216,41 @@ impl PointerReplication {
     /// that cannot produce `fresh` or a state that replaces it.
     pub async fn check_possession(&self, fresh: PointerState, peers: &[PeerId]) {
         let self_id = *self.p2p.peer_id();
-        let group: HashSet<PeerId> = self
-            .p2p
-            .dht_manager()
-            .find_closest_nodes_local_with_self(&fresh.address, self.config.close_group_size)
-            .await
-            .into_iter()
-            .map(|node| node.peer_id)
-            .collect();
         for peer in peers {
             // A peer that has left the group owes nothing, and one that cannot
             // be asked is never judged on its silence.
-            if *peer == self_id || !group.contains(peer) || !self.is_capable(peer) {
+            if *peer == self_id || !self.owes(peer, &fresh.address).await {
                 continue;
             }
-            let holds = match self.fetch_outcome(peer, &fresh.address).await {
-                Fetched::Record(record) => {
-                    let state = record.state();
-                    state.state_id == fresh.state_id || state.replaces(&fresh)
-                }
-                // Serving a record that does not verify has already been
-                // charged to the peer, once; it is not charged again here.
-                Fetched::Invalid => continue,
-                Fetched::Nothing => false,
-            };
-            if !holds {
-                warn!(
-                    "Peer {peer} does not hold pointer {} it was offered",
-                    hex::encode(fresh.address)
-                );
-                self.penalise(peer).await;
+            let fetched = self.fetch_outcome(peer, &fresh.address).await;
+            if judge_possession(fetched, &fresh) != Possession::Missing {
+                continue;
             }
+            // Asking can wait on this peer's other requests and on the peers
+            // before it, and it may have left the group meanwhile. It is
+            // judged on what it owes now, not on what it owed when this began.
+            if !self.owes(peer, &fresh.address).await {
+                continue;
+            }
+            warn!(
+                "Peer {peer} does not hold pointer {} it was offered",
+                hex::encode(fresh.address)
+            );
+            self.penalise(peer).await;
         }
+    }
+
+    /// Whether `peer` is responsible for `address` in this node's view, and
+    /// can be asked about it.
+    async fn owes(&self, peer: &PeerId, address: &XorName) -> bool {
+        self.is_capable(peer)
+            && self
+                .p2p
+                .dht_manager()
+                .find_closest_nodes_local_with_self(address, self.config.close_group_size)
+                .await
+                .iter()
+                .any(|node| node.peer_id == *peer)
     }
 
     // -----------------------------------------------------------------------
@@ -1350,6 +1389,7 @@ impl PointerReplication {
 mod tests {
     use super::*;
     use ant_protocol::pointer::{PointerTarget, PointerTargetKind};
+    use saorsa_pqc::api::sig::ml_dsa_65;
 
     fn state(counter: u64, target: u8, id: u8) -> PointerState {
         PointerState {
@@ -1370,6 +1410,31 @@ mod tests {
 
     /// A peer's outbound permits are dropped only once nothing holds them, so
     /// a request in flight keeps the one set later requests share.
+    fn record(counter: u64, target: u8) -> Pointer {
+        let (pk, sk) = ml_dsa_65().generate_keypair_from_seed(&[3; 32]);
+        let target = PointerTarget::new(PointerTargetKind::Chunk, [target; 32]);
+        Pointer::sign(&sk, &pk, counter, target).expect("sign")
+    }
+
+    #[test]
+    fn a_possession_check_judges_each_answer_once() {
+        let fresh = record(5, 1);
+        let judge = |fetched| judge_possession(fetched, &fresh.state());
+        assert_eq!(judge(Fetched::Record(fresh.clone())), Possession::Holds);
+        assert_eq!(
+            judge(Fetched::Record(record(6, 9))),
+            Possession::Holds,
+            "a newer state is as good"
+        );
+        assert_eq!(judge(Fetched::Record(record(4, 1))), Possession::Missing);
+        assert_eq!(judge(Fetched::Nothing), Possession::Missing);
+        // The fetch already charged the peer for an invalid record; charging
+        // it again as missing would count one bad answer twice.
+        assert_eq!(judge(Fetched::Invalid), Possession::NotJudged);
+        // A failure on this node says nothing about the peer.
+        assert_eq!(judge(Fetched::LocalFailure), Possession::NotJudged);
+    }
+
     #[tokio::test]
     async fn outbound_permits_in_use_are_never_dropped() {
         let permits = Arc::new(Semaphore::new(MAX_REQUESTS_PER_PEER));
