@@ -53,6 +53,7 @@ use saorsa_core::identity::PeerId;
 use saorsa_core::{P2PNode, TrustEvent};
 use tokio::sync::{mpsc, RwLock, Semaphore};
 use tokio::task::JoinHandle;
+use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -134,11 +135,27 @@ pub const FINAL_STATE_CHECK_WAIT: Duration = Duration::from_secs(2);
 /// costs the group one round of questions.
 pub const FINAL_STATE_CHECK_STRIPES: usize = 64;
 
-/// How many proven conflicts a node remembers, oldest forgotten first.
+/// How many addresses a node remembers proven final states for, oldest
+/// forgotten first.
 ///
-/// A conflict is a final state the close group proved, so it never goes
-/// stale; the cap only bounds memory, at about 200 bytes an entry.
+/// A proof is a final state the close group was shown to hold, so it never
+/// goes stale; the cap only bounds memory, at most two states of about 200
+/// bytes each per address.
 const MAX_PROVEN_FINALS: usize = 16_384;
+
+/// Proven final states remembered per address. Two different ones are enough
+/// to refuse every final state there: each conflicts with the other, and any
+/// third with both.
+const MAX_PROOFS_PER_ADDRESS: usize = 2;
+
+/// How long a look that found no conflict answers again for the same final
+/// state without asking anyone: long enough to cover replays queued behind
+/// it, short against how fast a close group changes.
+pub const FINAL_STATE_CLEAR_REUSE: Duration = Duration::from_secs(10);
+
+/// Most clear looks remembered for reuse. Each is at most
+/// [`FINAL_STATE_CLEAR_REUSE`] old, so this only bounds a burst.
+const MAX_CLEAR_LOOKS: usize = 4096;
 
 /// One peer's answer about one address: the state it holds there, if any.
 type StateAnswer = ((PeerId, XorName), Option<PointerState>);
@@ -267,10 +284,8 @@ pub struct PointerReplication {
     pending: Mutex<HashMap<XorName, Pending>>,
     /// When each held address was first seen continuously out of range.
     out_of_range: Mutex<HashMap<XorName, Instant>>,
-    /// Final states the close group proved, by address (ADR-0018).
-    proven_finals: Mutex<ProvenFinals>,
-    /// One turn per share of the address space for a finality check.
-    final_check_turns: Vec<tokio::sync::Mutex<()>>,
+    /// The bounds on looks before a final state (ADR-0018).
+    finality: FinalityLooks,
     shutdown: CancellationToken,
     tracker: TaskTracker,
 }
@@ -280,23 +295,33 @@ pub struct PointerReplication {
 /// anyone.
 #[derive(Default)]
 struct ProvenFinals {
-    by_address: HashMap<XorName, PointerState>,
+    /// Up to [`MAX_PROOFS_PER_ADDRESS`] different proven states per address.
+    by_address: HashMap<XorName, Vec<PointerState>>,
     /// Addresses in the order they were first proven, oldest first.
     order: VecDeque<XorName>,
 }
 
 impl ProvenFinals {
-    /// The proven final state at `state.address`, if it is not `state`.
+    /// A proven final state at `state.address` other than `state`.
     fn conflict(&self, state: &PointerState) -> Option<PointerState> {
         self.by_address
-            .get(&state.address)
-            .filter(|proven| proven.state_id != state.state_id)
+            .get(&state.address)?
+            .iter()
+            .find(|proven| proven.state_id != state.state_id)
             .copied()
     }
 
-    /// Remember `proven`, forgetting the oldest entries past the cap.
+    /// Remember `proven` beside what is already proven at its address, never
+    /// in place of it: a proof replaced would let the state it disproved in.
+    /// Forgets the oldest addresses past the cap.
     fn remember(&mut self, proven: PointerState) {
-        if self.by_address.insert(proven.address, proven).is_none() {
+        if let Some(states) = self.by_address.get_mut(&proven.address) {
+            let known = states.iter().any(|state| state.state_id == proven.state_id);
+            if !known && states.len() < MAX_PROOFS_PER_ADDRESS {
+                states.push(proven);
+            }
+        } else {
+            self.by_address.insert(proven.address, vec![proven]);
             self.order.push_back(proven.address);
         }
         while self.by_address.len() > MAX_PROVEN_FINALS {
@@ -304,6 +329,107 @@ impl ProvenFinals {
                 break;
             };
             self.by_address.remove(&oldest);
+        }
+    }
+}
+
+/// The bounds on looks before a final state (ADR-0018), apart from the
+/// network so they can be tested without one.
+///
+/// A look's answer is kept either way: a proof for good, a clear look briefly.
+/// Looks for one address take turns, so replays queued behind a look find its
+/// answer rather than asking again; at most [`FINAL_STATE_CHECK_STRIPES`]
+/// run at once.
+struct FinalityLooks {
+    proven: Mutex<ProvenFinals>,
+    /// When each final state was last looked for and found clear, on the
+    /// runtime's clock, which the look's own time bounds use as well.
+    clear: Mutex<HashMap<(XorName, XorName), TokioInstant>>,
+    /// One turn per share of the address space.
+    turns: Vec<tokio::sync::Mutex<()>>,
+}
+
+impl FinalityLooks {
+    fn new() -> Self {
+        Self {
+            proven: Mutex::new(ProvenFinals::default()),
+            clear: Mutex::new(HashMap::new()),
+            turns: (0..FINAL_STATE_CHECK_STRIPES)
+                .map(|_| tokio::sync::Mutex::new(()))
+                .collect(),
+        }
+    }
+
+    /// A proven final state that conflicts with `state`, asking nobody.
+    fn proven_conflict(&self, state: &PointerState) -> Option<PointerState> {
+        self.proven.lock().conflict(state)
+    }
+
+    /// Whether a look found `state` clear recently enough to answer again.
+    fn recently_clear(&self, state: &PointerState, now: TokioInstant) -> bool {
+        self.clear
+            .lock()
+            .get(&(state.address, state.state_id))
+            .is_some_and(|at| now.saturating_duration_since(*at) < FINAL_STATE_CLEAR_REUSE)
+    }
+
+    fn note_clear(&self, state: &PointerState, now: TokioInstant) {
+        let mut clear = self.clear.lock();
+        if clear.len() >= MAX_CLEAR_LOOKS {
+            clear.retain(|_, at| now.saturating_duration_since(*at) < FINAL_STATE_CLEAR_REUSE);
+        }
+        if clear.len() < MAX_CLEAR_LOOKS {
+            clear.insert((state.address, state.state_id), now);
+        }
+    }
+
+    /// Answer whether `state` may be taken, running `look` only when neither
+    /// a proof nor a recent clear look answers it already.
+    async fn check<Look, Fut>(&self, state: &PointerState, look: Look) -> FinalityCheck
+    where
+        Look: FnOnce() -> Fut + Send,
+        Fut: Future<Output = Option<Pointer>> + Send,
+    {
+        if !state.is_terminal() {
+            return FinalityCheck::Clear;
+        }
+        if let Some(conflict) = self.proven_conflict(state) {
+            return FinalityCheck::Conflict(conflict);
+        }
+        let stripe = usize::from(state.address.first().copied().unwrap_or_default())
+            % FINAL_STATE_CHECK_STRIPES;
+        let Some(turn) = self.turns.get(stripe) else {
+            return FinalityCheck::Busy;
+        };
+        let Ok(_turn) = tokio::time::timeout(FINAL_STATE_CHECK_WAIT, turn.lock()).await else {
+            return FinalityCheck::Busy;
+        };
+        // A look that held the turn may have answered this meanwhile.
+        if let Some(conflict) = self.proven_conflict(state) {
+            return FinalityCheck::Conflict(conflict);
+        }
+        if self.recently_clear(state, TokioInstant::now()) {
+            return FinalityCheck::Clear;
+        }
+        match tokio::time::timeout(FINAL_STATE_CHECK_BUDGET, look()).await {
+            Ok(Some(record)) => {
+                let conflict = record.state();
+                self.proven.lock().remember(conflict);
+                FinalityCheck::Conflict(conflict)
+            }
+            Ok(None) => {
+                self.note_clear(state, TokioInstant::now());
+                FinalityCheck::Clear
+            }
+            // Silence proves nothing, and is not kept for reuse either: the
+            // next look may be answered.
+            Err(_) => {
+                debug!(
+                    "Close group of pointer {} did not answer the finality check in time",
+                    hex::encode(state.address)
+                );
+                FinalityCheck::Clear
+            }
         }
     }
 }
@@ -335,10 +461,7 @@ impl PointerReplication {
             capable: Mutex::new(HashSet::new()),
             pending: Mutex::new(HashMap::new()),
             out_of_range: Mutex::new(HashMap::new()),
-            proven_finals: Mutex::new(ProvenFinals::default()),
-            final_check_turns: (0..FINAL_STATE_CHECK_STRIPES)
-                .map(|_| tokio::sync::Mutex::new(()))
-                .collect(),
+            finality: FinalityLooks::new(),
             shutdown,
             tracker,
         }
@@ -1024,7 +1147,7 @@ impl PointerReplication {
                 .store
                 .remembered(&state.address)
                 .is_some_and(|known| known.is_terminal());
-        if needs_final_check && self.proven_finals.lock().conflict(&state).is_some() {
+        if needs_final_check && self.finality.proven_conflict(&state).is_some() {
             return;
         }
         let record = match self.store.verify(parsed).await {
@@ -1122,53 +1245,21 @@ impl PointerReplication {
     /// final state, so one that verifies is the owner's own proof that it
     /// finalized the pointer before.
     ///
-    /// A proof is remembered, so the same loser is refused again without a
-    /// question. Checks for one address wait their turn, so a burst of replays
-    /// costs one round, and at most [`FINAL_STATE_CHECK_STRIPES`] run at once;
-    /// one that cannot start within [`FINAL_STATE_CHECK_WAIT`] answers `Busy`.
+    /// A proof is remembered, beside any other for the address, so the same
+    /// loser is refused again without a question; a clear look is reused for
+    /// the same state for [`FINAL_STATE_CLEAR_REUSE`]. Checks for one address
+    /// wait their turn, so a burst of replays queued behind a look costs that
+    /// one round, and at most [`FINAL_STATE_CHECK_STRIPES`] run at once; one
+    /// that cannot start within [`FINAL_STATE_CHECK_WAIT`] answers `Busy`.
     /// Once started it is bounded by [`FINAL_STATE_CHECK_BUDGET`], and only
     /// peers that have sent a pointer message are asked. A group that cannot
     /// be asked in time finds nothing, and the write goes ahead on the merge
     /// rule alone: a race is a fork the client detects, not one this can
     /// prevent.
     pub async fn check_final(&self, state: &PointerState) -> FinalityCheck {
-        if !state.is_terminal() {
-            return FinalityCheck::Clear;
-        }
-        let proven = self.proven_finals.lock().conflict(state);
-        if let Some(conflict) = proven {
-            return FinalityCheck::Conflict(conflict);
-        }
-        let stripe = usize::from(state.address.first().copied().unwrap_or_default())
-            % FINAL_STATE_CHECK_STRIPES;
-        let Some(turn) = self.final_check_turns.get(stripe) else {
-            return FinalityCheck::Busy;
-        };
-        let Ok(_turn) = tokio::time::timeout(FINAL_STATE_CHECK_WAIT, turn.lock()).await else {
-            return FinalityCheck::Busy;
-        };
-        // A check that held the turn may have proven it meanwhile.
-        let proven = self.proven_finals.lock().conflict(state);
-        if let Some(conflict) = proven {
-            return FinalityCheck::Conflict(conflict);
-        }
-        match tokio::time::timeout(FINAL_STATE_CHECK_BUDGET, self.find_conflicting_final(state))
+        self.finality
+            .check(state, || self.find_conflicting_final(state))
             .await
-        {
-            Ok(Some(record)) => {
-                let conflict = record.state();
-                self.proven_finals.lock().remember(conflict);
-                FinalityCheck::Conflict(conflict)
-            }
-            Ok(None) => FinalityCheck::Clear,
-            Err(_) => {
-                debug!(
-                    "Close group of pointer {} did not answer the finality check in time",
-                    hex::encode(state.address)
-                );
-                FinalityCheck::Clear
-            }
-        }
     }
 
     /// The body of [`Self::check_final`], without its bounds.
@@ -1427,7 +1518,7 @@ impl FinalStateWitness for PointerReplication {
     }
 
     fn proven_conflict(&self, state: &PointerState) -> Option<PointerState> {
-        self.proven_finals.lock().conflict(state)
+        self.finality.proven_conflict(state)
     }
 }
 
@@ -1478,6 +1569,7 @@ mod tests {
     use super::*;
     use ant_protocol::pointer::{PointerTarget, PointerTargetKind, FINAL_COUNTER};
     use saorsa_pqc::api::sig::ml_dsa_65;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn state(counter: u64, target: u8, id: u8) -> PointerState {
         PointerState {
@@ -1773,5 +1865,61 @@ mod tests {
             None,
             "the oldest proof is forgotten first"
         );
+    }
+
+    #[test]
+    fn a_second_proof_never_replaces_the_first() {
+        // Both sides of a fork proven at one address: each is refused by the
+        // other, so a later look that proved the other side cannot let back
+        // in the state the first look disproved.
+        let mut proven = ProvenFinals::default();
+        let a = final_record(12, 0xAA).state();
+        let b = final_record(12, 0xBB).state();
+        let c = final_record(12, 0xCC).state();
+        proven.remember(a);
+        proven.remember(b);
+        proven.remember(c);
+        assert_eq!(proven.conflict(&b), Some(a));
+        assert_eq!(proven.conflict(&a), Some(b));
+        assert!(proven.conflict(&c).is_some(), "a third is refused by both");
+        assert_eq!(
+            proven.by_address.get(&a.address).map(Vec::len),
+            Some(MAX_PROOFS_PER_ADDRESS)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replays_queued_behind_a_look_reuse_its_answer() {
+        let looks = FinalityLooks::new();
+        let taking = final_record(13, 0x01);
+        let asked = AtomicUsize::new(0);
+        let look = || {
+            asked.fetch_add(1, Ordering::SeqCst);
+            async {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                None
+            }
+        };
+        let state = taking.state();
+        let checks = (0..8).map(|_| looks.check(&state, look));
+        let answers = futures::future::join_all(checks).await;
+        assert!(answers.iter().all(|answer| *answer == FinalityCheck::Clear));
+        assert_eq!(asked.load(Ordering::SeqCst), 1, "eight replays, one look");
+
+        // Past the reuse window the group is asked again.
+        tokio::time::sleep(FINAL_STATE_CLEAR_REUSE).await;
+        assert_eq!(looks.check(&state, look).await, FinalityCheck::Clear);
+        assert_eq!(asked.load(Ordering::SeqCst), 2);
+
+        // A proof answers every replay of the loser without a look.
+        let loser = final_record(13, 0x02).state();
+        let rival = final_record(13, 0xAA);
+        let proved = looks.check(&loser, || async { Some(rival.clone()) }).await;
+        assert_eq!(proved, FinalityCheck::Conflict(rival.state()));
+        assert_eq!(
+            looks.check(&loser, look).await,
+            FinalityCheck::Conflict(rival.state())
+        );
+        assert_eq!(asked.load(Ordering::SeqCst), 2);
     }
 }
