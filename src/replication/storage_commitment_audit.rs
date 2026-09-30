@@ -2030,7 +2030,8 @@ async fn serve_slice_challenge(
 enum PointerServe {
     /// The record round 1 read.
     Record(Vec<u8>),
-    /// Nothing at all is held for it, which is a lost pointer.
+    /// The pointer is no longer held, which is a lost pointer, whatever
+    /// replaced records this node still keeps in memory.
     Absent,
     /// The pointer is held, but this node cannot serve the record round 1
     /// read: it has aged out or been evicted to keep memory bounded, or no
@@ -2055,16 +2056,19 @@ fn pointer_records(
     current: Option<Vec<u8>>,
     replaced: Vec<Bytes>,
 ) -> PointerServe {
-    if current.is_none() && replaced.is_empty() {
+    // A node that no longer holds the pointer has lost it. Records an update
+    // replaced are kept only to prove what round 1 read; they do not make up
+    // for the pointer itself being gone.
+    let Some(current) = current else {
         return PointerServe::Absent;
-    }
+    };
     let Some(root) = bound else {
         return PointerServe::Unavailable;
     };
     let reproduces = |record: &[u8]| {
         nonced_block_root(&challenge.nonce, &challenge.challenged_peer_id, key, record) == *root
     };
-    if let Some(current) = current.filter(|record| reproduces(record)) {
+    if reproduces(&current) {
         return PointerServe::Record(current);
     }
     replaced
@@ -3184,6 +3188,60 @@ mod pointer_audit_tests {
         let responder = Responder::new(24, 24).await;
         let nonce = mixed_nonce(responder.committed().tree());
         let openings = openings(&responder.proved_leaves(nonce).await);
+        let items = legacy_round2(&responder, nonce, &openings).await;
+        assert!(items
+            .iter()
+            .any(|item| matches!(item, SubtreeSliceItem::PointerRecord { .. })));
+        assert!(matches!(
+            verify_slice_response(&openings, &nonce, &responder.peer_bytes, &items),
+            AuditVerdict::Pass { .. }
+        ));
+    }
+
+    /// After one update between the rounds, the earlier entry point serves
+    /// the record held and the one it replaced, newest first, and passes.
+    #[tokio::test]
+    async fn the_earlier_entry_point_still_serves_across_one_update() {
+        let responder = Responder::new(24, 24).await;
+        let nonce = mixed_nonce(responder.committed().tree());
+        let openings = openings(&responder.proved_leaves(nonce).await);
+        let updated = first_pointer(&openings);
+        let owner = (0..24u8)
+            .find(|owner| pointer(*owner, 1).address() == updated)
+            .expect("the opened pointer is one of ours");
+        let replaced = responder
+            .pointers
+            .record_bytes(&updated)
+            .await
+            .expect("read")
+            .expect("held");
+        let newer = pointer(owner, 2).to_bytes();
+        responder.pointers.put_bytes(&newer).await.expect("update");
+
+        let items = legacy_round2(&responder, nonce, &openings).await;
+        let served = items.iter().find_map(|item| match item {
+            SubtreeSliceItem::PointerRecord { key, records } if *key == updated => {
+                Some(records.clone())
+            }
+            _ => None,
+        });
+        assert_eq!(
+            served,
+            Some(vec![newer, replaced]),
+            "the record held, then the one it replaced"
+        );
+        assert!(matches!(
+            verify_slice_response(&openings, &nonce, &responder.peer_bytes, &items),
+            AuditVerdict::Pass { .. }
+        ));
+    }
+
+    /// Round 2 through the earlier entry point, which takes no bindings.
+    async fn legacy_round2(
+        responder: &Responder,
+        nonce: [u8; 32],
+        openings: &[(SubtreeLeaf, u32)],
+    ) -> Vec<SubtreeSliceItem> {
         let challenge = SubtreeSliceChallenge {
             challenge_id: CHALLENGE_ID,
             nonce,
@@ -3209,13 +3267,7 @@ mod pointer_audit_tests {
         let SubtreeSliceResponse::Items { items, .. } = response else {
             panic!("expected items, got {response:?}");
         };
-        assert!(items
-            .iter()
-            .any(|item| matches!(item, SubtreeSliceItem::PointerRecord { .. })));
-        assert!(matches!(
-            verify_slice_response(&openings, &nonce, &responder.peer_bytes, &items),
-            AuditVerdict::Pass { .. }
-        ));
+        items
     }
 
     /// Round 1 binds each pointer it proves, and nothing else.
@@ -3426,6 +3478,40 @@ mod pointer_audit_tests {
             }
             other => panic!("expected a rejection, got {other:?}"),
         }
+    }
+
+    /// A node that lost the pointer is absent, even while it still keeps in
+    /// memory the record an update replaced, and even when that is the very
+    /// record round 1 read: the replaced records prove what round 1 read, not
+    /// that the node still holds the pointer.
+    #[tokio::test]
+    async fn a_lost_pointer_is_absent_whatever_replaced_records_remain() {
+        let responder = Responder::new(24, 24).await;
+        let nonce = mixed_nonce(responder.committed().tree());
+        let openings = openings(&responder.proved_leaves(nonce).await);
+        let lost = first_pointer(&openings);
+        let owner = (0..24u8)
+            .find(|owner| pointer(*owner, 1).address() == lost)
+            .expect("the opened pointer is one of ours");
+        responder
+            .pointers
+            .put_bytes(&pointer(owner, 2).to_bytes())
+            .await
+            .expect("update");
+        assert!(responder.pointers.delete(&lost).await.expect("delete"));
+        assert!(
+            !responder.pointers.superseded_all(&lost).is_empty(),
+            "the record round 1 read is still kept in memory"
+        );
+
+        let items = responder.round2(nonce, &openings).await;
+        assert!(items
+            .iter()
+            .any(|item| matches!(item, SubtreeSliceItem::Absent { key } if *key == lost)));
+        assert_eq!(
+            verify_slice_response(&openings, &nonce, &responder.peer_bytes, &items),
+            AuditVerdict::Fail(AuditFailureReason::KeyAbsent)
+        );
     }
 
     #[tokio::test]

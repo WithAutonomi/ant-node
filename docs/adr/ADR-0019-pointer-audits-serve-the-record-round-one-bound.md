@@ -79,7 +79,8 @@ We will take option 3.
   then has the session's two minutes. A test ties the ten minutes to those two
   figures for the default configuration; an auditor configured to wait longer
   than that can outlast the record. The overall cap stays 2,048 records, about
-  11 MB, oldest first wherever it is.
+  11 MB, oldest first wherever it is, and records past the ten minutes are
+  dropped at each prune pass even when no update comes to drop them.
 - **Round 2 serves the record that matches.** Among the record held now and the
   replaced records kept for that address, it serves the one whose nonced root,
   under the audit's own nonce, is the root round 1 reported. That is a single
@@ -88,9 +89,10 @@ We will take option 3.
   record aged out or was evicted, round 2 is rejected as `Transient`, as for a
   local read error. That is the auditor's timeout lane: no trust penalty, but
   the auditor forgets the holder's standing as a proven holder of every key
-  under the pinned commitment, until the holder passes again. A node that
-  holds nothing at all for the pointer still reports it absent, which is a
-  confirmed failure, as before.
+  under the pinned commitment, until the holder passes again. A node that no
+  longer holds the pointer reports it absent, which is a confirmed failure, as
+  before, whatever replaced records it still keeps: those prove what round 1
+  read, not that the pointer is still held.
 - **The roots are bounded, by admission.** Every live session together keeps
   at most `MAX_SESSION_POINTER_BINDINGS` (65,536) roots, 4 MiB of payload
   before the maps' own overhead. A round 1 whose roots would not fit withholds
