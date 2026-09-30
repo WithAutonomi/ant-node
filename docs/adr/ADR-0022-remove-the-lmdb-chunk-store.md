@@ -1,4 +1,4 @@
-# ADR-0015: Remove the LMDB Chunk Store
+# ADR-0022: Remove the LMDB Chunk Store
 
 - **Status:** Proposed
 - **Date:** 2026-08-28
