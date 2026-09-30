@@ -98,9 +98,9 @@ pub struct Cli {
     #[arg(long, env = "ANT_EVM_PAYMENT_VAULT")]
     pub evm_payment_vault: Option<String>,
 
-    /// Metrics port for Prometheus scraping (0 to disable).
-    #[arg(long, default_value = "9100", env = "ANT_METRICS_PORT")]
-    pub metrics_port: u16,
+    /// Loopback health JSON and Prometheus port (0 = off; set e.g. 9100 to enable).
+    #[arg(long, env = "ANT_METRICS_PORT")]
+    pub metrics_port: Option<u16>,
 
     /// Enable logging output.
     /// When omitted, the tracing subscriber is not installed and no log
@@ -302,7 +302,7 @@ impl Cli {
             cache_capacity: self.cache_capacity,
             rewards_address: self.rewards_address,
             evm_network,
-            metrics_port: self.metrics_port,
+            metrics_port: self.metrics_port.unwrap_or(config.payment.metrics_port),
         };
 
         // Determine bootstrap source and apply auto-discovery if needed.
@@ -373,6 +373,38 @@ mod tests {
     use super::Cli;
     use clap::Parser;
     use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn metrics_port_default_is_off() -> Result<(), Box<dyn std::error::Error>> {
+        use clap::CommandFactory;
+        let command = Cli::command().mut_arg("metrics_port", |arg| arg.env(None::<&str>));
+        let matches = command.try_get_matches_from(["ant-node"])?;
+        let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches)?;
+        assert_eq!(cli.into_config()?.0.payment.metrics_port, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn metrics_port_preserves_config_and_explicit_overrides(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use clap::{CommandFactory, FromArgMatches};
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("node.toml");
+        std::fs::write(&path, "[payment]\nmetrics_port = 23456\n")?;
+        let path = path.to_str().ok_or("config path must be UTF-8")?;
+        for (extra, expected) in [
+            (vec![], 23456),
+            (vec!["--metrics-port", "34567"], 34567),
+            (vec!["--metrics-port", "0"], 0),
+        ] {
+            let command = Cli::command().mut_arg("metrics_port", |arg| arg.env(None::<&str>));
+            let args = [vec!["ant-node", "--config", path], extra].concat();
+            let matches = command.try_get_matches_from(args)?;
+            let cli = Cli::from_arg_matches(&matches)?;
+            assert_eq!(cli.into_config()?.0.payment.metrics_port, expected);
+        }
+        Ok(())
+    }
 
     #[test]
     fn webrtc_direct_port_overrides_the_default_bind_port() -> Result<(), Box<dyn std::error::Error>>

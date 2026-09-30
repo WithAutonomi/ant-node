@@ -36,8 +36,8 @@ cache_capacity = 100000
 # EVM network: "arbitrum-one" or "arbitrum-sepolia"
 evm_network = "arbitrum-one"
 
-# Prometheus metrics port (0 to disable)
-metrics_port = 9100
+# Loopback health JSON and Prometheus port (0 = off; set e.g. 9100 to enable)
+metrics_port = 0
 
 # --- Storage ---
 [storage]
