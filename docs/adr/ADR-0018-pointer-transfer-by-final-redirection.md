@@ -157,9 +157,11 @@ try. What it guarantees instead:
   client retries such an error with the proof it already paid for. Looks are
   spread over the address's last byte, since the addresses one node holds
   share their leading bits.
-  Two seconds of waiting and four of looking stay inside the client's
-  ten-second store timeout. Flooding past that needs a new paid final state
-  per round.
+  Two seconds of waiting and four of looking add at most six seconds to a
+  PUT after its payment is verified; a PUT whose payment check is itself slow
+  can outlast the client's ten-second store timeout, and the client then
+  retries it as a missing answer with the proof it already paid for. Flooding
+  past all this needs a new paid final state per round.
 - **A node restores its own final state without looking.** A node that lost
   the file of a final state it held is admitted that exact state again and
   nothing else (ADR-0016's lost-record rule), so taking it back is a restore,
@@ -184,7 +186,8 @@ try. What it guarantees instead:
   final state adopts nothing else, and a node holding none adopts the final
   state a quorum holds. Between two final states a group wide enough to back
   both at quorum — never a seven-node group at four — the larger side is
-  adopted, not whichever answered first.
+  adopted, not whichever answered first, and a tie adopts neither until the
+  group settles.
 - **Hints** for a different final state are dropped by a node holding one,
   since the hint cannot replace it. No refetch loop.
 - **Possession.** A member holding a *different final* state is not penalised
@@ -287,7 +290,8 @@ try. What it guarantees instead:
   it cleared fails; looks for addresses sharing their leading bits run side by
   side.
 - Node, repair: a node holding a final state adopts nothing else; of two final
-  states with quorum, the larger side is adopted in either answer order.
+  states with quorum, the larger side is adopted in either answer order, and
+  a tie adopts neither in either order.
 - Node, live network: a transfer written to one node reaches the group and no
   node takes a second final state; a node that missed the transfer refuses a
   different one because a peer serves the one it holds, and still takes the

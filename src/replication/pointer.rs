@@ -63,7 +63,7 @@ use crate::payment::{
     PaymentVerifier, VerificationContext, MAX_PAYMENT_PROOF_SIZE_BYTES,
     MIN_PAYMENT_PROOF_SIZE_BYTES,
 };
-use crate::pointer::store::{Inspected, PointerStore};
+use crate::pointer::store::{Inspected, PointerStore, PutOutcome};
 use crate::pointer::{FinalStateWitness, FinalityCheck};
 use crate::replication::admission;
 use crate::replication::commitment_state::ResponderCommitmentState;
@@ -115,8 +115,9 @@ const MAX_PRUNE_CANDIDATES_PER_PASS: usize = 256;
 /// How long a node spends asking its close group for a conflicting final
 /// state before taking one (ADR-0018).
 ///
-/// It runs inside a client's PUT, after payment has been verified, so it has
-/// to leave that PUT well inside the client's ten-second store timeout. A
+/// It runs inside a client's PUT, after payment has been verified, so it adds
+/// to whatever that verification took; it is kept short so a PUT whose
+/// payment is quick stays inside the client's ten-second store timeout. A
 /// group that has not answered by then is taken to hold nothing that
 /// conflicts: silence is never a vote, here as anywhere else.
 pub const FINAL_STATE_CHECK_BUDGET: Duration = Duration::from_secs(4);
@@ -124,8 +125,8 @@ pub const FINAL_STATE_CHECK_BUDGET: Duration = Duration::from_secs(4);
 /// How long a finality check waits for its turn before it gives up and
 /// answers [`FinalityCheck::Busy`].
 ///
-/// With [`FINAL_STATE_CHECK_BUDGET`] after it, a check still ends well inside
-/// a client's ten-second store timeout.
+/// With [`FINAL_STATE_CHECK_BUDGET`] after it, a check adds at most six
+/// seconds to a PUT after its payment is verified.
 pub const FINAL_STATE_CHECK_WAIT: Duration = Duration::from_secs(2);
 
 /// How many finality checks run at once.
@@ -249,6 +250,20 @@ pub(crate) fn evaluate(
             },
         );
     if let Some((state, holders)) = best {
+        // Two final states backed by as many peers each: neither replaces the
+        // other and neither is the larger side, so only answer order would
+        // pick one, and two repairing nodes could pick differently. Neither
+        // is adopted until the group settles.
+        let tied = by_state.iter().any(|(other, others)| {
+            other.state_id != state.state_id
+                && others.len() == holders.len()
+                && beats_held(other)
+                && !other.replaces(state)
+                && !state.replaces(other)
+        });
+        if tied {
+            return Verdict::Undecided;
+        }
         return Verdict::Adopt {
             state: *state,
             holders: holders.clone(),
@@ -930,8 +945,10 @@ impl PointerReplication {
             return Ok(false);
         }
         let reservation = self.chunks.reserve(POINTER_WIRE_LEN as u64)?;
-        self.store.commit(record, Some(reservation)).await?;
-        Ok(true)
+        // Held now, whether this wrote it or it was already here; a commit
+        // that found a state it loses to is not.
+        let outcome = self.store.commit(record, Some(reservation)).await?;
+        Ok(!matches!(outcome, PutOutcome::Stale))
     }
 
     // -----------------------------------------------------------------------
@@ -1769,6 +1786,25 @@ mod tests {
                 }
                 other => panic!("expected the larger side, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn two_final_states_backed_equally_are_adopted_by_neither_order() {
+        // A group of eight with a quorum of four can back two final states
+        // four to four. Whichever answered first must not decide.
+        let one = state(u64::MAX, 1, 80);
+        let other = state(u64::MAX, 9, 81);
+        for order in [[one, other], [other, one]] {
+            let mut list = Vec::new();
+            let mut next = 1u8;
+            for candidate in order {
+                for _ in 0..4 {
+                    list.push((next, Some(candidate)));
+                    next += 1;
+                }
+            }
+            assert_eq!(evaluate(None, 8, &answers(&list), 4), Verdict::Undecided);
         }
     }
 
