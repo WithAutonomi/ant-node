@@ -164,6 +164,29 @@ const MAX_CLEAR_LOOKS: usize = 4096;
 /// One peer's answer about one address: the state it holds there, if any.
 type StateAnswer = ((PeerId, XorName), Option<PointerState>);
 
+/// One peer's state response, read against the addresses it was asked about.
+///
+/// An explicit "nothing held" is an answer. A summary about some other
+/// address is no answer at all, and is left out, so that it does not count as
+/// a peer that answered.
+fn read_state_answers(
+    peer: PeerId,
+    addresses: &[XorName],
+    states: Vec<Option<PointerStateSummary>>,
+) -> Vec<StateAnswer> {
+    addresses
+        .iter()
+        .zip(states)
+        .filter_map(|(address, summary)| match summary {
+            None => Some(((peer, *address), None)),
+            Some(summary) if summary.address == *address => {
+                Some(((peer, *address), Some(PointerState::from(summary))))
+            }
+            Some(_) => None,
+        })
+        .collect()
+}
+
 /// A pointer state this node accepted from a paying client, to be offered to
 /// the rest of its close group.
 pub struct PointerFreshWrite {
@@ -217,13 +240,13 @@ pub(crate) fn evaluate(
     if group_size == 0 || quorum_needed == 0 {
         return Verdict::Undecided;
     }
+    // Votes count together only for the same whole state. A summary is a
+    // peer's unauthenticated claim: one naming a real state's identifier with
+    // some other counter must not absorb, or reshape, the honest votes for it.
     let mut by_state: Vec<(PointerState, Vec<PeerId>)> = Vec::new();
     for (peer, answer) in answers {
         let Some(state) = answer else { continue };
-        match by_state
-            .iter_mut()
-            .find(|(known, _)| known.state_id == state.state_id)
-        {
+        match by_state.iter_mut().find(|(known, _)| known == state) {
             Some((_, holders)) => holders.push(*peer),
             None => by_state.push((*state, vec![*peer])),
         }
@@ -881,17 +904,7 @@ impl PointerReplication {
                 let Some(ReplicationMessageBody::PointerStateResponse(response)) = body else {
                     return Vec::new();
                 };
-                addresses
-                    .iter()
-                    .zip(response.states)
-                    .map(|(address, summary)| {
-                        // An answer about a different address is no answer.
-                        let state = summary
-                            .filter(|summary| summary.address == *address)
-                            .map(PointerState::from);
-                        ((peer, *address), state)
-                    })
-                    .collect()
+                read_state_answers(peer, &addresses, response.states)
             })
             .buffer_unordered(VERIFICATION_CONCURRENCY)
             .collect()
@@ -911,9 +924,10 @@ impl PointerReplication {
             let Some(record) = self.fetch_record(holder, &address).await else {
                 continue;
             };
-            // The quorum backed this state. A holder that has moved on since
-            // serves a different one, which that quorum says nothing about.
-            if record.state_id() != wanted.state_id {
+            // The quorum backed this state, exactly. A holder that has moved
+            // on since serves a different one, which that quorum says nothing
+            // about.
+            if record.state() != wanted {
                 continue;
             }
             match self.store_verified(record, None).await {
@@ -1849,6 +1863,41 @@ mod tests {
             }
             assert_eq!(evaluate(None, 8, &answers(&list), 4), Verdict::Undecided);
         }
+    }
+
+    #[test]
+    fn a_forged_summary_does_not_absorb_the_votes_for_a_final_state() {
+        // One peer names final state A's identifier with a lower counter. It
+        // must stand alone, not carry A's three honest votes as a non-final
+        // state of four and so slip past the guard for final states.
+        let a = state(u64::MAX, 1, 93);
+        let forged = PointerState {
+            counter: u64::MAX - 1,
+            ..a
+        };
+        let b = state(u64::MAX, 9, 94);
+        let mut list = vec![(1u8, Some(forged))];
+        list.extend((2..=4).map(|p| (p, Some(a))));
+        list.extend((5..=7).map(|p| (p, Some(b))));
+        assert!(!matches!(
+            evaluate(None, 8, &answers(&list), 4),
+            Verdict::Adopt { .. }
+        ));
+    }
+
+    #[test]
+    fn a_summary_for_another_address_is_no_answer_at_all() {
+        let (a, b, c) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        let mut elsewhere = state(3, 1, 95);
+        elsewhere.address = [9u8; 32];
+        let mut here = state(3, 1, 96);
+        here.address = c;
+        let read = read_state_answers(
+            peer(1),
+            &[a, b, c],
+            vec![None, Some(elsewhere.into()), Some(here.into())],
+        );
+        assert_eq!(read, vec![((peer(1), a), None), ((peer(1), c), Some(here))]);
     }
 
     #[test]
