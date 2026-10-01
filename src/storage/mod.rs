@@ -55,14 +55,8 @@ pub mod chunk_store;
 #[cfg(not(any(test, feature = "test-utils")))]
 pub(crate) mod chunk_store;
 mod handler;
-// Both are this crate's own business. The cleanup is called once, from the node builder, and
-// the signal was `pub(crate)` in the release that added it; exporting either would publish a
-// migration this release exists to finish.
+// This crate's own business: the cleanup is called once, from the node builder.
 pub(crate) mod legacy_artifacts;
-// Carried forward from the release before this one. Without it a node on this release reads
-// to its peers as one that never reported at all, and the fleet gate that authorised this
-// release could never come back clean again.
-pub(crate) mod migration_signal;
 pub(crate) mod traffic;
 
 pub use crate::ant_protocol::XorName;

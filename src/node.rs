@@ -15,6 +15,7 @@ use crate::payment::{
 use crate::replication::config::ReplicationConfig;
 use crate::replication::fresh::FreshWriteEvent;
 use crate::replication::ReplicationEngine;
+use crate::storage::legacy_artifacts;
 use crate::storage::traffic as storage_traffic;
 use crate::storage::MIB;
 use crate::storage::{AntProtocol, ChunkRequestContext, ChunkStore, ChunkStoreConfig};
@@ -43,8 +44,18 @@ use tokio::signal::unix::{signal, SignalKind};
 /// How long shutdown waits for in-flight request handlers to finish.
 ///
 /// Short, because these are single request/response exchanges and the peer will retry.
-/// The point is to stop new legacy reads starting, not to see every last one through.
+/// The point is to stop new storage work starting, not to see every last request through.
 const PROTOCOL_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The user agent this node announces itself with.
+///
+/// `saorsa-core` admits a peer to the DHT only when its agent starts with `node/`, so a node
+/// that lost the prefix would stop being routed to. The version is this build's rather than
+/// the transport's, because it is the one a peer needs in order to tell which release it is
+/// talking to.
+fn user_agent() -> String {
+    format!("node/{}", env!("CARGO_PKG_VERSION"))
+}
 
 /// Builder for constructing an Ant node.
 pub struct NodeBuilder {
@@ -168,16 +179,9 @@ impl NodeBuilder {
         // A node with storage switched off never builds one at all, so it never establishes
         // that anything was copied anywhere, and it does not delete. It also has no use for
         // the disk it would recover. Leaving the directory costs space on a node that is not
-        // storing anything anyway, and keeps its contents recoverable by the release that
-        // can read them.
-        //
-        // Waiting costs nothing in what this node reports. Its user agent was fixed when the
-        // transport was built a moment ago, but everything removed here is a leftover the
-        // signal already reads as finished with — carrying the mark or being empty is both
-        // what makes it removable and what makes it harmless — so the node announces `files`
-        // whether the deletion has finished, is still running, or has not started.
+        // storing anything anyway.
         if ant_protocol.is_some() {
-            crate::storage::legacy_artifacts::clean_up(&self.config.root_dir);
+            legacy_artifacts::clean_up(&self.config.root_dir);
         } else {
             info!(
                 "Chunk storage is disabled, so anything the storage migration left behind is \
@@ -332,25 +336,7 @@ impl NodeBuilder {
             }
         }
 
-        // Say on the wire whether this node still has an old chunk store. It costs no new
-        // message and no new field: saorsa-core already sends a user agent with every signed
-        // message and keeps each peer's, so this is a different value in a string that was
-        // already there. It is the only thing that tells us anything at all about the nodes we
-        // do not run and have no logs from. It cannot establish that the fleet has finished:
-        // a node sees only the peers it is connected to, and each answers as of its own last
-        // start, so the most this shows is that some peer reported an old store when it last
-        // started. It can never show that no node has one.
-        //
-        // Read from the filesystem here rather than from the store, because the store is
-        // built later and a node with storage switched off never builds one at all, while
-        // the directory on its disk is just as real either way.
-        //
-        // Fixed for the life of the process: saorsa-core copies the string when it builds
-        // the transport. A node that finishes migrating goes on saying `legacy` until it
-        // restarts, which overstates how much is left rather than understating it, and is
-        // the direction a release gate should err in.
-        let signal = crate::storage::migration_signal::MigrationSignal::from_disk(&config.root_dir);
-        core_config.custom_user_agent = Some(crate::storage::migration_signal::user_agent(signal));
+        core_config.custom_user_agent = Some(user_agent());
 
         // Persist close group peers + trust scores across restarts.
         // Default to root_dir (alongside node_identity.key) when not explicitly set.
@@ -719,22 +705,6 @@ impl RunningNode {
                 engine.start(dht_events);
             }
             info!("Replication engine started");
-        }
-
-        // Say where this node is with the move off the old chunk store, and what it can see
-        // of its neighbours. The release that deletes that store may only go out once the
-        // fleet has moved, and no calendar establishes that: our own logs cover the nodes we
-        // run, and this is the only view we get of the ones we do not.
-        {
-            // Weak on purpose: see `report_until_shutdown`. A reporter that kept the node
-            // alive would keep its port bound after the node was dropped.
-            let p2p = Arc::downgrade(&self.p2p_node);
-            let root_dir = self.config.root_dir.clone();
-            let shutdown = self.shutdown.clone();
-            tokio::spawn(async move {
-                crate::storage::migration_signal::report_until_shutdown(p2p, root_dir, shutdown)
-                    .await;
-            });
         }
 
         // Start upgrade monitor if enabled
@@ -1169,7 +1139,7 @@ mod tests {
     use rand::Rng;
     use tempfile::TempDir;
 
-    use crate::storage::migration_signal::LEGACY_ENV_DIR;
+    use crate::storage::legacy_artifacts::LEGACY_ENV_DIR;
 
     /// The e2e port range, so a test bind never lands on a production or dev instance.
     const TEST_PORT_RANGE: std::ops::Range<u16> = 20000..60000;
@@ -1644,5 +1614,16 @@ mod tests {
             identity2.peer_id(),
             "explicit --root-dir must yield stable identity"
         );
+    }
+
+    /// The prefix is what keeps this node in its peers' routing tables, and the version is
+    /// this build's, with nothing after it.
+    #[test]
+    fn the_user_agent_is_this_builds_version_under_the_node_prefix() {
+        assert_eq!(
+            super::user_agent(),
+            format!("node/{}", env!("CARGO_PKG_VERSION"))
+        );
+        assert!(super::user_agent().starts_with("node/"));
     }
 }
