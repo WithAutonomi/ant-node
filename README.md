@@ -963,9 +963,13 @@ The inherited `p2p_` and `ant_` names match existing local deployment tooling
 where meanings agree. Remote Prometheus worker-IP targets cannot reach this
 loopback listener, and dashboard panels for deferred metrics remain empty.
 Requests are read-only, served one at a time with bounded headers and a timeout;
-shutdown cancels active requests. Only `GET /health` and `GET /metrics` are
-supported; other paths return `404`, other methods `405`. Responses close the
-connection, disable caching, and have no CORS header.
+shutdown cancels active requests. A single `Host` header must name `127.0.0.1` or
+`localhost`, optionally followed by the bound port. Missing, duplicate or other
+host values return `403` without health data; this also rejects website hostnames
+that resolve to loopback. Normal curl and Prometheus requests supply this header.
+For trusted hosts, only `GET /health` and `GET /metrics` are supported; other paths
+return `404`, other methods `405` with `Allow: GET`. Responses close the connection,
+disable caching, and have no CORS header.
 
 ## CLI Reference
 

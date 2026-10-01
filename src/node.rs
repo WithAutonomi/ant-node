@@ -1443,7 +1443,11 @@ mod tests {
         ] {
             assert!(value[field].is_u64(), "{field} must be numeric");
         }
-        let metrics = health_request(port, "GET /metrics HTTP/1.1\r\n\r\n").await;
+        let metrics = health_request(
+            port,
+            &format!("GET /metrics HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
+        )
+        .await;
         assert!(
             metrics.starts_with("HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\n")
         );
@@ -1454,14 +1458,45 @@ mod tests {
             env!("CARGO_PKG_VERSION")
         )));
         for (request, expected) in [
-            ("GET /missing HTTP/1.1\r\n\r\n", "404 Not Found"),
-            ("GET /health/ HTTP/1.1\r\n\r\n", "404 Not Found"),
-            ("POST /health HTTP/1.1\r\n\r\n", "405 Method Not Allowed"),
-            ("HEAD /metrics HTTP/1.1\r\n\r\n", "405 Method Not Allowed"),
+            (
+                "GET /missing HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                "404 Not Found",
+            ),
+            (
+                "GET /health/ HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                "404 Not Found",
+            ),
+            (
+                "POST /health HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                "405 Method Not Allowed",
+            ),
+            (
+                "HEAD /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                "405 Method Not Allowed",
+            ),
         ] {
-            assert!(health_request(port, request)
-                .await
-                .starts_with(&format!("HTTP/1.1 {expected}\r\n")));
+            let response = health_request(port, request).await;
+            assert!(response.starts_with(&format!("HTTP/1.1 {expected}\r\n")));
+            if expected == "405 Method Not Allowed" {
+                assert!(response.contains("\r\nAllow: GET\r\n"));
+            }
+        }
+        for path in ["/health", "/metrics"] {
+            for headers in [
+                "",
+                "Host: example.com\r\n",
+                "Host: localhost.example.com\r\n",
+                "Host: localhost\r\nHost: example.com\r\n",
+                "Host: localhost:1\r\n",
+            ] {
+                let response =
+                    health_request(port, &format!("GET {path} HTTP/1.1\r\n{headers}\r\n")).await;
+                assert!(response.starts_with("HTTP/1.1 403 Forbidden\r\n"));
+                assert_eq!(
+                    response.split_once("\r\n\r\n").unwrap().1,
+                    "{\"error\":\"untrusted host\"}"
+                );
+            }
         }
 
         // A second real node must start despite the first owning its configured port.
@@ -1498,7 +1533,10 @@ mod tests {
             .unwrap();
         stream.write_all(b"GET /hea").await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        stream.write_all(b"lth HTTP/1.1\r\n\r\n").await.unwrap();
+        stream
+            .write_all(b"lth HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
         let mut response = String::new();
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -1558,7 +1596,8 @@ mod tests {
             if port == 0 {
                 assert!(!dir.path().join("metrics.port").exists());
             } else {
-                let response = health_request(port, "GET /health HTTP/1.1\r\n\r\n").await;
+                let response =
+                    health_request(port, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
                 let value: serde_json::Value =
                     serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
                 assert_eq!(value["storage_enabled"], false);

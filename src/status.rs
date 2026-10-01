@@ -183,10 +183,11 @@ async fn answer(
             return Ok(());
         }
         length += n;
-        if header[..length]
+        if let Some(end) = header[..length]
             .windows(4)
-            .any(|bytes| bytes == b"\r\n\r\n")
+            .position(|bytes| bytes == b"\r\n\r\n")
         {
+            length = end + 4;
             break;
         }
         if length == header.len() {
@@ -197,7 +198,13 @@ async fn answer(
     let mut tokens = request.lines().next().unwrap_or("").split_whitespace();
     let method = tokens.next().unwrap_or("");
     let path = tokens.next().unwrap_or("");
-    let (status, content_type, body) = if method != "GET" {
+    let (status, content_type, body) = if !trusted_host(&request, stream.local_addr()?.port()) {
+        (
+            "403 Forbidden",
+            "application/json",
+            "{\"error\":\"untrusted host\"}".to_string(),
+        )
+    } else if method != "GET" {
         (
             "405 Method Not Allowed",
             "application/json",
@@ -221,17 +228,81 @@ async fn answer(
             "{\"error\":\"not found\"}".to_string(),
         )
     };
+    let allow = if status == "405 Method Not Allowed" {
+        "Allow: GET\r\n"
+    } else {
+        ""
+    };
     let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{allow}Connection: close\r\nCache-Control: no-store\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(response.as_bytes()).await
+}
+
+fn trusted_host(request: &str, port: u16) -> bool {
+    // Loopback binding alone does not reject a website whose DNS resolves locally.
+    let mut hosts = request
+        .lines()
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("Host").then_some(value.trim())
+        });
+    let Some(host) = hosts.next() else {
+        return false;
+    };
+    if hosts.next().is_some() {
+        return false;
+    }
+    let suffix = format!(":{port}");
+    let host = host.strip_suffix(&suffix).unwrap_or(host);
+    host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost")
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn health_host_is_local_and_unambiguous() {
+        for host in [
+            "localhost",
+            "LOCALHOST:23456",
+            "127.0.0.1",
+            "127.0.0.1:23456",
+        ] {
+            assert!(trusted_host(
+                &format!("GET /health HTTP/1.1\r\nhOsT: {host}\r\n\r\n"),
+                23456
+            ));
+        }
+        for host in [
+            "",
+            "example.com",
+            "localhost.example.com",
+            "127.0.0.1.example.com",
+            "localhost:34567",
+            "127.0.0.1:34567",
+            "localhost,example.com",
+            "example.com@localhost",
+        ] {
+            assert!(!trusted_host(
+                &format!("GET /health HTTP/1.1\r\nHost: {host}\r\n\r\n"),
+                23456
+            ));
+        }
+        for request in [
+            "GET /health HTTP/1.1\r\n\r\n",
+            "GET /health HTTP/1.1\r\nHost: localhost\r\nHost: localhost\r\n\r\n",
+            "GET /health HTTP/1.1\r\nHost: localhost\r\nhost: example.com\r\n\r\n",
+            "GET /health HTTP/1.1\r\n\r\nHost: localhost\r\n",
+        ] {
+            assert!(!trusted_host(request, 23456));
+        }
+    }
 
     #[test]
     fn health_json_and_metrics_golden() {

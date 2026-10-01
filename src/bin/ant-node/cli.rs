@@ -407,6 +407,67 @@ mod tests {
     }
 
     #[test]
+    fn metrics_port_environment_and_cli_precedence() -> Result<(), Box<dyn std::error::Error>> {
+        const CHILD_EXPECTED: &str = "ANT_TEST_METRICS_PORT_EXPECTED";
+        const CHILD_CONFIG: &str = "ANT_TEST_METRICS_PORT_CONFIG";
+        const CHILD_CLI: &str = "ANT_TEST_METRICS_PORT_CLI";
+
+        if let Ok(expected) = std::env::var(CHILD_EXPECTED) {
+            let mut args = vec![
+                "ant-node".to_string(),
+                "--config".to_string(),
+                std::env::var(CHILD_CONFIG)?,
+            ];
+            if let Ok(port) = std::env::var(CHILD_CLI) {
+                args.extend(["--metrics-port".to_string(), port]);
+            }
+            let cli = Cli::try_parse_from(args)?;
+            assert_eq!(
+                cli.into_config()?.0.payment.metrics_port,
+                expected.parse::<u16>()?
+            );
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("node.toml");
+        std::fs::write(&path, "[payment]\nmetrics_port = 23456\n")?;
+        for (env_port, cli_port, expected) in [
+            (None, None, 23456),
+            (Some("34567"), None, 34567),
+            (Some("0"), None, 0),
+            (Some("0"), Some("45678"), 45678),
+            (Some("34567"), Some("0"), 0),
+        ] {
+            // Isolate clap's real environment bindings without changing this process's env.
+            let mut child = std::process::Command::new(std::env::current_exe()?);
+            child
+                .args([
+                    "--exact",
+                    "cli::tests::metrics_port_environment_and_cli_precedence",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env(CHILD_EXPECTED, expected.to_string())
+                .env(CHILD_CONFIG, &path);
+            if let Some(port) = env_port {
+                child.env("ANT_METRICS_PORT", port);
+            }
+            if let Some(port) = cli_port {
+                child.env(CHILD_CLI, port);
+            }
+            let output = child.output()?;
+            assert!(
+                output.status.success(),
+                "metrics env={env_port:?}, CLI={cli_port:?} failed:\n{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn webrtc_direct_port_overrides_the_default_bind_port() -> Result<(), Box<dyn std::error::Error>>
     {
         let cli = Cli::try_parse_from(["ant-node", "--webrtc-direct-port", "45000"])?;
