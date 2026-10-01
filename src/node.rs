@@ -169,9 +169,9 @@ impl NodeBuilder {
         };
 
         // Only now, and only if a store was actually opened. Clearing up after the storage
-        // migration deletes directories the previous release had finished with, and
-        // "finished with" means their chunks are in the file store — which is only true if
-        // the file store is there. Doing this earlier put the deletion in front of a
+        // migration deletes directories the previous release had retired, and retirement
+        // counted on every chunk the node kept being in the file store — which is only true
+        // if the file store is there. Doing this earlier put the deletion in front of a
         // constructor that can still fail on an unreadable layout, a directory it cannot
         // create, or a lock another process has not let go of, and a node that lost both
         // stores that way had nothing to go back to.
@@ -240,8 +240,7 @@ impl NodeBuilder {
     /// # Errors
     ///
     /// Never, currently: an engine that fails to start is logged and the node runs without
-    /// one, as it always has. The signature keeps its `Result` because the caller's does,
-    /// and because the migration release did have a case that had to refuse.
+    /// one, as it always has. The signature keeps its `Result` because the caller's does.
     async fn build_replication_engine(
         protocol: &Arc<AntProtocol>,
         repl_config: ReplicationConfig,
@@ -1322,8 +1321,8 @@ mod tests {
 
     /// Nothing is deleted until the store that replaced it has actually opened.
     ///
-    /// "Finished with" means the chunks are in the file store, which is only true if the file
-    /// store opens. An earlier version deleted first and let the constructor fail behind it,
+    /// Retirement counted on every chunk the node kept being in the file store, which is only
+    /// true if the file store opens. An earlier version deleted first and let the constructor fail behind it,
     /// on an unreadable layout or a directory it could not create, and a node that lost both
     /// stores that way had nothing left to go back to.
     #[tokio::test]

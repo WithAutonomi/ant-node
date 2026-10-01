@@ -73,9 +73,6 @@ const SHARD_COUNT: usize = 256;
 const CHUNK_NAME_LEN: usize = XORNAME_LEN * 2;
 
 /// How often to re-query available disk space, in seconds.
-///
-/// Matches the LMDB store's cadence so the capacity predicate behaves identically
-/// for callers that only ask "is there room at all".
 const DISK_CHECK_INTERVAL_SECS: u64 = 5;
 
 /// Allocation granularity assumed when charging a pending write against free space.
@@ -178,8 +175,6 @@ impl StoreLayout {
 /// Three answers, because deciding how long to stand down needs the distinction: a full
 /// disk is a standing condition worth waiting minutes on, while a failed query may have
 /// cleared by the next attempt and must not be treated as one.
-///
-/// Lived alongside the LMDB store until that was removed. It was never about LMDB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapacityVerdict {
     /// Available space is at or above the configured reserve. That is what the query
@@ -618,9 +613,9 @@ pub struct ChunkStore {
     index: Arc<parking_lot::RwLock<BTreeSet<XorName>>>,
     /// One mutex per shard, serialising writers of the same address.
     ///
-    /// LMDB gave exactly-once `put` semantics for free: the duplicate test happened
-    /// inside the write transaction. Two threads publishing the same address here would
-    /// otherwise both see an absent file, both rename, and both report "newly stored",
+    /// `put` must be exactly-once, so the duplicate test and the publish have to be one
+    /// step. Two threads publishing the same address would otherwise both see an absent
+    /// file, both rename, and both report "newly stored",
     /// double-counting the chunk. The lane is indexed by the address's LAST byte for the
     /// same reason the shard is: a node's keys share their leading bytes, so lanes keyed
     /// on the first byte would all collapse into one.
@@ -638,7 +633,7 @@ pub struct ChunkStore {
     /// Indexed by the address's LAST byte, for the reason the shard is: a node's keys share
     /// their leading bytes, so lanes keyed on the first would collapse into one.
     key_locks: Arc<Vec<tokio::sync::Mutex<()>>>,
-    /// Operation counters, same shape as the LMDB store reported.
+    /// Operation counters.
     stats: parking_lot::RwLock<StorageStats>,
     /// Which of the 256 shard directories are known to exist, so a steady-state write
     /// does not pay a `create_dir_all` syscall.
@@ -666,7 +661,7 @@ pub struct ChunkStore {
     /// It lets a delete queue behind the exact write it would otherwise race, rather than
     /// behind every write this store has in flight.
     ///
-    /// Counted, not a set. Cancellation can release the facade's key lane while the
+    /// Counted, not a set. Cancellation can release `put`'s key lock while the
     /// blocking half survives, so a second write for the same key can start behind the
     /// first. With one entry between them, whichever finished first would remove it and a
     /// waiter would be told the key is free while the other was still queued.
@@ -742,8 +737,8 @@ impl ChunkStore {
     pub async fn new(config: ChunkStoreConfig) -> Result<Self> {
         // Deliberately nothing about the old chunk store here. Clearing up after the storage
         // migration happens once, in `NodeBuilder::build`, and only after this constructor
-        // has succeeded: what it deletes are directories whose chunks are in this store, so
-        // it may not run until this store is open. Asking here as well would put that
+        // has succeeded: what it deletes are directories retirement cleared because every
+        // chunk the node kept is in this store, so it may not run until this store is open. Asking here as well would put that
         // decision in front of itself.
 
         let chunks_dir = config.root_dir.join(CHUNKS_DIR_NAME);
@@ -771,7 +766,8 @@ impl ChunkStore {
         let scan_lease = Arc::clone(&lock);
         // The node root as well as the chunk tree. The scan sweeps interrupted writes
         // under `chunks/`, which covers the layout marker's temporary because that lives
-        // there; the migration marker's lives in the root, where nothing looked.
+        // there; the previous release's migration marker wrote its temporaries in the root,
+        // where nothing looked.
         let root = config.root_dir.clone();
         let scan = spawn_blocking(move || {
             let _lease = scan_lease;
@@ -902,7 +898,7 @@ impl ChunkStore {
 
         let len = content.len() as u64;
         // Reserved after the duplicate test so re-storing an existing chunk stays a
-        // harmless no-op on a full disk, matching the LMDB store's ordering.
+        // harmless no-op on a full disk.
         let reservation = self.capacity.reserve(len)?;
 
         let shard = self.chunks_dir.join(shard_name(address));
@@ -968,8 +964,8 @@ impl ChunkStore {
                     }
                 };
                 // Placed, not yet durable. A failure from here on leaves the bytes on the
-                // disk: the chunk is rightly not reported as stored, because a copy that is
-                // not durable must not authorise deleting another, but the space is spent
+                // disk: the chunk is rightly not reported as stored, because a chunk that is
+                // not durable must not be reported as stored, but the space is spent
                 // all the same. Dropping the reservation would hand that charge back and
                 // admit the next write against room that is already gone.
                 //
@@ -1053,8 +1049,7 @@ impl ChunkStore {
         // never stored, and then discard the good copy arriving to repair it.
         // Every answer handled, because three of the four must not report the
         // chunk as stored. A caller that hears success acts on it: a client drops
-        // its own copy, replication marks the key held, and the copier takes it
-        // out of the legacy-only set.
+        // its own copy and replication marks the key held.
         match self.stored_bytes_match(address).await {
             StoredBytes::Good => {
                 // Admitted here, which is the first moment the bytes behind the
@@ -1088,8 +1083,8 @@ impl ChunkStore {
             // Replacing on an unanswered question would destroy a healthy copy,
             // and reporting success would discard the offered one. The index entry
             // stays: the file is still there, and dropping the entry would leave
-            // the chunk in neither this store's view nor the legacy one, which is
-            // what retirement destroys. Removing an entry is the quarantine path's
+            // a chunk on disk that this store no longer answers for. Removing an
+            // entry is the quarantine path's
             // job, and it removes the file with it, after a read that succeeded
             // and proved the bytes wrong.
             StoredBytes::Unreadable => Err(Error::Storage(format!(
@@ -1508,8 +1503,8 @@ impl ChunkStore {
     ///
     /// # Errors
     ///
-    /// Never fails. The signature keeps the shape the LMDB store had, because callers
-    /// treat the error as "assume absent".
+    /// Never fails. It returns a `Result` because callers treat an error as "assume
+    /// absent".
     pub fn exists(&self, address: &XorName) -> Result<bool> {
         if self.is_unservable(address) {
             return Ok(false);
@@ -1526,10 +1521,7 @@ impl ChunkStore {
     /// Is this chunk in the index, whether or not it can currently be read?
     ///
     /// The physical question, as against [`Self::exists`]'s question about what the node
-    /// is willing to claim. The migration must ask this one: a suspect chunk is still a
-    /// file this store has, and treating it as absent would put the key in the legacy-only
-    /// set, from where the union view advertises it again — a key the node claims through
-    /// one view and cannot serve through either.
+    /// is willing to claim.
     #[must_use]
     pub fn is_indexed(&self, address: &XorName) -> bool {
         self.index.read().contains(address)
@@ -1616,7 +1608,7 @@ impl ChunkStore {
     ///
     /// # Errors
     ///
-    /// Never fails. The signature matches the LMDB store's.
+    /// Never fails. It returns a `Result` for callers that treat an error as absent.
     // Async without awaiting anything, deliberately: the whole point of this store is
     // that the key set is already in memory. Callers are spread across the replication
     // engine and cannot all be de-async'd in this change.
@@ -1643,14 +1635,12 @@ impl ChunkStore {
     /// Stop answering for a chunk this store could not read.
     ///
     /// The file stays. It may be perfectly good and unreadable only for the moment, and
-    /// deleting it, or dropping it from the index, is how a chunk ends up in neither this
-    /// store's view nor the legacy one, which is what retirement destroys.
+    /// deleting it, or dropping it from the index, would lose it.
     ///
     /// What does change is what the node says about it. A chunk it cannot read is one it
     /// cannot serve, and claiming it anyway puts the key in signed commitments, answers
     /// presence probes with a yes, suppresses the replication that would repair it, and
-    /// earns a penalty at the next commitment-bound audit. Those penalties are not
-    /// suspended.
+    /// earns a penalty at the next commitment-bound audit.
     fn mark_suspect(&self, address: &XorName) {
         if self.suspect.write().insert(*address) {
             warn!(
@@ -1715,14 +1705,14 @@ impl ChunkStore {
     /// willing to claim and so leaves those out.
     ///
     /// Anything asking "how much is on this disk" wants this one, and that is what its
-    /// callers ask: the migration's progress, the storage stats, and the size an audit is
-    /// built for. Anything asking "what will this node answer for" wants `all_keys`.
-    /// Quietly filtering this one would move all three of those without saying so, which
-    /// is why the difference is written down here rather than removed.
+    /// callers ask: the storage stats, the quoting metrics, and the size an audit is built
+    /// for. Anything asking "what will this node answer for" wants `all_keys`. Quietly
+    /// filtering this one would move all three of those without saying so, which is why the difference is written down
+    /// here rather than removed.
     ///
     /// # Errors
     ///
-    /// Never fails. The signature matches the LMDB store's.
+    /// Never fails. It returns a `Result` for callers that treat an error as absent.
     pub fn current_chunks(&self) -> Result<u64> {
         Ok(self.index.read().len() as u64)
     }
@@ -1998,20 +1988,13 @@ impl ChunkStore {
         let index = Arc::clone(&self.index);
         let lane = shard_index(address);
         let key = *address;
-        // The bump happens inside the closure, with the mutation it describes. The
-        // closure runs to completion on its own thread whether or not anyone is still
-        // awaiting it, so bumping after the await is skipped entirely when a shutdown
-        // drops the caller — and the index change it was meant to announce still lands.
-        // A cached pre-retirement proof would then stay valid over a store that had
-        // quietly lost a chunk.
         self.blocking_tracker
             .spawn_blocking(move || {
                 let _lane = lanes.get(lane).map(parking_lot::Mutex::lock);
                 if path.exists() {
                     return false;
                 }
-                let forgotten = index.write().remove(&key);
-                forgotten
+                index.write().remove(&key)
             })
             .await
             .unwrap_or(false)
@@ -2216,9 +2199,9 @@ fn fsync_dir_best_effort(path: &Path) {
 
 /// Flush a directory, reporting whether it worked.
 ///
-/// Used where the answer is load-bearing: a chunk copied out of the legacy store is only
-/// durable once its directory entry is, and that copy is what permits the legacy store to
-/// be deleted.
+/// Used where the answer is load-bearing: a published chunk is only durable once its
+/// directory entry is, and a chunk reported as stored is what lets a client drop its own
+/// copy.
 #[cfg(unix)]
 fn fsync_dir(path: &Path) -> std::io::Result<()> {
     File::open(path)?.sync_all()
@@ -2229,10 +2212,12 @@ fn fsync_dir(path: &Path) -> std::io::Result<()> {
 ///
 /// That is why the publish path off Unix does not use a rename at all: it creates the
 /// chunk under its final name and flushes the file, which Microsoft documents as flushing
-/// the creation metadata with it. Directory creation has no equivalent, so the guarantee
-/// there rests on the pre-retirement pass, which re-reads every chunk before the legacy
-/// store is deleted, and on the operator gate that keeps retirement off a platform until
-/// forced power loss has been shown to hold old-or-new on it.
+/// the creation metadata with it. Directory creation has no equivalent, so a power loss soon
+/// after a shard directory is created can lose it and the chunks published into it, after the
+/// puts had reported success. The startup scan then does not find them and the node does not
+/// claim them; it gets them back only if a peer offers them while it is still responsible for
+/// them. Other replicas are untouched. This is the state the store has shipped in, and ADR-0022
+/// names it as not fixed here.
 ///
 /// Returns a `Result` so the callers that must handle a flush failure on Unix read the
 /// same on every platform.
@@ -2301,9 +2286,9 @@ fn is_marker_temp_name(name: &str) -> bool {
 /// Remove marker temporaries a previous run left beside `path`.
 ///
 /// `write_file_atomic` writes its temporary next to its target. For the layout marker
-/// that is inside `chunks/`, which the startup scan sweeps; for the migration marker it is
-/// the node root, which nothing sweeps, so a crash between the write and the rename leaves
-/// one there for the life of the node. Each is a few hundred bytes, so this is inodes
+/// that is inside `chunks/`, which the startup scan sweeps; the previous release's migration
+/// marker wrote its temporaries in the node root, which nothing swept, so a crash between the
+/// write and the rename left one there for the life of the node. Each is a few hundred bytes, so this is inodes
 /// rather than capacity, but nothing else was ever going to remove them.
 ///
 /// Only the exact shape this module writes, and only files: a name has to carry the temp
@@ -2351,9 +2336,8 @@ fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         rand::random::<u32>()
     ));
     write_temp(&temp, bytes)?;
-    // Through the retry, because these small files (the layout marker, the migration
-    // state) are rewritten while the node runs, and on Windows a scanner holding a handle
-    // for a few milliseconds turns an ordinary rewrite into a hard failure.
+    // Through the retry, because on Windows a scanner holding a handle for a few
+    // milliseconds turns an ordinary rename into a hard failure.
     rename_with_retry(&temp, path).map_err(|e| {
         let _ = std::fs::remove_file(&temp);
         Error::Storage(format!("Failed to publish {}: {e}", path.display()))
@@ -2435,13 +2419,10 @@ pub fn read_small_file(path: &Path) -> std::io::Result<Vec<u8>> {
 
 /// Take the store lock, or refuse to open the store.
 ///
-/// Both failures are refusals, deliberately. Unlike LMDB, which was genuinely
-/// multi-process safe, two of these stores on one directory keep independent in-memory
-/// indices, independent views of what is in flight, and independent opinions about
-/// whether the legacy environment may be deleted: both would report the same write as
-/// new and each would keep serving keys the other had deleted. A node that cannot create
-/// the lock file has no way to know it is alone, and this is the one migration where
-/// being wrong about that destroys data.
+/// Both failures are refusals, deliberately. Two of these stores on one directory keep
+/// independent in-memory indices and independent views of what is in flight: both would
+/// report the same write as new and each would keep serving keys the other had deleted. A
+/// node that cannot create the lock file has no way to know it is alone.
 ///
 /// The lock is an [`Arc`] so the work that relies on it can hold a lease. The startup
 /// scan sweeps interrupted writes on the strength of being alone in the directory, and it
@@ -2461,10 +2442,8 @@ fn acquire_store_lock(chunks_dir: &Path) -> Result<Arc<File>> {
     {
         Ok(f) => f,
         // Not a warning and carry on. Without this lock two processes can open the same
-        // directory, each with its own index, its own view of what is in flight, and its
-        // own opinion about whether the legacy environment may be deleted. A node that
-        // cannot take it has no way to know it is alone, and this is the one migration
-        // where being wrong about that destroys data.
+        // directory, each with its own index and its own view of what is in flight. A node
+        // that cannot take it has no way to know it is alone.
         Err(e) => {
             return Err(Error::Storage(format!(
                 "Could not create the chunk store lock {}: {e}. Refusing to start: \
@@ -2791,10 +2770,9 @@ pub fn rename_with_retry(temp_path: &Path, final_path: &Path) -> std::io::Result
 /// Write `payload` and publish it as `final_path`, replacing whatever is there.
 ///
 /// Success here means the bytes are durable, not merely written. The repair path this
-/// serves runs during the pre-retirement pass, where a chunk that fails to match its
-/// address is rewritten from the legacy store and the legacy store is then deleted. A
-/// replacement that a power loss can undo would leave that chunk with the wrong bytes and
-/// no other copy.
+/// serves replaces bytes a read has proven wrong with bytes that hash to the address, and
+/// a replacement that a power loss can undo would leave the wrong bytes in place while the
+/// node believes the chunk repaired.
 fn write_and_replace(
     temp_path: &Path,
     final_path: &Path,
@@ -2816,8 +2794,7 @@ fn write_and_replace(
         fsync_dir(shard).map_err(|e| {
             Error::Storage(format!(
                 "Replaced {} but could not flush {}: {e}. Not reporting the repair as \
-                 done, because a rewrite that is not durable must not authorise deleting \
-                 the copy it was rewritten from.",
+                 done, because a power loss could still undo it.",
                 final_path.display(),
                 shard.display()
             ))
@@ -2833,9 +2810,8 @@ fn write_and_replace(
     // The cost is that this is not atomic: a crash part-way leaves the file holding a mix
     // of old and new bytes.
     //
-    // That used to be justified by the legacy store still being there to repair from, which
-    // it no longer is. The argument now is narrower and does not depend on a second copy:
-    // every caller reaches this only after a read has proven the bytes under that name
+    // The argument for accepting that does not depend on a second copy: every caller
+    // reaches this only after a read has proven the bytes under that name
     // wrong. A crash part-way therefore leaves wrong bytes where wrong bytes already were,
     // which is not a loss, and the next verified read finds them and repairs again. What it
     // is NOT safe for is replacing bytes that were good, so this must not be reached on any
@@ -2867,8 +2843,7 @@ fn write_and_replace(
         file.sync_all().map_err(|e| {
             Error::Storage(format!(
                 "Rewrote {} but could not flush it: {e}. Not reporting the repair as \
-                 done, because a rewrite that is not durable must not authorise deleting \
-                 the copy it was rewritten from.",
+                 done, because a power loss could still undo it.",
                 final_path.display()
             ))
         })?;
@@ -2951,7 +2926,7 @@ fn publish(
 /// There is no way to flush a directory through the standard library, and Microsoft does
 /// not document `MoveFileEx` as durable at return unless it is called with
 /// `MOVEFILE_WRITE_THROUGH`, which std does not use. So off Unix a rename cannot be
-/// relied on to have reached the disk before the legacy store is deleted.
+/// relied on to have reached the disk when a put reports success.
 ///
 /// Creating the file under its final name sidesteps the rename entirely. Microsoft
 /// documents that creation metadata is cached and that `FlushFileBuffers`, which
@@ -2960,19 +2935,17 @@ fn publish(
 /// and no rename involved.
 ///
 /// The cost is that a crash mid-write leaves a partial file wearing a real chunk name.
-/// That is why a duplicate re-reads and verifies rather than trusting the name, and why
-/// the pre-retirement pass re-hashes everything before anything is deleted.
+/// That is why a duplicate re-reads and verifies rather than trusting the name.
 #[cfg(not(unix))]
 fn publish_in_place(
     final_path: &Path,
     payload: &[u8],
 ) -> std::result::Result<PutOutcome, PublishFailed> {
     // Test-only, and here rather than after the write so that it means the same thing on
-    // both platforms: the file half of a dual write has not happened yet. On Unix the
-    // equivalent point is the temporary file written and the rename not yet made, which is
-    // also before the chunk's name exists on disk. Stopping after the write instead would
-    // put the file under its real name already, so a crash there is not between the two
-    // halves at all, and it could not demonstrate anything about the missing flush either:
+    // both platforms: the chunk's name does not exist on disk yet. On Unix the equivalent
+    // point is the temporary file written and the rename not yet made. Stopping after the
+    // write instead would put the file under its real name already, and it could not
+    // demonstrate anything about the missing flush either:
     // killing a process does not empty the page cache, so the bytes are still there to be
     // read. Only losing power loses them, which no test that kills a process can stage.
     #[cfg(any(test, feature = "test-utils"))]
@@ -3034,12 +3007,11 @@ fn publish_via_rename(
     // it: on Windows a rename over a file another thread has open fails outright.
     //
     // The caller flushes either way. A name that is already there is not proof it is
-    // durable:
-    // the write that put it there may have been this store's own previous attempt, whose
-    // rename landed and whose directory flush then failed. That attempt returned an
-    // error, so nothing was retired on the strength of it, but if this call reported a
-    // durable duplicate without flushing, the retry would silently launder an unflushed
-    // rename into a copy that authorises deleting the last other one.
+    // durable: the write that put it there may have been this store's own previous attempt,
+    // whose rename landed and whose directory flush then failed. That attempt returned an
+    // error, so nobody acted on it, but if this call reported a durable duplicate without
+    // flushing, the retry would silently launder an unflushed rename into a chunk reported
+    // as stored.
     let outcome = if final_path.exists() {
         PutOutcome::Duplicate
     } else {
@@ -3097,10 +3069,9 @@ impl PublishFailed {
 /// spent the space and must not be reported as stored, so whoever is accounting for free
 /// space has to charge it while whoever is accounting for chunks must not count it.
 ///
-/// NOT best effort. The directory flush is what makes the rename durable, and a copy
-/// reported successful is what authorises deleting the only other copy. Swallowing the
-/// failure would let a power loss discard the directory entry after the legacy store had
-/// already been removed.
+/// NOT best effort. The directory flush is what makes the rename durable, and a chunk
+/// reported as stored is what lets a client drop its own copy. Swallowing the failure would
+/// let a power loss discard the directory entry after that copy was gone.
 ///
 /// # Errors
 ///
@@ -3110,7 +3081,7 @@ fn flush_publication(final_path: &Path, shard: &Path) -> Result<()> {
     fsync_dir(shard).map_err(|e| {
         Error::Storage(format!(
             "Published {} but could not flush {}: {e}. Not reporting this chunk as stored, \
-             because a copy that is not durable must not authorise deleting another.",
+             because a chunk that is not durable must not be reported as stored.",
             final_path.display(),
             shard.display()
         ))
@@ -3149,10 +3120,10 @@ mod tests {
 
     /// A chunk whose directory entry was never flushed is not reported as stored.
     ///
-    /// This is the whole safety argument for retirement: the legacy store is deleted
-    /// because every chunk was copied durably. A published file whose directory flush
-    /// failed can vanish on power loss, so counting it as copied would lose data. The
-    /// file staying on disk afterwards is fine, the next pass republishes it.
+    /// A chunk reported as stored lets the client drop its own copy, so a published file
+    /// whose directory flush failed, and which can vanish on power loss, must not be counted.
+    /// The file staying on disk afterwards is fine: a later put of the same chunk verifies
+    /// and keeps it.
     #[cfg(unix)]
     #[test]
     fn a_publish_whose_directory_flush_fails_is_not_reported_as_stored() {
@@ -3295,11 +3266,10 @@ mod tests {
 
     /// A chunk this store cannot read is kept but not claimed.
     ///
-    /// Both halves matter. Deleting it, or dropping it from the index, is how a chunk ends
-    /// up in neither this store's view nor the legacy one, which is what retirement
-    /// destroys. Claiming it anyway puts the key in signed commitments and answers
-    /// presence probes with a yes for a chunk the node cannot serve, and the audit that
-    /// catches that still penalises.
+    /// Both halves matter. Deleting it, or dropping it from the index, would lose a chunk
+    /// that may be readable again in a moment. Claiming it anyway puts the key in signed
+    /// commitments and answers presence probes with a yes for a chunk the node cannot serve,
+    /// and the audit that catches that penalises.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_chunk_that_cannot_be_read_is_kept_but_not_claimed() {
@@ -3799,9 +3769,9 @@ mod tests {
 
     /// A marker temporary left in the node root is swept, and nothing else is.
     ///
-    /// The migration marker is written next to itself in the root, which no sweep looked
-    /// at, so a crash between its write and its rename left one there for the life of the
-    /// node. Small, but nothing was ever going to remove it.
+    /// The previous release wrote its migration marker next to itself in the root, which no
+    /// sweep looked at, so a crash between its write and its rename left a temporary there
+    /// for the life of the node. Small, but nothing else was ever going to remove it.
     ///
     /// The second half is the point: this runs over a directory holding a node's data, so
     /// it has to take only the exact shape this module writes and leave everything else

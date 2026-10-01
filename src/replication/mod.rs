@@ -10291,18 +10291,12 @@ async fn rebuild_and_rotate_commitment(
         // when the node looked empty. It is gone, and the reason is worth keeping.
         //
         // "Empty" was decided from key counts, and every version of that test was wrong in
-        // the same direction. It read the committable set, which narrows to the file-backed
-        // keys once the migration settles, so a node whose disk filled before it could copy
-        // anything looked empty with a full legacy store beside it. Adding the raw file index
-        // still missed a file dropped from the index by a failed read while its legacy copy
-        // was being put back. Adding the legacy environment still missed a files-only node
-        // that had published bytes to disk but not yet indexed them, because a file is
+        // the same direction: a node can hold bytes the counts do not show, because a file is
         // published before it is indexed. Each fix closed one window and left another.
         //
         // The asymmetry is what settles it. Clearing wrongly repudiates a root a peer is
         // pinning, and `UnknownCommitment` is a confirmed failure on the commitment-bound
-        // lane, which is enforced in every release and is not the lane the migration holds
-        // off — so a node that still holds the bytes is slashed for holding them. Retiring
+        // lane, so a node that still holds the bytes is penalised for holding them. Retiring
         // wrongly costs a root that stops being advertised now and ages out by its gossip TTL
         // instead of vanishing now. Both set `has_current = false`; they differ only in
         // whether the node goes on being answerable in the meantime. A genuinely empty node

@@ -37,8 +37,11 @@
 //! them is finishing what the previous release had already started; the safety argument for them
 //! is the close group's proofs, not a local copy.
 //!
-//! **What may be deleted is decided once, by [`classify`].** The cleanup and the warning that
-//! names a kept directory read the same verdict, and the names they consider are one set of
+//! **Candidates for deletion are decided once, by [`classify`]**: a leftover carrying the mark,
+//! or an empty one. The deleting thread then re-checks each candidate on a directory handle and
+//! refuses anything a retired environment never contains — a subdirectory, more entries than
+//! one ever holds, a mark that is not a regular file — keeping it and naming it. So nothing is
+//! removed that `classify` did not call harmless, and the names considered are one set of
 //! constants.
 //!
 //! Two things are never done, both because a name is not evidence of what is behind it. A
@@ -184,11 +187,12 @@ fn classify(dir: &Path) -> Leftover {
 /// a node kept from running by what it found left over, which is what the first draft of this
 /// release did.
 ///
-/// Called once the file store has opened, and not before. "Finished with" means the chunks
-/// are in the file store, which is only true if the file store is there to hold them: running
-/// this earlier put the deletion in front of a constructor that can still fail, and a node
-/// that lost both stores that way had nothing to go back to. A node that never opens a store
-/// at all does not call this.
+/// Called once the file store has opened, and not before. Retirement cleared a directory
+/// because every chunk the node kept had been copied into the file store and re-hashed there,
+/// and every chunk it shed had been proven held by its close group; the first half is only
+/// true if the file store is there. Running this earlier put the deletion in front of a
+/// constructor that can still fail, and a node that lost both stores that way had nothing to
+/// go back to. A node that never opens a store at all does not call this.
 pub fn clean_up(root_dir: &Path) {
     // A root that cannot be listed hides every tombstone under it, so the answer is to remove
     // nothing and say so: an unlistable root is not evidence that there is nothing to keep.
@@ -205,9 +209,9 @@ pub fn clean_up(root_dir: &Path) {
     let mut finished_with = Vec::new();
     for dir in leftovers {
         match classify(&dir) {
-            // Its chunks are in the file store and the previous release simply did not
-            // finish deleting it, or there is nothing in it at all. Either way it holds
-            // nothing, so removing it cannot lose anything.
+            // Retirement cleared it and the previous release did not finish deleting it, or
+            // there is nothing in it at all. What the node kept is in the file store and what
+            // it shed was proven held by its close group, so nothing here needs it.
             Leftover::Harmless => finished_with.push(dir),
             Leftover::Holding | Leftover::Unreadable => warn!(
                 migration_event = "legacy_store_left",
@@ -252,8 +256,8 @@ fn why_it_is_kept(dir: &Path) -> &'static str {
              would have, so this node cannot tell whether it was finished with"
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            "it has chunks in it that were never copied into the file store, and this build \
-             cannot read them. Nothing here will delete them, so they are not lost. Whether \
+            "it has chunks in it that may not have been copied into the file store, and this \
+             build cannot read them. Nothing here will delete them, so they are not lost. Whether \
              this node's close group still needs them is the question to answer before \
              removing it by hand"
         }
@@ -273,8 +277,8 @@ fn why_it_is_kept(dir: &Path) -> &'static str {
 /// starting up. They are pure disk work with nothing waiting on them, so doing them in turn
 /// costs nothing that matters and bounds what this can do to a node's I/O.
 ///
-/// In the background and in place. Nothing has to be got out of the way first: these
-/// directories hold nothing, and this build has no code that would read them if they did. Not
+/// In the background and in place. Nothing has to be got out of the way first: retirement
+/// already cleared these directories, and this build has no code that would read them. Not
 /// renaming also means no name to allocate, which is what an earlier version of this could
 /// run out of and wedge itself on.
 fn remove_all(dirs: Vec<PathBuf>) {
@@ -1024,11 +1028,13 @@ mod tests {
         assert!(env.join(RETIRED_MARKER).exists());
     }
 
-    /// The cleanup removes exactly what `classify` calls harmless, and nothing else.
+    /// For ordinary shapes, the cleanup removes exactly what `classify` calls harmless.
     ///
     /// Deleting anything else could destroy chunks nothing migrated; keeping something
-    /// harmless leaves a node paying for the disk for ever. Every shape below is checked both
-    /// ways round, so a deleter that drifts from the classifier in either direction fails here.
+    /// harmless leaves a node paying for the disk for ever. Every shape below is ordinary — no
+    /// subdirectory, a handful of entries — so the deleter's own refusals do not apply, and each
+    /// is checked both ways round: a deleter that drifts from the classifier in either direction
+    /// fails here. The refusals have tests of their own.
     #[test]
     fn the_cleanup_removes_exactly_what_classify_calls_harmless() {
         let root = TempDir::new().unwrap();
