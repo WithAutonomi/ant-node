@@ -425,10 +425,8 @@ mod tests {
         let chunks = ChunkStore::new(crate::storage::ChunkStoreConfig {
             root_dir: dir.path().to_path_buf(),
             verify_on_read: false,
-            max_map_size: 0,
             // Larger than any disk, so every capacity question answers "full".
             disk_reserve: u64::MAX,
-            migration: crate::storage::MigrationConfig::default(),
         })
         .await
         .expect("chunk store");
@@ -477,9 +475,7 @@ mod tests {
         let chunks = ChunkStore::new(crate::storage::ChunkStoreConfig {
             root_dir: dir.path().to_path_buf(),
             verify_on_read: false,
-            max_map_size: 0,
             disk_reserve: 0,
-            migration: crate::storage::MigrationConfig::default(),
         })
         .await
         .expect("chunk store");
