@@ -1,0 +1,162 @@
+# Settings for generate.py, which the release workflow runs to produce the
+# THIRD-PARTY-NOTICES.txt shipped in every ant-node archive.
+
+header = """
+ant-node is licensed under MIT OR Apache-2.0; see LICENSE-MIT and
+LICENSE-APACHE. This file covers the third-party software in this build and
+the tools used to produce it. Each crate's Source link is its exact source,
+which is how source is made available where a licence requires it.
+"""
+
+# Licences the release may redistribute third-party code under, most preferred
+# first. A crate offering a choice is redistributed under the first allowed
+# option; a crate whose licence allows no option here fails generation.
+allowed = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "MIT-0",
+    "CC0-1.0",
+    "Unlicense",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
+]
+
+# Crates that may contain native code: they ship C, C++, Objective-C, CUDA or
+# assembly sources or prebuilt libraries, build with cc/cmake/nasm, declare
+# `links`, or are a `*-src` crate. Licence files anywhere in a crate are
+# reproduced automatically; each entry records what was found on review, and
+# can add licence files with other names through `files` (relative to the
+# crate root, globs allowed), which count as a bundled component's unless
+# `files_govern = true` marks them as the crate's own. An entry with a
+# `version` applies to that release only. A crate that needs an entry and has
+# none fails generation.
+
+[native.lmdb-master-sys]
+note = "bundles LMDB (Howard Chu, Symas Corp.) under the OpenLDAP Public License 2.8; its COPYRIGHT and LICENSE are reproduced."
+
+[native.libmimalloc-sys]
+note = "bundles mimalloc (Microsoft Corporation, Daan Leijen) under MIT; its LICENSE files are reproduced."
+
+[native.zstd-sys]
+note = "bundles zstd (Meta Platforms) under BSD-3-Clause (zstd/LICENSE), chosen from its BSD-3-Clause OR GPL-2.0 licence; zstd/COPYING is the GPL-2.0 alternative, reproduced only because the crate ships it."
+
+[native.bzip2-sys]
+note = "bundles bzip2 (Julian Seward) under its BSD-style licence; its LICENSE is reproduced."
+
+[native.lzma-sys]
+note = "bundles liblzma from XZ Utils, which is in the public domain (xz-*/COPYING); the GPL and LGPL texts next to it cover XZ Utils tools and scripts that lzma-sys does not build, and are reproduced only because the crate ships them."
+
+[native.aws-lc-sys]
+note = "bundles AWS-LC; its LICENSE lists each component it derives from (BoringSSL, OpenSSL, and others) with their copyright notices."
+
+[native.aws-lc-rs]
+note = "declares a `links` key but builds no native code of its own; AWS-LC comes from aws-lc-sys."
+
+[native.ring]
+note = "its C and assembly code derives from BoringSSL; LICENSE, LICENSE-BoringSSL and LICENSE-other-bits cover it."
+
+[native.blake3]
+note = "the C and assembly implementations are part of BLAKE3 and share the crate's licence."
+
+[native.cc]
+note = "a build tool; its one C file is compiled on the build machine to detect the C compiler, and nothing from it is linked."
+
+[native.syn-solidity]
+note = "a proc-macro dependency; src/ident/kw.c is a developer script that generated its keyword tables, and is not compiled."
+
+[native.nix]
+note = "its only C file is a kernel-module test fixture that is not compiled into dependants."
+
+[native.windows_x86_64_msvc]
+note = "ships the Windows import library that windows-rs links against on Windows builds; it is covered by the crate's MIT OR Apache-2.0 licence (Microsoft Corporation)."
+
+[native.saorsa-transport]
+version = "0.37.0"
+note = "the published crate also contains a .minimax/ folder of AI-assistant files (Python tools and .NET DLLs) committed to its repository by mistake; nothing in it is compiled or linked into this build."
+
+# Explanations printed with a crate's entry, for licence or notice files that
+# could mislead without context.
+
+[remark.security-framework]
+note = "its THIRD_PARTY file covers documentation adapted from Apple's Security Framework under the Apple Public Source License 2.0; that documentation is not compiled into this build."
+
+# Crates whose published files and repository contain no text of any licence
+# they are offered under. Each entry is for one reviewed version; it supplies
+# the canonical text of one of those licences, pinned by checksum, and says
+# why it is needed. Remove an entry once the crate ships the text; generation
+# prints a note when one goes unused.
+
+[missing.saorsa-pqc]
+version = "0.5.2"
+text_url = "https://www.apache.org/licenses/LICENSE-2.0.txt"
+text_sha256 = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+note = "declares MIT OR Apache-2.0 but its published crate and repository contain no licence text; it is redistributed under Apache-2.0, whose text is reproduced from apache.org."
+
+[missing.siphasher]
+version = "1.0.3"
+text_url = "https://raw.githubusercontent.com/spdx/license-list-data/v3.29.0/text/MIT.txt"
+text_sha256 = "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5"
+note = "its COPYING, reproduced with its copyright lines, refers to LICENSE-MIT and LICENSE-APACHE files that neither the crate nor its repository contain; the MIT text is reproduced from the SPDX licence list."
+
+[missing.lmdb-master-sys]
+version = "0.2.6"
+text_url = "https://www.apache.org/licenses/LICENSE-2.0.txt"
+text_sha256 = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+note = "declares Apache-2.0 for its Rust bindings but ships only LMDB's licence; the Apache-2.0 text is reproduced from apache.org."
+
+[missing.objc2]
+version = "0.6.4"
+text_url = "https://raw.githubusercontent.com/spdx/license-list-data/v3.29.0/text/MIT.txt"
+text_sha256 = "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5"
+note = "its repository's LICENSE.md, reproduced, names MIT without its text or a copyright line; the MIT text is reproduced from the SPDX licence list."
+
+[missing.block2]
+version = "0.6.2"
+text_url = "https://raw.githubusercontent.com/spdx/license-list-data/v3.29.0/text/MIT.txt"
+text_sha256 = "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5"
+note = "its repository's LICENSE.md, reproduced, names MIT without its text or a copyright line; the MIT text is reproduced from the SPDX licence list."
+
+[missing.objc2-encode]
+version = "4.1.0"
+text_url = "https://raw.githubusercontent.com/spdx/license-list-data/v3.29.0/text/MIT.txt"
+text_sha256 = "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5"
+note = "its repository's LICENSE.md, reproduced, names MIT without its text or a copyright line; the MIT text is reproduced from the SPDX licence list."
+
+[missing.objc2-foundation]
+version = "0.3.2"
+text_url = "https://raw.githubusercontent.com/spdx/license-list-data/v3.29.0/text/MIT.txt"
+text_sha256 = "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5"
+note = "its repository's LICENSE.md, reproduced, names MIT without its text or a copyright line; the MIT text is reproduced from the SPDX licence list."
+
+[missing.objc2-core-foundation]
+version = "0.3.2"
+text_url = "https://raw.githubusercontent.com/spdx/license-list-data/v3.29.0/text/MIT.txt"
+text_sha256 = "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5"
+note = "its repository's LICENSE.md, reproduced, names MIT without its text or a copyright line; the MIT text is reproduced from the SPDX licence list."
+
+[[appendix]]
+title = "Rust standard library"
+intro = """
+Every Rust program links the Rust standard library. Its copyright and licence
+notices, copied from the toolchain that built this binary, are in
+RUST-STD-COPYRIGHT.html next to this file.
+"""
+
+[[appendix]]
+title = "musl libc"
+targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
+intro = """
+This Linux build is statically linked against musl libc as shipped with Rust's
+musl targets. The musl release the building toolchain uses, and that release's
+COPYRIGHT file, follow.
+"""
+musl_from_rustc = true

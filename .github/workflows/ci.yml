@@ -40,6 +40,31 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
+  # The release workflow ships THIRD-PARTY-NOTICES.txt in every archive.
+  # Generating it on each pull request catches a dependency that ships no
+  # licence text, or a new crate that compiles bundled C code, before release.
+  notices:
+    name: Third-party notices
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Generate THIRD-PARTY-NOTICES.txt
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/third_party_notices/generate.py
+          --config scripts/third_party_notices/config.toml
+          --output THIRD-PARTY-NOTICES.txt
+          --target x86_64-unknown-linux-musl
+          --target aarch64-unknown-linux-musl
+          --target x86_64-apple-darwin
+          --target aarch64-apple-darwin
+          --target x86_64-pc-windows-msvc
+
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
