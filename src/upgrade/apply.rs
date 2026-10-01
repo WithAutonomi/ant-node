@@ -729,7 +729,10 @@ mod tests {
     #[test]
     fn test_auto_apply_upgrader_creation() {
         let upgrader = AutoApplyUpgrader::new();
-        assert!(!upgrader.current_version().to_string().is_empty());
+        assert!(
+            !upgrader.current_version().to_string().is_empty(),
+            "expected a non-empty current version"
+        );
     }
 
     #[test]
@@ -743,7 +746,10 @@ mod tests {
     #[test]
     fn test_default_impl() {
         let upgrader = AutoApplyUpgrader::default();
-        assert!(!upgrader.current_version().to_string().is_empty());
+        assert!(
+            !upgrader.current_version().to_string().is_empty(),
+            "expected a non-empty current version"
+        );
     }
 
     /// Helper: create a tar.gz archive containing a fake binary.

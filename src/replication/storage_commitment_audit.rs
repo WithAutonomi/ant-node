@@ -2371,7 +2371,7 @@ mod tests {
         assert!(structure(&built, &proof, &nonce, &peer).is_ok());
         // Round 2: honest responder opens real slices for the sample.
         let s = sample(&proof, &nonce, built.commitment().key_count);
-        assert!(!s.is_empty());
+        assert!(!s.is_empty(), "expected a non-empty sample");
         let openings = openings_for(&s);
         let items = served_honest_items(&openings, &nonce, &peer);
         match verify_slice_response(&openings, &nonce, &peer, &items) {

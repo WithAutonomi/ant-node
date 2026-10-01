@@ -1871,7 +1871,11 @@ mod tests {
         let mut first = test_entry(1);
         first.next_verify_at = Instant::now() + Duration::from_mins(1);
         assert!(queues.add_pending_verify(key, first).admitted());
-        assert!(queues.ready_pending_keys(Instant::now()).is_empty());
+        let ready = queues.ready_pending_keys(Instant::now());
+        assert!(
+            ready.is_empty(),
+            "expected no ready pending keys before the retry delay elapses, got {ready:?}"
+        );
         assert!(!queues.add_pending_verify(key, test_entry(2)).admitted());
         assert_eq!(queues.pending_count(), 1);
         assert_eq!(
@@ -1990,7 +1994,11 @@ mod tests {
             vec![source_a, source_b],
         ));
 
-        assert!(queues.remove_hint_source(&source_a).is_empty());
+        let orphaned = queues.remove_hint_source(&source_a);
+        assert!(
+            orphaned.is_empty(),
+            "expected no orphaned keys while source_b still advertises, got {orphaned:?}"
+        );
         let candidate = queues.dequeue_fetch().expect("candidate remains fetchable");
         assert_eq!(candidate.sources, vec![source_b]);
         assert_eq!(

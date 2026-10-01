@@ -652,7 +652,7 @@ mod tests {
 
         let batch = select_sync_batch(&mut state, 4, Duration::from_secs(0));
 
-        assert!(batch.is_empty());
+        assert!(batch.is_empty(), "expected an empty batch, got {batch:?}");
         assert_eq!(state.cursor, 0);
     }
 
@@ -671,8 +671,15 @@ mod tests {
         let cooldown = Duration::from_hours(1);
         let batch = select_sync_batch(&mut state, 4, cooldown);
 
-        assert!(batch.is_empty());
-        assert!(state.order.is_empty());
+        assert!(
+            batch.is_empty(),
+            "expected an empty batch while every peer is in cooldown, got {batch:?}"
+        );
+        assert!(
+            state.order.is_empty(),
+            "expected an empty order, got {:?}",
+            state.order
+        );
     }
 
     // -- handle_sync_failure -------------------------------------------------
@@ -735,7 +742,11 @@ mod tests {
         let replacement =
             handle_sync_failure(&mut state, &peer_id_from_byte(1), Duration::from_secs(0));
 
-        assert!(state.order.is_empty());
+        assert!(
+            state.order.is_empty(),
+            "expected the order to be exhausted, got {:?}",
+            state.order
+        );
         assert!(replacement.is_none());
     }
 
@@ -1154,7 +1165,10 @@ mod tests {
 
         // Extra call after cycle complete returns empty.
         let round4 = select_sync_batch(&mut state, batch_size, no_cooldown);
-        assert!(round4.is_empty());
+        assert!(
+            round4.is_empty(),
+            "expected an empty batch once the cycle is complete, got {round4:?}"
+        );
     }
 
     /// Scenario 37: Non-`LocalRT` inbound sync behavior.

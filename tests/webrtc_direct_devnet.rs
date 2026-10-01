@@ -447,7 +447,7 @@ async fn stalled_connection_times_out_and_allows_a_new_client() -> Result<(), Bo
                 .await?;
             client.close().await?;
             assert_eq!(hello["status"], "ok");
-            assert!(content.is_empty());
+            assert!(content.is_empty(), "expected no content, got {content:?}");
             Ok::<(), Box<dyn Error>>(())
         })
         .await??;
@@ -501,7 +501,7 @@ async fn encrypted_hello_and_manifest_never_disclose_verification_rpc() -> Resul
     client.close().await?;
     devnet.shutdown().await?;
     assert_eq!(hello["status"], "ok");
-    assert!(content.is_empty());
+    assert!(content.is_empty(), "expected no content, got {content:?}");
     assert_eq!(
         hello["payment"],
         json!({
@@ -616,7 +616,10 @@ async fn seeded_public_file_downloads_and_paid_uploads_over_direct_node_endpoint
         hello["endpoint"]["multiaddr"],
         endpoint.endpoint.multiaddr.clone()
     );
-    assert!(hello_content.is_empty());
+    assert!(
+        hello_content.is_empty(),
+        "expected no hello content, got {hello_content:?}"
+    );
 
     let (closest, closest_content) = seed_client
         .rpc(
@@ -633,7 +636,10 @@ async fn seeded_public_file_downloads_and_paid_uploads_over_direct_node_endpoint
     assert_eq!(closest["status"], "ok");
     assert_eq!(closest["type"], "nodes");
     assert_eq!(closest["target"], public_file.address);
-    assert!(closest_content.is_empty());
+    assert!(
+        closest_content.is_empty(),
+        "expected no closest-nodes content, got {closest_content:?}"
+    );
     let discovered = closest["nodes"]
         .as_array()
         .and_then(|nodes| {
@@ -680,7 +686,10 @@ async fn seeded_public_file_downloads_and_paid_uploads_over_direct_node_endpoint
     assert!(next_hop["nodes"]
         .as_array()
         .is_some_and(|nodes| !nodes.is_empty()));
-    assert!(next_hop_content.is_empty());
+    assert!(
+        next_hop_content.is_empty(),
+        "expected no next-hop content, got {next_hop_content:?}"
+    );
     let (header, data_map_bytes) = download_client
         .rpc(
             json!({

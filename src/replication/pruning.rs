@@ -2258,7 +2258,10 @@ mod tests {
 
         // The same evidence fails a quorum of 3.
         let confirmed = confirmed_keys_from_presence(&candidates, &present_by_key, 3);
-        assert!(confirmed.is_empty());
+        assert!(
+            confirmed.is_empty(),
+            "expected no confirmed keys at a quorum of 3, got {confirmed:?}"
+        );
     }
 
     #[test]

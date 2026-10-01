@@ -11,11 +11,11 @@ env:
 
 jobs:
   msrv:
-    name: Rust 1.91 MSRV
+    name: Rust 1.95 MSRV
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets --all-features --locked
 

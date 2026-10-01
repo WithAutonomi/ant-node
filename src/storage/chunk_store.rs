@@ -3203,7 +3203,11 @@ mod tests {
             .await
             .expect("copy rest");
         assert_eq!(rest.copied, 3);
-        assert!(store.legacy_only_keys().is_empty());
+        let legacy = store.legacy_only_keys();
+        assert!(
+            legacy.is_empty(),
+            "expected no legacy-only keys, got {legacy:?}"
+        );
         assert_eq!(store.current_chunks().expect("count"), 5);
     }
 
@@ -4684,7 +4688,11 @@ mod tests {
             .copy_batch(&keys, 0, 0, &never_cancelled())
             .await
             .expect("copy");
-        assert!(store.legacy_only_keys().is_empty());
+        let legacy = store.legacy_only_keys();
+        assert!(
+            legacy.is_empty(),
+            "expected no legacy-only keys, got {legacy:?}"
+        );
 
         let victim = keys.first().copied().expect("a key");
         let path = dir
@@ -4788,7 +4796,11 @@ mod tests {
             .copy_batch(&late, 0, 0, &never_cancelled())
             .await
             .expect("copy");
-        assert!(store.legacy_only_keys().is_empty());
+        let legacy = store.legacy_only_keys();
+        assert!(
+            legacy.is_empty(),
+            "expected no legacy-only keys, got {legacy:?}"
+        );
         assert_eq!(
             store
                 .get(late.first().expect("a key"))
@@ -4844,7 +4856,11 @@ mod tests {
             .copy_batch(&keys, 0, 0, &never_cancelled())
             .await
             .expect("copy");
-        assert!(store.legacy_only_keys().is_empty());
+        let legacy = store.legacy_only_keys();
+        assert!(
+            legacy.is_empty(),
+            "expected no legacy-only keys, got {legacy:?}"
+        );
 
         // Remove the file without telling the store, which is what the pruner's own
         // delete looks like if it lands mid-pass. Republishing from the legacy copy here
@@ -4986,7 +5002,11 @@ mod tests {
             .expect("copy");
         assert_eq!(report.copied, 0);
         assert_eq!(report.unusable, 1);
-        assert!(store.legacy_only_keys().is_empty());
+        let legacy = store.legacy_only_keys();
+        assert!(
+            legacy.is_empty(),
+            "expected no legacy-only keys, got {legacy:?}"
+        );
 
         // And it is gone from the environment, so the pass below cannot find it and put
         // it back. That is the loop this is about.

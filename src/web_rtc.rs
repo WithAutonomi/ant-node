@@ -167,7 +167,7 @@ impl ByteBudget {
         error: &'static str,
     ) -> ServerResult<ByteReservation> {
         self.in_use
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current
                     .checked_add(amount)
                     .filter(|next| *next <= self.limit)
@@ -199,7 +199,7 @@ impl ByteReservation {
     fn try_grow(&mut self, amount: usize) -> ServerResult<()> {
         self.budget
             .in_use
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current
                     .checked_add(amount)
                     .filter(|next| *next <= self.budget.limit)

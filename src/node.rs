@@ -1537,7 +1537,7 @@ mod tests {
     fn test_scan_identity_dirs_empty_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let dirs = NodeBuilder::scan_identity_dirs(tmp.path()).unwrap();
-        assert!(dirs.is_empty());
+        assert!(dirs.is_empty(), "expected no identity dirs, got {dirs:?}");
     }
 
     #[test]
@@ -1545,7 +1545,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("nonexistent_identity_dir");
         let dirs = NodeBuilder::scan_identity_dirs(&path).unwrap();
-        assert!(dirs.is_empty());
+        assert!(dirs.is_empty(), "expected no identity dirs, got {dirs:?}");
     }
 
     #[test]
