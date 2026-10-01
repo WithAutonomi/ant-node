@@ -764,14 +764,11 @@ impl ChunkStore {
         // cancelled startup that released the lock would leave it sweeping a directory
         // another process had just been let into.
         let scan_lease = Arc::clone(&lock);
-        // The node root as well as the chunk tree. The scan sweeps interrupted writes
-        // under `chunks/`, which covers the layout marker's temporary because that lives
-        // there; the previous release's migration marker wrote its temporaries in the root,
-        // where nothing looked.
-        let root = config.root_dir.clone();
+        // Only the chunk tree. Its scan sweeps interrupted writes under `chunks/`, which
+        // covers the layout marker's temporary because that lives there too. Nothing in the
+        // node root is this store's to remove.
         let scan = spawn_blocking(move || {
             let _lease = scan_lease;
-            sweep_marker_temps(&root);
             scan_store(&scan_dir)
         })
         .await
@@ -2261,68 +2258,6 @@ fn check_path_budget(chunks_dir: &Path) {
 fn check_path_budget(_chunks_dir: &Path) {}
 
 /// Write `bytes` to `path` so a reader sees either the old content or the new.
-/// Is this the exact name [`write_file_atomic`] gives its temporaries?
-///
-/// `.tmp.<pid>.<8 hex>.marker`, with both middle parts checked. Matching on the prefix and
-/// suffix alone would also take `.tmp.operator-notes.marker`, and this runs over a
-/// directory holding a node's data, so what it removes is not a place to be approximate.
-fn is_marker_temp_name(name: &str) -> bool {
-    let Some(rest) = name.strip_prefix(TEMP_PREFIX) else {
-        return false;
-    };
-    let Some(rest) = rest.strip_suffix(".marker") else {
-        return false;
-    };
-    let mut parts = rest.split('.');
-    let (Some(pid), Some(nonce), None) = (parts.next(), parts.next(), parts.next()) else {
-        return false;
-    };
-    !pid.is_empty()
-        && pid.bytes().all(|b| b.is_ascii_digit())
-        && nonce.len() == 8
-        && nonce.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
-/// Remove marker temporaries a previous run left beside `path`.
-///
-/// `write_file_atomic` writes its temporary next to its target. For the layout marker
-/// that is inside `chunks/`, which the startup scan sweeps; the previous release's migration
-/// marker wrote its temporaries in the node root, which nothing swept, so a crash between the
-/// write and the rename left one there for the life of the node. Each is a few hundred bytes, so this is inodes
-/// rather than capacity, but nothing else was ever going to remove them.
-///
-/// Only the exact shape this module writes, and only files: a name has to carry the temp
-/// prefix and the marker suffix. Anything broader would be this function deciding what
-/// else in a node's root directory is rubbish, which is not its business.
-///
-/// Best effort throughout. Failing to tidy up is not a reason to refuse to start, and the
-/// caller takes the store lock before this runs, so there is no other process whose live
-/// temporary this could take.
-pub fn sweep_marker_temps(dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if !is_marker_temp_name(name) {
-            continue;
-        }
-        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
-            continue;
-        }
-        match std::fs::remove_file(entry.path()) {
-            Ok(()) => debug!(
-                "Swept a leftover marker temporary {}",
-                entry.path().display()
-            ),
-            Err(e) => debug!("Could not sweep {}: {e}", entry.path().display()),
-        }
-    }
-}
-
 fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let Some(dir) = path.parent() else {
         return Err(Error::Storage(format!(
@@ -3767,50 +3702,33 @@ mod tests {
         );
     }
 
-    /// A marker temporary left in the node root is swept, and nothing else is.
+    /// Opening the store removes nothing from the node root.
     ///
-    /// The previous release wrote its migration marker next to itself in the root, which no
-    /// sweep looked at, so a crash between its write and its rename left a temporary there
-    /// for the life of the node. Small, but nothing else was ever going to remove it.
-    ///
-    /// The second half is the point: this runs over a directory holding a node's data, so
-    /// it has to take only the exact shape this module writes and leave everything else
-    /// where it is.
+    /// The release before this one swept the root for its migration marker's temporaries.
+    /// This build neither writes nor reads that marker, and markers already on disk are left
+    /// where they are. The root holds a node's identity and whatever its operator put there,
+    /// so nothing in it is this store's to remove, whatever its name looks like.
     #[tokio::test]
-    async fn a_leftover_marker_temporary_is_swept_and_its_neighbours_are_not() {
+    async fn opening_the_store_leaves_the_node_root_alone() {
         let dir = TempDir::new().expect("temp dir");
         let root = dir.path();
-        let leftover = root.join(format!("{TEMP_PREFIX}1234.abcdef01.marker"));
-        std::fs::write(&leftover, b"an interrupted marker write").expect("plant");
-
-        // Things that must survive: the marker itself, a chunk-shaped temp that belongs to
-        // the chunk tree's own sweep, and anything an operator put there.
-        let keep = [
+        let untouched = [
             root.join("migration-state.json"),
+            root.join(format!("{TEMP_PREFIX}1234.abcdef01.marker")),
             root.join(format!("{TEMP_PREFIX}1234.abcdef01.chunk")),
             root.join("notes.txt"),
-            // Prefix and suffix alone would take these. The pid and the nonce are checked
-            // because this runs over a directory holding a node's data.
-            root.join(format!("{TEMP_PREFIX}operator-notes.marker")),
-            root.join(format!("{TEMP_PREFIX}1234.nothex01.marker")),
-            root.join(format!("{TEMP_PREFIX}1234.abcdef0.marker")),
-            root.join(format!("{TEMP_PREFIX}1234.abcdef01.extra.marker")),
         ];
-        for path in &keep {
+        for path in &untouched {
             std::fs::write(path, b"keep me").expect("plant");
         }
 
         let store = reopen(&dir).await;
         drop(store);
 
-        assert!(
-            !leftover.exists(),
-            "the leftover marker temporary is still in the node root"
-        );
-        for path in &keep {
+        for path in &untouched {
             assert!(
                 path.exists(),
-                "{} was swept and should not have been",
+                "{} was removed from the node root",
                 path.display()
             );
         }
