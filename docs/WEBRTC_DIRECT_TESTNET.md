@@ -7,7 +7,7 @@ and serves browser bootstrap metadata; the companion site lives in the sibling
 
 ## Start the node testnet
 
-Rust 1.91 or newer is the shared native/WASM baseline.
+Rust 1.95 or newer is the shared native/WASM baseline.
 The startup and transport policy is recorded in [ADR-0015](adr/ADR-0015-direct-browser-clients-over-webrtc-direct.md).
 
 ```bash

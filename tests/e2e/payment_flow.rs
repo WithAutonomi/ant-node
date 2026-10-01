@@ -116,7 +116,10 @@ mod helper_tests {
 
         // Verify we can create wallets
         let wallet = env.create_funded_wallet()?;
-        assert!(!wallet.address().to_string().is_empty());
+        assert!(
+            !wallet.address().to_string().is_empty(),
+            "expected a non-empty wallet address"
+        );
 
         // Verify harness is accessible
         assert!(env.harness.node(0).is_some(), "Node 0 should exist");

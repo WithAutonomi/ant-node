@@ -90,11 +90,11 @@ async fn rejection_recorded_after_peer_removal_expires_instead_of_stalling() {
 
     // Removal cleanup runs FIRST: nothing is recorded yet, so both halves
     // are no-ops.
-    assert!(queues
-        .write()
-        .await
-        .remove_hint_source(&departed)
-        .is_empty());
+    let orphaned = queues.write().await.remove_hint_source(&departed);
+    assert!(
+        orphaned.is_empty(),
+        "expected nothing to clean up before any hint is recorded, got {orphaned:?}"
+    );
     assert!(!clear_capacity_rejected(&bootstrap_state, &departed).await);
 
     // The racing admission cycle then records the rejection for the
@@ -126,7 +126,11 @@ async fn peer_removal_preserves_hint_with_another_live_source() {
     let key = [9; 32];
 
     queues.add_pending_verify(key, entry(HashSet::from([departed, remaining])));
-    assert!(queues.remove_hint_source(&departed).is_empty());
+    let orphaned = queues.remove_hint_source(&departed);
+    assert!(
+        orphaned.is_empty(),
+        "expected the hint to survive while {remaining:?} still advertises it, got {orphaned:?}"
+    );
 
     let pending = queues.remove_pending(&key).expect("hint remains pending");
     assert_eq!(pending.hint_sources, HashSet::from([remaining]));

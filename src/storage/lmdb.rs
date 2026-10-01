@@ -1807,7 +1807,7 @@ mod tests {
 
         // Empty storage
         let keys = storage.all_keys().await.expect("all_keys empty");
-        assert!(keys.is_empty());
+        assert!(keys.is_empty(), "expected empty storage, got {keys:?}");
 
         // Store some chunks
         let content1 = b"chunk one for keys";

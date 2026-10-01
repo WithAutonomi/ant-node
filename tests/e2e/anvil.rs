@@ -198,7 +198,10 @@ mod tests {
     async fn test_anvil_creation() {
         let anvil = TestAnvil::new().await.unwrap();
         let _network = anvil.to_network();
-        assert!(!anvil.default_wallet_key().unwrap().is_empty());
+        assert!(
+            !anvil.default_wallet_key().unwrap().is_empty(),
+            "expected a non-empty default wallet key"
+        );
     }
 
     #[test]

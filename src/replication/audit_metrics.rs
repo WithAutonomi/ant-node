@@ -755,6 +755,11 @@ mod tests {
         assert_eq!(snapshot.origins[0].total_avg_ms(), 55);
         assert_eq!(snapshot.origins[0].peak_global_inflight, 31);
         assert_eq!(snapshot.total.global_pool_drops, 1);
-        assert!(metrics.take_snapshot().origins.is_empty());
+        let drained = metrics.take_snapshot();
+        assert!(
+            drained.origins.is_empty(),
+            "expected the snapshot to have been drained, got {:?}",
+            drained.origins
+        );
     }
 }

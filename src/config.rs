@@ -825,7 +825,11 @@ mod tests {
         let toml_str = r"peers = []";
         let config: BootstrapPeersConfig =
             toml::from_str(toml_str).expect("empty peers should parse");
-        assert!(config.peers.is_empty());
+        assert!(
+            config.peers.is_empty(),
+            "expected no peers, got {:?}",
+            config.peers
+        );
     }
 
     #[test]
@@ -833,7 +837,11 @@ mod tests {
         let toml_str = "";
         let config: BootstrapPeersConfig =
             toml::from_str(toml_str).expect("missing field should use default");
-        assert!(config.peers.is_empty());
+        assert!(
+            config.peers.is_empty(),
+            "expected no peers, got {:?}",
+            config.peers
+        );
     }
 
     #[test]

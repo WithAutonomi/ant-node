@@ -2262,7 +2262,11 @@ mod tests {
         assert_eq!(decoded.request_id, 6);
         if let ReplicationMessageBody::NeighborSyncResponse(resp) = decoded.body {
             assert_eq!(resp.replica_hints.len(), 1);
-            assert!(resp.paid_hints.is_empty());
+            assert!(
+                resp.paid_hints.is_empty(),
+                "expected no paid hints, got {:?}",
+                resp.paid_hints
+            );
             assert!(!resp.bootstrapping);
             assert_eq!(resp.rejected_keys.len(), 2);
         } else {

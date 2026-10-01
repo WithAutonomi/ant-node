@@ -283,9 +283,21 @@ mod tests {
             rejected_keys: Vec::new(),
         };
 
-        assert!(result.replica_keys.is_empty());
-        assert!(result.paid_only_keys.is_empty());
-        assert!(result.rejected_keys.is_empty());
+        assert!(
+            result.replica_keys.is_empty(),
+            "expected no replica keys, got {:?}",
+            result.replica_keys
+        );
+        assert!(
+            result.paid_only_keys.is_empty(),
+            "expected no paid-only keys, got {:?}",
+            result.paid_only_keys
+        );
+        assert!(
+            result.rejected_keys.is_empty(),
+            "expected no rejected keys, got {:?}",
+            result.rejected_keys
+        );
     }
 
     #[test]

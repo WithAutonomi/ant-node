@@ -607,7 +607,10 @@ mod tests {
     fn test_default_impl() {
         let upgrader = Upgrader::default();
         // Should not panic and should have a valid version
-        assert!(!upgrader.current_version().to_string().is_empty());
+        assert!(
+            !upgrader.current_version().to_string().is_empty(),
+            "expected a non-empty current version"
+        );
     }
 
     /// Test 11: Backup with special characters in filename
