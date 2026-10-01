@@ -23,19 +23,28 @@ actually has to happen is larger, and two parts of it are decisions rather than 
 
 ## Decision
 
-**Do not restore the penalty here.** It stays suspended for one more release, and the
-release after this one turns it back on. The reasoning is in *The penalty is restored by the
-release after this one* below: a node that was away while the migration ran arrives here
-holding a store this build cannot read, and restoring the accusation in the release that
-stranded it would slash it for a state it had no chance to leave.
+**Restore the penalty here, and remove the switch with it.** An earlier version of this record
+held the penalty off for one more release, on the ground that a node away while the migration
+ran arrives here holding a store this build cannot read, and accusing it in the release that
+stranded it would penalise it for a state it had no chance to leave. The decision owner reversed
+that on 2026-10-01: the release is held back two more weeks so that the nodes still finishing
+can finish, and a node that has still not migrated when it lands is penalised like any other
+node that cannot serve the chunks it is responsible for. The reasoning is in *The penalty is
+restored in this release* below.
 
-The switch itself stays. The process-wide atomic, the `ANT_SUSPEND_UNHELD_CHUNK_PENALTY`
-override and the startup announcement are not migration machinery: they are one release-level
-policy that several audit paths have to obey identically, and the release that restores a
-penalty is exactly the one most likely to need it undone in a hurry. Removing them would discard the
-cheapest lever at the moment it is most useful. A test now pins the shipped value, because
-the existing tests set the switch both ways on purpose and so could never notice which way
-it was compiled.
+So the switch goes too: the build constant, the process-wide atomic, the
+`ANT_SUSPEND_UNHELD_CHUNK_PENALTY` override, the startup announcement, the helper every accusing
+lane went through, and the two splits (`SingletonHintFault`, `FetchFault`) that existed only so
+that sub-cases of one accusation could be charged differently. The lanes report trust exactly as
+they did before the suspension, at the same weights, including the responsible-chunk audit's
+charge for a timeout.
+
+**Remove the migration signal.** The user agent is now `node/<version>`, this build's version
+without the `migration/<state>` token, still under the `node/` prefix `saorsa-core` admits DHT
+participants on.
+The reporter that logged a tally of the peers' announcements every fifteen minutes is gone, and
+so is the record of which peers had received the current commitment root, which only the
+migration's shedding gate read. Their job was to tell when this release could ship.
 
 **Delete the LMDB chunk store and the migration, and keep the name `ChunkStore`.** There is
 one store. It is one file per chunk, it lives in `src/storage/chunk_store.rs`, and it is
@@ -84,14 +93,12 @@ been offline long enough to miss the previous release entirely has no retained r
 peer — the answerability window is three hours and its close group has long since re-placed
 what it held — so it takes no *commitment-bound* penalty, which is the lane refusing was
 protecting it from. The node that is exposed on that lane is one that was running and
-unmigrated when this release landed, and that is exactly the population the previous release's
-fleet signal exists to count and wait out.
+unmigrated when this release landed, and that is exactly the population this release is held
+back for.
 
-It is not penalty-free, and it is worth being exact about what remains rather than rounding it
-to nothing. This release does NOT restore the close-group unheld-chunk penalty; that waits for
-the release after it, for the reason given below. What it cannot hold off is the
-commitment-bound audit, which is a separate lane and is enforced in every release. A node
-carrying an old store it cannot read is a node
+It is not penalty-free, and since the penalty is restored it is not close to it. A node
+carrying an old store it cannot read is charged on every lane that asks it for one of those
+chunks, on top of the commitment-bound audit that every release enforces. It is also a node
 with that much less disk, and a node short of disk fails to take on the chunks it is
 responsible for and is penalised on that lane like any other full node. That is not a penalty
 for having migrated badly; it is the ordinary consequence of a full disk, arriving through a
@@ -211,8 +218,8 @@ of `chunks.mdb` must not leave the `RETIRED` file in it.**
 **The mark is removed last.** `remove_dir_all` gives no promise about the order it unlinks
 things in, and if the mark went before the chunks did and the process stopped there, the next
 start would find an unmarked directory with data in it, decide it might be an unmigrated
-store, and keep it for good. It is not one, but nothing on disk would say so any more, and
-the node would report itself unfinished to the whole network for as long as it lived. So the
+store, and keep it for good. It is not one, but nothing on disk would say so any more, and the
+node would never get that disk back. So the
 contents go, then the mark, then the directory: at every point either the mark is still there
 and the next start resumes, or the directory is empty, which is also finished with.
 
@@ -222,11 +229,7 @@ file store, which is only true if the file store is there to hold them.
 An earlier draft ran this as soon as the root was known, which put the deletion in front of a
 constructor that can still fail on an unreadable layout, a directory it cannot create, or a
 lock another process has not let go of — and a node that lost both stores that way had
-nothing to go back to. Waiting costs nothing in what this node reports: its user agent is
-fixed when the transport is built, a moment earlier, but everything removed here is a leftover
-the signal already reads as finished with — carrying the mark or being empty is both what
-makes it removable and what makes it harmless — so the node announces `files` whether the
-deletion has finished, is still running, or has not started.
+nothing to go back to.
 
 Nothing here can fail. `clean_up` returns `()`. Every way a filesystem can disappoint it ends
 in a node that runs, a warning that names the directory, and disk that has not come back —
@@ -234,7 +237,8 @@ which is a worse place than success and a far better one than a restart loop.
 
 Nothing here can leave a node with no store: the deletion runs only after the store that
 replaced it has opened, and only over directories retirement had already cleared — everything
-kept copied and re-hashed, everything shed proven held by the close group. A node that
+kept copied and re-hashed, everything shed proven held by the close group — or that are empty.
+A node that
 never opens one, because storage is switched off, deletes nothing at all — it has established
 nothing about where those chunks went, and it has no use for the disk either.
 
@@ -245,15 +249,15 @@ process holds — still stops the node, exactly as it did in the release before 
 this release removes is the *other* reason a node could fail to start, the one its first draft
 introduced: being refused for what it was found carrying.
 
-**What may be deleted is decided by the previous release's own classifier**, not by a second
-reading of the same directory. The signal ADR-0014 put on the wire reports a node as finished
-when nothing under its root is holding chunks or unreadable, and this release is published on
-the strength of that count; so the cleanup calls that same function rather than carrying its
-own idea of which directories are finished with. Two classifiers could drift, and either
-direction is a fault: one would let a node delete a directory it was still reporting as
-unfinished, the other would leave it reporting `files` while paying for the disk for ever.
-There is a test that stages every shape a root can present and checks both directions of that
-correspondence, so a re-introduced private classifier fails there rather than on a fleet.
+**What may be deleted is decided in two steps.** The function the previous release used to
+report a node as finished now lives beside the cleanup and picks the candidates: a leftover
+carrying the mark, or an empty one. The deleting thread then re-checks each candidate on a
+directory handle and refuses anything a retired environment never contains — a subdirectory,
+more entries than one ever holds, a mark that is not a regular file — which it keeps and names.
+So nothing is removed that the classifier did not call harmless. A test stages every
+classification over ordinary shapes and checks both directions, so a deleter that drifts from
+the classifier fails there rather than on a fleet; the refusals are pinned by tests of their
+own.
 
 **The deletion is made against a directory handle, not against a path.** An earlier draft of
 this decision named a path for the checks and named it again for the unlinking, and accepted the
@@ -370,33 +374,40 @@ A legacy directory that happens to contain such a value is kept if it is unmarke
 it carries the mark, exactly like every other directory, and for exactly the same reasons. This
 release never looks inside one, so its contents are not a factor in either verdict.
 
-### The penalty is restored by the release after this one, not by this one
+### The penalty is restored in this release
 
 The original plan had this release delete the old store and restore the close-group storage
-penalty together. They are now separated, and the separation is the point.
+penalty together. An earlier version of this record separated them; the decision owner put
+them back together on 2026-10-01.
 
-The upgrade monitor picks the newest eligible release rather than the next one. A node that was
-offline while the migration ran therefore arrives here having never migrated, holding a legacy
-store this build cannot read. This release keeps that store rather than deleting it, which is
-right for its data, but the node cannot serve those chunks and its close group will notice.
-Restoring the accusation in the same release would slash that node for a state it had no chance
-to leave, in the release that put it there.
+The argument for separating them still describes what happens. The upgrade monitor picks the
+newest eligible release rather than the next one, so a node that was offline while the
+migration ran arrives here having never migrated, holding a store this build cannot read. This
+release keeps that store rather than deleting it, which is right for its data, but the node
+cannot serve those chunks and its close group notices. With the penalty restored it is charged
+for each one, its trust at its neighbours falls below the swap threshold, and it loses routing
+slots to peers that can serve what it cannot.
 
-So this release ships with the penalty still held off, and the release after it restores the
-penalty once the fleet has been observed clean for long enough to include the nodes that were
-away. That is a one-line change to a build constant, and it costs one extra release to stop the
-cleanup and the accusation landing on a stranded node at the same moment.
+That is accepted, and the release is held back instead. Two more weeks gives the nodes still
+moving their chunks time to finish, and a node that is still unmigrated after that is treated
+like any other node that cannot serve what it is responsible for. Holding the penalty off for
+another release would have kept a switch, an override and a split in every accusing lane alive
+for nodes that have had the whole migration to move, and left the network another release
+without the accusation that keeps a node honest about what it stores.
 
-What this leaves is one migration-era constant still in the tree after the release that was
-meant to remove them all. That is a deliberate trade: the objective this protects is that no
-release breaks the fleet, and it outranks the objective that no migration code survives.
+It does not cost data. The store such a node keeps is left on its disk, unread and undeleted,
+and the replicas its close group holds are not touched by any of this. Losing the routing slots
+hands responsibility for those chunks to peers that can serve them, which is what the penalty
+is for.
 
 ## Consequences
 
 ### Positive
 
 - One store, one name, and about 5,600 lines of bridge and driver gone.
-- The unheld-chunk penalty is still held off, and the release after this one restores it.
+- The unheld-chunk penalty is restored on every lane, and nothing of the suspension is left in
+  the tree.
+- No node logs a per-peer tally every fifteen minutes any more.
 - **The cleanup never vetoes a start.** Not the same as "every node starts": the file store
   is built first and one that cannot open still stops the node, exactly as before. What is
   gone is the other reason, the refusal this release's first draft introduced.
@@ -406,16 +417,13 @@ release breaks the fleet, and it outranks the objective that no migration code s
 
 - **A node that never finished migrating keeps its old store and does not get that disk
   back.** That population is the short-of-disk nodes, and how large it is remains the open
-  fleet question ADR-0014 records — which is why that release now reports it on the wire, and
-  why this one is not published until the count is clean. Such a node runs and serves what it
-  migrated; what it does not do is reclaim the space, which it could not do safely under any
-  of the three answers considered here.
-- **The two halves have very different emergency levers, which is why they are not in the same
-  release.** Restoring the penalty is a switch, undoable in minutes and from the fleet side.
-  Deleting the bridge can only be undone by not shipping the release at all — and not even by
-  rolling the binary back, since the upgrade monitor takes the node forward again. That
-  asymmetry is the reason the penalty waits for the release after this one rather than riding
-  along with the deletion, and it is a decision rather than a scheduling accident.
+  fleet question ADR-0014 records, which is why this release is held back. Such a node runs and
+  serves what it migrated, is penalised for what it did not, and does not reclaim the space,
+  which it could not do safely under any of the three answers considered here.
+- **Neither half has a fast lever any more.** The override that could have suspended the
+  penalty from the fleet side is gone with the switch, so turning the accusation off again
+  takes a release, as undoing the deletion of the bridge always did — and not even rolling the
+  binary back undoes that, since the upgrade monitor takes the node forward again.
 - `ChunkStore` and its module were renamed from `FileStore` and `file_store.rs`. Callers of
   the facade did not change, because they already used that name — but **`FileStore`,
   `FileStoreConfig`, `StoreLayout`, `VerifyReport` and `LEGACY_ENV_DIR` were exported too**,
@@ -429,8 +437,10 @@ release breaks the fleet, and it outranks the objective that no migration code s
 
 ### Neutral / Operational
 
-- `ANT_SUSPEND_UNHELD_CHUNK_PENALTY` still works and still logs loudly when it disagrees
-  with the build.
+- `ANT_SUSPEND_UNHELD_CHUNK_PENALTY` has no effect.
+- The user agent no longer carries a `migration/` token, and `migration_event = "signal"` and
+  `peer_state` lines are no longer logged. Peers on earlier releases read the shorter agent as
+  a node that does not report, which changes only their own log lines.
 - `storage.migration` and `storage.db_size_gb` are gone from the configuration. The second
   capped a memory map that no longer exists, and a setting that silently does nothing is
   worse than one that is absent. Nothing declares `deny_unknown_fields`, so a config file
@@ -473,15 +483,17 @@ the ceiling rather than testing that something went wrong.
 Three further properties are pinned that the earlier draft had no test for, because it had no
 code for them either.
 
-**The correspondence with the fleet signal.** A root is staged carrying at least one shape for
+**The correspondence with the classifier.** A root is staged carrying at least one shape for
 every verdict the classifier can return — harmless three ways (a marked live environment, a
 marked tombstone, an empty one), holding two (an unmarked tombstone with chunks in it, a link
 wearing a tombstone's name), unreadable two (something that is not the mark using the mark's
 name, and a plain file wearing a tombstone's name) — plus the near misses that are not in the
 name set at all. Each is classified before anything is removed, and afterwards each is asserted
 gone exactly when it was called harmless and still there exactly when it was not. Both
-directions, so a classifier that drifts either way fails here; mutation-checked by making a link
-classify harmless, which the test catches.
+directions, for these ordinary shapes, so a classifier that drifts either way fails here;
+mutation-checked by making a link classify harmless, which the test catches. A marked directory
+the deleter refuses — one with a subdirectory in it, or more entries than a retired environment
+holds — is classified harmless and still kept, and those refusals have their own tests.
 
 **A marked directory is removed even when nothing was copied into this node's file store**,
 staged with no file store at all. That is a shedding node's ordinary state, and pinning it is
@@ -506,10 +518,8 @@ Through `NodeBuilder::build()`: a node with an unmigrated store starts under bot
 `storage.enabled = true` and `false` and still has its chunks afterwards; a node with a marked
 one starts and the leftover goes; and a node whose file store cannot open — staged with a file
 where the chunk directory has to be — fails to build with its old store still intact, which is
-what pins the deletion behind the replacement. The penalty staying SUSPENDED is pinned by a test
-on the shipped constant, which fails if it is flipped — in either direction. The existing tests
-set the switch both ways on purpose, so none of them could ever notice which way it was
-compiled, which is how a suspension outlives the thing it was suspended for.
+what pins the deletion behind the replacement. The restored penalty is pinned by the
+possession-check tests, which assert the charge with no switch left to set.
 
 **Deleted, and what replaced it.** ADR-0014's validation section describes four harnesses.
 Most of three of them existed to prove the bridge worked: that the disk came back when the
@@ -556,43 +566,24 @@ current and still claimed by that method's own documentation, and nothing tests 
 needs a live P2P node to stage, which is why it is called out here rather than quietly
 rewritten in the same change that deleted it.
 
-**A fleet gate this decision adds.** Before this ships, the fleet has to show that nodes are
-actually on the file store, because this is the release that stops any of them going back.
-ADR-0014 puts the answer on the wire: every node announces `migration/legacy`,
-`migration/files` or `migration/unknown` in the user agent it already sends with every signed
-message, and each node counts what it sees around it. The gate is that nothing reports
-`legacy` or `unknown` for itself, and that no observed peer reports `legacy`, `unknown`, or
-nothing at all, over several consecutive days, against a roster of nodes we expect to hear
-from. A peer that reports nothing is running a build from before the signal existed, which is
-not evidence of anything having finished; the tally counts it as outstanding for that reason. Silence is not readiness:
-a zero from a collector that scraped nothing looks exactly like a zero from a clean fleet,
-which is why the count needs a denominator and not just a numerator.
-
-That gate cannot be made airtight, and it is worth being honest about which part is soft.
-Nodes that are offline for the whole window are in nobody's count and come back afterwards;
-that is the population this decision knowingly cleans up rather than the one it waits for.
-
-**Where that gate stands as this is written, which is nowhere yet.** The signal first shipped in
-`v0.19.0-beta.1`, published 2026-09-09, so there is under a day of it against a gate that asks
-for several consecutive days. More to the point, the beta's own lines do not mean yet what the
-gate needs them to mean: the staged migrations have not started, so a node reporting `files`
-today is reporting that it has nothing to move rather than that it has finished moving it, and
-those two are indistinguishable in the tally. And the population the gate exists for — the
-community nodes, and the NTFS hosts where the store's case-folding and directory-entry
-behaviour differ from ours — is not reporting to us at all. **No count taken before the staged
-migrations run should be read as progress towards this gate**, and this release is not published
-on the strength of one.
+**The fleet gate, and how it was answered.** The previous releases put each node's migration
+state in its user agent so that this release could wait for the fleet to finish, and that gate
+could never be made airtight: a node sees only the peers it connects to, each answering as of
+its own last start, and a node offline for the whole window is in nobody's count. It was
+answered by a decision rather than by a count reaching zero: the release is held back two more
+weeks after the nodes the project runs had all finished, and whatever has not finished by then
+is penalised as described above. The signal is removed in this release because it has no further
+use; an unmigrated node is now visible the way any node is that cannot serve its chunks, through
+the audits.
 
 ## What this release does not fix
 
 Named rather than implied. None is a regression; each is the state before this change.
 
 - **A node that kept an unreadable store does not get that disk back**, and being short of disk
-  is how that costs it: it fails to take on chunks it is responsible for. Note that this
-  release does not add the unheld-chunk accusation on top — that lane is still suspended here
-  and returns in the release after. What such a node is exposed to is the commitment-bound
-  lane, which every release enforces. The remedy is the operator's, and the warning names the
-  directory.
+  is how that costs it: it fails to take on chunks it is responsible for, and with the
+  unheld-chunk accusation restored it is charged for the ones it cannot read as well. The
+  remedy is the operator's, and the warning names the directory.
 - **Neither build re-marks or retries the way retirement did.** That release would retry a
   failed final removal many times and write the mark back if it could not finish. This one makes
   one attempt per start and leaves the rest to the next start, which is a longer wait on a host
@@ -614,14 +605,19 @@ Named rather than implied. None is a regression; each is the state before this c
 - **`deploy/terraform/cloud-init/worker.yml` still cannot start a node**: it passes no rewards
   address, which production mode requires. The binary also sits in `/usr/local/bin` while the
   unit runs under `ProtectSystem=strict`, so an in-process upgrade cannot replace it. Both
-  predate this work and belong to whoever owns that deployment. That path is not evidence for
-  the fleet gate until they are fixed.
+  predate this work and belong to whoever owns that deployment. That path is not evidence of
+  fleet behaviour until they are fixed.
 - **Off Unix a chunk is published under its final name**, so a power loss can leave a real
   chunk name over partial bytes, and a commitment built before anything reads it claims a
   chunk the node cannot produce. ADR-0014 states this; the forced power-loss run is still an
-  open gate.
+  open gate. Nor can a directory be flushed off Unix through the standard library, so a power
+  loss soon after a shard directory is created can lose it with the chunks just published into
+  it, after the puts had succeeded. This node gets those back only if a peer offers them while
+  it is still responsible for them; other replicas are untouched. Both predate this release,
+  which neither widens nor narrows them.
 - **There is no supported way to hold a node on an earlier release.** This is named here
-  because it is what makes the fleet gate a gate rather than a preference. The on-disk format
+  because it is why this release had to wait for the fleet rather than let nodes catch up
+  afterwards. The on-disk format
   rolls back cleanly — the previous release reads the same one-file-per-chunk layout, and a
   legacy directory this release kept is one it can still pick up and finish — but the
   *operation* does not: `build_upgrade_monitor` is called unconditionally, `UpgradeConfig` has
