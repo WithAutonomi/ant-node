@@ -1,6 +1,6 @@
 [package]
 name = "ant-node"
-version = "0.20.0"
+version = "0.21.0"
 edition = "2021"
 authors = ["David Irvine <david.irvine@maidsafe.net>"]
 description = "Pure quantum-proof network node for the Autonomi decentralized network"
@@ -35,7 +35,7 @@ mimalloc = "0.1"
 # node-only DHT internals (DHTNode, TrustEvent, DhtNetworkEvent), which
 # Cargo unifies with ant-protocol's version constraint.
 #
-ant-protocol = "3.0.0"
+ant-protocol = "3.1.0"
 
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
 saorsa-core = "0.28.0"
@@ -227,13 +227,6 @@ webrtc-direct = [
     "saorsa-transport/webrtc-direct",
     "dep:self_encryption",
 ]
-
-[patch.crates-io]
-# Pointers (ADR-0016) add the `Pointer` record and its wire messages on top of
-# the published 3.0.0, so this is the only entry that has to leave the release
-# baseline. A rev, not a branch, so the pin is immutable. Drop it once the
-# pointer PR lands and a release includes it. Versions are bumped at release.
-ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "d11d1010d93958fee6e63e4aace8770f39a0678b" }
 
 [profile.release]
 lto = true
