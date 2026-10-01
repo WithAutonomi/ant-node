@@ -714,9 +714,9 @@ impl ChunkStore {
             Ok(Some(content)) => return Ok(Some(content)),
             Ok(None) => {}
             // Same rule as `get`: while the legacy environment is there it may have the
-            // bytes, and this is the read that drives digest audits, possession checks
-            // and pruning. Answering "no digest" for a chunk the node can still produce
-            // is a failed audit for nothing.
+            // bytes, and this is the read that answers digest and subtree audits.
+            // Answering "no digest" for a chunk the node can still produce is a failed
+            // audit for nothing.
             Err(e) => {
                 let Some(legacy) = fallback else {
                     return Err(e);
@@ -744,6 +744,33 @@ impl ChunkStore {
             legacy.only.write().insert(*address);
         }
         Ok(raw)
+    }
+
+    /// Take a key out of service after its raw bytes were found not to hash to it.
+    ///
+    /// [`Self::get_raw`] does not verify, and it is the read that answers audits, so a
+    /// rotted or torn file is never noticed there: the node goes on committing the key
+    /// and failing every audit that lands on it, and only a fetch of that exact key
+    /// would ever repair it. A caller that has hashed raw bytes anyway and found them
+    /// wrong passes the key here, and the verifying read does the rest exactly as it
+    /// does for a fetch: it re-reads the file under the write lane, removes it only if
+    /// it is still wrong, stops the node claiming the key so its next commitment leaves
+    /// it out and replication brings a good copy back, and re-queues a legacy copy if
+    /// there is one.
+    ///
+    /// Follows the node's `verify_on_read` setting, like every other verifying read.
+    pub(crate) async fn recheck_corrupt(&self, address: &XorName) {
+        match self.get(address).await {
+            Ok(Some(_)) => debug!(
+                "Chunk {} reads back intact or was served from the legacy environment",
+                hex::encode(address)
+            ),
+            Ok(None) => debug!("Chunk {} is no longer stored", hex::encode(address)),
+            Err(e) => debug!(
+                "Chunk {} taken out of service after a failed check: {e}",
+                hex::encode(address)
+            ),
+        }
     }
 
     /// Check whether a chunk is stored, in either backing.
@@ -3022,6 +3049,7 @@ where
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::storage::file_store::CHUNKS_DIR_NAME;
     use crate::storage::migration::{now_unix, rank_closest_first, MIN_RETIRE_DELAY_HOURS};
     use tempfile::TempDir;
 
@@ -4711,6 +4739,52 @@ mod tests {
         assert!(
             store.legacy_only_keys().contains(&victim),
             "the key must go back on the copier's list"
+        );
+    }
+
+    #[tokio::test]
+    async fn recheck_corrupt_takes_a_rotted_file_out_of_service_and_spares_a_good_one() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = open(&dir).await;
+        let (good, good_bytes) = addressed("intact");
+        let (bad, bad_bytes) = addressed("rotted");
+        store.put(&good, &good_bytes).await.expect("put good");
+        store.put(&bad, &bad_bytes).await.expect("put bad");
+
+        let path = dir
+            .path()
+            .join(CHUNKS_DIR_NAME)
+            .join(format!("{:02x}", bad.last().copied().unwrap_or(0)))
+            .join(hex::encode(bad));
+        std::fs::write(&path, b"rotted").expect("corrupt the file");
+        // The raw read that answers audits still hands the rotted bytes out.
+        assert_eq!(
+            store.get_raw(&bad).await.expect("raw").as_deref(),
+            Some(b"rotted".as_slice())
+        );
+
+        // A false alarm must never cost a good chunk: the recheck reads it back first.
+        store.recheck_corrupt(&good).await;
+        store.recheck_corrupt(&bad).await;
+
+        let keys = store.all_keys().await.expect("keys");
+        assert!(keys.contains(&good), "an intact chunk stays in service");
+        assert!(
+            !keys.contains(&bad),
+            "a rotted chunk must leave the view the next commitment is built from"
+        );
+        assert!(!path.exists(), "the rotted file is removed");
+        assert!(!store.exists(&bad).expect("exists"));
+        assert_eq!(
+            store.get(&good).await.expect("get").expect("present"),
+            good_bytes
+        );
+
+        // Replication's repair is an ordinary store of the right bytes.
+        store.put(&bad, &bad_bytes).await.expect("repair");
+        assert_eq!(
+            store.get(&bad).await.expect("get").expect("present"),
+            bad_bytes
         );
     }
 

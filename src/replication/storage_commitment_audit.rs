@@ -1360,6 +1360,17 @@ pub struct Round1Work {
     /// since the per-peer cooldown is escapable by rotating identity, the
     /// responder-wide work budget is the only bound that would have caught it.
     pub content_bytes: i64,
+    /// Committed chunks whose bytes, read for this proof, no longer hash to
+    /// their key.
+    ///
+    /// The proof still carries what was read, so the auditor's verdict on them
+    /// is unchanged. The caller hands each one to the chunk store's corruption
+    /// recheck once the reply has gone, so the node stops committing a chunk it
+    /// cannot prove and replication can repair it, rather than failing every
+    /// audit that lands on that key until a fetch of the same key happens to
+    /// notice. Done after the reply, not here, so the cleanup never delays the
+    /// answer the auditor is waiting for.
+    pub corrupt_keys: Vec<XorName>,
 }
 
 /// [`handle_subtree_challenge`], additionally reporting the read-and-hash work
@@ -1396,6 +1407,7 @@ pub async fn handle_subtree_challenge_measured_with_pointers(
     // exit reports its work by construction: a new early return cannot forget to
     // account for the reads that already happened.
     let mut content_bytes = 0i64;
+    let mut corrupt_keys = Vec::new();
     let response = subtree_challenge_response(
         challenge,
         storage,
@@ -1404,18 +1416,21 @@ pub async fn handle_subtree_challenge_measured_with_pointers(
         is_bootstrapping,
         commitment_state,
         &mut content_bytes,
+        &mut corrupt_keys,
     )
     .await;
     Round1Work {
         response,
         content_bytes,
+        corrupt_keys,
     }
 }
 
 /// The round-1 responder proper. `content_bytes` accrues the chunk content read
 /// and hashed so far, and is meaningful on every return path, not just the
-/// successful one.
-#[allow(clippy::too_many_lines)]
+/// successful one. `corrupt_keys` collects the committed chunks whose bytes did
+/// not hash to their key (see [`Round1Work::corrupt_keys`]).
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn subtree_challenge_response(
     challenge: &SubtreeAuditChallenge,
     storage: &ChunkStore,
@@ -1424,6 +1439,7 @@ async fn subtree_challenge_response(
     is_bootstrapping: bool,
     commitment_state: Option<&Arc<ResponderCommitmentState>>,
     content_bytes: &mut i64,
+    corrupt_keys: &mut Vec<XorName>,
 ) -> SubtreeAuditResponse {
     if is_bootstrapping {
         return SubtreeAuditResponse::Bootstrapping {
@@ -1620,6 +1636,17 @@ async fn subtree_challenge_response(
                 };
             }
         };
+        // The leaf's plain hash is the content address of what was just read, so a
+        // committed chunk whose file no longer matches its name shows up here at no
+        // extra cost. See `Round1Work::corrupt_keys` for what happens to it.
+        if leaf.bytes_hash != *key {
+            warn!(
+                "Subtree audit: committed key {} does not hash to its address; \
+                 it will be taken out of service so replication can repair it",
+                hex::encode(key)
+            );
+            corrupt_keys.push(*key);
+        }
         leaves.push(leaf);
     }
 
@@ -2750,9 +2777,11 @@ mod pointer_audit_tests {
     use super::*;
     use crate::replication::commitment::MerkleTree;
     use crate::replication::commitment_state::BuiltCommitment;
+    use crate::storage::file_store::CHUNKS_DIR_NAME;
     use crate::storage::ChunkStoreConfig;
     use ant_protocol::pointer::{PointerTarget, PointerTargetKind};
     use saorsa_pqc::api::sig::ml_dsa_65;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     const CHALLENGE_ID: u64 = 7;
@@ -2777,6 +2806,7 @@ mod pointer_audit_tests {
         state: Arc<ResponderCommitmentState>,
         peer: PeerId,
         peer_bytes: [u8; 32],
+        chunk_root: PathBuf,
         _dirs: (TempDir, TempDir),
     }
 
@@ -2822,8 +2852,17 @@ mod pointer_audit_tests {
                 state,
                 peer: PeerId::from_bytes(peer_bytes),
                 peer_bytes,
+                chunk_root: chunk_dir.path().to_path_buf(),
                 _dirs: (chunk_dir, pointer_dir),
             }
+        }
+
+        /// Where the file store keeps `key`'s bytes, so a test can rot them.
+        fn chunk_file(&self, key: &XorName) -> PathBuf {
+            self.chunk_root
+                .join(CHUNKS_DIR_NAME)
+                .join(format!("{:02x}", key.last().copied().unwrap_or(0)))
+                .join(hex::encode(key))
         }
 
         fn committed(&self) -> Arc<BuiltCommitment> {
@@ -2831,6 +2870,10 @@ mod pointer_audit_tests {
         }
 
         async fn round1(&self, nonce: [u8; 32]) -> SubtreeAuditResponse {
+            self.round1_work(nonce).await.response
+        }
+
+        async fn round1_work(&self, nonce: [u8; 32]) -> Round1Work {
             let challenge = SubtreeAuditChallenge {
                 challenge_id: CHALLENGE_ID,
                 nonce,
@@ -2846,7 +2889,6 @@ mod pointer_audit_tests {
                 Some(&self.state),
             )
             .await
-            .response
         }
 
         async fn round2(
@@ -3061,6 +3103,73 @@ mod pointer_audit_tests {
             verify_slice_response(&openings, &nonce, &responder.peer_bytes, &items),
             AuditVerdict::Fail(AuditFailureReason::DigestMismatch)
         );
+    }
+
+    /// A committed chunk whose file has rotted fails round 1 exactly as before,
+    /// but the responder reports it while answering and, once the reply has gone,
+    /// stops claiming it, so its next commitment leaves the chunk out and
+    /// replication can repair it rather than the node failing every audit that
+    /// lands on that key.
+    #[tokio::test]
+    async fn round_one_takes_a_rotted_committed_chunk_out_of_service() {
+        let responder = Responder::new(24, 0).await;
+        let committed = responder.committed();
+        let nonce = [7u8; 32];
+        let plan = subtree_plan(committed.tree(), &nonce).expect("plan");
+        let victim = plan.leaf_keys.first().copied().expect("a selected chunk");
+        let path = responder.chunk_file(&victim);
+        std::fs::write(&path, b"rotted").expect("corrupt the file");
+
+        let work = responder.round1_work(nonce).await;
+        assert_eq!(
+            work.corrupt_keys,
+            vec![victim],
+            "the responder reports exactly the rotted chunk"
+        );
+        match work.response {
+            SubtreeAuditResponse::Proof {
+                commitment, proof, ..
+            } => assert_eq!(
+                evaluate_subtree_structure(
+                    &commitment,
+                    &proof,
+                    &nonce,
+                    &committed.hash(),
+                    &responder.peer_bytes,
+                ),
+                Err(AuditFailureReason::DigestMismatch),
+                "the auditor's verdict on the rotted chunk is unchanged"
+            ),
+            other => panic!("expected a proof, got {other:?}"),
+        }
+
+        // What the replication engine does with the report once the reply has gone.
+        for key in &work.corrupt_keys {
+            responder.storage.recheck_corrupt(key).await;
+        }
+        let keys = responder.storage.all_keys().await.expect("keys");
+        assert!(
+            !keys.contains(&victim),
+            "the rotted chunk leaves the view the next commitment is built from"
+        );
+        assert!(!path.exists(), "the rotted file is removed");
+        assert_eq!(keys.len(), 23, "every intact chunk stays in service");
+    }
+
+    /// An honest round 1 over intact chunks takes nothing out of service.
+    #[tokio::test]
+    async fn round_one_over_intact_chunks_keeps_every_chunk() {
+        let responder = Responder::new(24, 0).await;
+        for seed in 0..8u8 {
+            assert!(responder
+                .round1_work([seed; 32])
+                .await
+                .corrupt_keys
+                .is_empty());
+            let leaves = responder.proved_leaves([seed; 32]).await;
+            assert!(!leaves.is_empty());
+        }
+        assert_eq!(responder.storage.all_keys().await.expect("keys").len(), 24);
     }
 
     fn replace_records(items: &mut [SubtreeSliceItem], target: &XorName, with: &[Vec<u8>]) {

@@ -4308,8 +4308,10 @@ impl fmt::Display for ResponderAdmissionFailure {
 
 /// RAII admission for one audit-responder task: holds the GLOBAL permit and,
 /// on drop, decrements the PER-PEER in-flight count. Moving this into the
-/// spawned task ties both bounds to the task's exact lifetime — no manual
-/// decrement to forget on an early return or panic.
+/// spawned task ties both bounds to the task's lifetime — no manual decrement
+/// to forget on an early return or panic. A task may drop it once its reply has
+/// gone, before purely local follow-up work (round 1 does, before taking
+/// rotted chunks out of service), so that work never holds back another audit.
 struct ResponderGuard {
     _permit: tokio::sync::OwnedSemaphorePermit,
     _peer_slot: PeerResponderSlot,
@@ -5200,12 +5202,14 @@ async fn handle_replication_message(
             let responder_metrics = Arc::clone(&ctx.audit_responder_metrics);
             let subtree_round1 = ctx.subtree_round1.clone();
             ctx.detached_task_tracker.spawn(async move {
-                let _guard = guard; // global permit + per-peer slot, held until done
+                // `guard` is the global permit + per-peer slot, held until the
+                // reply has gone.
                 let worker_started = Instant::now();
                 let processing_started = Instant::now();
                 let storage_commitment_audit::Round1Work {
                     response,
                     content_bytes,
+                    corrupt_keys,
                 } = storage_commitment_audit::handle_subtree_challenge_measured_with_pointers(
                     &challenge,
                     &storage,
@@ -5272,6 +5276,13 @@ async fn handle_replication_message(
                     processing,
                     response_send,
                 );
+                drop(guard);
+                // A committed chunk this proof found rotted is taken out of service
+                // only now, with the reply gone and the permit released, so the
+                // cleanup never delays the auditor or holds back another audit.
+                for key in &corrupt_keys {
+                    storage.recheck_corrupt(key).await;
+                }
             });
             Ok(())
         }
