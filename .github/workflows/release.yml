@@ -125,6 +125,25 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Collects, unaltered, the licence, copyright and notice files of every
+      # crate this target's build resolves, including build-time tools, and
+      # fails if any crate's licence is outside the policy or its texts cannot
+      # be found (see the script and its config). The token raises the GitHub
+      # rate limit for licence files fetched from crates' repositories.
+      - name: Generate THIRD-PARTY-NOTICES.txt
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/third_party_notices/generate.py
+          --config scripts/third_party_notices/config.toml
+          --output THIRD-PARTY-NOTICES.txt
+          --target ${{ matrix.target }}
+
       - name: Install cross (Linux ARM64)
         if: matrix.cross
         run: cargo install cross --git https://github.com/cross-rs/cross
@@ -140,21 +159,30 @@ jobs:
         if: ${{ !matrix.cross }}
         run: cargo build --release --target ${{ matrix.target }}
 
+      # Archives carry the project's licence files, the third-party notices and
+      # the Rust standard library's notices from the toolchain that built the
+      # binary. The upgrade path extracts only the binary by name, so extra
+      # files do not affect it.
       - name: Create archive (Unix)
         if: matrix.archive == 'tar.gz'
         run: |
-          cp config/bootstrap_peers.toml target/${{ matrix.target }}/release/
+          cp config/bootstrap_peers.toml LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt target/${{ matrix.target }}/release/
+          cp "$(rustc --print sysroot)/share/doc/rust/COPYRIGHT-library.html" target/${{ matrix.target }}/release/RUST-STD-COPYRIGHT.html
           cd target/${{ matrix.target }}/release
-          tar -czvf ../../../ant-node-cli-${{ matrix.friendly_name }}.tar.gz ${{ matrix.binary }} bootstrap_peers.toml
+          tar -czvf ../../../ant-node-cli-${{ matrix.friendly_name }}.tar.gz ${{ matrix.binary }} bootstrap_peers.toml LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt RUST-STD-COPYRIGHT.html
           cd ../../..
 
       - name: Create archive (Windows)
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          Copy-Item "config/bootstrap_peers.toml" "target/${{ matrix.target }}/release/bootstrap_peers.toml"
+          foreach ($file in "config/bootstrap_peers.toml", "LICENSE-MIT", "LICENSE-APACHE", "THIRD-PARTY-NOTICES.txt") {
+            Copy-Item $file "target/${{ matrix.target }}/release/" -ErrorAction Stop
+          }
+          $sysroot = (rustc --print sysroot).Trim()
+          Copy-Item (Join-Path $sysroot "share/doc/rust/COPYRIGHT-library.html") "target/${{ matrix.target }}/release/RUST-STD-COPYRIGHT.html" -ErrorAction Stop
           Push-Location "target/${{ matrix.target }}/release"
-          Compress-Archive -Path "${{ matrix.binary }}", "bootstrap_peers.toml" -DestinationPath "../../../ant-node-cli-${{ matrix.friendly_name }}.zip"
+          Compress-Archive -Path "${{ matrix.binary }}", "bootstrap_peers.toml", "LICENSE-MIT", "LICENSE-APACHE", "THIRD-PARTY-NOTICES.txt", "RUST-STD-COPYRIGHT.html" -DestinationPath "../../../ant-node-cli-${{ matrix.friendly_name }}.zip"
           Pop-Location
 
       - name: Upload artifact
@@ -267,6 +295,13 @@ jobs:
           mkdir "$staging"
           cp artifacts/ant-node.exe "$staging/"
           cp config/bootstrap_peers.toml "$staging/"
+          for file in LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt RUST-STD-COPYRIGHT.html; do
+            if [ ! -f "artifacts/$file" ]; then
+              echo "::error::$file not found in the unsigned archive"
+              exit 1
+            fi
+            cp "artifacts/$file" "$staging/"
+          done
           (cd "$staging" && 7z a "../${staging}.zip" ./*)
 
 
@@ -404,6 +439,8 @@ jobs:
             | macOS x64 | `ant-node-cli-macos-x64.tar.gz` |
             | macOS ARM64 (Apple Silicon) | `ant-node-cli-macos-arm64.tar.gz` |
             | Windows x64 | `ant-node-cli-windows-x64.zip` |
+
+            Each archive also contains `LICENSE-MIT` and `LICENSE-APACHE`, plus `THIRD-PARTY-NOTICES.txt` and `RUST-STD-COPYRIGHT.html` with the licences and copyright notices of the third-party code in the binary and of the tools used to build it.
 
             **CLI Usage:**
             ```bash
