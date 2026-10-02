@@ -1364,12 +1364,14 @@ pub struct Round1Work {
     /// their key.
     ///
     /// The proof still carries what was read, so the auditor's verdict on them
-    /// is unchanged. The caller hands each one to the chunk store's corruption
-    /// recheck once the reply has gone, so the node stops committing a chunk it
-    /// cannot prove and replication can repair it, rather than failing every
+    /// is unchanged. The caller reports them to the chunk store
+    /// (`ChunkStore::report_corrupt`), whose recheck worker takes the ones its
+    /// bounded queue admits out of service, so the node stops committing a chunk
+    /// it cannot prove and replication can repair it, rather than failing every
     /// audit that lands on that key until a fetch of the same key happens to
-    /// notice. Done after the reply, not here, so the cleanup never delays the
-    /// answer the auditor is waiting for.
+    /// notice. A key the queue cannot take stays committed, so the next audit
+    /// that reads it reports it again. Not done here, so the cleanup never delays
+    /// the answer the auditor is waiting for.
     pub corrupt_keys: Vec<XorName>,
 }
 
@@ -1642,7 +1644,8 @@ async fn subtree_challenge_response(
         if leaf.bytes_hash != *key {
             warn!(
                 "Subtree audit: committed key {} does not hash to its address; \
-                 it will be taken out of service so replication can repair it",
+                 reporting it for a recheck so it can be taken out of service \
+                 and repaired",
                 hex::encode(key)
             );
             corrupt_keys.push(*key);
@@ -2783,6 +2786,7 @@ mod pointer_audit_tests {
     use saorsa_pqc::api::sig::ml_dsa_65;
     use std::path::PathBuf;
     use tempfile::TempDir;
+    use tokio_util::sync::CancellationToken;
 
     const CHALLENGE_ID: u64 = 7;
 
@@ -3106,10 +3110,10 @@ mod pointer_audit_tests {
     }
 
     /// A committed chunk whose file has rotted fails round 1 exactly as before,
-    /// but the responder reports it while answering and, once the reply has gone,
-    /// stops claiming it, so its next commitment leaves the chunk out and
-    /// replication can repair it rather than the node failing every audit that
-    /// lands on that key.
+    /// but the responder reports it, and the chunk store's recheck worker then
+    /// stops the node claiming it, so its next commitment leaves the chunk out
+    /// and replication can repair it rather than the node failing every audit
+    /// that lands on that key.
     #[tokio::test]
     async fn round_one_takes_a_rotted_committed_chunk_out_of_service() {
         let responder = Responder::new(24, 0).await;
@@ -3143,10 +3147,19 @@ mod pointer_audit_tests {
             other => panic!("expected a proof, got {other:?}"),
         }
 
-        // What the replication engine does with the report once the reply has gone.
-        for key in &work.corrupt_keys {
-            responder.storage.recheck_corrupt(key).await;
-        }
+        // What the replication engine does with the report: queue it for the chunk
+        // store's recheck worker. The worker finishes the recheck it is on before it
+        // stops, so once it returns the chunk has been dealt with.
+        responder.storage.report_corrupt(&work.corrupt_keys);
+        let stop = CancellationToken::new();
+        let removed = async {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while path.exists() && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            stop.cancel();
+        };
+        tokio::join!(responder.storage.run_corrupt_rechecks(&stop), removed);
         let keys = responder.storage.all_keys().await.expect("keys");
         assert!(
             !keys.contains(&victim),
@@ -3161,13 +3174,13 @@ mod pointer_audit_tests {
     async fn round_one_over_intact_chunks_keeps_every_chunk() {
         let responder = Responder::new(24, 0).await;
         for seed in 0..8u8 {
-            assert!(responder
-                .round1_work([seed; 32])
-                .await
-                .corrupt_keys
-                .is_empty());
+            let corrupt = responder.round1_work([seed; 32]).await.corrupt_keys;
+            assert!(
+                corrupt.is_empty(),
+                "an intact chunk was reported rotted: {corrupt:?}"
+            );
             let leaves = responder.proved_leaves([seed; 32]).await;
-            assert!(!leaves.is_empty());
+            assert!(!leaves.is_empty(), "expected round 1 to prove some leaves");
         }
         assert_eq!(responder.storage.all_keys().await.expect("keys").len(), 24);
     }

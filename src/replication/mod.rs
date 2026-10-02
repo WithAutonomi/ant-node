@@ -2257,6 +2257,8 @@ impl ReplicationEngine {
         info!("Starting replication engine");
 
         self.start_message_handler();
+        // Takes out of service the rotted chunks that round-1 proofs report.
+        self.start_corrupt_recheck_worker();
         self.start_neighbor_sync_loop();
         self.start_self_lookup_loop();
         // Audit #2 (responsible-chunk): periodic tick auditing peers for the
@@ -3297,6 +3299,22 @@ impl ReplicationEngine {
         self.task_handles.push(handle);
     }
 
+    /// Spawn the one task that takes chunks audits found rotted out of service.
+    ///
+    /// One, so that the rechecks hold at most one blocking thread between them however
+    /// many audits report rot; see [`ChunkStore::run_corrupt_rechecks`]. Tracked with
+    /// the detached storage work rather than the engine's loops, because shutdown aborts
+    /// a loop that outlasts its drain timeout and a recheck must not be dropped part-way.
+    /// The worker itself stops at the shutdown token, between rechecks.
+    fn start_corrupt_recheck_worker(&self) {
+        let storage = Arc::clone(&self.storage);
+        let shutdown = self.shutdown.clone();
+        self.detached_task_tracker.spawn(async move {
+            storage.run_corrupt_rechecks(&shutdown).await;
+            debug!("Corrupt-chunk recheck worker shut down");
+        });
+    }
+
     /// Periodic responsible-chunk audit loop (audit #2): every
     /// [`ReplicationConfig::random_audit_tick_interval`] (~10-20 min), audit one
     /// eligible close peer for the chunks it *should* be storing (by
@@ -4308,10 +4326,8 @@ impl fmt::Display for ResponderAdmissionFailure {
 
 /// RAII admission for one audit-responder task: holds the GLOBAL permit and,
 /// on drop, decrements the PER-PEER in-flight count. Moving this into the
-/// spawned task ties both bounds to the task's lifetime — no manual decrement
-/// to forget on an early return or panic. A task may drop it once its reply has
-/// gone, before purely local follow-up work (round 1 does, before taking
-/// rotted chunks out of service), so that work never holds back another audit.
+/// spawned task ties both bounds to the task's exact lifetime — no manual
+/// decrement to forget on an early return or panic.
 struct ResponderGuard {
     _permit: tokio::sync::OwnedSemaphorePermit,
     _peer_slot: PeerResponderSlot,
@@ -5202,8 +5218,7 @@ async fn handle_replication_message(
             let responder_metrics = Arc::clone(&ctx.audit_responder_metrics);
             let subtree_round1 = ctx.subtree_round1.clone();
             ctx.detached_task_tracker.spawn(async move {
-                // `guard` is the global permit + per-peer slot, held until the
-                // reply has gone.
+                let _guard = guard; // global permit + per-peer slot, held until done
                 let worker_started = Instant::now();
                 let processing_started = Instant::now();
                 let storage_commitment_audit::Round1Work {
@@ -5220,6 +5235,11 @@ async fn handle_replication_message(
                 )
                 .await;
                 let processing = processing_started.elapsed();
+                // Committed chunks this proof found rotted go to the chunk store's
+                // single recheck worker. Queueing never waits, so no number of
+                // audits over a rotted chunk can pile up cleanup work outside this
+                // task's admission.
+                storage.report_corrupt(&corrupt_keys);
                 // Charge the work actually done, on EVERY outcome.
                 //
                 // This used to charge only the `Proof` arm, reasoning that the
@@ -5276,13 +5296,6 @@ async fn handle_replication_message(
                     processing,
                     response_send,
                 );
-                drop(guard);
-                // A committed chunk this proof found rotted is taken out of service
-                // only now, with the reply gone and the permit released, so the
-                // cleanup never delays the auditor or holds back another audit.
-                for key in &corrupt_keys {
-                    storage.recheck_corrupt(key).await;
-                }
             });
             Ok(())
         }

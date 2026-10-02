@@ -1452,7 +1452,11 @@ mod tests {
             &[honest(good, good_bytes), honest(paired, paired_bytes)],
         )
         .await;
-        assert!(partial.failed_keys.is_empty());
+        assert!(
+            partial.failed_keys.is_empty(),
+            "an honest peer failed against a rotted reference: {:?}",
+            partial.failed_keys
+        );
         assert_eq!(partial.verified, 1);
         assert!(matches!(
             unfailed_audit_verdict(&peer, 2, partial.verified),
