@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::logging::{debug, info, warn};
+use bytes::Bytes;
 use rand::Rng;
 
 use crate::ant_protocol::XorName;
@@ -748,6 +749,27 @@ const _: () = assert!(
     "a replaced pointer record must outlive the audit session that may be owed it"
 );
 
+/// What round 1 bound for each committed pointer it proved, by address.
+///
+/// Each is the nonced root round 1 reported over the record it read
+/// (ADR-0019). Round 2 is owed that record, whatever the pointer holds by the
+/// time it asks.
+pub type PointerBindings = HashMap<XorName, [u8; 32]>;
+
+/// The pointer bindings a round-1 response reports. Only a proof reports any.
+#[must_use]
+pub fn pointer_bindings(response: &SubtreeAuditResponse) -> PointerBindings {
+    match response {
+        SubtreeAuditResponse::Proof { proof, .. } => proof
+            .leaves
+            .iter()
+            .filter(|leaf| is_pointer_leaf(leaf))
+            .map(|leaf| (leaf.key, leaf.nonced_root))
+            .collect(),
+        _ => PointerBindings::new(),
+    }
+}
+
 /// Whether a round-1 leaf commits a pointer (ADR-0016): committed under
 /// [`pointer_leaf_hash`] of its key, at the fixed record length.
 fn is_pointer_leaf(leaf: &SubtreeLeaf) -> bool {
@@ -977,7 +999,7 @@ pub(crate) fn verify_slice_response(
         // belong at the committed address, and be the record round 1 bound its
         // nonced root over, which the responder had to read before it knew what
         // would be sampled. An update between the rounds does not fail an
-        // honest holder: it serves the record it held then beside the new one.
+        // honest holder: it serves the record round 1 read (ADR-0019).
         if is_pointer_leaf(leaf) {
             if let Err(reason) = verify_pointer_item(nonce, challenged_peer_bytes, leaf, items) {
                 return AuditVerdict::Fail(reason);
@@ -1729,9 +1751,10 @@ pub async fn handle_subtree_slice_challenge(
     is_bootstrapping: bool,
     commitment_state: Option<&Arc<ResponderCommitmentState>>,
 ) -> SubtreeSliceResponse {
-    handle_subtree_slice_challenge_with_pointers(
+    serve_slice_challenge(
         challenge,
         storage,
+        None,
         None,
         self_peer_id,
         is_bootstrapping,
@@ -1741,12 +1764,65 @@ pub async fn handle_subtree_slice_challenge(
 }
 
 /// [`handle_subtree_slice_challenge`] for a node that also commits pointers
-/// (ADR-0016): a committed pointer is answered with its whole signed record.
-#[allow(clippy::too_many_lines)]
+/// (ADR-0016), without what round 1 bound for them.
+///
+/// Kept for callers of the earlier signature, and answering as it did: a
+/// committed pointer is served as the record held now and the newest one an
+/// update replaced, and one no longer held is absent. That fails an honest holder after two updates between
+/// the rounds, which is what ADR-0019 fixes; the engine uses
+/// [`handle_subtree_slice_challenge_with_pointer_bindings`].
 pub async fn handle_subtree_slice_challenge_with_pointers(
     challenge: &SubtreeSliceChallenge,
     storage: &ChunkStore,
     pointers: Option<&PointerStore>,
+    self_peer_id: &PeerId,
+    is_bootstrapping: bool,
+    commitment_state: Option<&Arc<ResponderCommitmentState>>,
+) -> SubtreeSliceResponse {
+    serve_slice_challenge(
+        challenge,
+        storage,
+        pointers,
+        None,
+        self_peer_id,
+        is_bootstrapping,
+        commitment_state,
+    )
+    .await
+}
+
+/// [`handle_subtree_slice_challenge`] for a node that also commits pointers
+/// (ADR-0016): a committed pointer is answered with its whole signed record,
+/// the one `bound` says round 1 read (ADR-0019).
+pub async fn handle_subtree_slice_challenge_with_pointer_bindings(
+    challenge: &SubtreeSliceChallenge,
+    storage: &ChunkStore,
+    pointers: Option<&PointerStore>,
+    bound: &PointerBindings,
+    self_peer_id: &PeerId,
+    is_bootstrapping: bool,
+    commitment_state: Option<&Arc<ResponderCommitmentState>>,
+) -> SubtreeSliceResponse {
+    serve_slice_challenge(
+        challenge,
+        storage,
+        pointers,
+        Some(bound),
+        self_peer_id,
+        is_bootstrapping,
+        commitment_state,
+    )
+    .await
+}
+
+/// The body of the slice-challenge handlers. `bound` is `None` for the
+/// earlier entry point, which serves pointers as it did before ADR-0019.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+async fn serve_slice_challenge(
+    challenge: &SubtreeSliceChallenge,
+    storage: &ChunkStore,
+    pointers: Option<&PointerStore>,
+    bound: Option<&PointerBindings>,
     self_peer_id: &PeerId,
     is_bootstrapping: bool,
     commitment_state: Option<&Arc<ResponderCommitmentState>>,
@@ -1882,10 +1958,10 @@ pub async fn handle_subtree_slice_challenge_with_pointers(
     for key in key_order {
         let indices = indices_by_key.remove(&key).unwrap_or_default();
         if built.tree().commits_pointer(&key) {
-            // The bytes held now, exactly as round 1 read them, and the record
-            // an update replaced since, if any: round 1 bound one of the two.
-            // The auditor verifies whichever it checks, so nothing is verified
-            // here.
+            // The record round 1 read, found by the root it reported over it
+            // among what is held now and every record updates have replaced
+            // since. The auditor verifies whatever is served, so nothing is
+            // verified here.
             let Some(store) = pointers else {
                 items.push(SubtreeSliceItem::Absent { key });
                 continue;
@@ -1900,11 +1976,44 @@ pub async fn handle_subtree_slice_challenge_with_pointers(
                     }
                 }
             };
-            let records: Vec<Vec<u8>> = current.into_iter().chain(store.superseded(&key)).collect();
-            if records.is_empty() {
-                items.push(SubtreeSliceItem::Absent { key });
-            } else {
-                items.push(SubtreeSliceItem::PointerRecord { key, records });
+            let Some(bound) = bound else {
+                // As before ADR-0019, the record held and the newest one an
+                // update replaced; but a node that no longer holds the pointer
+                // is absent, whatever replaced records it still keeps.
+                match current {
+                    Some(current) => {
+                        let mut records = vec![current];
+                        records.extend(store.superseded(&key));
+                        items.push(SubtreeSliceItem::PointerRecord { key, records });
+                    }
+                    None => items.push(SubtreeSliceItem::Absent { key }),
+                }
+                continue;
+            };
+            match pointer_records(
+                challenge,
+                &key,
+                bound.get(&key),
+                current,
+                store.superseded_all(&key),
+            ) {
+                PointerServe::Record(record) => {
+                    items.push(SubtreeSliceItem::PointerRecord {
+                        key,
+                        records: vec![record],
+                    });
+                }
+                PointerServe::Absent => items.push(SubtreeSliceItem::Absent { key }),
+                PointerServe::Unavailable => {
+                    return SubtreeSliceResponse::Rejected {
+                        challenge_id: challenge.challenge_id,
+                        kind: RejectKind::Transient,
+                        reason: format!(
+                            "cannot serve the record round 1 read for pointer {}",
+                            hex::encode(key)
+                        ),
+                    }
+                }
             }
             continue;
         }
@@ -1919,6 +2028,59 @@ pub async fn handle_subtree_slice_challenge_with_pointers(
         challenge_id: challenge.challenge_id,
         items,
     }
+}
+
+/// What round 2 serves for a committed pointer.
+enum PointerServe {
+    /// The record round 1 read.
+    Record(Vec<u8>),
+    /// The pointer is no longer held, which is a lost pointer, whatever
+    /// replaced records this node still keeps in memory.
+    Absent,
+    /// The pointer is held, but this node cannot serve the record round 1
+    /// read: it has aged out or been evicted to keep memory bounded, or no
+    /// root for it was kept, which a session this node opened never lacks. A
+    /// local limit, not a lost pointer, so it is reported as one rather than
+    /// proved wrong.
+    Unavailable,
+}
+
+/// Choose what round 2 serves for the pointer at `key` (ADR-0019), from the
+/// record held now and the records updates replaced: the one that reproduces
+/// the root round 1 reported.
+///
+/// Without that root nothing is served for a pointer still held. Neither the
+/// record held now nor the replaced records kept can show that no update came
+/// since round 1 read it, since the kept ones are capped, so serving one would
+/// be a guess that fails the node when it is wrong.
+fn pointer_records(
+    challenge: &SubtreeSliceChallenge,
+    key: &XorName,
+    bound: Option<&[u8; 32]>,
+    current: Option<Vec<u8>>,
+    replaced: Vec<Bytes>,
+) -> PointerServe {
+    // A node that no longer holds the pointer has lost it. Records an update
+    // replaced are kept only to prove what round 1 read; they do not make up
+    // for the pointer itself being gone.
+    let Some(current) = current else {
+        return PointerServe::Absent;
+    };
+    let Some(root) = bound else {
+        return PointerServe::Unavailable;
+    };
+    let reproduces = |record: &[u8]| {
+        nonced_block_root(&challenge.nonce, &challenge.challenged_peer_id, key, record) == *root
+    };
+    if reproduces(&current) {
+        return PointerServe::Record(current);
+    }
+    replaced
+        .into_iter()
+        .find(|record| reproduces(record))
+        .map_or(PointerServe::Unavailable, |record| {
+            PointerServe::Record(Vec::from(record))
+        })
 }
 
 /// Outcome of serving all requested openings for one committed key.
@@ -2749,7 +2911,9 @@ mod tests {
 mod pointer_audit_tests {
     use super::*;
     use crate::replication::commitment::MerkleTree;
+    use crate::replication::commitment::MAX_COMMITMENT_KEY_COUNT;
     use crate::replication::commitment_state::BuiltCommitment;
+    use crate::replication::subtree::max_subtree_leaves;
     use crate::storage::ChunkStoreConfig;
     use ant_protocol::pointer::{PointerTarget, PointerTargetKind};
     use saorsa_pqc::api::sig::ml_dsa_65;
@@ -2849,11 +3013,40 @@ mod pointer_audit_tests {
             .response
         }
 
+        /// Round 2 as the engine serves it: with what round 1 bound for each
+        /// pointer it opens, as the live session carries it.
         async fn round2(
             &self,
             nonce: [u8; 32],
             openings: &[(SubtreeLeaf, u32)],
         ) -> Vec<SubtreeSliceItem> {
+            let bound = openings
+                .iter()
+                .map(|(leaf, _)| leaf)
+                .filter(|leaf| is_pointer_leaf(leaf))
+                .map(|leaf| (leaf.key, leaf.nonced_root))
+                .collect();
+            self.round2_bound(nonce, openings, &bound).await
+        }
+
+        async fn round2_bound(
+            &self,
+            nonce: [u8; 32],
+            openings: &[(SubtreeLeaf, u32)],
+            bound: &PointerBindings,
+        ) -> Vec<SubtreeSliceItem> {
+            match self.round2_response(nonce, openings, bound).await {
+                SubtreeSliceResponse::Items { items, .. } => items,
+                other => panic!("expected items, got {other:?}"),
+            }
+        }
+
+        async fn round2_response(
+            &self,
+            nonce: [u8; 32],
+            openings: &[(SubtreeLeaf, u32)],
+            bound: &PointerBindings,
+        ) -> SubtreeSliceResponse {
             let challenge = SubtreeSliceChallenge {
                 challenge_id: CHALLENGE_ID,
                 nonce,
@@ -2867,19 +3060,16 @@ mod pointer_audit_tests {
                     })
                     .collect(),
             };
-            match handle_subtree_slice_challenge_with_pointers(
+            handle_subtree_slice_challenge_with_pointer_bindings(
                 &challenge,
                 &self.storage,
                 Some(&self.pointers),
+                bound,
                 &self.peer,
                 false,
                 Some(&self.state),
             )
             .await
-            {
-                SubtreeSliceResponse::Items { items, .. } => items,
-                other => panic!("expected items, got {other:?}"),
-            }
         }
 
         /// Round 1 as the auditor sees it: the proof, checked against the pin.
@@ -2978,6 +3168,247 @@ mod pointer_audit_tests {
         );
     }
 
+    /// A record an update replaces is kept for longer than the slowest audit
+    /// can take: a round 1 over the largest subtree an auditor waits for,
+    /// which may have read the pointer at its start, then the session its
+    /// round 2 must arrive within.
+    #[test]
+    fn a_replaced_record_outlives_the_slowest_audit_by_default() {
+        let largest =
+            usize::try_from(max_subtree_leaves(MAX_COMMITMENT_KEY_COUNT)).expect("fits a usize");
+        let slowest =
+            ReplicationConfig::default().audit_response_timeout(largest) + SUBTREE_SESSION_TTL;
+        assert!(
+            SUPERSEDED_RETENTION > slowest,
+            "{SUPERSEDED_RETENTION:?} must outlive {slowest:?}"
+        );
+    }
+
+    /// The earlier entry point knows nothing of round 1's roots, and answers
+    /// as it did before them: an unchanged pointer is served, and passes,
+    /// rather than reported as a transient failure.
+    #[tokio::test]
+    async fn the_earlier_entry_point_still_serves_an_unchanged_pointer() {
+        let responder = Responder::new(24, 24).await;
+        let nonce = mixed_nonce(responder.committed().tree());
+        let openings = openings(&responder.proved_leaves(nonce).await);
+        let items = legacy_round2(&responder, nonce, &openings).await;
+        assert!(items
+            .iter()
+            .any(|item| matches!(item, SubtreeSliceItem::PointerRecord { .. })));
+        assert!(matches!(
+            verify_slice_response(&openings, &nonce, &responder.peer_bytes, &items),
+            AuditVerdict::Pass { .. }
+        ));
+    }
+
+    /// After one update between the rounds, the earlier entry point serves
+    /// the record held and the one it replaced, newest first, and passes.
+    #[tokio::test]
+    async fn the_earlier_entry_point_still_serves_across_one_update() {
+        let responder = Responder::new(24, 24).await;
+        let nonce = mixed_nonce(responder.committed().tree());
+        let openings = openings(&responder.proved_leaves(nonce).await);
+        let updated = first_pointer(&openings);
+        let owner = (0..24u8)
+            .find(|owner| pointer(*owner, 1).address() == updated)
+            .expect("the opened pointer is one of ours");
+        let replaced = responder
+            .pointers
+            .record_bytes(&updated)
+            .await
+            .expect("read")
+            .expect("held");
+        let newer = pointer(owner, 2).to_bytes();
+        responder.pointers.put_bytes(&newer).await.expect("update");
+
+        let items = legacy_round2(&responder, nonce, &openings).await;
+        let served = items.iter().find_map(|item| match item {
+            SubtreeSliceItem::PointerRecord { key, records } if *key == updated => {
+                Some(records.clone())
+            }
+            _ => None,
+        });
+        assert_eq!(
+            served,
+            Some(vec![newer, replaced]),
+            "the record held, then the one it replaced"
+        );
+        assert!(matches!(
+            verify_slice_response(&openings, &nonce, &responder.peer_bytes, &items),
+            AuditVerdict::Pass { .. }
+        ));
+    }
+
+    /// Through the earlier entry point too, a pointer updated and then lost
+    /// is absent, not proved by the record the update replaced.
+    #[tokio::test]
+    async fn the_earlier_entry_point_reports_a_lost_pointer_absent() {
+        let responder = Responder::new(24, 24).await;
+        let nonce = mixed_nonce(responder.committed().tree());
+        let openings = openings(&responder.proved_leaves(nonce).await);
+        let lost = first_pointer(&openings);
+        let owner = (0..24u8)
+            .find(|owner| pointer(*owner, 1).address() == lost)
+            .expect("the opened pointer is one of ours");
+        responder
+            .pointers
+            .put_bytes(&pointer(owner, 2).to_bytes())
+            .await
+            .expect("update");
+        assert!(responder.pointers.delete(&lost).await.expect("delete"));
+
+        let items = legacy_round2(&responder, nonce, &openings).await;
+        assert!(items
+            .iter()
+            .any(|item| matches!(item, SubtreeSliceItem::Absent { key } if *key == lost)));
+        assert_eq!(
+            verify_slice_response(&openings, &nonce, &responder.peer_bytes, &items),
+            AuditVerdict::Fail(AuditFailureReason::KeyAbsent)
+        );
+    }
+
+    /// Round 2 through the earlier entry point, which takes no bindings.
+    async fn legacy_round2(
+        responder: &Responder,
+        nonce: [u8; 32],
+        openings: &[(SubtreeLeaf, u32)],
+    ) -> Vec<SubtreeSliceItem> {
+        let challenge = SubtreeSliceChallenge {
+            challenge_id: CHALLENGE_ID,
+            nonce,
+            challenged_peer_id: responder.peer_bytes,
+            expected_commitment_hash: responder.committed().hash(),
+            openings: openings
+                .iter()
+                .map(|(leaf, block_index)| SubtreeSliceOpening {
+                    key: leaf.key,
+                    block_index: *block_index,
+                })
+                .collect(),
+        };
+        let response = handle_subtree_slice_challenge_with_pointers(
+            &challenge,
+            &responder.storage,
+            Some(&responder.pointers),
+            &responder.peer,
+            false,
+            Some(&responder.state),
+        )
+        .await;
+        let SubtreeSliceResponse::Items { items, .. } = response else {
+            panic!("expected items, got {response:?}");
+        };
+        items
+    }
+
+    /// Round 1 binds each pointer it proves, and nothing else.
+    #[tokio::test]
+    async fn round_one_binds_exactly_the_pointers_it_proves() {
+        let responder = Responder::new(24, 24).await;
+        let nonce = mixed_nonce(responder.committed().tree());
+        let response = responder.round1(nonce).await;
+        let SubtreeAuditResponse::Proof { proof, .. } = &response else {
+            panic!("expected a proof, got {response:?}");
+        };
+        let expected: PointerBindings = proof
+            .leaves
+            .iter()
+            .filter(|leaf| responder.committed().tree().commits_pointer(&leaf.key))
+            .map(|leaf| (leaf.key, leaf.nonced_root))
+            .collect();
+        assert!(!expected.is_empty(), "the subtree holds a pointer");
+        assert_eq!(pointer_bindings(&response), expected);
+        assert!(
+            pointer_bindings(&SubtreeAuditResponse::Bootstrapping {
+                challenge_id: CHALLENGE_ID
+            })
+            .is_empty(),
+            "only a proof binds anything"
+        );
+    }
+
+    /// Without the root round 1 reported, which a session this node opened
+    /// never lacks but a direct caller can, a pointer still held is reported
+    /// as a transient failure, updated or not: the node cannot show which
+    /// record round 1 read, and guessing would risk a confirmed failure it did
+    /// not earn.
+    #[tokio::test]
+    async fn without_the_bound_root_a_pointer_is_unavailable_not_failed() {
+        let responder = Responder::new(24, 24).await;
+        let nonce = mixed_nonce(responder.committed().tree());
+        let openings = openings(&responder.proved_leaves(nonce).await);
+        let unavailable = |response: SubtreeSliceResponse| {
+            matches!(
+                response,
+                SubtreeSliceResponse::Rejected {
+                    kind: RejectKind::Transient,
+                    ..
+                }
+            )
+        };
+
+        assert!(unavailable(
+            responder
+                .round2_response(nonce, &openings, &PointerBindings::new())
+                .await
+        ));
+
+        let updated = first_pointer(&openings);
+        let owner = (0..24u8)
+            .find(|owner| pointer(*owner, 1).address() == updated)
+            .expect("the opened pointer is one of ours");
+        responder
+            .pointers
+            .put_bytes(&pointer(owner, 2).to_bytes())
+            .await
+            .expect("update");
+        assert!(unavailable(
+            responder
+                .round2_response(nonce, &openings, &PointerBindings::new())
+                .await
+        ));
+    }
+
+    /// A root round 1 reported that nothing held now reproduces, as when the
+    /// record it read has been evicted to keep memory bounded, is reported as
+    /// a transient failure while the pointer is still held, and as absent
+    /// once nothing at all is.
+    #[tokio::test]
+    async fn a_bound_record_no_longer_held_is_unavailable_not_failed() {
+        let responder = Responder::new(24, 24).await;
+        let nonce = mixed_nonce(responder.committed().tree());
+        let openings = openings(&responder.proved_leaves(nonce).await);
+        let target = first_pointer(&openings);
+        let evicted: PointerBindings = openings
+            .iter()
+            .map(|(leaf, _)| leaf)
+            .filter(|leaf| is_pointer_leaf(leaf))
+            .map(|leaf| (leaf.key, [0xEE; 32]))
+            .collect();
+
+        assert!(matches!(
+            responder.round2_response(nonce, &openings, &evicted).await,
+            SubtreeSliceResponse::Rejected {
+                kind: RejectKind::Transient,
+                ..
+            }
+        ));
+
+        for (leaf, _) in openings.iter().filter(|(leaf, _)| is_pointer_leaf(leaf)) {
+            responder.pointers.delete(&leaf.key).await.expect("delete");
+        }
+        let items = responder.round2_bound(nonce, &openings, &evicted).await;
+        assert!(items
+            .iter()
+            .any(|item| matches!(item, SubtreeSliceItem::Absent { key } if *key == target)));
+        assert_eq!(
+            verify_slice_response(&openings, &nonce, &responder.peer_bytes, &items),
+            AuditVerdict::Fail(AuditFailureReason::KeyAbsent),
+            "a pointer lost outright is still a confirmed failure"
+        );
+    }
+
     /// The commitment binds which pointers are held, not their state, so an
     /// owner updating a pointer mid-audit cannot fail the node holding it.
     #[tokio::test]
@@ -3003,6 +3434,59 @@ mod pointer_audit_tests {
         ));
     }
 
+    /// However many paid updates land between the rounds, the record round 1
+    /// bound is the one round 2 serves: the owner's activity is not the
+    /// holder's failure.
+    #[tokio::test]
+    async fn several_updates_between_the_rounds_do_not_fail_an_honest_holder() {
+        let responder = Responder::new(24, 24).await;
+        let nonce = mixed_nonce(responder.committed().tree());
+        let openings = openings(&responder.proved_leaves(nonce).await);
+        let updated = first_pointer(&openings);
+
+        let owner = (0..24u8)
+            .find(|owner| pointer(*owner, 1).address() == updated)
+            .expect("the opened pointer is one of ours");
+        for counter in 2..=4 {
+            responder
+                .pointers
+                .put_bytes(&pointer(owner, counter).to_bytes())
+                .await
+                .expect("update");
+        }
+
+        let items = responder.round2(nonce, &openings).await;
+        assert!(
+            matches!(
+                verify_slice_response(&openings, &nonce, &responder.peer_bytes, &items),
+                AuditVerdict::Pass { .. }
+            ),
+            "three updates between the rounds must not fail the holder, got {:?}",
+            verify_slice_response(&openings, &nonce, &responder.peer_bytes, &items)
+        );
+        let served = items.iter().find_map(|item| match item {
+            SubtreeSliceItem::PointerRecord { key, records } if *key == updated => Some(records),
+            _ => None,
+        });
+        assert_eq!(
+            served,
+            Some(&vec![pointer_record_bound_in_round_one(&responder, owner)]),
+            "exactly the record round 1 read, and nothing else"
+        );
+    }
+
+    /// The record a responder held for `owner`'s pointer before any update:
+    /// counter 1, as [`Responder::new`] stored it.
+    fn pointer_record_bound_in_round_one(responder: &Responder, owner: u8) -> Vec<u8> {
+        let address = pointer(owner, 1).address();
+        responder
+            .pointers
+            .superseded_all(&address)
+            .last()
+            .map(|record| record.to_vec())
+            .expect("the first record is kept")
+    }
+
     #[tokio::test]
     async fn a_node_that_lost_a_committed_pointer_fails_round_one() {
         let responder = Responder::new(24, 24).await;
@@ -3026,6 +3510,40 @@ mod pointer_audit_tests {
             }
             other => panic!("expected a rejection, got {other:?}"),
         }
+    }
+
+    /// A node that lost the pointer is absent, even while it still keeps in
+    /// memory the record an update replaced, and even when that is the very
+    /// record round 1 read: the replaced records prove what round 1 read, not
+    /// that the node still holds the pointer.
+    #[tokio::test]
+    async fn a_lost_pointer_is_absent_whatever_replaced_records_remain() {
+        let responder = Responder::new(24, 24).await;
+        let nonce = mixed_nonce(responder.committed().tree());
+        let openings = openings(&responder.proved_leaves(nonce).await);
+        let lost = first_pointer(&openings);
+        let owner = (0..24u8)
+            .find(|owner| pointer(*owner, 1).address() == lost)
+            .expect("the opened pointer is one of ours");
+        responder
+            .pointers
+            .put_bytes(&pointer(owner, 2).to_bytes())
+            .await
+            .expect("update");
+        assert!(responder.pointers.delete(&lost).await.expect("delete"));
+        assert!(
+            !responder.pointers.superseded_all(&lost).is_empty(),
+            "the record round 1 read is still kept in memory"
+        );
+
+        let items = responder.round2(nonce, &openings).await;
+        assert!(items
+            .iter()
+            .any(|item| matches!(item, SubtreeSliceItem::Absent { key } if *key == lost)));
+        assert_eq!(
+            verify_slice_response(&openings, &nonce, &responder.peer_bytes, &items),
+            AuditVerdict::Fail(AuditFailureReason::KeyAbsent)
+        );
     }
 
     #[tokio::test]
@@ -3080,14 +3598,16 @@ mod pointer_audit_tests {
     async fn a_relay_that_fetches_records_only_in_round_two_fails() {
         let responder = Responder::new(24, 24).await;
         let nonce = mixed_nonce(responder.committed().tree());
-        let mut leaves = responder.proved_leaves(nonce).await;
+        let genuine = responder.proved_leaves(nonce).await;
+        let held = openings(&genuine);
         // What a relay can say in round 1 without the bytes.
+        let mut leaves = genuine;
         for leaf in leaves.iter_mut().filter(|leaf| is_pointer_leaf(leaf)) {
             leaf.nonced_root = [0u8; 32];
         }
         let openings = openings(&leaves);
         // And in round 2 it serves the genuine records, fetched on demand.
-        let items = responder.round2(nonce, &openings).await;
+        let items = responder.round2(nonce, &held).await;
         assert_eq!(
             verify_slice_response(&openings, &nonce, &responder.peer_bytes, &items),
             AuditVerdict::Fail(AuditFailureReason::DigestMismatch)
@@ -3121,8 +3641,8 @@ mod pointer_audit_tests {
         );
     }
 
-    /// A pointer item may carry the record held now and the one it replaced,
-    /// never more.
+    /// A pointer item may carry at most two records. This build serves one;
+    /// two is what a responder that kept no round-1 roots served (ADR-0016).
     #[tokio::test]
     async fn a_pointer_item_with_more_than_two_records_is_malformed() {
         let responder = Responder::new(24, 24).await;

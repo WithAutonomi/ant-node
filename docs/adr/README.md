@@ -37,3 +37,4 @@ See [`TOOLING.md`](./TOOLING.md) for `adrs`, `adr-kit`, and AI harness setup.
 - [ADR-0015: Direct browser clients over WebRTC Direct](./ADR-0015-direct-browser-clients-over-webrtc-direct.md)
 - [ADR-0016: Pointers — paid mutable references with an immutable owner](./ADR-0016-pointers-immutable-owner.md)
 - [ADR-0018: Pointer ownership transfer by final redirection](./ADR-0018-pointer-transfer-by-final-redirection.md)
+- [ADR-0019: Pointer audits serve the record round 1 bound](./ADR-0019-pointer-audits-serve-the-record-round-one-bound.md)

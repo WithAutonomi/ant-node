@@ -1456,6 +1456,9 @@ impl PointerReplication {
         allow_remote: bool,
         commitment_state: Option<&ResponderCommitmentState>,
     ) {
+        // Replaced records kept for audits go when their retention does,
+        // whether or not another update comes along to drop them.
+        self.store.drop_expired_superseded();
         let committed = |address: &XorName| commitment_state.is_some_and(|cs| cs.is_held(address));
         let self_id = *self.p2p.peer_id();
         let retention = storage_admission_width(self.config.close_group_size);
