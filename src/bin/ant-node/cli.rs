@@ -98,9 +98,9 @@ pub struct Cli {
     #[arg(long, env = "ANT_EVM_PAYMENT_VAULT")]
     pub evm_payment_vault: Option<String>,
 
-    /// Metrics port for Prometheus scraping (0 to disable).
-    #[arg(long, default_value = "9100", env = "ANT_METRICS_PORT")]
-    pub metrics_port: u16,
+    /// Loopback health JSON and Prometheus port (0 = off; set e.g. 9100 to enable).
+    #[arg(long, env = "ANT_METRICS_PORT")]
+    pub metrics_port: Option<u16>,
 
     /// Enable logging output.
     /// When omitted, the tracing subscriber is not installed and no log
@@ -302,7 +302,7 @@ impl Cli {
             cache_capacity: self.cache_capacity,
             rewards_address: self.rewards_address,
             evm_network,
-            metrics_port: self.metrics_port,
+            metrics_port: self.metrics_port.unwrap_or(config.payment.metrics_port),
         };
 
         // Determine bootstrap source and apply auto-discovery if needed.
@@ -373,6 +373,99 @@ mod tests {
     use super::Cli;
     use clap::Parser;
     use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn metrics_port_default_is_off() -> Result<(), Box<dyn std::error::Error>> {
+        use clap::CommandFactory;
+        let command = Cli::command().mut_arg("metrics_port", |arg| arg.env(None::<&str>));
+        let matches = command.try_get_matches_from(["ant-node"])?;
+        let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches)?;
+        assert_eq!(cli.into_config()?.0.payment.metrics_port, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn metrics_port_preserves_config_and_explicit_overrides(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use clap::{CommandFactory, FromArgMatches};
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("node.toml");
+        std::fs::write(&path, "[payment]\nmetrics_port = 23456\n")?;
+        let path = path.to_str().ok_or("config path must be UTF-8")?;
+        for (extra, expected) in [
+            (vec![], 23456),
+            (vec!["--metrics-port", "34567"], 34567),
+            (vec!["--metrics-port", "0"], 0),
+        ] {
+            let command = Cli::command().mut_arg("metrics_port", |arg| arg.env(None::<&str>));
+            let args = [vec!["ant-node", "--config", path], extra].concat();
+            let matches = command.try_get_matches_from(args)?;
+            let cli = Cli::from_arg_matches(&matches)?;
+            assert_eq!(cli.into_config()?.0.payment.metrics_port, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn metrics_port_environment_and_cli_precedence() -> Result<(), Box<dyn std::error::Error>> {
+        const CHILD_EXPECTED: &str = "ANT_TEST_METRICS_PORT_EXPECTED";
+        const CHILD_CONFIG: &str = "ANT_TEST_METRICS_PORT_CONFIG";
+        const CHILD_CLI: &str = "ANT_TEST_METRICS_PORT_CLI";
+
+        if let Ok(expected) = std::env::var(CHILD_EXPECTED) {
+            let mut args = vec![
+                "ant-node".to_string(),
+                "--config".to_string(),
+                std::env::var(CHILD_CONFIG)?,
+            ];
+            if let Ok(port) = std::env::var(CHILD_CLI) {
+                args.extend(["--metrics-port".to_string(), port]);
+            }
+            let cli = Cli::try_parse_from(args)?;
+            assert_eq!(
+                cli.into_config()?.0.payment.metrics_port,
+                expected.parse::<u16>()?
+            );
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("node.toml");
+        std::fs::write(&path, "[payment]\nmetrics_port = 23456\n")?;
+        for (env_port, cli_port, expected) in [
+            (None, None, 23456),
+            (Some("34567"), None, 34567),
+            (Some("0"), None, 0),
+            (Some("0"), Some("45678"), 45678),
+            (Some("34567"), Some("0"), 0),
+        ] {
+            // Isolate clap's real environment bindings without changing this process's env.
+            let mut child = std::process::Command::new(std::env::current_exe()?);
+            child
+                .args([
+                    "--exact",
+                    "cli::tests::metrics_port_environment_and_cli_precedence",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env(CHILD_EXPECTED, expected.to_string())
+                .env(CHILD_CONFIG, &path);
+            if let Some(port) = env_port {
+                child.env("ANT_METRICS_PORT", port);
+            }
+            if let Some(port) = cli_port {
+                child.env(CHILD_CLI, port);
+            }
+            let output = child.output()?;
+            assert!(
+                output.status.success(),
+                "metrics env={env_port:?}, CLI={cli_port:?} failed:\n{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn webrtc_direct_port_overrides_the_default_bind_port() -> Result<(), Box<dyn std::error::Error>>

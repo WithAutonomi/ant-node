@@ -205,6 +205,7 @@ impl NodeBuilder {
             ant_protocol,
             replication_engine,
             protocol_task: None,
+            status_task: None,
             migration_task,
             protocol_children: TaskTracker::new(),
             #[cfg(feature = "webrtc-direct")]
@@ -622,6 +623,8 @@ pub struct RunningNode {
     replication_engine: Option<ReplicationEngine>,
     /// Protocol message routing background task.
     protocol_task: Option<JoinHandle<()>>,
+    /// Sequential loopback health responder, cancelled and joined during cleanup.
+    status_task: Option<JoinHandle<()>>,
     /// The task moving this node off the legacy chunk store, if it has one.
     ///
     /// Awaited before the replication engine and the P2P layer are torn down, because it
@@ -714,6 +717,15 @@ impl RunningNode {
 
         let listen_addrs = self.p2p_node.listen_addrs().await;
         info!(listen_addrs = ?listen_addrs, "P2P node started");
+
+        self.status_task = crate::status::spawn(
+            self.config.payment.metrics_port,
+            &self.config.root_dir,
+            Arc::clone(&self.p2p_node),
+            self.ant_protocol.clone(),
+            self.shutdown.clone(),
+        )
+        .await;
 
         // Extract the actual bound port (config port may be 0 = auto-select)
         let actual_port = listen_addrs
@@ -955,6 +967,12 @@ impl RunningNode {
     /// Drain dependent work before shutting down native networking.
     async fn cleanup(&mut self) {
         self.shutdown.cancel();
+        if let Some(task) = self.status_task.take() {
+            if let Err(error) = task.await {
+                warn!("Health endpoint task shutdown failed: {error}");
+            }
+        }
+        crate::status::clear_port_file(&self.config.root_dir).await;
         // The shared token closes the WebRtcDirect accept loop and active
         // browser sessions before storage and native P2P are torn down.
         #[cfg(feature = "webrtc-direct")]
@@ -1340,6 +1358,266 @@ mod tests {
                 ..crate::config::PaymentConfig::default()
             },
             ..NodeConfig::default()
+        }
+    }
+
+    async fn health_test_node(root: &Path, metrics_port: u16, storage: bool) -> RunningNode {
+        let mut config = local_node_config(root, rand::thread_rng().gen_range(TEST_PORT_RANGE));
+        config.payment.metrics_port = metrics_port;
+        config.storage.enabled = storage;
+        config.webrtc_direct.enabled = false;
+        let mut node = NodeBuilder::new(config)
+            .build()
+            .await
+            .expect("build health test node");
+        node.upgrade_monitor = None;
+        node
+    }
+
+    async fn health_request(port: u16, request: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut stream = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+                .await
+                .unwrap();
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+            assert!(headers.contains("Connection: close\r\n"));
+            assert!(headers.contains("Cache-Control: no-store"));
+            assert!(!headers.contains("Access-Control"));
+            assert!(headers.contains(&format!("Content-Length: {}\r\n", body.len())));
+            response
+        })
+        .await
+        .expect("health request timed out")
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One lifecycle: serving, collision, cancellation, cleanup.
+    async fn health_endpoints_run_collision_and_cleanup() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("first");
+        let reservation = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let mut node = health_test_node(&root, port, true).await;
+        let peer_id = node.p2p_node.peer_id().to_hex();
+        let shutdown = node.shutdown.clone();
+        let mut events = node.subscribe_events();
+        let task = tokio::spawn(async move {
+            node.run().await.expect("normal run");
+            node
+        });
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            NodeEvent::Started
+        ));
+        assert_eq!(
+            std::fs::read_to_string(root.join("metrics.port")).unwrap(),
+            format!("{port}\n")
+        );
+        let json = health_request(port, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+        assert!(json.starts_with("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"));
+        let value: serde_json::Value =
+            serde_json::from_str(json.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(value["peer_id"], peer_id);
+        assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(value["storage_enabled"], true);
+        assert!(value["bootstrapped"].is_boolean());
+        assert_eq!(value.as_object().unwrap().len(), 12);
+        for field in [
+            "uptime_secs",
+            "peer_count",
+            "routing_table_size",
+            "chunks_current",
+            "chunks_written_total",
+            "bytes_written_total",
+            "chunks_served_total",
+            "bytes_served_total",
+        ] {
+            assert!(value[field].is_u64(), "{field} must be numeric");
+        }
+        let metrics = health_request(
+            port,
+            &format!("GET /metrics HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
+        )
+        .await;
+        assert!(
+            metrics.starts_with("HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\n")
+        );
+        assert!(metrics.contains("# TYPE ant_chunks_current gauge\n"));
+        assert!(metrics.contains("# TYPE ant_chunks_written_total counter\n"));
+        assert!(metrics.contains(&format!(
+            "peer_id=\"{peer_id}\",version=\"{}\"",
+            env!("CARGO_PKG_VERSION")
+        )));
+        for (request, expected) in [
+            (
+                "GET /missing HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                "404 Not Found",
+            ),
+            (
+                "GET /health/ HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                "404 Not Found",
+            ),
+            (
+                "POST /health HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                "405 Method Not Allowed",
+            ),
+            (
+                "HEAD /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                "405 Method Not Allowed",
+            ),
+        ] {
+            let response = health_request(port, request).await;
+            assert!(response.starts_with(&format!("HTTP/1.1 {expected}\r\n")));
+            if expected == "405 Method Not Allowed" {
+                assert!(response.contains("\r\nAllow: GET\r\n"));
+            }
+        }
+        for path in ["/health", "/metrics"] {
+            for headers in [
+                "",
+                "Host: example.com\r\n",
+                "Host: localhost.example.com\r\n",
+                "Host: localhost\r\nHost: example.com\r\n",
+                "Host: localhost:1\r\n",
+            ] {
+                let response =
+                    health_request(port, &format!("GET {path} HTTP/1.1\r\n{headers}\r\n")).await;
+                assert!(response.starts_with("HTTP/1.1 403 Forbidden\r\n"));
+                assert_eq!(
+                    response.split_once("\r\n\r\n").unwrap().1,
+                    "{\"error\":\"untrusted host\"}"
+                );
+            }
+        }
+
+        // A second real node must start despite the first owning its configured port.
+        let second_root = dir.path().join("second");
+        let mut second = health_test_node(&second_root, port, false).await;
+        std::fs::write(second_root.join("metrics.port"), "stale\n").unwrap();
+        let second_shutdown = second.shutdown.clone();
+        let mut second_events = second.subscribe_events();
+        let second_task = tokio::spawn(async move {
+            second
+                .run()
+                .await
+                .expect("collision must not fail node startup");
+            second
+        });
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), second_events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            NodeEvent::Started
+        ));
+        assert!(!second_root.join("metrics.port").exists());
+        second_shutdown.cancel();
+        let second = tokio::time::timeout(std::time::Duration::from_secs(10), second_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(second.status_task.is_none());
+
+        // Complete fragmented headers work; shutdown interrupts an incomplete one.
+        let mut stream = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        stream.write_all(b"GET /hea").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        stream
+            .write_all(b"lth HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_to_string(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        let mut slow = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        slow.write_all(b"GET /health HTTP/1.1\r\n").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        shutdown.cancel();
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), slow.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        let node = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(node.status_task.is_none(), "responder must be joined");
+        assert!(!root.join("metrics.port").exists());
+        let _released = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .expect("cleanup releases socket");
+    }
+
+    #[tokio::test]
+    async fn health_disabled_clears_stale_file_and_storage_stats_are_zero() {
+        let dir = TempDir::new().unwrap();
+        let reservation = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let enabled_port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        for port in [0, enabled_port] {
+            let mut node = health_test_node(dir.path(), port, false).await;
+            std::fs::write(dir.path().join("metrics.port"), "stale\n").unwrap();
+            let shutdown = node.shutdown.clone();
+            let mut events = node.subscribe_events();
+            let task = tokio::spawn(async move {
+                node.run().await.unwrap();
+                node
+            });
+            assert!(matches!(
+                tokio::time::timeout(std::time::Duration::from_secs(10), events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                NodeEvent::Started
+            ));
+            if port == 0 {
+                assert!(!dir.path().join("metrics.port").exists());
+            } else {
+                let response =
+                    health_request(port, "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+                let value: serde_json::Value =
+                    serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+                assert_eq!(value["storage_enabled"], false);
+                for field in [
+                    "chunks_current",
+                    "chunks_written_total",
+                    "bytes_written_total",
+                    "chunks_served_total",
+                    "bytes_served_total",
+                ] {
+                    assert_eq!(value[field], 0);
+                }
+            }
+            shutdown.cancel();
+            let node = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(node.status_task.is_none());
+            assert!(!dir.path().join("metrics.port").exists());
         }
     }
 
