@@ -170,6 +170,47 @@ pub const SELF_LOOKUP_INTERVAL_MAX: Duration = Duration::from_secs(SELF_LOOKUP_I
 /// at most ~12 MB queued for the upload link at any instant.
 pub const MAX_CONCURRENT_REPLICATION_SENDS: usize = 3;
 
+/// Maximum number of encoded fresh-replication offers held in memory.
+///
+/// Each accepted write is encoded once (chunk plus proof, up to ~4 MB) and
+/// that buffer stays alive until the last of its per-peer sends completes.
+/// With only `MAX_CONCURRENT_REPLICATION_SENDS` transfers in flight, a write
+/// rate above the network's send rate would otherwise queue an unbounded
+/// number of encoded offers behind the send permits. The offer dispatcher
+/// takes one of these permits before it reads and encodes a chunk, so the
+/// backlog waits as small queued events instead of chunk-sized buffers.
+pub const MAX_PENDING_FRESH_OFFERS: usize = 8;
+
+/// How many times the offer dispatcher tries to read an accepted chunk back
+/// from storage before giving up on its fresh offers.
+///
+/// The chunk was stored moments earlier, so a failed read is a transient
+/// fault (exhausted descriptors, an I/O hiccup) far more often than a lost
+/// chunk, and such a fault is usually store-wide: every queued write fails
+/// at once. The retries back off (see [`fresh_read_retry_delay`]), so these
+/// attempts span about a minute and a fault shorter than that costs no
+/// offers. A lost chunk reports `None` and is skipped without retry.
+pub const MAX_FRESH_READ_ATTEMPTS: u32 = 7;
+
+/// Pause before the first retry of a failed chunk read-back in the offer
+/// dispatcher; each later retry waits [`FRESH_READ_RETRY_BACKOFF_FACTOR`]
+/// times longer than the one before.
+pub const FRESH_READ_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// Growth of the pause between successive read-back retries.
+pub const FRESH_READ_RETRY_BACKOFF_FACTOR: u32 = 2;
+
+/// Pause before retrying a read-back that has failed `failed_attempts` times.
+///
+/// [`FRESH_READ_RETRY_DELAY`], grown by [`FRESH_READ_RETRY_BACKOFF_FACTOR`]
+/// per earlier failure. With [`MAX_FRESH_READ_ATTEMPTS`] the retries come 1,
+/// 2, 4, 8, 16 and 32 seconds apart.
+#[must_use]
+pub fn fresh_read_retry_delay(failed_attempts: u32) -> Duration {
+    let growth = FRESH_READ_RETRY_BACKOFF_FACTOR.saturating_pow(failed_attempts.saturating_sub(1));
+    FRESH_READ_RETRY_DELAY.saturating_mul(growth)
+}
+
 /// Maximum number of concurrent in-flight audit-responder tasks.
 ///
 /// The LIGHT audit-responder handlers — responsible-chunk audits and subtree
@@ -2077,6 +2118,28 @@ mod tests {
         assert!(
             VERIFICATION_RETRY_BACKOFF_MAX * 4 <= PENDING_VERIFY_MAX_AGE,
             "a capped retry must still get several looks inside one entry lifetime"
+        );
+    }
+
+    #[test]
+    fn fresh_read_retries_back_off_over_about_a_minute() {
+        let delays: Vec<Duration> = (1..MAX_FRESH_READ_ATTEMPTS)
+            .map(fresh_read_retry_delay)
+            .collect();
+        let expected: Vec<Duration> = [1, 2, 4, 8, 16, 32]
+            .into_iter()
+            .map(Duration::from_secs)
+            .collect();
+        assert_eq!(delays, expected);
+        assert_eq!(
+            delays.iter().sum::<Duration>(),
+            Duration::from_secs(63),
+            "a store-wide read fault shorter than this costs no fresh offers"
+        );
+        // Out-of-range inputs saturate rather than panic.
+        assert_eq!(fresh_read_retry_delay(0), FRESH_READ_RETRY_DELAY);
+        assert!(
+            fresh_read_retry_delay(u32::MAX) >= fresh_read_retry_delay(MAX_FRESH_READ_ATTEMPTS)
         );
     }
 }

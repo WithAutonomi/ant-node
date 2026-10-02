@@ -1108,9 +1108,12 @@ impl RunningNode {
         let traffic_key = handled.traffic_key;
         match handled.response {
             Ok(Some(response)) => {
+                let response_len = response.len();
                 let send_started = Instant::now();
+                // Handed over as the `Bytes` it already is: a chunk GET
+                // response is up to a whole chunk, and `to_vec` copied it.
                 let send_result = p2p
-                    .send_message(source, response_topic, response.to_vec(), &[])
+                    .send_message(source, response_topic, response, &[])
                     .await;
                 if let Some(telemetry) = telemetry {
                     telemetry.finish_send(send_started.elapsed(), send_result.is_ok());
@@ -1118,14 +1121,14 @@ impl RunningNode {
                 // V2-834: attribute response bytes only once the send is
                 // confirmed; failed sends are itemised separately.
                 match (&send_result, traffic_key) {
-                    (Ok(()), Some(key)) => storage_traffic::record_tx(key, response.len()),
+                    (Ok(()), Some(key)) => storage_traffic::record_tx(key, response_len),
                     (Ok(()), None) => {
                         storage_traffic::record_tx(
                             storage_traffic::ChunkResponseKey::Other,
-                            response.len(),
+                            response_len,
                         );
                     }
-                    (Err(_), _) => storage_traffic::record_send_failed(response.len()),
+                    (Err(_), _) => storage_traffic::record_send_failed(response_len),
                 }
                 if let Err(e) = send_result {
                     warn!("Failed to send {data_type} protocol response to {source}: {e}");

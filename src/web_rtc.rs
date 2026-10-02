@@ -13,6 +13,7 @@ use crate::ant_protocol::{
     ChunkQuoteResponse, MAX_CHUNK_SIZE,
 };
 use crate::browser::{browser_payment_network, BrowserEndpoint, BrowserPaymentNetwork};
+use crate::codec::{encode_exact, ExactEncodeError};
 use crate::config::WebRtcDirectConfig;
 use crate::error::{Error, Result};
 use crate::logging::{debug, info, warn};
@@ -1762,16 +1763,12 @@ fn binary_response_limit(body: &ChunkMessageBody) -> ServerResult<usize> {
 
 fn encode_binary_response(message: &ChunkMessage, limit: usize) -> ServerResult<Vec<u8>> {
     // Size without allocating, then encode into exactly the charged space.
-    // This also prevents Vec growth from retaining an oversized capacity.
-    let length = postcard::experimental::serialized_size(message)
-        .map_err(|error| public_error("invalid_response", error))?;
-    if length > limit {
-        return Err("chunk protocol response exceeds operation limit".to_string());
-    }
-    let mut bytes = vec![0; length];
-    postcard::to_slice(message, &mut bytes)
-        .map_err(|error| public_error("invalid_response", error))?;
-    Ok(bytes)
+    encode_exact(message, limit).map_err(|error| match error {
+        ExactEncodeError::Serialize(error) => public_error("invalid_response", error),
+        ExactEncodeError::TooLarge { .. } => {
+            "chunk protocol response exceeds operation limit".to_string()
+        }
+    })
 }
 
 fn hello_response(request_id: u64, state: &ServerState) -> Response {
