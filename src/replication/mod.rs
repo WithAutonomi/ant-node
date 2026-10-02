@@ -82,9 +82,9 @@ use crate::replication::config::{
     max_parallel_fetch, storage_admission_width, ReplicationConfig, MAX_AUDIT_RESPONSES_PER_PEER,
     MAX_CONCURRENT_AUDIT_RESPONSES, MAX_CONCURRENT_REPLICATION_SENDS,
     MAX_DIGEST_AUDIT_RESPONSES_PER_PEER, MAX_INCOMING_VERIFICATION_KEYS,
-    MAX_SUBTREE_ROUND1_PER_PEER, MAX_SUBTREE_SESSIONS, MAX_VERIFICATION_KEYS_PER_CYCLE,
-    REPLICATION_PROTOCOL_ID, SUBTREE_AUDIT_PROTOCOL_ID, SUBTREE_ROUND1_WORK_BURST_BYTES,
-    SUBTREE_ROUND1_WORK_REFILL_BYTES_PER_SEC, SUBTREE_SESSION_TTL,
+    MAX_SESSION_POINTER_BINDINGS, MAX_SUBTREE_ROUND1_PER_PEER, MAX_SUBTREE_SESSIONS,
+    MAX_VERIFICATION_KEYS_PER_CYCLE, REPLICATION_PROTOCOL_ID, SUBTREE_AUDIT_PROTOCOL_ID,
+    SUBTREE_ROUND1_WORK_BURST_BYTES, SUBTREE_ROUND1_WORK_REFILL_BYTES_PER_SEC, SUBTREE_SESSION_TTL,
 };
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
@@ -94,6 +94,7 @@ use crate::replication::protocol::{
 use crate::replication::quorum::KeyVerificationOutcome;
 use crate::replication::recent_provers::RecentProvers;
 use crate::replication::scheduling::{CapacityDisplacement, DeferralOutcome, ReplicationQueues};
+use crate::replication::storage_commitment_audit::PointerBindings;
 use crate::replication::types::{
     AuditFailureReason, BootstrapClaimObservation, BootstrapState, FailureEvidence,
     NeighborSyncState, PeerSyncRecord, PresenceEvidence, RepairProofs, VerificationEntry,
@@ -4624,6 +4625,9 @@ struct SubtreeSession {
     commitment_hash: [u8; 32],
     nonce: [u8; 32],
     inserted: Instant,
+    /// What round 1 bound for each pointer it proved, so round 2 serves that
+    /// record however many updates land in between (ADR-0019).
+    pointer_bindings: PointerBindings,
 }
 
 /// Responder-wide token bucket over the chunk bytes round-1 proof building may
@@ -4787,16 +4791,31 @@ impl SubtreeRound1Limiter {
 
     /// Record a single-use session once a round-1 proof is built and about to be
     /// sent, so the matching round 2 is admitted exactly once.
+    ///
+    /// The session keeps what round 1 bound for each pointer it proved, while
+    /// every live session together holds no more than
+    /// [`MAX_SESSION_POINTER_BINDINGS`] of them. A session whose bindings do
+    /// not fit is not opened and `false` is returned, so its proof is not
+    /// sent and round 1 is answered `Transient` instead: the bindings of
+    /// sessions already answered are never given up, because their round 2 is
+    /// owed them (ADR-0019).
     async fn open_session(
         &self,
         source: PeerId,
         challenge_id: u64,
         commitment_hash: [u8; 32],
         nonce: [u8; 32],
-    ) {
+        pointer_bindings: PointerBindings,
+    ) -> bool {
         let now = Instant::now();
         let mut sessions = self.sessions.write().await;
         sessions.retain(|_, e| now.duration_since(e.inserted) < SUBTREE_SESSION_TTL);
+        // Checked before anything is evicted, so a session refused here costs
+        // no other session its place.
+        let held: usize = sessions.values().map(|e| e.pointer_bindings.len()).sum();
+        if held.saturating_add(pointer_bindings.len()) > MAX_SESSION_POINTER_BINDINGS {
+            return false;
+        }
         if sessions.len() >= MAX_SUBTREE_SESSIONS {
             if let Some(oldest) = sessions
                 .iter()
@@ -4812,21 +4831,24 @@ impl SubtreeRound1Limiter {
                 commitment_hash,
                 nonce,
                 inserted: now,
+                pointer_bindings,
             },
         );
+        true
     }
 
-    /// Atomically consume the round-2 session for this exchange. `true` iff a
+    /// Atomically consume the round-2 session for this exchange. `Some` iff a
     /// live session matching `(source, challenge_id, commitment_hash, nonce)`
-    /// existed (and is now removed); a miss silently drops round 2 to the graced
-    /// timeout lane (sessions are ephemeral and can be lost across a restart).
+    /// existed (and is now removed), carrying what its round 1 bound for each
+    /// pointer; a miss silently drops round 2 to the graced timeout lane
+    /// (sessions are ephemeral and can be lost across a restart).
     async fn consume_session(
         &self,
         source: &PeerId,
         challenge_id: u64,
         commitment_hash: &[u8; 32],
         nonce: &[u8; 32],
-    ) -> bool {
+    ) -> Option<PointerBindings> {
         let mut sessions = self.sessions.write().await;
         let matches = sessions.get(&(*source, challenge_id)).is_some_and(|e| {
             Instant::now().duration_since(e.inserted) < SUBTREE_SESSION_TTL
@@ -4834,17 +4856,21 @@ impl SubtreeRound1Limiter {
                 && &e.nonce == nonce
         });
         if matches {
-            sessions.remove(&(*source, challenge_id));
+            sessions
+                .remove(&(*source, challenge_id))
+                .map(|e| e.pointer_bindings)
+        } else {
+            None
         }
-        matches
     }
 }
 
 /// Outcome of admitting a round-2 slice challenge.
 enum SliceAdmission {
     /// Admitted: the guard holds the global permit and the per-peer slot, and
-    /// the single-use round-1 session has been consumed.
-    Admitted(AuditResponderGuard),
+    /// the single-use round-1 session has been consumed, yielding what its
+    /// round 1 bound for each pointer.
+    Admitted(AuditResponderGuard, PointerBindings),
     /// Refused at a responder ceiling. The round-1 session is left INTACT.
     Capacity(AuditResponderAdmissionFailure),
     /// No live round-1 session matched this challenge.
@@ -4885,7 +4911,7 @@ async fn admit_slice_challenge(
             Ok(guard) => guard,
             Err(failure) => return SliceAdmission::Capacity(failure),
         };
-    if !round1
+    let Some(pointer_bindings) = round1
         .consume_session(
             source,
             challenge.challenge_id,
@@ -4893,13 +4919,13 @@ async fn admit_slice_challenge(
             &challenge.nonce,
         )
         .await
-    {
+    else {
         // Release the permit and per-peer slot before the caller replies: no
         // chunk work follows, so holding them would shrink the pool for nothing.
         drop(guard);
         return SliceAdmission::NoSession;
-    }
-    SliceAdmission::Admitted(guard)
+    };
+    SliceAdmission::Admitted(guard, pointer_bindings)
 }
 
 /// Try to admit one audit-responder task for `source`: take a global permit AND
@@ -5234,16 +5260,42 @@ async fn handle_replication_message(
                 // A round-1 proof authorizes exactly one matching round 2: open a
                 // single-use session so a slice challenge cannot be served without
                 // a live round-1 exchange.
+                let mut response = response;
                 if let crate::replication::protocol::SubtreeAuditResponse::Proof { .. } = &response
                 {
-                    subtree_round1
+                    let opened = subtree_round1
                         .open_session(
                             source,
                             challenge.challenge_id,
                             challenge.expected_commitment_hash,
                             challenge.nonce,
+                            storage_commitment_audit::pointer_bindings(&response),
                         )
                         .await;
+                    // A proof round 2 could not be answered for is not sent.
+                    // The node says so instead, as for a local read error: the
+                    // auditor's timeout lane, with no trust penalty, where
+                    // silence would read as a peer that did not answer
+                    // (ADR-0019).
+                    if !opened {
+                        protocol::record_audit_drop(protocol::AuditDropKind::Subtree);
+                        warn!(
+                            target: "ant_node::replication::audit_responder",
+                            event = "admission_dropped",
+                            kind = "subtree",
+                            responder_class = class.as_str(),
+                            source = %source,
+                            challenge_id = challenge.challenge_id,
+                            request_response = rr_message_id.is_some(),
+                            reason = "pointer_binding_budget",
+                            "Audit responder admission dropped"
+                        );
+                        response = crate::replication::protocol::SubtreeAuditResponse::Rejected {
+                            challenge_id: challenge.challenge_id,
+                            kind: protocol::RejectKind::Transient,
+                            reason: "pointer binding budget full".to_string(),
+                        };
+                    }
                 }
                 let response_kind = subtree_audit_response_kind(&response);
                 let work_items = subtree_audit_response_work_items(&response);
@@ -5286,7 +5338,7 @@ async fn handle_replication_message(
                 "Audit challenge received: kind=slice source={source} request_response={}",
                 rr_message_id.is_some(),
             );
-            let guard = match admit_slice_challenge(
+            let (guard, pointer_bindings) = match admit_slice_challenge(
                 &ctx.audit_responder_semaphore,
                 &ctx.audit_responder_inflight,
                 &ctx.subtree_round1,
@@ -5295,7 +5347,7 @@ async fn handle_replication_message(
             )
             .await
             {
-                SliceAdmission::Admitted(guard) => guard,
+                SliceAdmission::Admitted(guard, pointer_bindings) => (guard, pointer_bindings),
                 SliceAdmission::Capacity(failure) => {
                     protocol::record_audit_drop(protocol::AuditDropKind::Slice);
                     audit_metrics::record_admission_drop(class);
@@ -5391,10 +5443,11 @@ async fn handle_replication_message(
                 let worker_started = Instant::now();
                 let processing_started = Instant::now();
                 let response =
-                    storage_commitment_audit::handle_subtree_slice_challenge_with_pointers(
+                    storage_commitment_audit::handle_subtree_slice_challenge_with_pointer_bindings(
                         &challenge,
                         &storage,
                         pointer_store.as_ref(),
+                        &pointer_bindings,
                         p2p_node.peer_id(),
                         bootstrapping,
                         Some(&my_commitment_state),
@@ -10723,15 +10776,156 @@ mod tests {
         // Session: opened by round 1, consumed exactly once by the matching round 2.
         let hash = [7u8; 32];
         let nonce = [9u8; 32];
-        limiter.open_session(peer, 42, hash, nonce).await;
+        assert!(
+            limiter
+                .open_session(peer, 42, hash, nonce, PointerBindings::new())
+                .await
+        );
         // Wrong nonce / commitment does not match.
-        assert!(!limiter.consume_session(&peer, 42, &hash, &[0u8; 32]).await);
-        assert!(!limiter.consume_session(&peer, 42, &[0u8; 32], &nonce).await);
+        assert!(limiter
+            .consume_session(&peer, 42, &hash, &[0u8; 32])
+            .await
+            .is_none());
+        assert!(limiter
+            .consume_session(&peer, 42, &[0u8; 32], &nonce)
+            .await
+            .is_none());
         // A round 2 with no prior round 1 (wrong challenge_id) misses.
-        assert!(!limiter.consume_session(&peer, 99, &hash, &nonce).await);
+        assert!(limiter
+            .consume_session(&peer, 99, &hash, &nonce)
+            .await
+            .is_none());
         // The matching round 2 consumes it — and only once (single-use).
-        assert!(limiter.consume_session(&peer, 42, &hash, &nonce).await);
-        assert!(!limiter.consume_session(&peer, 42, &hash, &nonce).await);
+        assert!(limiter
+            .consume_session(&peer, 42, &hash, &nonce)
+            .await
+            .is_some());
+        assert!(limiter
+            .consume_session(&peer, 42, &hash, &nonce)
+            .await
+            .is_none());
+    }
+
+    // A session carries what its round 1 bound for each pointer to round 2,
+    // and every live session together stays under the binding budget. A
+    // session that does not fit is refused, and no session already opened
+    // gives up its bindings or its place for it.
+    #[tokio::test]
+    async fn subtree_session_carries_pointer_bindings_within_the_budget() {
+        let limiter = SubtreeRound1Limiter::new(Duration::ZERO, 1);
+        let (hash, nonce) = ([1u8; 32], [2u8; 32]);
+        let bindings = |from: u64, count: usize| -> PointerBindings {
+            (from..)
+                .take(count)
+                .map(|i| {
+                    let mut key = [0u8; 32];
+                    key[..8].copy_from_slice(&i.to_le_bytes());
+                    (key, [0xAB; 32])
+                })
+                .collect()
+        };
+
+        let half = MAX_SESSION_POINTER_BINDINGS / 2;
+        let first = bindings(0, half);
+        assert!(
+            limiter
+                .open_session(test_peer(1), 1, hash, nonce, first.clone())
+                .await
+        );
+        assert!(
+            limiter
+                .open_session(test_peer(2), 2, hash, nonce, bindings(1 << 40, half))
+                .await
+        );
+        // The budget is full: one more binding is refused, but a round 1 with
+        // no pointers in it still opens.
+        assert!(
+            !limiter
+                .open_session(test_peer(3), 3, hash, nonce, bindings(1 << 41, 1))
+                .await
+        );
+        assert!(
+            limiter
+                .open_session(test_peer(4), 4, hash, nonce, PointerBindings::new())
+                .await
+        );
+
+        assert_eq!(
+            limiter
+                .consume_session(&test_peer(1), 1, &hash, &nonce)
+                .await,
+            Some(first.clone()),
+            "an opened session keeps every binding it was given"
+        );
+        assert!(
+            limiter
+                .consume_session(&test_peer(3), 3, &hash, &nonce)
+                .await
+                .is_none(),
+            "a refused session was never opened"
+        );
+        assert_eq!(
+            limiter
+                .consume_session(&test_peer(2), 2, &hash, &nonce)
+                .await
+                .map(|b| b.len()),
+            Some(half)
+        );
+
+        // Consumed sessions free their room.
+        assert!(
+            limiter
+                .open_session(test_peer(5), 5, hash, nonce, bindings(1 << 42, half))
+                .await
+        );
+    }
+
+    // A session refused for the binding budget is refused before the session
+    // cap evicts anything: with both full, the refusal costs no session its
+    // place.
+    #[tokio::test]
+    async fn a_session_refused_for_bindings_evicts_no_other_session() {
+        let limiter = SubtreeRound1Limiter::new(Duration::ZERO, 1);
+        let (hash, nonce) = ([1u8; 32], [2u8; 32]);
+        let full: PointerBindings = (0u64..)
+            .take(MAX_SESSION_POINTER_BINDINGS)
+            .map(|i| {
+                let mut key = [0u8; 32];
+                key[..8].copy_from_slice(&i.to_le_bytes());
+                (key, [0xCD; 32])
+            })
+            .collect();
+        assert!(
+            limiter
+                .open_session(test_peer(0), 0, hash, nonce, full)
+                .await
+        );
+        for id in 1..MAX_SUBTREE_SESSIONS as u64 {
+            assert!(
+                limiter
+                    .open_session(test_peer(1), id, hash, nonce, PointerBindings::new())
+                    .await
+            );
+        }
+
+        let one: PointerBindings = std::iter::once(([0xEE; 32], [0xEE; 32])).collect();
+        assert!(
+            !limiter
+                .open_session(test_peer(2), u64::MAX, hash, nonce, one)
+                .await
+        );
+        assert_eq!(
+            limiter.sessions.read().await.len(),
+            MAX_SUBTREE_SESSIONS,
+            "every session is still there"
+        );
+        assert!(
+            limiter
+                .consume_session(&test_peer(0), 0, &hash, &nonce)
+                .await
+                .is_some(),
+            "including the oldest"
+        );
     }
 
     // The concurrency pool and the per-peer cooldown are both keyed by peer id,
@@ -10945,7 +11139,11 @@ mod tests {
         let (id, hash, nonce) = (77u64, [3u8; 32], [4u8; 32]);
         let challenge = slice_challenge(id, hash, nonce);
 
-        round1.open_session(peer, id, hash, nonce).await;
+        assert!(
+            round1
+                .open_session(peer, id, hash, nonce, PointerBindings::new())
+                .await
+        );
 
         // Saturate this peer's share so the next admission must be refused.
         let mut hold = Vec::new();
@@ -10970,7 +11168,7 @@ mod tests {
         let retried =
             admit_slice_challenge(&semaphore, &inflight, &round1, &peer, &challenge).await;
         assert!(
-            matches!(retried, SliceAdmission::Admitted(_)),
+            matches!(retried, SliceAdmission::Admitted(..)),
             "the round-1 session must survive a capacity refusal so the retry succeeds"
         );
 
