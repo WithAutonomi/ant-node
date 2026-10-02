@@ -20,11 +20,12 @@ use crate::storage::migration::{
     CopyReport, MigrationConfig, MigrationPhase, MigrationState, REQUIRED_REBUILDS_BEFORE_RETIRE,
 };
 use crate::storage::StorageStats;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 /// Directory name of the legacy LMDB environment, under the node root.
@@ -89,6 +90,17 @@ const VERIFY_LOG_EVERY: u64 = 2000;
 /// node's keys share their leading bytes, so lanes keyed on the first byte would all
 /// collapse into one.
 const KEY_LOCK_LANES: usize = 256;
+
+/// Most chunks that may be waiting for a corruption recheck at once, counting the one
+/// being rechecked.
+///
+/// Enough for everything a single round-1 proof can report: a proof covers at most
+/// `max_subtree_leaves(MAX_COMMITMENT_KEY_COUNT)` leaves, the square root of the largest
+/// legal commitment rounded up to a power of two. That function is not `const`, so a test
+/// checks this stays at least that large. A key reported while this is full is dropped
+/// rather than waited for: it is still on disk and still committed, so the next audit
+/// that reads it reports it again.
+const MAX_CORRUPT_REPORTS: usize = 1024;
 
 /// Configuration for [`ChunkStore`].
 #[derive(Debug, Clone)]
@@ -219,6 +231,40 @@ impl Legacy {
     }
 }
 
+/// Chunks found not to hash to their address, waiting for
+/// [`ChunkStore::run_corrupt_rechecks`].
+#[derive(Default)]
+struct CorruptReports {
+    /// Waiting to be rechecked, oldest first.
+    waiting: VecDeque<XorName>,
+    /// Everything in `waiting` plus the key being rechecked now, so a chunk reported again
+    /// before its recheck has finished is not queued twice.
+    queued: HashSet<XorName>,
+}
+
+impl CorruptReports {
+    /// Queue each key not already queued or being rechecked, while there is room.
+    ///
+    /// Returns how many were queued, and how many were dropped for want of room.
+    fn add(&mut self, keys: &[XorName]) -> (usize, usize) {
+        let mut added = 0;
+        let mut dropped = 0;
+        for key in keys {
+            if self.queued.contains(key) {
+                continue;
+            }
+            if self.queued.len() >= MAX_CORRUPT_REPORTS {
+                dropped += 1;
+                continue;
+            }
+            self.queued.insert(*key);
+            self.waiting.push_back(*key);
+            added += 1;
+        }
+        (added, dropped)
+    }
+}
+
 /// Content-addressed chunk storage.
 pub struct ChunkStore {
     /// The file store. Always present, always the write target.
@@ -253,6 +299,10 @@ pub struct ChunkStore {
     /// then the copier's write lands and resurrects it. One critical section per key,
     /// held across put, delete and copy, is what closes that.
     key_locks: Vec<tokio::sync::Mutex<()>>,
+    /// Chunks [`Self::report_corrupt`] has queued for the recheck worker.
+    corrupt: parking_lot::Mutex<CorruptReports>,
+    /// Wakes the recheck worker when a report queues something.
+    corrupt_reported: Notify,
 }
 
 impl ChunkStore {
@@ -371,6 +421,8 @@ impl ChunkStore {
             key_locks: std::iter::repeat_with(|| tokio::sync::Mutex::new(()))
                 .take(KEY_LOCK_LANES)
                 .collect(),
+            corrupt: parking_lot::Mutex::new(CorruptReports::default()),
+            corrupt_reported: Notify::new(),
         };
 
         let (file_keys, legacy_keys) = store.split_counts();
@@ -714,9 +766,9 @@ impl ChunkStore {
             Ok(Some(content)) => return Ok(Some(content)),
             Ok(None) => {}
             // Same rule as `get`: while the legacy environment is there it may have the
-            // bytes, and this is the read that drives digest audits, possession checks
-            // and pruning. Answering "no digest" for a chunk the node can still produce
-            // is a failed audit for nothing.
+            // bytes, and this is the read that answers digest and subtree audits.
+            // Answering "no digest" for a chunk the node can still produce is a failed
+            // audit for nothing.
             Err(e) => {
                 let Some(legacy) = fallback else {
                     return Err(e);
@@ -744,6 +796,91 @@ impl ChunkStore {
             legacy.only.write().insert(*address);
         }
         Ok(raw)
+    }
+
+    /// Queue keys whose raw bytes were found not to hash to them, for
+    /// [`Self::run_corrupt_rechecks`] to take out of service.
+    ///
+    /// [`Self::get_raw`] does not verify, and it is the read that answers audits, so a
+    /// rotted or torn file is never noticed there: the node goes on committing the key
+    /// and failing every audit that lands on it, and only a fetch of that exact key
+    /// would ever repair it. A caller that has hashed raw bytes anyway and found them
+    /// wrong reports the key here.
+    ///
+    /// Never waits. Rechecking here instead would let every audit that reads a rotted
+    /// chunk start a recheck of its own, outside every responder limit, and while a
+    /// quarantine waits on its shard's write lane each of those would hold a blocking
+    /// thread. A key already queued or being rechecked is not queued again, and one that
+    /// does not fit under [`MAX_CORRUPT_REPORTS`] is dropped.
+    pub(crate) fn report_corrupt(&self, keys: &[XorName]) {
+        let (added, dropped) = self.corrupt.lock().add(keys);
+        if added > 0 {
+            self.corrupt_reported.notify_one();
+        }
+        if dropped > 0 {
+            warn!(
+                "{dropped} chunk(s) found rotted were not queued for a recheck, because \
+                 {MAX_CORRUPT_REPORTS} already are; the next audit that reads them will \
+                 report them again"
+            );
+        }
+    }
+
+    /// Take the keys [`Self::report_corrupt`] queued out of service, one at a time and
+    /// oldest first, until `stop` is cancelled.
+    ///
+    /// The node runs exactly one of these, on the replication engine, so however many
+    /// audits report rot, and however long a quarantine waits for its shard's write lane,
+    /// the rechecks hold at most one blocking thread between them. `stop` is raced only
+    /// against waiting for work, never against a recheck, which may be reading the legacy
+    /// environment and must not be dropped part-way. Keys still queued when it stops are
+    /// left there: each is still on disk and still committed, so after a restart the next
+    /// audit that reads it reports it again.
+    pub(crate) async fn run_corrupt_rechecks(&self, stop: &CancellationToken) {
+        // A worker stopped part-way through a recheck leaves that key marked as queued
+        // with nothing left to finish it; clear it so the key can be reported again.
+        {
+            let mut reports = self.corrupt.lock();
+            reports.queued = reports.waiting.iter().copied().collect();
+        }
+        loop {
+            if stop.is_cancelled() {
+                return;
+            }
+            let next = self.corrupt.lock().waiting.pop_front();
+            let Some(key) = next else {
+                tokio::select! {
+                    biased;
+                    () = stop.cancelled() => return,
+                    () = self.corrupt_reported.notified() => {}
+                }
+                continue;
+            };
+            self.recheck_corrupt(&key).await;
+            self.corrupt.lock().queued.remove(&key);
+        }
+    }
+
+    /// Take a key out of service if its bytes really do not hash to it.
+    ///
+    /// The verifying read does this exactly as it does for a fetch: it re-reads the file
+    /// under the write lane, removes it only if it is still wrong, stops the node claiming
+    /// the key so its next commitment leaves it out and replication brings a good copy
+    /// back, and re-queues a legacy copy if there is one.
+    ///
+    /// Follows the node's `verify_on_read` setting, like every other verifying read.
+    async fn recheck_corrupt(&self, address: &XorName) {
+        match self.get(address).await {
+            Ok(Some(_)) => debug!(
+                "Chunk {} reads back intact or was served from the legacy environment",
+                hex::encode(address)
+            ),
+            Ok(None) => debug!("Chunk {} is no longer stored", hex::encode(address)),
+            Err(e) => debug!(
+                "Chunk {} taken out of service after a failed check: {e}",
+                hex::encode(address)
+            ),
+        }
     }
 
     /// Check whether a chunk is stored, in either backing.
@@ -3022,7 +3159,13 @@ where
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::replication::commitment::MAX_COMMITMENT_KEY_COUNT;
+    use crate::replication::subtree::max_subtree_leaves;
+    use crate::storage::file_store::CHUNKS_DIR_NAME;
     use crate::storage::migration::{now_unix, rank_closest_first, MIN_RETIRE_DELAY_HOURS};
+    use std::sync::mpsc::{self, Sender};
+    use std::thread::JoinHandle;
+    use std::time::Instant;
     use tempfile::TempDir;
 
     /// Everything currently legacy-only, as the set a test has "approved" for shedding.
@@ -4712,6 +4855,266 @@ mod tests {
             store.legacy_only_keys().contains(&victim),
             "the key must go back on the copier's list"
         );
+    }
+
+    #[tokio::test]
+    async fn recheck_corrupt_takes_a_rotted_file_out_of_service_and_spares_a_good_one() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = open(&dir).await;
+        let (good, good_bytes) = addressed("intact");
+        let (bad, bad_bytes) = addressed("rotted");
+        store.put(&good, &good_bytes).await.expect("put good");
+        store.put(&bad, &bad_bytes).await.expect("put bad");
+
+        let path = dir
+            .path()
+            .join(CHUNKS_DIR_NAME)
+            .join(format!("{:02x}", bad.last().copied().unwrap_or(0)))
+            .join(hex::encode(bad));
+        std::fs::write(&path, b"rotted").expect("corrupt the file");
+        // The raw read that answers audits still hands the rotted bytes out.
+        assert_eq!(
+            store.get_raw(&bad).await.expect("raw").as_deref(),
+            Some(b"rotted".as_slice())
+        );
+
+        // A false alarm must never cost a good chunk: the recheck reads it back first.
+        store.recheck_corrupt(&good).await;
+        store.recheck_corrupt(&bad).await;
+
+        let keys = store.all_keys().await.expect("keys");
+        assert!(keys.contains(&good), "an intact chunk stays in service");
+        assert!(
+            !keys.contains(&bad),
+            "a rotted chunk must leave the view the next commitment is built from"
+        );
+        assert!(!path.exists(), "the rotted file is removed");
+        assert!(!store.exists(&bad).expect("exists"));
+        assert_eq!(
+            store.get(&good).await.expect("get").expect("present"),
+            good_bytes
+        );
+
+        // Replication's repair is an ordinary store of the right bytes.
+        store.put(&bad, &bad_bytes).await.expect("repair");
+        assert_eq!(
+            store.get(&bad).await.expect("get").expect("present"),
+            bad_bytes
+        );
+    }
+
+    /// Poll `done` until it holds, failing with `what` if it has not within 30 seconds.
+    async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !done() {
+            assert!(Instant::now() < deadline, "{what}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Hold the write lane `address` is quarantined under until the returned sender is used
+    /// or dropped, stalling that shard the way a hung disk would. Held from a thread of its
+    /// own, so nothing holds a blocking guard across an await.
+    fn stall_write_lane(store: &ChunkStore, address: &XorName) -> (Sender<()>, JoinHandle<()>) {
+        let (lanes, lane) = store.files.test_write_lane(address);
+        let (held_tx, held_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _stalled = lanes.get(lane).map(parking_lot::Mutex::lock);
+            held_tx.send(()).ok();
+            release_rx.recv().ok();
+        });
+        held_rx.recv().expect("the lane is held");
+        (release_tx, holder)
+    }
+
+    /// A quarantine stalled on its shard's write lane holds one blocking thread, however
+    /// many audits report rot meanwhile, and what they reported is worked through once the
+    /// lane frees.
+    ///
+    /// This is the hazard as it arises: a retained commitment keeps the rotted key in
+    /// every subtree an auditor selects over it, the raw read that answers audits keeps
+    /// reading the file, and identities are cheap, so reports keep coming while the
+    /// quarantine waits. A recheck run by each report would park a blocking thread per
+    /// report, outside every responder limit.
+    #[tokio::test]
+    async fn a_stalled_quarantine_holds_one_blocking_thread_however_many_reports_arrive() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = Arc::new(open(&dir).await);
+        let chunk_path = |key: &XorName| {
+            dir.path()
+                .join(CHUNKS_DIR_NAME)
+                .join(format!("{:02x}", key.last().copied().unwrap_or(0)))
+                .join(hex::encode(key))
+        };
+        let (bad, bad_bytes) = addressed("stalled");
+        let (other, other_bytes) = addressed("queued-behind-the-stall");
+        let (later, later_bytes) = addressed("rotted-after-the-stall");
+        for (key, bytes) in [
+            (&bad, &bad_bytes),
+            (&other, &other_bytes),
+            (&later, &later_bytes),
+        ] {
+            store.put(key, bytes).await.expect("put");
+        }
+        for key in [&bad, &other] {
+            std::fs::write(chunk_path(key), b"rotted").expect("rot the file");
+        }
+
+        let (release, holder) = stall_write_lane(&store, &bad);
+
+        let stop = CancellationToken::new();
+        let worker = {
+            let store = Arc::clone(&store);
+            let stop = stop.clone();
+            tokio::spawn(async move { store.run_corrupt_rechecks(&stop).await })
+        };
+
+        // The first report: the worker reads the file, proves it wrong, stops claiming it
+        // and parks in the quarantine behind the held lane. Waited for rather than slept
+        // at, so the reports below really do arrive while the quarantine is stalled.
+        store.report_corrupt(&[bad]);
+        wait_until("the recheck never reached the stalled quarantine", || {
+            !store.exists(&bad).expect("exists") && store.files.tasks_in_flight() > 0
+        })
+        .await;
+
+        // Audits keep reporting it, and another rotted chunk, while the quarantine waits.
+        let reporters: Vec<_> = (0..32)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                tokio::spawn(async move { store.report_corrupt(&[bad, other]) })
+            })
+            .collect();
+        let mut most_in_flight = 0;
+        let watch_until = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < watch_until {
+            most_in_flight = most_in_flight.max(store.files.tasks_in_flight());
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            most_in_flight <= 1,
+            "{most_in_flight} rechecks held blocking threads behind one stalled write lane; \
+             reports must queue for the single worker, not each start one"
+        );
+        let waiting = reporters.iter().filter(|r| !r.is_finished()).count();
+        assert_eq!(
+            waiting, 0,
+            "{waiting} reports waited on the stalled recheck"
+        );
+        for reporter in reporters {
+            reporter.await.expect("report");
+        }
+        {
+            let reports = store.corrupt.lock();
+            assert_eq!(
+                reports.waiting,
+                VecDeque::from([other]),
+                "the key being rechecked must not be queued again, and the other waits its turn"
+            );
+            assert_eq!(reports.queued.len(), 2, "one being rechecked, one waiting");
+        }
+
+        // The lane frees: both rotted chunks leave service in turn.
+        release.send(()).ok();
+        holder.join().expect("lane holder");
+        wait_until(
+            "the queue was not worked through after the lane freed",
+            || {
+                !chunk_path(&bad).exists()
+                    && !chunk_path(&other).exists()
+                    && store.corrupt.lock().queued.is_empty()
+            },
+        )
+        .await;
+        let keys = store.all_keys().await.expect("keys");
+        assert!(
+            !keys.contains(&bad) && !keys.contains(&other),
+            "both rotted chunks must leave the view the next commitment is built from"
+        );
+        assert!(keys.contains(&later), "an intact chunk stays in service");
+
+        // The worker is still there for the next report.
+        std::fs::write(chunk_path(&later), b"rotted").expect("rot the file");
+        store.report_corrupt(&[later]);
+        wait_until("a report after the stall was never rechecked", || {
+            !chunk_path(&later).exists()
+        })
+        .await;
+
+        stop.cancel();
+        tokio::time::timeout(Duration::from_secs(10), worker)
+            .await
+            .expect("an idle worker stops when told to")
+            .expect("worker");
+    }
+
+    /// Every key one maximal round-1 proof can report fits an empty queue, so none of a
+    /// subtree that rotted whole is dropped for want of room.
+    #[tokio::test]
+    async fn the_corrupt_queue_holds_everything_one_proof_can_report() {
+        let most = usize::try_from(max_subtree_leaves(MAX_COMMITMENT_KEY_COUNT))
+            .expect("a leaf count fits in usize");
+        let dir = TempDir::new().expect("temp dir");
+        let store = open(&dir).await;
+        let keys: Vec<XorName> = (0..most)
+            .map(|i| addressed(&format!("leaf-{i}")).0)
+            .collect();
+        store.report_corrupt(&keys);
+        assert_eq!(
+            store.corrupt.lock().waiting.len(),
+            most,
+            "a maximal proof's report must fit an empty queue"
+        );
+    }
+
+    /// Reports are deduplicated against both the queue and the key being rechecked, and
+    /// what does not fit is dropped rather than waited for.
+    #[tokio::test]
+    async fn corrupt_reports_are_deduplicated_and_capped() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = open(&dir).await;
+        let keys: Vec<XorName> = (0..MAX_CORRUPT_REPORTS + 8)
+            .map(|i| addressed(&format!("reported-{i}")).0)
+            .collect();
+
+        store.report_corrupt(&keys);
+        {
+            let reports = store.corrupt.lock();
+            assert_eq!(reports.waiting.len(), MAX_CORRUPT_REPORTS);
+            assert_eq!(reports.queued.len(), MAX_CORRUPT_REPORTS);
+            assert_eq!(reports.waiting.front(), keys.first(), "oldest first");
+        }
+
+        // Reported again, nothing is queued twice.
+        store.report_corrupt(&keys);
+        assert_eq!(store.corrupt.lock().waiting.len(), MAX_CORRUPT_REPORTS);
+
+        // Nor is a key the worker has taken and not yet finished, and it still counts
+        // toward the cap. Taken here exactly as the worker takes one.
+        let taken = store
+            .corrupt
+            .lock()
+            .waiting
+            .pop_front()
+            .expect("a waiting key");
+        store.report_corrupt(&[taken]);
+        {
+            let reports = store.corrupt.lock();
+            assert!(
+                !reports.waiting.contains(&taken),
+                "a key being rechecked was queued again"
+            );
+            assert_eq!(reports.queued.len(), MAX_CORRUPT_REPORTS);
+        }
+
+        // A worker stopped part-way through that recheck leaves the key marked. The next
+        // one to start clears the mark, so the key can be reported again.
+        let stopped = CancellationToken::new();
+        stopped.cancel();
+        store.run_corrupt_rechecks(&stopped).await;
+        store.report_corrupt(&[taken]);
+        assert_eq!(store.corrupt.lock().waiting.back(), Some(&taken));
     }
 
     #[tokio::test]

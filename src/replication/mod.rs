@@ -2257,6 +2257,8 @@ impl ReplicationEngine {
         info!("Starting replication engine");
 
         self.start_message_handler();
+        // Takes out of service the rotted chunks that round-1 proofs report.
+        self.start_corrupt_recheck_worker();
         self.start_neighbor_sync_loop();
         self.start_self_lookup_loop();
         // Audit #2 (responsible-chunk): periodic tick auditing peers for the
@@ -3295,6 +3297,22 @@ impl ReplicationEngine {
             debug!("Self-lookup loop shut down");
         });
         self.task_handles.push(handle);
+    }
+
+    /// Spawn the one task that takes chunks audits found rotted out of service.
+    ///
+    /// One, so that the rechecks hold at most one blocking thread between them however
+    /// many audits report rot; see [`ChunkStore::run_corrupt_rechecks`]. Tracked with
+    /// the detached storage work rather than the engine's loops, because shutdown aborts
+    /// a loop that outlasts its drain timeout and a recheck must not be dropped part-way.
+    /// The worker itself stops at the shutdown token, between rechecks.
+    fn start_corrupt_recheck_worker(&self) {
+        let storage = Arc::clone(&self.storage);
+        let shutdown = self.shutdown.clone();
+        self.detached_task_tracker.spawn(async move {
+            storage.run_corrupt_rechecks(&shutdown).await;
+            debug!("Corrupt-chunk recheck worker shut down");
+        });
     }
 
     /// Periodic responsible-chunk audit loop (audit #2): every
@@ -5206,6 +5224,7 @@ async fn handle_replication_message(
                 let storage_commitment_audit::Round1Work {
                     response,
                     content_bytes,
+                    corrupt_keys,
                 } = storage_commitment_audit::handle_subtree_challenge_measured_with_pointers(
                     &challenge,
                     &storage,
@@ -5216,6 +5235,11 @@ async fn handle_replication_message(
                 )
                 .await;
                 let processing = processing_started.elapsed();
+                // Committed chunks this proof found rotted go to the chunk store's
+                // single recheck worker. Queueing never waits, so no number of
+                // audits over a rotted chunk can pile up cleanup work outside this
+                // task's admission.
+                storage.report_corrupt(&corrupt_keys);
                 // Charge the work actually done, on EVERY outcome.
                 //
                 // This used to charge only the `Proof` arm, reasoning that the

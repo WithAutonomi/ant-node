@@ -148,8 +148,11 @@ pub(crate) async fn run_possession_check(
     // Read our canonical copy once: the audit digest is recomputed from these
     // bytes for every peer (hoisted out of the per-peer loop). If we no longer
     // hold the chunk we cannot verify any peer's proof, and we are no longer a
-    // responsible checker for it — skip without penalising anyone.
-    let local_bytes = match storage.get_raw(&key).await {
+    // responsible checker for it — skip without penalising anyone. Read through
+    // the verifying path for the same reason: a local copy that no longer hashes
+    // to its key would fail every honest peer, so it is taken out of service by
+    // the read (replication repairs it) and the check is skipped.
+    let local_bytes = match storage.get(&key).await {
         Ok(Some(bytes)) => bytes,
         Ok(None) => {
             debug!("Possession check: checker no longer holds {key_hex}; skipping");
