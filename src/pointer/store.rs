@@ -1481,7 +1481,11 @@ mod tests {
 
         // One more: the first address held the oldest record, so it goes.
         keep(second, vec![0xFF]);
-        assert!(store.superseded_all(&first).is_empty());
+        let evicted = store.superseded_all(&first);
+        assert!(
+            evicted.is_empty(),
+            "expected the oldest address evicted, got {evicted:?}"
+        );
         assert!(!store.inner.superseded.lock().contains_key(&first));
         assert_eq!(store.superseded_all(&second).len(), MAX_SUPERSEDED);
 
