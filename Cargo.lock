@@ -884,7 +884,7 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "3.1.0"
-source = "git+https://github.com/WithAutonomi/ant-protocol?rev=7218b60533fad8e3ffe357a89f163a38b6dc100d#7218b60533fad8e3ffe357a89f163a38b6dc100d"
+source = "git+https://github.com/WithAutonomi/ant-protocol?rev=ab459e52b3db19c0db15ed33a97fe6282dfd4ae0#ab459e52b3db19c0db15ed33a97fe6282dfd4ae0"
 dependencies = [
  "blake3",
  "bytes",
