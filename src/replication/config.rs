@@ -258,6 +258,17 @@ pub const SUBTREE_SESSION_TTL: Duration = Duration::from_mins(2);
 /// peers open sessions; oldest are evicted past this).
 pub const MAX_SUBTREE_SESSIONS: usize = 4 * MAX_CONCURRENT_SUBTREE_ROUND1 * 256;
 
+/// Most pointer bindings every live round-1 session holds together
+/// (ADR-0019): 4 MiB of keys and roots at the cap, before the maps' own
+/// overhead.
+///
+/// A session keeps one per pointer its round 1 proved, and a round-1 subtree
+/// can hold about a thousand leaves, so [`MAX_SUBTREE_SESSIONS`] full sessions
+/// would otherwise hold two million. A round 1 whose bindings would not fit
+/// withholds its proof and answers `Transient`, and no session already
+/// answered gives its bindings up.
+pub const MAX_SESSION_POINTER_BINDINGS: usize = 1 << 16;
+
 /// Sustained rate at which the responder-wide round-1 work budget refills, in
 /// bytes of chunk content per second.
 ///
