@@ -937,9 +937,21 @@ impl Inner {
             // have committed while it ran.
             let replacing = index.get(&address).is_some_and(|entry| entry.on_disk);
             let outcome = match index.get(&address) {
-                // Nothing held, or a record this node lost: either way the
-                // write must happen, whatever state it carries.
-                None | Some(IndexEntry { on_disk: false, .. }) => PutOutcome::Changed,
+                // Nothing held: any state lands.
+                None => PutOutcome::Changed,
+                // A record this node lost: the lost state itself lands, to
+                // restore it, and so does anything that replaces it, but
+                // nothing older, so an arrival verified before the loss cannot
+                // roll the node back past it (the rule `admits` states).
+                Some(entry @ IndexEntry { on_disk: false, .. }) => {
+                    if entry.state.state_id == record.state_id()
+                        || record.state().replaces(&entry.state)
+                    {
+                        PutOutcome::Changed
+                    } else {
+                        PutOutcome::Stale
+                    }
+                }
                 Some(entry) if entry.state.state_id == record.state_id() => PutOutcome::Unchanged,
                 Some(entry) if record.state().replaces(&entry.state) => PutOutcome::Changed,
                 Some(_) => PutOutcome::Stale,
@@ -1960,6 +1972,33 @@ mod tests {
             "a resubmission must repair a record the disk lost"
         );
         assert!(store.get(&record.address()).await.expect("get").is_some());
+    }
+
+    /// The commit itself holds the line `admits` states for a lost record, so
+    /// an older state that reaches it without that gate, or was admitted
+    /// before the loss, cannot roll the node back.
+    #[tokio::test]
+    async fn a_commit_after_a_loss_takes_nothing_older_than_what_was_lost() {
+        let (store, _dir) = store().await;
+        let held = signed(1, 3, 1);
+        store.put_bytes(&held.to_bytes()).await.expect("put");
+        std::fs::remove_file(store.file_for(&held.address())).expect("remove");
+        assert!(store.get(&held.address()).await.expect("get").is_none());
+
+        assert_eq!(
+            store
+                .put_bytes(&signed(1, 2, 2).to_bytes())
+                .await
+                .expect("put"),
+            PutOutcome::Stale,
+            "an older state must not replace the one that was lost"
+        );
+        assert!(!store.contains(&held.address()), "nothing was written");
+        assert_eq!(
+            store.put_bytes(&held.to_bytes()).await.expect("put"),
+            PutOutcome::Changed,
+            "the lost state itself is restored"
+        );
     }
 
     #[tokio::test]
