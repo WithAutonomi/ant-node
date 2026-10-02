@@ -5602,23 +5602,27 @@ async fn handle_replication_message(
         }
         ReplicationMessageBody::PointerFetchRequest(request) => {
             if let Some(pointers) = &ctx.pointers {
-                pointers.serve_fetch_detached(
-                    *source,
-                    request,
-                    msg.request_id,
-                    rr_message_id.map(ToOwned::to_owned),
-                );
+                pointers
+                    .serve_fetch_detached(
+                        *source,
+                        request,
+                        msg.request_id,
+                        rr_message_id.map(ToOwned::to_owned),
+                    )
+                    .await;
             }
             Ok(())
         }
         ReplicationMessageBody::PointerStateRequest(request) => {
             if let Some(pointers) = &ctx.pointers {
-                pointers.serve_state_detached(
-                    *source,
-                    request,
-                    msg.request_id,
-                    rr_message_id.map(ToOwned::to_owned),
-                );
+                pointers
+                    .serve_state_detached(
+                        *source,
+                        request,
+                        msg.request_id,
+                        rr_message_id.map(ToOwned::to_owned),
+                    )
+                    .await;
             }
             Ok(())
         }
@@ -6589,12 +6593,6 @@ async fn dispatch_neighbor_sync_request(
     received_at: Instant,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
-    // A peer syncing with us gets our pointer hints as well — including a
-    // node that is bootstrapping, which is how it learns the pointers it
-    // should hold.
-    if let Some(pointers) = &ctx.pointers {
-        pointers.push_hints_detached(vec![source]);
-    }
     let guard = match admit_bounded_responder(
         &ctx.neighbor_sync_responder_admission_semaphore,
         &ctx.neighbor_sync_responder_inflight,
@@ -6618,7 +6616,7 @@ async fn dispatch_neighbor_sync_request(
             return Ok(());
         }
     };
-
+    let pointers = ctx.pointers.clone();
     let worker_semaphore = Arc::clone(&ctx.neighbor_sync_responder_worker_semaphore);
     let p2p_node = Arc::clone(&ctx.p2p_node);
     let storage = Arc::clone(&ctx.storage);
@@ -6650,6 +6648,14 @@ async fn dispatch_neighbor_sync_request(
                 "Stale neighbor-sync request shed at dequeue"
             );
             return;
+        }
+        // A peer whose sync request is admitted and fresh gets our pointer
+        // hints as well, including a node that is bootstrapping, which is how
+        // it learns the pointers it should hold. Only such a request: each
+        // answer scans every pointer held, and a refused or stale one must
+        // cost nothing.
+        if let Some(pointers) = &pointers {
+            pointers.answer_sync_with_hints(source);
         }
         if let Err(e) = handle_neighbor_sync_request(
             &source,
