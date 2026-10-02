@@ -6,11 +6,18 @@
 //! These are the property tests behind that claim, plus the two anti-abuse
 //! properties the merge rule exists to provide: one payment funds one state,
 //! and no re-signature of a stored state can displace it.
+//!
+//! ADR-0018 carves out one exception: a final state (counter `u64::MAX`) is
+//! replaced by nothing, so two *different* final states are unordered and a
+//! node keeps the first one it took. The claim holds for every set with at
+//! most one final state in it; with two, the first final state delivered wins,
+//! and nothing delivered after it moves a node off it.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::collections::BTreeSet;
 
+use ant_node::pointer::store::{PointerStore, PutOutcome};
 use ant_protocol::pointer::{Pointer, PointerTarget, PointerTargetKind};
 use proptest::prelude::*;
 use saorsa_pqc::api::sig::{
@@ -438,8 +445,6 @@ fn the_wire_format_is_what_the_adr_says() {
 /// layer does, which is where the cost would actually have been paid.
 #[tokio::test]
 async fn sixty_four_signatures_buy_exactly_one_write() {
-    use ant_node::pointer::store::{PointerStore, PutOutcome};
-
     let dir = tempfile::tempdir().expect("tempdir");
     let store = PointerStore::new(dir.path()).await.expect("open store");
 
@@ -559,11 +564,10 @@ fn an_unknown_version_is_refused_rather_than_accepted_at_its_own_price() {
     }
 }
 
-/// At `u64::MAX` no *counter* can out-rank the winner, but a smaller *target*
-/// still can. That asymmetry is why migration has to happen before the terminal
-/// update rather than on it.
+/// At `u64::MAX` nothing out-ranks the held state: no counter is larger, and
+/// an equal counter no longer resolves by target (ADR-0018).
 #[test]
-fn a_terminal_counter_cannot_be_out_counted_only_out_targeted() {
+fn a_final_state_is_out_ranked_by_nothing() {
     let terminal = signed(13, u64::MAX, 5, PointerTargetKind::Chunk);
     assert!(terminal.is_terminal());
     assert!(terminal.next_counter().is_err(), "no successor exists");
@@ -575,91 +579,137 @@ fn a_terminal_counter_cannot_be_out_counted_only_out_targeted() {
         assert!(terminal.replaces(&earlier));
     }
 
-    // The order does not degenerate there: equal-counter conflicts at the
-    // maximum still resolve deterministically, so replicas cannot split.
+    // Nor does another final state, whichever way its target sorts: the first
+    // one a node took is the one it keeps.
     let low = signed(13, u64::MAX, 1, PointerTargetKind::Chunk);
     let high = signed(13, u64::MAX, 2, PointerTargetKind::Chunk);
-    assert!(low.replaces(&high));
+    assert!(!low.replaces(&high));
     assert!(!high.replaces(&low));
-    assert_eq!(winner(&[&high, &low]).state_id(), low.state_id());
+    assert_eq!(winner(&[&high, &low]).state_id(), high.state_id());
     assert_eq!(winner(&[&low, &high]).state_id(), low.state_id());
 }
 
-/// Why migration must happen *before* the terminal update.
-///
-/// At `u64::MAX` the counter can no longer advance, but the pointer is not
-/// frozen: the merge order still resolves equal counters by target bytes, and
-/// *smaller* target bytes win. So a migration written at the terminal counter
-/// can still be displaced — by the owner, or by anyone replaying an older
-/// signed record of theirs with a smaller target. The only safe migration is
-/// one made while a successor counter still exists, because a strictly larger
-/// counter is the one move nothing can answer.
+/// A transfer is final on a node's disk: once stored, the former owner cannot
+/// take the address back — not with a later counter, which does not exist, and
+/// not with a final state whose target sorts first, which the previous rule
+/// would have let displace it.
 #[tokio::test]
-async fn migration_must_happen_before_the_terminal_update() {
-    use ant_node::pointer::store::{PointerStore, PutOutcome};
-    use ant_protocol::pointer::PointerTarget;
-    use saorsa_pqc::api::sig::ml_dsa_65;
-
+async fn a_stored_transfer_cannot_be_taken_back() {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = PointerStore::new(dir.path()).await.expect("store");
 
     let (pk, sk) = ml_dsa_65().generate_keypair_from_seed(&[14u8; 32]);
-    let sign_at = |counter: u64, target: PointerTarget| {
-        Pointer::sign(&sk, &pk, counter, target).expect("sign")
-    };
-
-    // One update short of the end: a successor counter still exists.
-    let penultimate = sign_at(
-        u64::MAX - 1,
+    let current = Pointer::create(
+        &sk,
+        &pk,
         PointerTarget::new(PointerTargetKind::Chunk, [0x10u8; 32]),
-    );
-    assert!(!penultimate.is_terminal());
+    )
+    .expect("create");
     assert_eq!(
-        store.put_bytes(&penultimate.to_bytes()).await.expect("put"),
+        store.put_bytes(&current.to_bytes()).await.expect("put"),
         PutOutcome::Changed
     );
 
-    // The safe migration: spend the last counter. A strictly larger counter
-    // beats every target, so nothing at u64::MAX - 1 can answer it.
-    let migration = sign_at(
-        penultimate.next_counter().expect("successor exists"),
-        PointerTarget::new(PointerTargetKind::Pointer, [0x80u8; 32]),
-    );
+    // The handover: one final state, pointing at the recipient's pointer.
+    let recipient = [0x80u8; 32];
+    let transfer = current.transfer_to(&sk, recipient).expect("transfer");
+    assert_eq!(transfer.transferred_to(), Some(recipient));
     assert_eq!(
-        store.put_bytes(&migration.to_bytes()).await.expect("put"),
+        store.put_bytes(&transfer.to_bytes()).await.expect("put"),
         PutOutcome::Changed
     );
-    assert!(migration.is_terminal());
-    assert!(migration.next_counter().is_err());
 
-    // Now the danger. The counter is spent, so the only remaining moves are to
-    // strictly smaller target bytes — and they still win.
-    let smaller_target = sign_at(
+    // A former owner grinding a target that sorts first. Under the previous
+    // rule this displaced the transfer; now it is stale.
+    let take_back = Pointer::sign(
+        &sk,
+        &pk,
         u64::MAX,
-        PointerTarget::new(PointerTargetKind::Chunk, [0x01u8; 32]),
-    );
-    assert!(
-        smaller_target.to_bytes() != migration.to_bytes(),
-        "a genuinely different state"
-    );
+        PointerTarget::new(PointerTargetKind::Chunk, [0x00u8; 32]),
+    )
+    .expect("sign");
+    assert!(take_back.target().to_bytes() < transfer.target().to_bytes());
     assert_eq!(
-        store
-            .put_bytes(&smaller_target.to_bytes())
-            .await
-            .expect("put"),
-        PutOutcome::Changed,
-        "a terminal pointer is NOT frozen: a smaller target still displaces it"
-    );
-
-    // Larger target bytes cannot claw it back: the move is one-way.
-    assert_eq!(
-        store.put_bytes(&migration.to_bytes()).await.expect("put"),
+        store.put_bytes(&take_back.to_bytes()).await.expect("put"),
         PutOutcome::Stale,
-        "and the displaced migration can never be restored"
+        "a second final state must not displace the first"
     );
 
-    // Which is the whole point: a migration made at the terminal counter is
-    // not final, so it has to be made earlier, where the counter still answers.
-    assert!(smaller_target.replaces(&migration));
-    assert!(!migration.replaces(&smaller_target));
+    // Nor any lower counter, and the held state is the transfer throughout.
+    for counter in [0u64, 1, u64::MAX - 1] {
+        let older = Pointer::sign(
+            &sk,
+            &pk,
+            counter,
+            PointerTarget::new(PointerTargetKind::Chunk, [0x00u8; 32]),
+        )
+        .expect("sign");
+        assert_eq!(
+            store.put_bytes(&older.to_bytes()).await.expect("put"),
+            PutOutcome::Stale
+        );
+    }
+    assert_eq!(
+        store.state_id(&transfer.address()),
+        Some(transfer.state_id())
+    );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(16))]
+
+    /// With one final state among the records, every delivery order still
+    /// ends on it: rule 0 only leaves two *final* states unordered.
+    #[test]
+    fn one_final_state_wins_in_every_delivery_order(
+        counters in prop::collection::vec(0u64..4, 1..5),
+        targets in prop::collection::vec(0u8..4, 1..5),
+        final_target in 0u8..4,
+    ) {
+        let mut records: Vec<Pointer> = counters
+            .iter()
+            .zip(targets.iter())
+            .map(|(counter, target)| signed(1, *counter, *target, PointerTargetKind::Chunk))
+            .collect();
+        let finalized = signed(1, u64::MAX, final_target, PointerTargetKind::Pointer);
+        records.push(finalized.clone());
+
+        let mut order: Vec<&Pointer> = records.iter().collect();
+        let mut permutations = 0usize;
+        permute(&mut order, 0, &mut |candidate| {
+            prop_assert_eq!(winner(candidate).state_id(), finalized.state_id());
+            Ok(())
+        }, &mut permutations)?;
+        prop_assert_eq!(permutations, factorial(records.len()));
+    }
+
+    /// With two different final states, the one delivered first is what a
+    /// node keeps, whatever else arrives before, between or after them.
+    #[test]
+    fn the_first_final_state_delivered_is_kept(
+        counters in prop::collection::vec(0u64..4, 1..4),
+        targets in prop::collection::vec(0u8..4, 1..4),
+        first_target in 0u8..8,
+        second_target in 8u8..16,
+    ) {
+        let mut records: Vec<Pointer> = counters
+            .iter()
+            .zip(targets.iter())
+            .map(|(counter, target)| signed(1, *counter, *target, PointerTargetKind::Chunk))
+            .collect();
+        records.push(signed(1, u64::MAX, first_target, PointerTargetKind::Pointer));
+        records.push(signed(1, u64::MAX, second_target, PointerTargetKind::Pointer));
+
+        let mut order: Vec<&Pointer> = records.iter().collect();
+        let mut permutations = 0usize;
+        permute(&mut order, 0, &mut |candidate| {
+            let first_final = candidate
+                .iter()
+                .find(|record| record.is_terminal())
+                .expect("two finals were delivered");
+            prop_assert_eq!(winner(candidate).state_id(), first_final.state_id());
+            Ok(())
+        }, &mut permutations)?;
+        prop_assert_eq!(permutations, factorial(records.len()));
+    }
 }

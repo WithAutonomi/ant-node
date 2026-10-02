@@ -1371,11 +1371,11 @@ impl TestNetwork {
             .await
             {
                 Ok(mut engine) => {
-                    // Pointers replicate through the same engine (ADR-0016).
+                    // Pointers replicate through the same engine (ADR-0016),
+                    // which the service also asks before a final state
+                    // (ADR-0018).
                     if let Some(service) = protocol.pointer_service() {
-                        let (writes, fresh_writes) = tokio::sync::mpsc::unbounded_channel();
-                        service.attach_fresh_writes(writes);
-                        engine.with_pointers(service.store().clone(), fresh_writes);
+                        engine.with_pointer_service(service);
                     }
                     let dht_events = p2p.dht_manager().subscribe_events();
                     engine.start(dht_events);

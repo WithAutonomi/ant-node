@@ -17,9 +17,17 @@ use ant_node::pointer::PointerStore;
 use ant_node::replication::audit::AuditTickResult;
 use ant_node::replication::commitment::pointer_leaf_hash;
 use ant_node::replication::commitment_state::{BuiltCommitment, ResponderCommitmentState};
+use ant_node::replication::config::SUBTREE_AUDIT_PROTOCOL_ID;
 use ant_node::replication::pointer::{PointerFreshWrite, PointerReplication};
+use ant_node::replication::protocol::{
+    ReplicationMessage, ReplicationMessageBody, SubtreeAuditChallenge, SubtreeAuditResponse,
+    SubtreeSliceChallenge, SubtreeSliceItem, SubtreeSliceOpening, SubtreeSliceResponse,
+};
+use ant_node::replication::slice::nonced_block_root;
 use ant_node::ReplicationConfig;
-use ant_protocol::pointer::{Pointer, PointerState, PointerTarget, PointerTargetKind};
+use ant_protocol::pointer::{
+    Pointer, PointerState, PointerTarget, PointerTargetKind, FINAL_COUNTER,
+};
 use bytes::Bytes;
 use saorsa_core::identity::PeerId;
 use saorsa_pqc::api::sig::{ml_dsa_65, MlDsaPublicKey, MlDsaSecretKey};
@@ -32,6 +40,9 @@ const SETTLE: Duration = Duration::from_secs(30);
 
 /// How often to look while waiting.
 const POLL: Duration = Duration::from_millis(200);
+
+/// The id a hand-driven storage audit uses for both of its rounds.
+const CHALLENGE_ID: u64 = 0x5EED;
 
 /// A proof the receivers never parse: the state is pre-marked as paid in each
 /// verifier's cache, so verification answers from the cache.
@@ -47,6 +58,18 @@ fn signed(pk: &MlDsaPublicKey, sk: &MlDsaSecretKey, counter: u64, target: u8) ->
         pk,
         counter,
         PointerTarget::new(PointerTargetKind::Chunk, [target; 32]),
+    )
+    .expect("sign")
+}
+
+/// The final state that hands `pk`'s pointer over to the pointer at
+/// `recipient` (ADR-0018).
+fn transfer(pk: &MlDsaPublicKey, sk: &MlDsaSecretKey, recipient: u8) -> Pointer {
+    Pointer::sign(
+        sk,
+        pk,
+        FINAL_COUNTER,
+        PointerTarget::new(PointerTargetKind::Pointer, [recipient; 32]),
     )
     .expect("sign")
 }
@@ -452,6 +475,177 @@ async fn the_possession_check_penalises_only_a_member_that_dropped_the_record() 
     harness.teardown().await.expect("teardown");
 }
 
+/// A transfer written to one node reaches the whole group, and after that no
+/// node takes a second final state — not even one whose target sorts first,
+/// which the previous merge rule let displace the first everywhere (ADR-0018).
+#[tokio::test]
+#[serial]
+async fn a_transfer_reaches_the_group_and_no_node_takes_a_second_one() {
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let (pk, sk) = owner();
+    let created = signed(&pk, &sk, 0, 1);
+    let handed_over = transfer(&pk, &sk, 0x77);
+    let take_back = transfer(&pk, &sk, 0x01);
+    assert!(take_back.target().to_bytes() < handed_over.target().to_bytes());
+    for record in [&created, &handed_over, &take_back] {
+        mark_paid(&harness, record);
+    }
+
+    put(harness.test_node(1).expect("node"), &created).await;
+    for i in 0..harness.node_count() {
+        assert!(
+            wait_for(&harness, i, &created).await,
+            "node {i} lacks the create"
+        );
+    }
+    match put(harness.test_node(2).expect("node"), &handed_over).await {
+        PointerPutResponse::Success { state_id, .. } => {
+            assert_eq!(state_id, handed_over.state_id());
+        }
+        other => panic!("the transfer was refused: {other:?}"),
+    }
+    for i in 0..harness.node_count() {
+        assert!(
+            wait_for(&harness, i, &handed_over).await,
+            "node {i} never received the transfer"
+        );
+    }
+
+    // The former owner, paid up, tries to take it back on every node.
+    for i in 0..harness.node_count() {
+        match put(harness.test_node(i).expect("node"), &take_back).await {
+            PointerPutResponse::Stale { state_id, .. } => assert_eq!(
+                state_id,
+                handed_over.state_id(),
+                "node {i} must name the transfer it holds"
+            ),
+            other => panic!("node {i} took a second final state: {other:?}"),
+        }
+        assert!(holds(harness.test_node(i).expect("node"), &handed_over));
+    }
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// A node that never heard of a transfer — one that joined after it, or lost
+/// its copy — would take any final state on the merge rule alone. Before it
+/// does, it asks its group, and a peer that serves the transfer it holds is
+/// proof enough to refuse the second one.
+#[tokio::test]
+#[serial]
+async fn a_node_that_missed_the_transfer_refuses_another_its_group_proves() {
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let (pk, sk) = owner();
+    let created = signed(&pk, &sk, 0, 1);
+    let handed_over = transfer(&pk, &sk, 0x77);
+    let second = transfer(&pk, &sk, 0x01);
+    mark_paid(&harness, &second);
+    mark_paid(&harness, &handed_over);
+
+    // Everyone holds the create, and learns everyone else understands
+    // pointers while there is nothing newer to hint.
+    let everyone: Vec<usize> = (0..harness.node_count()).collect();
+    for i in &everyone {
+        store(harness.test_node(*i).expect("node"))
+            .put_bytes(&created.to_bytes())
+            .await
+            .expect("put");
+    }
+    exchange_hints(&harness, &everyone, &everyone).await;
+
+    // The transfer lands everywhere but one node, written straight into the
+    // stores so nothing replicates or hints it there.
+    let unaware = 4;
+    for i in others(&harness, &[unaware]) {
+        store(harness.test_node(i).expect("node"))
+            .put_bytes(&handed_over.to_bytes())
+            .await
+            .expect("put");
+    }
+    let node = harness.test_node(unaware).expect("node");
+    assert!(
+        holds(node, &created),
+        "the unaware node has only the create"
+    );
+
+    match put(node, &second).await {
+        PointerPutResponse::Stale { state_id, .. } => assert_eq!(
+            state_id,
+            handed_over.state_id(),
+            "the refusal names the transfer the group proved"
+        ),
+        other => panic!("the unaware node took a second final state: {other:?}"),
+    }
+    assert!(holds(node, &created), "nothing was written");
+
+    // The transfer the group holds is not refused: it is no conflict.
+    match put(node, &handed_over).await {
+        PointerPutResponse::Success { state_id, .. } => {
+            assert_eq!(state_id, handed_over.state_id());
+        }
+        other => panic!("the group's own transfer was refused: {other:?}"),
+    }
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// Two different final states are a fork only the owner can make, by racing
+/// them. A member holding the other side took what reached it first, as the
+/// merge rule says; the possession check does not penalise it for the owner's
+/// fork, while it still penalises a member that holds nothing.
+#[tokio::test]
+#[serial]
+async fn the_possession_check_does_not_penalise_the_other_side_of_a_fork() {
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let (pk, sk) = owner();
+    let one_side = transfer(&pk, &sk, 0x77);
+    let other_side = transfer(&pk, &sk, 0x01);
+    let checker = 3;
+    let forked = 1;
+    let dropper = 2;
+    for i in others(&harness, &[forked, dropper]) {
+        store(harness.test_node(i).expect("node"))
+            .put_bytes(&one_side.to_bytes())
+            .await
+            .expect("put");
+    }
+    store(harness.test_node(forked).expect("node"))
+        .put_bytes(&other_side.to_bytes())
+        .await
+        .expect("put");
+
+    let everyone: Vec<usize> = (0..harness.node_count()).collect();
+    exchange_hints(&harness, &everyone, &[checker]).await;
+
+    let checker_node = harness.test_node(checker).expect("node");
+    let checker_p2p = checker_node.p2p_node.as_ref().expect("p2p");
+    let forked_peer = peer(harness.test_node(forked).expect("node"));
+    let dropper_peer = peer(harness.test_node(dropper).expect("node"));
+    let forked_before = checker_p2p.peer_trust(&forked_peer);
+    let dropper_before = checker_p2p.peer_trust(&dropper_peer);
+
+    replication(checker_node)
+        .check_possession(one_side.state(), &[forked_peer, dropper_peer])
+        .await;
+
+    assert!(
+        checker_p2p.peer_trust(&forked_peer) >= forked_before,
+        "the member holding the other final state was penalised"
+    );
+    assert!(
+        checker_p2p.peer_trust(&dropper_peer) < dropper_before,
+        "the member holding nothing was not penalised"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
 /// A network whose close group is two nodes, so that in five nodes some node
 /// is always outside the retention width (two plus the margin of two) for any
 /// address, with no pruning hysteresis.
@@ -632,13 +826,23 @@ async fn commit_pointers(
     auditor: usize,
     count: usize,
 ) -> Vec<Pointer> {
-    let holder_node = harness.test_node(holder).expect("holder");
     let records: Vec<Pointer> = (0..count)
         .map(|_| {
             let (pk, sk) = owner();
             signed(&pk, &sk, 1, 1)
         })
         .collect();
+    commit_records(harness, holder, auditor, records).await
+}
+
+/// [`commit_pointers`] over records the caller signed.
+async fn commit_records(
+    harness: &TestHarness,
+    holder: usize,
+    auditor: usize,
+    records: Vec<Pointer>,
+) -> Vec<Pointer> {
+    let holder_node = harness.test_node(holder).expect("holder");
     for record in &records {
         store(holder_node)
             .put_bytes(&record.to_bytes())
@@ -700,6 +904,144 @@ async fn a_node_holding_its_committed_pointers_passes_the_storage_audit() {
         matches!(result, AuditTickResult::Passed { keys_checked, .. } if keys_checked >= 1),
         "an honest pointer holder must pass, got {result:?}"
     );
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// Several paid updates between the two rounds of a storage audit do not fail
+/// the node holding the pointer: round 2 serves the record round 1 read, found
+/// by the root round 1 reported over it (ADR-0019). Driven one round at a time
+/// against the holder's live engine, so it is the round-1 session that carries
+/// what round 1 bound across to round 2.
+#[tokio::test]
+#[serial]
+async fn round_two_serves_the_record_round_one_read_across_several_updates() {
+    let harness = TestHarness::setup_small().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+    let (holder, auditor) = (7, 8);
+    let owners: Vec<(MlDsaPublicKey, MlDsaSecretKey)> = (0..24).map(|_| owner()).collect();
+    let records = owners.iter().map(|(pk, sk)| signed(pk, sk, 1, 1)).collect();
+    commit_records(&harness, holder, auditor, records).await;
+
+    let holder_node = harness.test_node(holder).expect("holder");
+    let holder_peer = peer(holder_node);
+    let committed = commitments(holder_node)
+        .current()
+        .expect("a current commitment");
+    let pointer_keys = committed.pointer_leaf_keys();
+    let auditor_p2p = harness
+        .test_node(auditor)
+        .expect("auditor")
+        .p2p_node
+        .as_ref()
+        .expect("p2p")
+        .clone();
+    let ask = |body: ReplicationMessageBody| {
+        let auditor_p2p = Arc::clone(&auditor_p2p);
+        async move {
+            let request = ReplicationMessage {
+                request_id: CHALLENGE_ID,
+                body,
+            }
+            .encode()
+            .expect("encode");
+            let response = auditor_p2p
+                .send_request(
+                    &holder_peer,
+                    SUBTREE_AUDIT_PROTOCOL_ID,
+                    request,
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect("a response");
+            ReplicationMessage::decode_subtree_audit_response(&response.data)
+                .expect("decode")
+                .body
+        }
+    };
+
+    // Round 1: the holder binds the record it holds for each pointer.
+    let nonce = [0x5A; 32];
+    let round1 = ask(ReplicationMessageBody::SubtreeAuditChallenge(
+        SubtreeAuditChallenge {
+            challenge_id: CHALLENGE_ID,
+            nonce,
+            challenged_peer_id: *holder_peer.as_bytes(),
+            expected_commitment_hash: committed.hash(),
+        },
+    ))
+    .await;
+    let ReplicationMessageBody::SubtreeAuditResponse(SubtreeAuditResponse::Proof { proof, .. }) =
+        round1
+    else {
+        panic!("expected a round-1 proof, got {round1:?}");
+    };
+    let opened: Vec<_> = proof
+        .leaves
+        .iter()
+        .filter(|leaf| pointer_keys.contains(&leaf.key))
+        .take(5)
+        .cloned()
+        .collect();
+    assert!(!opened.is_empty(), "round 1 proved a pointer");
+
+    // Between the rounds, the owner of every pointer about to be opened
+    // updates it three times, each a state the holder accepts.
+    let holder_store = store(holder_node);
+    for leaf in &opened {
+        let (pk, sk) = owners
+            .iter()
+            .find(|(pk, sk)| signed(pk, sk, 1, 1).address() == leaf.key)
+            .expect("an owner for every committed pointer");
+        for counter in 2..=4 {
+            holder_store
+                .put_bytes(&signed(pk, sk, counter, 2).to_bytes())
+                .await
+                .expect("update");
+        }
+    }
+
+    // Round 2: each opened pointer is proved by the record round 1 read.
+    let round2 = ask(ReplicationMessageBody::SubtreeSliceChallenge(
+        SubtreeSliceChallenge {
+            challenge_id: CHALLENGE_ID,
+            nonce,
+            challenged_peer_id: *holder_peer.as_bytes(),
+            expected_commitment_hash: committed.hash(),
+            openings: opened
+                .iter()
+                .map(|leaf| SubtreeSliceOpening {
+                    key: leaf.key,
+                    block_index: 0,
+                })
+                .collect(),
+        },
+    ))
+    .await;
+    let ReplicationMessageBody::SubtreeSliceResponse(SubtreeSliceResponse::Items { items, .. }) =
+        round2
+    else {
+        panic!("expected round-2 items, got {round2:?}");
+    };
+    for leaf in &opened {
+        let served = items
+            .iter()
+            .find_map(|item| match item {
+                SubtreeSliceItem::PointerRecord { key, records } if *key == leaf.key => {
+                    Some(records.as_slice())
+                }
+                _ => None,
+            })
+            .expect("a record for every opened pointer");
+        assert!(
+            served.iter().any(|record| {
+                nonced_block_root(&nonce, holder_peer.as_bytes(), &leaf.key, record)
+                    == leaf.nonced_root
+                    && Pointer::from_bytes(record).is_ok_and(|p| p.address() == leaf.key)
+            }),
+            "round 2 must serve the record round 1 bound, after three updates"
+        );
+    }
 
     harness.teardown().await.expect("teardown");
 }
