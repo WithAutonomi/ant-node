@@ -237,8 +237,8 @@ webrtc-direct = [
 # Copy-free sends (ADR-0017): saorsa-core's `send_message` takes
 # `impl Into<Bytes>`, and saorsa-transport writes owned buffers to QUIC
 # streams without copying. Drop both once releases include them.
-saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core", rev = "7f815141ff8d5e07f443c25c99607586fa7099cf" }
-saorsa-transport = { git = "https://github.com/WithAutonomi/saorsa-transport", rev = "6a772bd3cf806e381cf5706cfe34492bede3141e" }
+saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core", rev = "c0022b871961c7f373f2ccde815385816962de98" }
+saorsa-transport = { git = "https://github.com/WithAutonomi/saorsa-transport", rev = "1e6eb1a3bc5b8b7f51c6773b11a152ae50d87320" }
 
 [profile.release]
 lto = true

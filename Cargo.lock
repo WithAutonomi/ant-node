@@ -5306,7 +5306,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.28.0"
-source = "git+https://github.com/WithAutonomi/saorsa-core?rev=7f815141ff8d5e07f443c25c99607586fa7099cf#7f815141ff8d5e07f443c25c99607586fa7099cf"
+source = "git+https://github.com/WithAutonomi/saorsa-core?rev=c0022b871961c7f373f2ccde815385816962de98#c0022b871961c7f373f2ccde815385816962de98"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5374,7 +5374,7 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.37.0"
-source = "git+https://github.com/WithAutonomi/saorsa-transport?rev=6a772bd3cf806e381cf5706cfe34492bede3141e#6a772bd3cf806e381cf5706cfe34492bede3141e"
+source = "git+https://github.com/WithAutonomi/saorsa-transport?rev=1e6eb1a3bc5b8b7f51c6773b11a152ae50d87320#1e6eb1a3bc5b8b7f51c6773b11a152ae50d87320"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7103,7 +7103,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
