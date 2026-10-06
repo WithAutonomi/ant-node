@@ -47,6 +47,7 @@
 pub mod ant_protocol;
 pub mod browser;
 pub mod client;
+mod codec;
 pub mod config;
 pub mod devnet;
 pub mod error;
