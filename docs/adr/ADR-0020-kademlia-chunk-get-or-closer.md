@@ -187,6 +187,12 @@ still arriving. Conflicting reports about a peer are resolved with
   Measured with the per-peer fallback that this decision keeps for old nodes:
   p50 5.95 s to about 1 s, p90 13 s to about 2 s, and the whole file 3.7 times
   faster.
+- **Today's nodes, through the per-peer fallback.** A client built from
+  this design downloaded the 612 MB production file in 56 s, against 242 s
+  for the current client, with identical bytes. Production nodes do not
+  announce the token yet, so every lookup step took the FIND_NODE-plus-GET
+  route, and all 150 chunks were found without falling back to the old
+  read path.
 - **Upgraded nodes answer each lookup step with one request** instead of
   FIND_NODE plus GET. The chunk travels in that same reply.
 - **Compatible in both directions.** Old clients never send the new variant.
@@ -241,9 +247,12 @@ still arriving. Conflicting reports about a peer are resolved with
     - treat a hash mismatch as an error
     - keep a transfer alive past its lookup round's grace window
     - fall back to today's path when the lookup finds nothing
+  - In-process test networks:
+    - A network whose nodes all announce the token is read with
+      get-or-closer requests only, and no plain GET.
+    - The full end-to-end suite reads through the new path.
   - Live: a new client against today's nodes takes the legacy route for every
-    peer and stays within the measured latency of option 3. A local devnet of
-    upgraded nodes takes the `GetOrCloserRequest` route.
+    peer and stays within the measured latency of option 3.
 - **Review triggers**
   - Node egress for reads rises enough to matter: add the "have it" variant.
   - Browser reads need this request: add the portable decoder and a HELLO
