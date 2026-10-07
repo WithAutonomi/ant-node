@@ -644,6 +644,23 @@ pub(crate) fn log_traffic_summary() {
         get_commitment_by_pin_response_rx_count = rc(16),
         "replication traffic summary (cumulative)"
     );
+    crate::logging::info!(
+        target: "ant_node::replication::traffic",
+        group = 4,
+        pointer_fresh_offer_tx_bytes = tb(17), pointer_fresh_offer_tx_count = tc(17),
+        pointer_fresh_offer_rx_bytes = rb(17), pointer_fresh_offer_rx_count = rc(17),
+        pointer_hints_tx_bytes = tb(18), pointer_hints_tx_count = tc(18),
+        pointer_hints_rx_bytes = rb(18), pointer_hints_rx_count = rc(18),
+        pointer_fetch_request_tx_bytes = tb(19), pointer_fetch_request_tx_count = tc(19),
+        pointer_fetch_request_rx_bytes = rb(19), pointer_fetch_request_rx_count = rc(19),
+        pointer_fetch_response_tx_bytes = tb(20), pointer_fetch_response_tx_count = tc(20),
+        pointer_fetch_response_rx_bytes = rb(20), pointer_fetch_response_rx_count = rc(20),
+        pointer_state_request_tx_bytes = tb(21), pointer_state_request_tx_count = tc(21),
+        pointer_state_request_rx_bytes = rb(21), pointer_state_request_rx_count = rc(21),
+        pointer_state_response_tx_bytes = tb(22), pointer_state_response_tx_count = tc(22),
+        pointer_state_response_rx_bytes = rb(22), pointer_state_response_rx_count = rc(22),
+        "replication traffic summary (cumulative)"
+    );
 }
 
 // ---------------------------------------------------------------------------
