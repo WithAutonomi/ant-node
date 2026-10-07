@@ -2171,13 +2171,22 @@ impl ReplicationEngine {
     /// The only guard left standing is the per-attempt recheck inside
     /// `execute_single_fetch` — exactly the gate e2e tests use this seam to
     /// exercise.
+    ///
+    /// A replica hint for `key` that reached pending verification first is
+    /// dropped, so the key enters the fetch queue as it would have without
+    /// it. Callers host the chunk on a holder before calling this, which makes
+    /// it advertisable, and a change to the holder's closest peers starts a
+    /// neighbour-sync round at once. Left in place, the hint's entry made
+    /// `enqueue_fetch` refuse the key, and with one holder and no paid-list
+    /// entry it does not reach a quorum, so the key was not fetched that way
+    /// either. A key already in the fetch queue or in flight, or a full fetch
+    /// queue, still returns `false`.
     #[cfg(any(test, feature = "test-utils"))]
     pub async fn enqueue_fetch_for_test(&self, key: XorName, sources: Vec<PeerId>) -> bool {
         let distance = crate::client::xor_distance(&key, self.p2p_node.peer_id().as_bytes());
-        self.queues
-            .write()
-            .await
-            .enqueue_fetch(key, distance, sources)
+        let mut queues = self.queues.write().await;
+        queues.remove_pending(&key);
+        queues.enqueue_fetch(key, distance, sources)
     }
 
     /// Test-only: whether `key` is still tracked in any fetch-pipeline stage
@@ -2185,6 +2194,21 @@ impl ReplicationEngine {
     #[cfg(any(test, feature = "test-utils"))]
     pub async fn fetch_pipeline_contains_for_test(&self, key: &XorName) -> bool {
         self.queues.read().await.contains_key(key)
+    }
+
+    /// Test-only: whether `key` is in the fetch queue or in flight, which is
+    /// where a candidate placed by [`Self::enqueue_fetch_for_test`] stays
+    /// until it resolves.
+    ///
+    /// Such a candidate carries no verification retry metadata, so it is never
+    /// requeued for verification: once it leaves these two stages it is done.
+    /// Pending verification is left out on purpose. The chunk the test hosted
+    /// stays advertisable, so a replica hint can put the key there after the
+    /// candidate resolved, and counting that entry would hold a test's wait
+    /// loop until its deadline.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn fetch_queued_or_in_flight_for_test(&self, key: &XorName) -> bool {
+        self.queues.read().await.fetch_queued_or_in_flight(key)
     }
 
     /// Test-only: place `key` into pending verification as though `hinter` had
