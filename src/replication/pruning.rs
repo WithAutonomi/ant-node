@@ -1969,8 +1969,12 @@ async fn local_record_digest(
         .map(|bytes| compute_audit_digest(nonce, peer.as_bytes(), key, &bytes))
 }
 
+/// The local copy a prune audit judges peers against. Read through the verifying
+/// path: a local file that no longer hashes to its key would fail every honest
+/// holder and hold the prune back indefinitely, so it is taken out of service by the
+/// read instead, and the key is not audited.
 async fn local_record_bytes(key: &XorName, storage: &Arc<ChunkStore>) -> Option<Vec<u8>> {
-    match storage.get_raw(key).await {
+    match storage.get(key).await {
         Ok(Some(bytes)) => Some(bytes),
         Ok(None) => {
             debug!(
@@ -2138,6 +2142,9 @@ async fn peer_is_currently_responsible(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::storage::file_store::CHUNKS_DIR_NAME;
+    use crate::storage::ChunkStoreConfig;
+    use tempfile::TempDir;
 
     fn peer_id_from_byte(b: u8) -> PeerId {
         let mut bytes = [0u8; 32];
@@ -2157,6 +2164,40 @@ mod tests {
 
     fn candidate(key: XorName, target_peers: Vec<PeerId>) -> RecordPruneCandidate {
         RecordPruneCandidate { key, target_peers }
+    }
+
+    /// A prune audit judges holders against this node's own copy. A copy that
+    /// no longer hashes to its key would fail every honest holder and hold the
+    /// prune back forever, so it is not used as a reference: the read takes it
+    /// out of service instead, and an intact copy is used as before.
+    #[tokio::test]
+    async fn a_rotted_local_copy_is_not_used_to_judge_holders() {
+        let dir = TempDir::new().expect("temp dir");
+        let storage = Arc::new(
+            ChunkStore::new(ChunkStoreConfig {
+                root_dir: dir.path().to_path_buf(),
+                ..ChunkStoreConfig::test_default()
+            })
+            .await
+            .expect("chunk store"),
+        );
+        let good_bytes = b"intact prune candidate".to_vec();
+        let bad_bytes = b"rotted prune candidate".to_vec();
+        let good = ChunkStore::compute_address(&good_bytes);
+        let bad = ChunkStore::compute_address(&bad_bytes);
+        storage.put(&good, &good_bytes).await.expect("put good");
+        storage.put(&bad, &bad_bytes).await.expect("put bad");
+        let path = dir
+            .path()
+            .join(CHUNKS_DIR_NAME)
+            .join(format!("{:02x}", bad.last().copied().unwrap_or(0)))
+            .join(hex::encode(bad));
+        std::fs::write(&path, b"rotted").expect("corrupt the file");
+
+        assert_eq!(local_record_bytes(&good, &storage).await, Some(good_bytes));
+        assert_eq!(local_record_bytes(&bad, &storage).await, None);
+        assert!(!storage.exists(&bad).expect("exists"));
+        assert!(!path.exists(), "the rotted local copy is removed");
     }
 
     #[test]

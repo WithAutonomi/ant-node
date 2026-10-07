@@ -34,6 +34,8 @@ use crate::replication::config::REPAIR_HINT_MIN_AGE;
 #[cfg(test)]
 use crate::replication::types::{BootstrapClaimObservation, NeighborSyncState};
 #[cfg(test)]
+use crate::storage::file_store::CHUNKS_DIR_NAME;
+#[cfg(test)]
 use crate::storage::ChunkStoreConfig;
 #[cfg(test)]
 use tempfile::TempDir;
@@ -565,20 +567,62 @@ async fn verify_digests(
         .await;
     }
 
-    let challenged_peer_bytes = challenged_peer.as_bytes();
+    let DigestComparison {
+        failed_keys,
+        verified,
+    } = compare_with_local_copies(storage, nonce, challenged_peer.as_bytes(), keys, digests).await;
+
+    if failed_keys.is_empty() {
+        return unfailed_audit_verdict(challenged_peer, keys.len(), verified);
+    }
+
+    // Step 9: Responsibility confirmation for failed keys.
+    handle_classified_audit_failure(
+        challenged_peer,
+        challenge_id,
+        &failed_keys,
+        AuditFailureReason::DigestMismatch,
+        keys.len(),
+        None,
+        p2p_node,
+        config,
+    )
+    .await
+}
+
+/// What comparing a peer's digests with this node's own copies found.
+struct DigestComparison {
+    /// Keys the peer admitted missing, or whose digest did not match.
+    failed_keys: Vec<AuditKeyFailure>,
+    /// Keys whose digest matched one recomputed from a good local copy.
+    verified: usize,
+}
+
+/// Compare per-key digests with ones recomputed from this node's own copies.
+///
+/// The local copy is the reference the peer is judged against, so it is read
+/// through the verifying path: a local file that no longer hashes to its key
+/// must not fail an honest peer. Such a copy is taken out of service by the read
+/// (replication repairs it) and the key is skipped, like any other key this node
+/// cannot read. A skipped key is neither a failure nor a verification.
+async fn compare_with_local_copies(
+    storage: &ChunkStore,
+    nonce: &[u8; 32],
+    challenged_peer_bytes: &[u8; 32],
+    keys: &[XorName],
+    digests: &[[u8; 32]],
+) -> DigestComparison {
     let mut failed_keys = Vec::new();
+    let mut verified = 0usize;
 
-    for (i, key) in keys.iter().enumerate() {
-        let received_digest = &digests[i];
-
+    for (key, received_digest) in keys.iter().zip(digests) {
         // Check for absent sentinel.
         if *received_digest == ABSENT_KEY_DIGEST {
             failed_keys.push(AuditKeyFailure::absent(*key));
             continue;
         }
 
-        // Recompute expected digest from local copy.
-        let local_bytes = match storage.get_raw(key).await {
+        let local_bytes = match storage.get(key).await {
             Ok(Some(bytes)) => bytes,
             Ok(None) => {
                 // We should hold this key (we sampled it), but it's gone.
@@ -595,34 +639,48 @@ async fn verify_digests(
         };
 
         let expected = compute_audit_digest(nonce, challenged_peer_bytes, key, &local_bytes);
-        if *received_digest != expected {
+        if *received_digest == expected {
+            verified += 1;
+        } else {
             failed_keys.push(AuditKeyFailure::digest_mismatch(*key));
         }
     }
 
-    if failed_keys.is_empty() {
-        info!(
-            "Audit: peer {challenged_peer} passed (all {} keys verified)",
-            keys.len()
-        );
-        return AuditTickResult::Passed {
-            challenged_peer: *challenged_peer,
-            keys_checked: keys.len(),
-        };
+    DigestComparison {
+        failed_keys,
+        verified,
     }
+}
 
-    // Step 9: Responsibility confirmation for failed keys.
-    handle_classified_audit_failure(
-        challenged_peer,
-        challenge_id,
-        &failed_keys,
-        AuditFailureReason::DigestMismatch,
-        keys.len(),
-        None,
-        p2p_node,
-        config,
-    )
-    .await
+/// The verdict on an audit in which no key failed.
+///
+/// A pass needs at least one key actually checked: when every key was skipped for
+/// want of a good local copy, nothing is known about the peer, so it earns no pass
+/// (and no trust credit) and the audit is idle instead.
+fn unfailed_audit_verdict(
+    challenged_peer: &PeerId,
+    key_count: usize,
+    verified: usize,
+) -> AuditTickResult {
+    if verified == 0 {
+        debug!(
+            "Audit: no key could be checked against a local copy for {challenged_peer}; \
+             not counted as a pass"
+        );
+        return AuditTickResult::Idle;
+    }
+    if verified == key_count {
+        info!("Audit: peer {challenged_peer} passed (all {verified} keys verified)");
+    } else {
+        info!(
+            "Audit: peer {challenged_peer} passed ({verified} of {key_count} keys verified, \
+             the rest skipped for want of a good local copy)"
+        );
+    }
+    AuditTickResult::Passed {
+        challenged_peer: *challenged_peer,
+        keys_checked: verified,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1315,6 +1373,105 @@ mod tests {
             AuditResponse::Bootstrapping { .. } => panic!("Expected Digests"),
             AuditResponse::Rejected { .. } => panic!("Unexpected Rejected response"),
         }
+    }
+
+    // -- A rotted local reference copy -------------------------------------------
+
+    /// The auditor's own copy is the reference a peer is judged against. A local
+    /// copy that has rotted must not fail an honest peer, must not count as a
+    /// verification either, and is taken out of service so replication repairs it.
+    #[tokio::test]
+    async fn a_rotted_local_copy_neither_fails_nor_passes_the_peer() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let storage = ChunkStore::new(ChunkStoreConfig {
+            root_dir: temp_dir.path().to_path_buf(),
+            ..ChunkStoreConfig::test_default()
+        })
+        .await
+        .expect("storage");
+        let nonce = [0x42; 32];
+        let peer = PeerId::from_bytes([0x24; 32]);
+        let rot = |key: &XorName| {
+            let path = temp_dir
+                .path()
+                .join(CHUNKS_DIR_NAME)
+                .join(format!("{:02x}", key.last().copied().unwrap_or(0)))
+                .join(hex::encode(key));
+            std::fs::write(path, b"rotted").expect("corrupt the file");
+        };
+
+        let mut stored = Vec::new();
+        for content in [
+            &b"intact copy"[..],
+            b"first rotted copy",
+            b"second rotted copy",
+        ] {
+            let key = ChunkStore::compute_address(content);
+            storage.put(&key, content).await.expect("put");
+            stored.push((key, content.to_vec()));
+        }
+        let [(good, good_bytes), (lone, lone_bytes), (paired, paired_bytes)] = stored.as_slice()
+        else {
+            panic!("three chunks stored");
+        };
+        rot(lone);
+        rot(paired);
+        let honest = |key: &XorName, content: &[u8]| {
+            compute_audit_digest(&nonce, peer.as_bytes(), key, content)
+        };
+
+        // Only a rotted reference: nothing can be checked, so no pass either way.
+        let nothing = compare_with_local_copies(
+            &storage,
+            &nonce,
+            peer.as_bytes(),
+            &[*lone],
+            &[honest(lone, lone_bytes)],
+        )
+        .await;
+        assert!(
+            nothing.failed_keys.is_empty(),
+            "an honest peer is not failed"
+        );
+        assert_eq!(nothing.verified, 0);
+        assert!(matches!(
+            unfailed_audit_verdict(&peer, 1, nothing.verified),
+            AuditTickResult::Idle
+        ));
+        assert!(
+            !storage.exists(lone).expect("exists"),
+            "the rotted local copy is taken out of service"
+        );
+
+        // A good and a rotted reference: the peer passes on what was checked.
+        let partial = compare_with_local_copies(
+            &storage,
+            &nonce,
+            peer.as_bytes(),
+            &[*good, *paired],
+            &[honest(good, good_bytes), honest(paired, paired_bytes)],
+        )
+        .await;
+        assert!(
+            partial.failed_keys.is_empty(),
+            "an honest peer failed against a rotted reference: {:?}",
+            partial.failed_keys
+        );
+        assert_eq!(partial.verified, 1);
+        assert!(matches!(
+            unfailed_audit_verdict(&peer, 2, partial.verified),
+            AuditTickResult::Passed {
+                keys_checked: 1,
+                ..
+            }
+        ));
+
+        // A wrong digest against a good reference still fails, as before.
+        let wrong =
+            compare_with_local_copies(&storage, &nonce, peer.as_bytes(), &[*good], &[[0xAB; 32]])
+                .await;
+        assert_eq!(wrong.failed_keys.len(), 1);
+        assert_eq!(wrong.verified, 0);
     }
 
     // -- Scenario 55: Empty failure set means no evidence -------------------------

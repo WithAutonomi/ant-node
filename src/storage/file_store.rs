@@ -1572,6 +1572,20 @@ impl FileStore {
         Arc::clone(&self.test_put_gate)
     }
 
+    /// Test-only handle to the write lanes, and the index of the one `address` is
+    /// written, repaired and quarantined under.
+    ///
+    /// Holding that lane stalls every write, repair and quarantine in the shard the way a
+    /// hung disk would. [`Self::test_put_gate`] cannot stand in for it: a put parks there
+    /// before it takes its lane.
+    #[cfg(test)]
+    pub(crate) fn test_write_lane(
+        &self,
+        address: &XorName,
+    ) -> (Arc<Vec<parking_lot::Mutex<()>>>, usize) {
+        (Arc::clone(&self.write_lanes), shard_index(address))
+    }
+
     /// Register a write of `address` and hand back the token that clears it.
     ///
     /// The token must be moved into the blocking closure that does the work, so the entry

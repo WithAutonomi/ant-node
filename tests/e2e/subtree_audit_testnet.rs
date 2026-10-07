@@ -20,6 +20,7 @@ use std::time::{Duration, SystemTime};
 use super::TestHarness;
 use ant_node::replication::audit::AuditTickResult;
 use ant_node::replication::{FirstAuditStats, MonetizedPinEvent, ReplicationEngine};
+use ant_node::storage::file_store::CHUNKS_DIR_NAME;
 use serial_test::serial;
 use tokio::time::sleep;
 
@@ -178,6 +179,79 @@ async fn data_deleting_node_fails_subtree_audit() {
         matches!(result, AuditTickResult::Failed { .. }),
         "a node that deleted its committed data must FAIL the audit, got {result:?}"
     );
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// SELF-REPAIR: a node whose committed chunk files rotted on disk still fails the
+/// audit over them, and then starts taking the rotted chunks its proof read out of
+/// service, so its next commitment leaves them out and replication can bring good
+/// copies back.
+///
+/// Drives the shipped path end to end: the round-1 responder reports the rotted
+/// leaves and the engine's recheck worker removes them. Requires at least one to
+/// go, and every one gone to be unclaimed. Nothing else removes a rotted file this
+/// quickly, so a responder that stopped reporting, or an engine that never started
+/// the worker, leaves every file in place and fails this.
+#[tokio::test]
+#[serial]
+async fn a_node_whose_chunks_rotted_takes_them_out_of_service_after_an_audit() {
+    let harness = TestHarness::setup_small().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let (a_idx, b_idx) = (5, 6);
+    let addrs = commit_and_seed(&harness, a_idx, b_idx, 64).await;
+
+    let a = harness.test_node(a_idx).expect("a");
+    let a_store = a.ant_protocol.as_ref().expect("a protocol").storage();
+    let chunk_path = |addr: &[u8; 32]| {
+        a.data_dir
+            .join(CHUNKS_DIR_NAME)
+            .join(format!("{:02x}", addr.last().copied().unwrap_or(0)))
+            .join(hex::encode(addr))
+    };
+    // Every file rots in place, under its own name, so the node still claims all of
+    // them and its raw reads still find them.
+    for addr in &addrs {
+        std::fs::write(chunk_path(addr), b"rotted").expect("rot the file");
+    }
+
+    let a_peer = *a.p2p_node.as_ref().expect("a p2p").peer_id();
+    let b_engine = harness
+        .test_node(b_idx)
+        .expect("b")
+        .replication_engine
+        .as_ref()
+        .expect("b engine");
+    let result = b_engine.audit_peer_now(&a_peer).await;
+    assert!(
+        matches!(result, AuditTickResult::Failed { .. }),
+        "a node serving rotted bytes must still FAIL the audit, got {result:?}"
+    );
+
+    let start = std::time::Instant::now();
+    let removed = loop {
+        let removed: Vec<_> = addrs
+            .iter()
+            .filter(|addr| !chunk_path(addr).exists())
+            .collect();
+        if !removed.is_empty() || start.elapsed() >= Duration::from_secs(30) {
+            break removed;
+        }
+        sleep(Duration::from_millis(100)).await;
+    };
+    assert!(
+        !removed.is_empty(),
+        "no rotted chunk the audit read was taken out of service"
+    );
+    let claimed = a_store.all_keys().await.expect("a keys");
+    for addr in &removed {
+        assert!(
+            !claimed.contains(*addr),
+            "{} lost its file but is still claimed",
+            hex::encode(addr)
+        );
+    }
 
     harness.teardown().await.expect("teardown");
 }
