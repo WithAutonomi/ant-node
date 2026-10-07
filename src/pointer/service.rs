@@ -16,11 +16,22 @@
 //!    are both 32 bytes from the same range; the domain separator makes a
 //!    collision infeasible, not impossible. A node that holds one kind at an
 //!    address refuses the other rather than silently choosing.
+//! 4. **A look before a final state.** A state at the final counter is
+//!    replaced by nothing, so a node that takes one can never be corrected.
+//!    Before taking one it neither holds nor lost, the node asks its close
+//!    group whether a *different* final state is already held there, and
+//!    refuses if a peer proves one with the signed record (ADR-0018). That is
+//!    what keeps a former owner from handing an address over a second time to
+//!    a node that had not heard of the first, whenever a peer can prove the
+//!    first in time. A proven loser is remembered and refused again before its
+//!    signature is checked.
 //!
 //! # Order of work
 //!
 //! ```text
-//! parse → compare with what is held → verify signature → check payment → commit
+//! parse → compare with what is held → (final state only) a proven loser?
+//!       → verify signature → check payment
+//!       → (final state only) ask the close group → commit
 //! ```
 //!
 //! The comparison precedes the signature check, so re-submitting a state the
@@ -35,6 +46,7 @@ use ant_protocol::chunk::{
     XorName,
 };
 use bytes::Bytes;
+use futures::future::BoxFuture;
 use parking_lot::RwLock;
 use saorsa_core::P2PNode;
 use tokio::sync::mpsc;
@@ -46,7 +58,46 @@ use crate::pointer::store::{Inspected, PointerStore, PutOutcome};
 use crate::replication::admission;
 use crate::replication::pointer::PointerFreshWrite;
 use crate::storage::{ChunkStore, SELF_CLOSENESS_GATE_WIDTH};
-use ant_protocol::pointer::POINTER_WIRE_LEN;
+use ant_protocol::pointer::{PointerState, POINTER_WIRE_LEN};
+
+/// Where a node looks, before it takes a final state, for a different final
+/// state its close group already holds (ADR-0018).
+///
+/// A trait rather than the replication engine itself, because the engine is
+/// built after this service and needs a running P2P node, and because what the
+/// service decides from the answer is worth testing without one.
+pub trait FinalStateWitness: Send + Sync {
+    /// Ask the close group whether a final state other than `state` is
+    /// already held at `state.address`.
+    fn check_final<'a>(&'a self, state: &'a PointerState) -> BoxFuture<'a, FinalityCheck>;
+
+    /// A final state at `state.address`, other than `state`, that an earlier
+    /// check already proved, without asking anyone.
+    ///
+    /// Cheap enough to consult ahead of the signature check, so a final state
+    /// that lost once is refused again for nothing, however often the same
+    /// paid record is replayed.
+    fn proven_conflict(&self, state: &PointerState) -> Option<PointerState>;
+
+    /// Forget that a look found `state` clear: the write it cleared did not
+    /// land, so a retry must look again rather than reuse the answer.
+    fn forget_clear(&self, state: &PointerState);
+}
+
+/// What a close group said about a final state a node is about to take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalityCheck {
+    /// No peer proved a different final state. Also the answer when the group
+    /// could not be asked in time: silence is not evidence, so it never
+    /// refuses a write.
+    Clear,
+    /// A different final state a peer holds, proven by the signed record,
+    /// which only the owner could have made.
+    Conflict(PointerState),
+    /// Too many checks were running to start this one in time. The state is
+    /// neither taken nor refused for good, and the sender may try again.
+    Busy,
+}
 
 /// Handles pointer requests against a [`PointerStore`].
 #[derive(Clone)]
@@ -70,6 +121,10 @@ pub struct PointerService {
     /// handler before it has a running P2P node. `None` in unit tests that
     /// never attach one, exactly as the chunk path does.
     p2p_node: Arc<RwLock<Option<Arc<P2PNode>>>>,
+    /// Asked before a final state is taken (ADR-0018). Attached with the
+    /// replication engine; `None` where nothing replicates, and then a final
+    /// state is taken on the merge rule alone.
+    final_witness: Arc<RwLock<Option<Arc<dyn FinalStateWitness>>>>,
 }
 
 impl std::fmt::Debug for PointerService {
@@ -92,6 +147,7 @@ impl PointerService {
             payments: None,
             fresh_writes: Arc::new(RwLock::new(None)),
             p2p_node: Arc::new(RwLock::new(None)),
+            final_witness: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -123,6 +179,11 @@ impl PointerService {
     /// Hand every newly stored paid state to replication on `writes`.
     pub fn attach_fresh_writes(&self, writes: mpsc::UnboundedSender<PointerFreshWrite>) {
         *self.fresh_writes.write() = Some(writes);
+    }
+
+    /// Ask `witness` before taking a final state this node does not hold.
+    pub fn attach_final_state_witness(&self, witness: Arc<dyn FinalStateWitness>) {
+        *self.final_witness.write() = Some(witness);
     }
 
     /// The store this service fronts.
@@ -162,10 +223,11 @@ impl PointerService {
             }
         };
 
-        let address = parsed.state().address;
-        let state_id = parsed.state().state_id;
+        let state = *parsed.state();
+        let address = state.address;
+        let state_id = state.state_id;
 
-        if let Some(refusal) = self.admit(parsed.state()).await {
+        if let Some(refusal) = self.admit(&state).await {
             return refusal;
         }
 
@@ -191,6 +253,13 @@ impl PointerService {
             }
         }
 
+        // Last, because it costs the close group a round trip, and only for a
+        // paid final state: if a peer proves a different final state is
+        // already held, this one lost the race to it everywhere that matters.
+        if let Some(refusal) = self.final_refusal(&state).await {
+            return refusal;
+        }
+
         // Charge the bytes this write will take, and hold the charge until it
         // lands. Checking capacity and then writing is the race the file store
         // exists to close: concurrent writers all pass one cached measurement
@@ -202,6 +271,7 @@ impl PointerService {
                 Ok(reservation) => Some(reservation),
                 Err(e) => {
                     debug!("Rejecting pointer PUT for {}: {e}", hex::encode(address));
+                    self.forget_clear(&state);
                     return PointerPutResponse::Error(ProtocolError::StorageFailed(e.to_string()));
                 }
             },
@@ -211,7 +281,7 @@ impl PointerService {
         // release it the moment this future is dropped, while the blocking
         // transaction it started runs on and publishes the file.
         let record_bytes = request.record.to_vec();
-        match self.store.commit(record, reservation).await {
+        let response = match self.store.commit(record, reservation).await {
             Ok(PutOutcome::Changed) => {
                 // Offer it to the rest of the close group, proof included, so
                 // every member holds it whichever of them the client reached.
@@ -243,6 +313,24 @@ impl PointerService {
                 warn!("Pointer commit failed for {}: {e}", hex::encode(address));
                 PointerPutResponse::Error(ProtocolError::StorageFailed(e.to_string()))
             }
+        };
+        // A look that cleared a final state is reused briefly for replays of
+        // it; a write that did not land must not leave that answer behind.
+        if !matches!(
+            response,
+            PointerPutResponse::Success { .. } | PointerPutResponse::Unchanged { .. }
+        ) {
+            self.forget_clear(&state);
+        }
+        response
+    }
+
+    /// Forget a clear look for `state`, if a witness took one.
+    fn forget_clear(&self, state: &PointerState) {
+        if state.is_terminal() {
+            if let Some(witness) = self.final_witness.read().as_ref() {
+                witness.forget_clear(state);
+            }
         }
     }
 
@@ -251,10 +339,7 @@ impl PointerService {
     /// `Some(response)` means refuse. Ordered cheapest first, and all of it
     /// ahead of the signature check, so a forged record for an address this
     /// node does not serve buys no cryptography.
-    async fn admit(
-        &self,
-        state: &ant_protocol::pointer::PointerState,
-    ) -> Option<PointerPutResponse> {
+    async fn admit(&self, state: &PointerState) -> Option<PointerPutResponse> {
         let address = state.address;
 
         // Any state the merge rule prefers to what this node knows, whatever
@@ -269,9 +354,15 @@ impl PointerService {
                 hex::encode(address),
                 state.counter
             );
+            // Named as the state this node knows, even one whose file it
+            // lost, so the sender can see what it must catch up to.
             return Some(PointerPutResponse::Stale {
                 address,
-                state_id: self.store.state_id(&address).unwrap_or_default(),
+                state_id: self
+                    .store
+                    .remembered(&address)
+                    .map(|known| known.state_id)
+                    .unwrap_or_default(),
             });
         }
 
@@ -316,7 +407,79 @@ impl PointerService {
                 )));
             }
         }
+
+        // A final state an earlier check proved lost to another is refused
+        // again here, before it buys a signature check or a round trip.
+        if self.needs_final_check(state) {
+            let proven = self
+                .final_witness
+                .read()
+                .as_ref()
+                .and_then(|witness| witness.proven_conflict(state));
+            if let Some(conflict) = proven {
+                return Some(PointerPutResponse::Stale {
+                    address,
+                    state_id: conflict.state_id,
+                });
+            }
+        }
         None
+    }
+
+    /// Whether `state` needs the close group's word before this node takes
+    /// it: it is final, and this node neither holds nor remembers a final
+    /// state at its address.
+    ///
+    /// Nothing else is asked about. A lower counter can be replaced, so taking
+    /// one blind costs nothing a later state cannot fix. A node that holds a
+    /// final state has had its answer from the merge rule before this runs:
+    /// the same state is unchanged and any other is stale. And a node that
+    /// lost the file of a final state it held is admitted only that state
+    /// again ([`PointerStore::admits`]), which restores what it already took
+    /// rather than taking a new one. Asking there would let any peer on the
+    /// other side of a fork keep it from restoring its own copy.
+    fn needs_final_check(&self, state: &PointerState) -> bool {
+        state.is_terminal()
+            && !self
+                .store
+                .remembered(&state.address)
+                .is_some_and(|known| known.is_terminal())
+    }
+
+    /// The answer to a paid final state the close group proves already lost,
+    /// or that could not be checked in time; `None` to take it.
+    async fn final_refusal(&self, state: &PointerState) -> Option<PointerPutResponse> {
+        if !self.needs_final_check(state) {
+            return None;
+        }
+        let witness = self.final_witness.read().as_ref().map(Arc::clone)?;
+        match witness.check_final(state).await {
+            FinalityCheck::Clear => None,
+            // Named as the state the group proved, as for any stale arrival.
+            FinalityCheck::Conflict(conflict) => {
+                info!(
+                    "Refusing final pointer state {} at {}: the close group already holds \
+                     final state {}, so the owner has finalized it before",
+                    hex::encode(state.state_id),
+                    hex::encode(state.address),
+                    hex::encode(conflict.state_id)
+                );
+                Some(PointerPutResponse::Stale {
+                    address: state.address,
+                    state_id: conflict.state_id,
+                })
+            }
+            FinalityCheck::Busy => {
+                debug!(
+                    "Deferring final pointer state {} at {}: too many finality checks running",
+                    hex::encode(state.state_id),
+                    hex::encode(state.address)
+                );
+                Some(PointerPutResponse::Error(ProtocolError::Internal(
+                    "too many finality checks running; try again".to_string(),
+                )))
+            }
+        }
     }
 
     /// Handle a pointer GET.
@@ -399,8 +562,9 @@ fn cross_kind_refusal(address: XorName, chunk_present: Result<bool>) -> Option<P
 mod tests {
     use super::*;
     use crate::payment::{EvmVerifierConfig, PriceFloorConfig};
-    use ant_protocol::pointer::{Pointer, PointerTarget, PointerTargetKind};
+    use ant_protocol::pointer::{Pointer, PointerTarget, PointerTargetKind, FINAL_COUNTER};
     use saorsa_pqc::api::sig::{ml_dsa_65, MlDsaPublicKey, MlDsaSecretKey};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn keypair(seed: u8) -> (MlDsaPublicKey, MlDsaSecretKey) {
         ml_dsa_65().generate_keypair_from_seed(&[seed; 32])
@@ -779,6 +943,372 @@ mod tests {
             .expect("get")
             .expect("present");
         assert_eq!(held.counter(), u64::MAX);
+    }
+
+    /// A close group whose answer to the finality question is fixed, and
+    /// which counts how often it was asked.
+    struct StubWitness {
+        answer: FinalityCheck,
+        proven: Option<PointerState>,
+        asked: AtomicUsize,
+        forgotten: AtomicUsize,
+    }
+
+    impl StubWitness {
+        fn answering(answer: FinalityCheck) -> Arc<Self> {
+            Arc::new(Self {
+                answer,
+                proven: None,
+                asked: AtomicUsize::new(0),
+                forgotten: AtomicUsize::new(0),
+            })
+        }
+
+        /// One that already proved `conflict` in an earlier check.
+        fn having_proven(conflict: PointerState) -> Arc<Self> {
+            Arc::new(Self {
+                answer: FinalityCheck::Clear,
+                proven: Some(conflict),
+                asked: AtomicUsize::new(0),
+                forgotten: AtomicUsize::new(0),
+            })
+        }
+
+        fn asked(&self) -> usize {
+            self.asked.load(Ordering::SeqCst)
+        }
+    }
+
+    impl FinalStateWitness for StubWitness {
+        fn check_final<'a>(&'a self, _state: &'a PointerState) -> BoxFuture<'a, FinalityCheck> {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            let answer = self.answer;
+            Box::pin(async move { answer })
+        }
+
+        fn proven_conflict(&self, state: &PointerState) -> Option<PointerState> {
+            self.proven
+                .filter(|proven| proven.state_id != state.state_id)
+        }
+
+        fn forget_clear(&self, _state: &PointerState) {
+            self.forgotten.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn final_state(seed: u8, target_byte: u8) -> Pointer {
+        let (pk, sk) = keypair(seed);
+        let target = PointerTarget::new(PointerTargetKind::Pointer, [target_byte; 32]);
+        Pointer::sign(&sk, &pk, FINAL_COUNTER, target).expect("sign")
+    }
+
+    #[tokio::test]
+    async fn a_final_state_the_group_proves_is_already_superseded_is_refused() {
+        // The node has the pointer's ordinary state and has never seen a final
+        // one, so the merge rule alone would take this. The group proves the
+        // owner already finalized it elsewhere, so it is refused, named as the
+        // state that got there first, and nothing is written.
+        let (service, _dir) = service().await;
+        let current = signed(1, 3, 1);
+        service.handle_put(put(&current)).await;
+
+        let established = final_state(1, 0xAA);
+        let late = final_state(1, 0x01);
+        let witness = StubWitness::answering(FinalityCheck::Conflict(established.state()));
+        service.attach_final_state_witness(witness.clone());
+
+        match service.handle_put(put(&late)).await {
+            PointerPutResponse::Stale { address, state_id } => {
+                assert_eq!(address, late.address());
+                assert_eq!(
+                    state_id,
+                    established.state_id(),
+                    "the first final state is named"
+                );
+            }
+            other => panic!("a second final state must be refused, got {other:?}"),
+        }
+        assert_eq!(witness.asked(), 1);
+        assert_eq!(
+            service.store().state_id(&late.address()),
+            Some(current.state_id()),
+            "nothing was written"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_final_state_nobody_contradicts_is_taken() {
+        // Silence is not evidence: a group that proves nothing lets the final
+        // state through on the merge rule.
+        let (service, _dir) = service().await;
+        let witness = StubWitness::answering(FinalityCheck::Clear);
+        service.attach_final_state_witness(witness.clone());
+
+        let transfer = final_state(2, 0x42);
+        assert!(matches!(
+            service.handle_put(put(&transfer)).await,
+            PointerPutResponse::Success { .. }
+        ));
+        assert_eq!(witness.asked(), 1);
+        assert_eq!(
+            service.store().state_id(&transfer.address()),
+            Some(transfer.state_id())
+        );
+    }
+
+    #[tokio::test]
+    async fn the_group_is_asked_only_about_a_final_state_the_node_lacks() {
+        // A lower counter can always be replaced later, so it is taken without
+        // a round trip. A node already holding a final state has its answer
+        // from the merge rule before any round trip: the same state is
+        // unchanged, and any other is stale.
+        let (service, _dir) = service().await;
+        let witness = StubWitness::answering(FinalityCheck::Clear);
+        service.attach_final_state_witness(witness.clone());
+
+        for counter in [0u64, 1, u64::MAX - 1] {
+            assert!(matches!(
+                service.handle_put(put(&signed(3, counter, 1))).await,
+                PointerPutResponse::Success { .. }
+            ));
+        }
+        assert_eq!(witness.asked(), 0, "no final state yet, no question");
+
+        let first = final_state(3, 0x10);
+        assert!(matches!(
+            service.handle_put(put(&first)).await,
+            PointerPutResponse::Success { .. }
+        ));
+        assert_eq!(witness.asked(), 1);
+
+        let second = final_state(3, 0x01);
+        match service.handle_put(put(&second)).await {
+            PointerPutResponse::Stale { state_id, .. } => {
+                assert_eq!(state_id, first.state_id());
+            }
+            other => panic!("a second final state must be stale, got {other:?}"),
+        }
+        assert!(matches!(
+            service.handle_put(put(&final_state(3, 0x10))).await,
+            PointerPutResponse::Unchanged { .. }
+        ));
+        assert_eq!(witness.asked(), 1, "a held final state answers for itself");
+    }
+
+    #[tokio::test]
+    async fn a_node_restores_its_own_lost_final_state_without_asking() {
+        // The node took a final state, then lost the file. The group holds
+        // the other side of a fork, which a check would prove. Asking would
+        // keep the node from restoring what it already took, for good; the
+        // lost state itself is the one thing it is admitted, so nobody is
+        // asked, and the rival is still refused.
+        let (service, _dir) = service().await;
+        let own = final_state(5, 0x10);
+        let rival = final_state(5, 0x01);
+        assert!(matches!(
+            service.handle_put(put(&own)).await,
+            PointerPutResponse::Success { .. }
+        ));
+        std::fs::remove_file(service.store().file_for(&own.address())).expect("remove");
+        assert!(service
+            .store()
+            .get(&own.address())
+            .await
+            .expect("get")
+            .is_none());
+
+        let witness = StubWitness::answering(FinalityCheck::Conflict(rival.state()));
+        service.attach_final_state_witness(witness.clone());
+        assert!(matches!(
+            service.handle_put(put(&own)).await,
+            PointerPutResponse::Success { .. }
+        ));
+        assert_eq!(witness.asked(), 0, "restoring its own state asks nobody");
+        assert_eq!(
+            service.store().state_id(&own.address()),
+            Some(own.state_id())
+        );
+        std::fs::remove_file(service.store().file_for(&own.address())).expect("remove");
+        assert!(service
+            .store()
+            .get(&own.address())
+            .await
+            .expect("get")
+            .is_none());
+        match service.handle_put(put(&rival)).await {
+            PointerPutResponse::Stale { state_id, .. } => {
+                assert_eq!(
+                    state_id,
+                    own.state_id(),
+                    "the rival is told which state won"
+                );
+            }
+            other => panic!("the rival must be stale, got {other:?}"),
+        }
+    }
+
+    /// A group that answers clear while, meanwhile, a rival final state
+    /// lands on this node: the race a clear look can lose.
+    struct RacingWitness {
+        store: PointerStore,
+        rival: Pointer,
+        forgotten: AtomicUsize,
+    }
+
+    impl FinalStateWitness for RacingWitness {
+        fn check_final<'a>(&'a self, _state: &'a PointerState) -> BoxFuture<'a, FinalityCheck> {
+            Box::pin(async move {
+                self.store
+                    .put_bytes(&self.rival.to_bytes())
+                    .await
+                    .expect("the rival lands");
+                FinalityCheck::Clear
+            })
+        }
+
+        fn proven_conflict(&self, _state: &PointerState) -> Option<PointerState> {
+            None
+        }
+
+        fn forget_clear(&self, _state: &PointerState) {
+            self.forgotten.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cleared_final_state_whose_write_fails_is_looked_for_again() {
+        // The look found nothing, but a rival final state landed while it
+        // looked, so the write it cleared comes back stale. The clear answer
+        // must not outlive that write: a retry has to look again.
+        let (landing, _other) = service().await;
+        let (service, _dir) = service().await;
+        let witness = Arc::new(RacingWitness {
+            store: service.store().clone(),
+            rival: final_state(8, 0x01),
+            forgotten: AtomicUsize::new(0),
+        });
+        service.attach_final_state_witness(witness.clone());
+        assert!(matches!(
+            service.handle_put(put(&final_state(8, 0x42))).await,
+            PointerPutResponse::Stale { .. }
+        ));
+        assert_eq!(witness.forgotten.load(Ordering::SeqCst), 1);
+
+        // A write that lands keeps its answer.
+        let witness = StubWitness::answering(FinalityCheck::Clear);
+        landing.attach_final_state_witness(witness.clone());
+        assert!(matches!(
+            landing.handle_put(put(&final_state(9, 0x42))).await,
+            PointerPutResponse::Success { .. }
+        ));
+        assert_eq!(witness.forgotten.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_busy_check_neither_takes_nor_refuses_a_final_state_for_good() {
+        let (service, _dir) = service().await;
+        let current = signed(6, 3, 1);
+        service.handle_put(put(&current)).await;
+        let witness = StubWitness::answering(FinalityCheck::Busy);
+        service.attach_final_state_witness(witness.clone());
+
+        let transfer = final_state(6, 0x42);
+        assert!(matches!(
+            service.handle_put(put(&transfer)).await,
+            PointerPutResponse::Error(ProtocolError::Internal(_))
+        ));
+        assert_eq!(witness.asked(), 1);
+        assert_eq!(
+            service.store().state_id(&transfer.address()),
+            Some(current.state_id()),
+            "nothing was written"
+        );
+        assert!(
+            service.store().admits(&transfer.state()),
+            "and the state can still be taken later"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_proven_conflict_is_refused_again_before_any_signature_check() {
+        // Replaying a paid final state that already lost costs a node
+        // nothing: the refusal comes from what an earlier check proved, ahead
+        // of the signature check and without asking the group. A record
+        // whose signature does not even verify shows the order.
+        let (unwitnessed, _other) = service().await;
+        let (service, _dir) = service().await;
+        let established = final_state(7, 0xAA);
+        let late = final_state(7, 0x01);
+        let witness = StubWitness::having_proven(established.state());
+        service.attach_final_state_witness(witness.clone());
+
+        let mut forged = late.to_bytes();
+        if let Some(last) = forged.last_mut() {
+            *last ^= 0xFF;
+        }
+        match service
+            .handle_put(PointerPutRequest::new(Bytes::from(forged.clone())))
+            .await
+        {
+            PointerPutResponse::Stale { state_id, .. } => {
+                assert_eq!(state_id, established.state_id());
+            }
+            other => panic!("a proven loser must be refused as stale, got {other:?}"),
+        }
+        assert_eq!(witness.asked(), 0, "and nobody is asked again");
+        assert!(
+            matches!(
+                unwitnessed
+                    .handle_put(PointerPutRequest::new(Bytes::from(forged.clone())))
+                    .await,
+                PointerPutResponse::Error(_)
+            ),
+            "the record really does fail its signature check"
+        );
+
+        // The proven state itself is not refused by its own proof.
+        assert!(matches!(
+            service.handle_put(put(&established)).await,
+            PointerPutResponse::Success { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn two_final_states_raced_to_two_nodes_leave_each_on_its_first() {
+        // The one fork ADR-0018 allows: the owner signs two final states and
+        // sends one to each node before either has heard of the other. Each
+        // keeps what it took first and refuses the other, whichever sorts
+        // first. Nothing on a node can settle it; a reader decides by how many
+        // of the group hold each side.
+        let (first_node, _a) = service().await;
+        let (second_node, _b) = service().await;
+        let one = final_state(4, 0x09);
+        let other = final_state(4, 0x01);
+
+        assert!(matches!(
+            first_node.handle_put(put(&one)).await,
+            PointerPutResponse::Success { .. }
+        ));
+        assert!(matches!(
+            second_node.handle_put(put(&other)).await,
+            PointerPutResponse::Success { .. }
+        ));
+        assert!(matches!(
+            first_node.handle_put(put(&other)).await,
+            PointerPutResponse::Stale { .. }
+        ));
+        assert!(matches!(
+            second_node.handle_put(put(&one)).await,
+            PointerPutResponse::Stale { .. }
+        ));
+        assert_eq!(
+            first_node.store().state_id(&one.address()),
+            Some(one.state_id())
+        );
+        assert_eq!(
+            second_node.store().state_id(&other.address()),
+            Some(other.state_id())
+        );
     }
 
     #[test]

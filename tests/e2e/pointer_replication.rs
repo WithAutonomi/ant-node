@@ -25,7 +25,9 @@ use ant_node::replication::protocol::{
 };
 use ant_node::replication::slice::nonced_block_root;
 use ant_node::ReplicationConfig;
-use ant_protocol::pointer::{Pointer, PointerState, PointerTarget, PointerTargetKind};
+use ant_protocol::pointer::{
+    Pointer, PointerState, PointerTarget, PointerTargetKind, FINAL_COUNTER,
+};
 use bytes::Bytes;
 use saorsa_core::identity::PeerId;
 use saorsa_pqc::api::sig::{ml_dsa_65, MlDsaPublicKey, MlDsaSecretKey};
@@ -56,6 +58,18 @@ fn signed(pk: &MlDsaPublicKey, sk: &MlDsaSecretKey, counter: u64, target: u8) ->
         pk,
         counter,
         PointerTarget::new(PointerTargetKind::Chunk, [target; 32]),
+    )
+    .expect("sign")
+}
+
+/// The final state that hands `pk`'s pointer over to the pointer at
+/// `recipient` (ADR-0018).
+fn transfer(pk: &MlDsaPublicKey, sk: &MlDsaSecretKey, recipient: u8) -> Pointer {
+    Pointer::sign(
+        sk,
+        pk,
+        FINAL_COUNTER,
+        PointerTarget::new(PointerTargetKind::Pointer, [recipient; 32]),
     )
     .expect("sign")
 }
@@ -456,6 +470,177 @@ async fn the_possession_check_penalises_only_a_member_that_dropped_the_record() 
     assert!(
         checker_p2p.peer_trust(&keeper_peer) >= keeper_before,
         "the member that holds the record was penalised"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// A transfer written to one node reaches the whole group, and after that no
+/// node takes a second final state — not even one whose target sorts first,
+/// which the previous merge rule let displace the first everywhere (ADR-0018).
+#[tokio::test]
+#[serial]
+async fn a_transfer_reaches_the_group_and_no_node_takes_a_second_one() {
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let (pk, sk) = owner();
+    let created = signed(&pk, &sk, 0, 1);
+    let handed_over = transfer(&pk, &sk, 0x77);
+    let take_back = transfer(&pk, &sk, 0x01);
+    assert!(take_back.target().to_bytes() < handed_over.target().to_bytes());
+    for record in [&created, &handed_over, &take_back] {
+        mark_paid(&harness, record);
+    }
+
+    put(harness.test_node(1).expect("node"), &created).await;
+    for i in 0..harness.node_count() {
+        assert!(
+            wait_for(&harness, i, &created).await,
+            "node {i} lacks the create"
+        );
+    }
+    match put(harness.test_node(2).expect("node"), &handed_over).await {
+        PointerPutResponse::Success { state_id, .. } => {
+            assert_eq!(state_id, handed_over.state_id());
+        }
+        other => panic!("the transfer was refused: {other:?}"),
+    }
+    for i in 0..harness.node_count() {
+        assert!(
+            wait_for(&harness, i, &handed_over).await,
+            "node {i} never received the transfer"
+        );
+    }
+
+    // The former owner, paid up, tries to take it back on every node.
+    for i in 0..harness.node_count() {
+        match put(harness.test_node(i).expect("node"), &take_back).await {
+            PointerPutResponse::Stale { state_id, .. } => assert_eq!(
+                state_id,
+                handed_over.state_id(),
+                "node {i} must name the transfer it holds"
+            ),
+            other => panic!("node {i} took a second final state: {other:?}"),
+        }
+        assert!(holds(harness.test_node(i).expect("node"), &handed_over));
+    }
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// A node that never heard of a transfer — one that joined after it, or lost
+/// its copy — would take any final state on the merge rule alone. Before it
+/// does, it asks its group, and a peer that serves the transfer it holds is
+/// proof enough to refuse the second one.
+#[tokio::test]
+#[serial]
+async fn a_node_that_missed_the_transfer_refuses_another_its_group_proves() {
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let (pk, sk) = owner();
+    let created = signed(&pk, &sk, 0, 1);
+    let handed_over = transfer(&pk, &sk, 0x77);
+    let second = transfer(&pk, &sk, 0x01);
+    mark_paid(&harness, &second);
+    mark_paid(&harness, &handed_over);
+
+    // Everyone holds the create, and learns everyone else understands
+    // pointers while there is nothing newer to hint.
+    let everyone: Vec<usize> = (0..harness.node_count()).collect();
+    for i in &everyone {
+        store(harness.test_node(*i).expect("node"))
+            .put_bytes(&created.to_bytes())
+            .await
+            .expect("put");
+    }
+    exchange_hints(&harness, &everyone, &everyone).await;
+
+    // The transfer lands everywhere but one node, written straight into the
+    // stores so nothing replicates or hints it there.
+    let unaware = 4;
+    for i in others(&harness, &[unaware]) {
+        store(harness.test_node(i).expect("node"))
+            .put_bytes(&handed_over.to_bytes())
+            .await
+            .expect("put");
+    }
+    let node = harness.test_node(unaware).expect("node");
+    assert!(
+        holds(node, &created),
+        "the unaware node has only the create"
+    );
+
+    match put(node, &second).await {
+        PointerPutResponse::Stale { state_id, .. } => assert_eq!(
+            state_id,
+            handed_over.state_id(),
+            "the refusal names the transfer the group proved"
+        ),
+        other => panic!("the unaware node took a second final state: {other:?}"),
+    }
+    assert!(holds(node, &created), "nothing was written");
+
+    // The transfer the group holds is not refused: it is no conflict.
+    match put(node, &handed_over).await {
+        PointerPutResponse::Success { state_id, .. } => {
+            assert_eq!(state_id, handed_over.state_id());
+        }
+        other => panic!("the group's own transfer was refused: {other:?}"),
+    }
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// Two different final states are a fork only the owner can make, by racing
+/// them. A member holding the other side took what reached it first, as the
+/// merge rule says; the possession check does not penalise it for the owner's
+/// fork, while it still penalises a member that holds nothing.
+#[tokio::test]
+#[serial]
+async fn the_possession_check_does_not_penalise_the_other_side_of_a_fork() {
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let (pk, sk) = owner();
+    let one_side = transfer(&pk, &sk, 0x77);
+    let other_side = transfer(&pk, &sk, 0x01);
+    let checker = 3;
+    let forked = 1;
+    let dropper = 2;
+    for i in others(&harness, &[forked, dropper]) {
+        store(harness.test_node(i).expect("node"))
+            .put_bytes(&one_side.to_bytes())
+            .await
+            .expect("put");
+    }
+    store(harness.test_node(forked).expect("node"))
+        .put_bytes(&other_side.to_bytes())
+        .await
+        .expect("put");
+
+    let everyone: Vec<usize> = (0..harness.node_count()).collect();
+    exchange_hints(&harness, &everyone, &[checker]).await;
+
+    let checker_node = harness.test_node(checker).expect("node");
+    let checker_p2p = checker_node.p2p_node.as_ref().expect("p2p");
+    let forked_peer = peer(harness.test_node(forked).expect("node"));
+    let dropper_peer = peer(harness.test_node(dropper).expect("node"));
+    let forked_before = checker_p2p.peer_trust(&forked_peer);
+    let dropper_before = checker_p2p.peer_trust(&dropper_peer);
+
+    replication(checker_node)
+        .check_possession(one_side.state(), &[forked_peer, dropper_peer])
+        .await;
+
+    assert!(
+        checker_p2p.peer_trust(&forked_peer) >= forked_before,
+        "the member holding the other final state was penalised"
+    );
+    assert!(
+        checker_p2p.peer_trust(&dropper_peer) < dropper_before,
+        "the member holding nothing was not penalised"
     );
 
     harness.teardown().await.expect("teardown");

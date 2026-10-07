@@ -68,6 +68,7 @@ use crate::payment::{
     MIN_PAYMENT_PROOF_SIZE_BYTES,
 };
 use crate::pointer::store::PointerStore;
+use crate::pointer::{FinalStateWitness, PointerService};
 use crate::replication::audit::AuditTickResult;
 use crate::replication::audit_coordinator::AuditChallengeCoordinator;
 use crate::replication::audit_metrics::{
@@ -2228,6 +2229,10 @@ impl ReplicationEngine {
     /// Replicate pointers too (ADR-0016): the records in `store`, and the
     /// fresh writes the pointer PUT handler sends on `fresh_writes`.
     ///
+    /// The PUT handler is not wired to ask this engine anything before it
+    /// takes a final state (ADR-0018); [`Self::with_pointer_service`] wires
+    /// both.
+    ///
     /// Call before [`Self::start`].
     pub fn with_pointers(
         &mut self,
@@ -2246,6 +2251,22 @@ impl ReplicationEngine {
             self.detached_task_tracker.clone(),
         )));
         self.pointer_fresh_rx = Some(fresh_writes);
+    }
+
+    /// Replicate the pointers `service` stores (ADR-0016), and wire the
+    /// service to this engine both ways: it hands each newly stored paid
+    /// state here to be offered on, and asks here before it takes a final
+    /// state (ADR-0018).
+    ///
+    /// Call before [`Self::start`].
+    pub fn with_pointer_service(&mut self, service: &PointerService) {
+        let (writes, fresh_writes) = mpsc::unbounded_channel();
+        service.attach_fresh_writes(writes);
+        self.with_pointers(service.store().clone(), fresh_writes);
+        if let Some(replication) = &self.pointers {
+            let witness: Arc<dyn FinalStateWitness> = replication.clone();
+            service.attach_final_state_witness(witness);
+        }
     }
 
     /// The pointer replication, when enabled. Tests use it to drive rounds.
