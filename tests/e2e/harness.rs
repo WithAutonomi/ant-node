@@ -379,6 +379,19 @@ impl TestHarness {
         self.network.node_mut(index)
     }
 
+    /// Pre-populate the payment cache on every node.
+    ///
+    /// The source of a write and every receiver of its fresh offers and
+    /// `PaidNotify` then accept a dummy proof for `address`, as if it had
+    /// been paid for on chain (no Anvil runs in most suites).
+    pub fn prepopulate_payment_cache_everywhere(&self, address: &XorName) {
+        for node in self.network.nodes() {
+            if let Some(ref protocol) = node.ant_protocol {
+                protocol.payment_verifier().cache_insert(*address);
+            }
+        }
+    }
+
     /// Pre-populate the payment cache on the node matching `peer_id`.
     ///
     /// Inserts `address` into the target node's payment verifier cache so

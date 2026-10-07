@@ -79,11 +79,12 @@ use crate::replication::commitment_state::{
     PeerCommitmentRecord, PersistedRetention, ResponderCommitmentState, GOSSIP_ANSWERABILITY_TTL,
 };
 use crate::replication::config::{
-    max_parallel_fetch, storage_admission_width, ReplicationConfig, MAX_AUDIT_RESPONSES_PER_PEER,
-    MAX_CONCURRENT_AUDIT_RESPONSES, MAX_CONCURRENT_REPLICATION_SENDS,
-    MAX_DIGEST_AUDIT_RESPONSES_PER_PEER, MAX_INCOMING_VERIFICATION_KEYS,
-    MAX_SUBTREE_ROUND1_PER_PEER, MAX_SUBTREE_SESSIONS, MAX_VERIFICATION_KEYS_PER_CYCLE,
-    REPLICATION_PROTOCOL_ID, SUBTREE_AUDIT_PROTOCOL_ID, SUBTREE_ROUND1_WORK_BURST_BYTES,
+    fresh_read_retry_delay, max_parallel_fetch, storage_admission_width, ReplicationConfig,
+    MAX_AUDIT_RESPONSES_PER_PEER, MAX_CONCURRENT_AUDIT_RESPONSES, MAX_CONCURRENT_REPLICATION_SENDS,
+    MAX_DIGEST_AUDIT_RESPONSES_PER_PEER, MAX_FRESH_READ_ATTEMPTS, MAX_INCOMING_VERIFICATION_KEYS,
+    MAX_PENDING_FRESH_OFFERS, MAX_SESSION_POINTER_BINDINGS, MAX_SUBTREE_ROUND1_PER_PEER,
+    MAX_SUBTREE_SESSIONS, MAX_VERIFICATION_KEYS_PER_CYCLE, REPLICATION_PROTOCOL_ID,
+    SUBTREE_AUDIT_PROTOCOL_ID, SUBTREE_ROUND1_WORK_BURST_BYTES,
     SUBTREE_ROUND1_WORK_REFILL_BYTES_PER_SEC, SUBTREE_SESSION_TTL,
 };
 use crate::replication::paid_list::PaidList;
@@ -94,6 +95,7 @@ use crate::replication::protocol::{
 use crate::replication::quorum::KeyVerificationOutcome;
 use crate::replication::recent_provers::RecentProvers;
 use crate::replication::scheduling::{CapacityDisplacement, DeferralOutcome, ReplicationQueues};
+use crate::replication::storage_commitment_audit::PointerBindings;
 use crate::replication::types::{
     AuditFailureReason, BootstrapClaimObservation, BootstrapState, FailureEvidence,
     NeighborSyncState, PeerSyncRecord, PresenceEvidence, RepairProofs, VerificationEntry,
@@ -1748,6 +1750,11 @@ pub struct ReplicationEngine {
     /// Limits concurrent outbound replication sends to prevent bandwidth
     /// saturation on home broadband connections.
     send_semaphore: Arc<Semaphore>,
+    /// Bounds how many encoded fresh offers can wait behind `send_semaphore`;
+    /// see [`MAX_PENDING_FRESH_OFFERS`].
+    pending_offer_semaphore: Arc<Semaphore>,
+    /// Fresh offers encoded and handed to their per-peer sends.
+    fresh_offers_dispatched: Arc<AtomicU64>,
     /// Bounds concurrent IN-FLIGHT LIGHT audit-responder tasks (responsible-chunk
     /// audits + subtree slice round 2). The heavy subtree round 1 has its own
     /// tighter pool ([`SubtreeRound1Limiter`]). Those are spawned off the serial
@@ -1814,16 +1821,18 @@ pub struct ReplicationEngine {
     subtree_round1: SubtreeRound1Limiter,
     /// Receiver for fresh-write events from the chunk PUT handler.
     ///
-    /// When present, `start()` spawns a drainer task that calls
-    /// `replicate_fresh` for each event.
+    /// When present, `start()` spawns the fresh-write drainer, which records
+    /// paid-list evidence for each event immediately and forwards it to the
+    /// offer dispatcher.
     fresh_write_rx: Option<mpsc::UnboundedReceiver<fresh::FreshWriteEvent>>,
     /// Pointer replication (ADR-0016), when this node stores pointers.
     pointers: Option<Arc<pointer::PointerReplication>>,
     /// Receiver for fresh pointer writes, taken by `start()`.
     pointer_fresh_rx: Option<mpsc::UnboundedReceiver<pointer::PointerFreshWrite>>,
-    /// Sender for delayed possession-check events (ADR-0003). The fresh-write
-    /// drainer pushes the responsible close-group peers here after each fresh
-    /// replication; the possession-check scheduler drains the paired receiver.
+    /// Sender for delayed possession-check events (ADR-0003). Sending a write's
+    /// fresh offers (`fresh::send_fresh_offers`) pushes its responsible
+    /// close-group peers here; the possession-check scheduler drains the paired
+    /// receiver.
     possession_check_tx: mpsc::UnboundedSender<possession::PossessionCheckEvent>,
     /// Receiver paired with `possession_check_tx`; taken by the scheduler task.
     possession_check_rx: Option<mpsc::UnboundedReceiver<possession::PossessionCheckEvent>>,
@@ -1917,6 +1926,8 @@ impl ReplicationEngine {
             recent_provers: Arc::new(RwLock::new(RecentProvers::new())),
             sig_verify_attempts: Arc::new(RwLock::new(HashMap::new())),
             send_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_REPLICATION_SENDS)),
+            pending_offer_semaphore: Arc::new(Semaphore::new(MAX_PENDING_FRESH_OFFERS)),
+            fresh_offers_dispatched: Arc::new(AtomicU64::new(0)),
             audit_responder_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_AUDIT_RESPONSES)),
             audit_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
             audit_responder_metrics: Arc::new(AuditResponderMetrics::default()),
@@ -2244,6 +2255,38 @@ impl ReplicationEngine {
         self.pointers.as_ref()
     }
 
+    /// Test-only: pending-offer permits not currently held by an encoded
+    /// fresh offer. Equals [`MAX_PENDING_FRESH_OFFERS`] when no fresh
+    /// replication is in flight, which is how tests prove a burst of writes
+    /// drained without leaking a permit.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn pending_offer_permits_available(&self) -> usize {
+        self.pending_offer_semaphore.available_permits()
+    }
+
+    /// Test-only: fresh offers encoded and handed to their per-peer sends
+    /// since the engine was created. A write skipped because its chunk is gone
+    /// is not counted.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn fresh_offers_dispatched(&self) -> u64 {
+        self.fresh_offers_dispatched.load(Ordering::Relaxed)
+    }
+
+    /// Test-only: take every outbound replication send permit. Until the
+    /// returned permit is dropped, encoded fresh offers wait behind the send
+    /// stage, so a test can fill the pending-offer budget deterministically.
+    /// The send semaphore is never closed, so this returns `Some`.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn hold_replication_sends(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let all = u32::try_from(MAX_CONCURRENT_REPLICATION_SENDS).ok()?;
+        Arc::clone(&self.send_semaphore)
+            .acquire_many_owned(all)
+            .await
+            .ok()
+    }
+
     /// Start all background tasks.
     ///
     /// `dht_events` must be subscribed **before** `P2PNode::start()` so that
@@ -2271,7 +2314,7 @@ impl ReplicationEngine {
         self.start_fetch_worker();
         self.start_verification_worker();
         self.start_bootstrap_sync(dht_events);
-        self.start_fresh_write_drainer();
+        self.start_fresh_replication();
         self.start_possession_check_scheduler();
         if let Some(pointers) = &self.pointers {
             self.task_handles.push(pointers.start_verification_loop());
@@ -2410,26 +2453,47 @@ impl ReplicationEngine {
         self.sync_trigger.notify_one();
     }
 
-    /// Execute fresh replication for a newly stored record, then schedule the
-    /// delayed possession check for the responsible close-group peers
-    /// (ADR-0003). The production PUT path schedules via the fresh-write
-    /// drainer; this direct entry point schedules here so callers (and tests)
-    /// that drive replication directly still get the possession check.
+    /// Execute fresh replication for a newly stored record: announce it, then
+    /// send its offers and schedule the delayed possession check for the
+    /// responsible close-group peers (ADR-0003), as the PUT path does.
+    ///
+    /// Unlike the PUT path, this waits for a pending-offer permit before
+    /// returning, and it offers the caller's bytes rather than reading them
+    /// back from storage.
     pub async fn replicate_fresh(&self, key: &XorName, data: &[u8], proof_of_payment: &[u8]) {
-        let peers = fresh::replicate_fresh(
+        fresh::announce_paid_write(
             key,
-            data,
             proof_of_payment,
-            &self.p2p_node,
             &self.paid_list,
+            &self.p2p_node,
             &self.config,
-            &self.send_semaphore,
         )
         .await;
-        if !peers.is_empty() {
-            let _ = self
-                .possession_check_tx
-                .send(possession::PossessionCheckEvent { key: *key, peers });
+        // Never closed, so this cannot fail; the arm keeps the call panic-free.
+        let Ok(pending_offer) = Arc::clone(&self.pending_offer_semaphore)
+            .acquire_owned()
+            .await
+        else {
+            return;
+        };
+        fresh::send_fresh_offers(
+            &self.fresh_offer_context(),
+            key,
+            data.to_vec(),
+            proof_of_payment.to_vec(),
+            pending_offer,
+        )
+        .await;
+    }
+
+    /// Handles the offer dispatcher and the direct entry point share.
+    fn fresh_offer_context(&self) -> fresh::FreshOfferContext {
+        fresh::FreshOfferContext {
+            p2p_node: Arc::clone(&self.p2p_node),
+            config: Arc::clone(&self.config),
+            send_semaphore: Arc::clone(&self.send_semaphore),
+            possession_check_tx: self.possession_check_tx.clone(),
+            dispatched: Arc::clone(&self.fresh_offers_dispatched),
         }
     }
 
@@ -2437,48 +2501,171 @@ impl ReplicationEngine {
     // Background task launchers
     // =======================================================================
 
-    /// Spawn a task that drains the fresh-write channel and triggers
-    /// replication for each newly-stored chunk.
-    fn start_fresh_write_drainer(&mut self) {
-        let Some(mut rx) = self.fresh_write_rx.take() else {
+    /// Spawn fresh replication's two stages, joined by an unbounded FIFO of
+    /// key + proof events: the drainer, which announces every write at arrival
+    /// rate, and the offer dispatcher, the only permit-gated stage.
+    fn start_fresh_replication(&mut self) {
+        let Some(writes) = self.fresh_write_rx.take() else {
             return;
         };
+        let (offer_tx, offer_rx) = mpsc::unbounded_channel();
+        self.start_fresh_write_drainer(writes, offer_tx.clone());
+        self.start_fresh_offer_dispatcher(offer_rx, offer_tx);
+    }
+
+    /// Spawn a task that drains the fresh-write channel: it announces each
+    /// newly-stored chunk and hands it to the offer dispatcher.
+    fn start_fresh_write_drainer(
+        &mut self,
+        mut rx: mpsc::UnboundedReceiver<fresh::FreshWriteEvent>,
+        offer_tx: mpsc::UnboundedSender<fresh::FreshOfferEvent>,
+    ) {
         let p2p = Arc::clone(&self.p2p_node);
         let paid_list = Arc::clone(&self.paid_list);
         let config = Arc::clone(&self.config);
-        let send_semaphore = Arc::clone(&self.send_semaphore);
-        let possession_tx = self.possession_check_tx.clone();
         let shutdown = self.shutdown.clone();
 
         let handle = tokio::spawn(async move {
             loop {
-                tokio::select! {
+                let event = tokio::select! {
                     () = shutdown.cancelled() => break,
                     event = rx.recv() => {
                         let Some(event) = event else { break };
-                        let peers = fresh::replicate_fresh(
-                            &event.key,
-                            &event.data,
-                            &event.payment_proof,
-                            &p2p,
-                            &paid_list,
-                            &config,
-                            &send_semaphore,
-                        )
-                        .await;
-                        // Schedule the delayed possession check (ADR-0003) for
-                        // the responsible close-group peers. A closed receiver
-                        // (engine shutting down) is ignored.
-                        if !peers.is_empty() {
-                            let _ = possession_tx.send(possession::PossessionCheckEvent {
-                                key: event.key,
-                                peers,
-                            });
-                        }
+                        event
                     }
+                };
+                // Stage one never waits for chunk back-pressure: the paid-list
+                // entry and PaidNotify are what let peers repair the key later,
+                // so every queued write gets them at arrival rate.
+                fresh::announce_paid_write(
+                    &event.key,
+                    &event.payment_proof,
+                    &paid_list,
+                    &p2p,
+                    &config,
+                )
+                .await;
+                if offer_tx
+                    .send(fresh::FreshOfferEvent {
+                        key: event.key,
+                        payment_proof: event.payment_proof,
+                        read_attempts: 0,
+                    })
+                    .is_err()
+                {
+                    break;
                 }
             }
             debug!("Fresh-write drainer shut down");
+        });
+        self.task_handles.push(handle);
+    }
+
+    /// Spawn the fresh-offer dispatcher: the only stage of fresh replication
+    /// that waits for a pending-offer permit.
+    ///
+    /// For each forwarded write it acquires a permit, reads the chunk back
+    /// from storage and dispatches the offers. A missing chunk is skipped; a
+    /// failed read is retried up to `MAX_FRESH_READ_ATTEMPTS` times, backing
+    /// off over about a minute with the permit released in between, so a
+    /// transient I/O fault does not lose the write's replication. The retry
+    /// waits on its own task, never on the dispatcher.
+    fn start_fresh_offer_dispatcher(
+        &mut self,
+        mut rx: mpsc::UnboundedReceiver<fresh::FreshOfferEvent>,
+        offer_tx: mpsc::UnboundedSender<fresh::FreshOfferEvent>,
+    ) {
+        let storage = Arc::clone(&self.storage);
+        let pending_offer_semaphore = Arc::clone(&self.pending_offer_semaphore);
+        let ctx = self.fresh_offer_context();
+        let shutdown = self.shutdown.clone();
+        let retries = self.detached_task_tracker.clone();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let event = tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    event = rx.recv() => {
+                        let Some(event) = event else { break };
+                        event
+                    }
+                };
+                // Wait for a pending-offer permit before touching the chunk so a
+                // send backlog holds queued events, not encoded chunk buffers.
+                let pending_offer = tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    permit = Arc::clone(&pending_offer_semaphore).acquire_owned() => {
+                        let Ok(permit) = permit else { break };
+                        permit
+                    }
+                };
+                let key_hex = hex::encode(event.key);
+                // The same verified read the fetch path serves from. The bytes
+                // were content-checked when they were stored, but they come
+                // off disk now, possibly long after, and every receiver
+                // charges the sender for an offer that does not hash to its
+                // key. A chunk that fails verification is quarantined by this
+                // read, so its retry finds it gone and skips it.
+                let data = match storage.get(&event.key).await {
+                    Ok(Some(data)) => data,
+                    Ok(None) => {
+                        debug!("Chunk {key_hex} no longer stored, skipping fresh replication");
+                        continue;
+                    }
+                    Err(e) => {
+                        // The permit is released as this iteration ends, well
+                        // before any retry is due.
+                        let attempts = event.read_attempts + 1;
+                        if attempts >= MAX_FRESH_READ_ATTEMPTS {
+                            warn!(
+                                "Giving up fresh replication of {key_hex} after {attempts} failed reads: {e}"
+                            );
+                            continue;
+                        }
+                        // One warning per write: a store-wide fault fails the
+                        // whole backlog, once per retry.
+                        if attempts == 1 {
+                            warn!(
+                                "Failed to read chunk {key_hex} for fresh replication; will retry: {e}"
+                            );
+                        } else {
+                            debug!(
+                                "Failed to read chunk {key_hex} for fresh replication (attempt {attempts}): {e}"
+                            );
+                        }
+                        // Wait on a task of its own: a read fault is often
+                        // shared (exhausted descriptors), and sleeping here
+                        // would hold every healthy write queued behind this
+                        // one for the whole delay, once per failed read. The
+                        // delay grows, so a store-wide fault spends a write's
+                        // attempts over about a minute rather than seconds.
+                        let retry_tx = offer_tx.clone();
+                        let retry_shutdown = shutdown.clone();
+                        let delay = fresh_read_retry_delay(attempts);
+                        retries.spawn(async move {
+                            tokio::select! {
+                                () = retry_shutdown.cancelled() => {}
+                                () = tokio::time::sleep(delay) => {
+                                    let _ = retry_tx.send(fresh::FreshOfferEvent {
+                                        read_attempts: attempts,
+                                        ..event
+                                    });
+                                }
+                            }
+                        });
+                        continue;
+                    }
+                };
+                fresh::send_fresh_offers(
+                    &ctx,
+                    &event.key,
+                    data,
+                    event.payment_proof,
+                    pending_offer,
+                )
+                .await;
+            }
+            debug!("Fresh-offer dispatcher shut down");
         });
         self.task_handles.push(handle);
     }
@@ -4642,6 +4829,9 @@ struct SubtreeSession {
     commitment_hash: [u8; 32],
     nonce: [u8; 32],
     inserted: Instant,
+    /// What round 1 bound for each pointer it proved, so round 2 serves that
+    /// record however many updates land in between (ADR-0019).
+    pointer_bindings: PointerBindings,
 }
 
 /// Responder-wide token bucket over the chunk bytes round-1 proof building may
@@ -4805,16 +4995,31 @@ impl SubtreeRound1Limiter {
 
     /// Record a single-use session once a round-1 proof is built and about to be
     /// sent, so the matching round 2 is admitted exactly once.
+    ///
+    /// The session keeps what round 1 bound for each pointer it proved, while
+    /// every live session together holds no more than
+    /// [`MAX_SESSION_POINTER_BINDINGS`] of them. A session whose bindings do
+    /// not fit is not opened and `false` is returned, so its proof is not
+    /// sent and round 1 is answered `Transient` instead: the bindings of
+    /// sessions already answered are never given up, because their round 2 is
+    /// owed them (ADR-0019).
     async fn open_session(
         &self,
         source: PeerId,
         challenge_id: u64,
         commitment_hash: [u8; 32],
         nonce: [u8; 32],
-    ) {
+        pointer_bindings: PointerBindings,
+    ) -> bool {
         let now = Instant::now();
         let mut sessions = self.sessions.write().await;
         sessions.retain(|_, e| now.duration_since(e.inserted) < SUBTREE_SESSION_TTL);
+        // Checked before anything is evicted, so a session refused here costs
+        // no other session its place.
+        let held: usize = sessions.values().map(|e| e.pointer_bindings.len()).sum();
+        if held.saturating_add(pointer_bindings.len()) > MAX_SESSION_POINTER_BINDINGS {
+            return false;
+        }
         if sessions.len() >= MAX_SUBTREE_SESSIONS {
             if let Some(oldest) = sessions
                 .iter()
@@ -4830,21 +5035,24 @@ impl SubtreeRound1Limiter {
                 commitment_hash,
                 nonce,
                 inserted: now,
+                pointer_bindings,
             },
         );
+        true
     }
 
-    /// Atomically consume the round-2 session for this exchange. `true` iff a
+    /// Atomically consume the round-2 session for this exchange. `Some` iff a
     /// live session matching `(source, challenge_id, commitment_hash, nonce)`
-    /// existed (and is now removed); a miss silently drops round 2 to the graced
-    /// timeout lane (sessions are ephemeral and can be lost across a restart).
+    /// existed (and is now removed), carrying what its round 1 bound for each
+    /// pointer; a miss silently drops round 2 to the graced timeout lane
+    /// (sessions are ephemeral and can be lost across a restart).
     async fn consume_session(
         &self,
         source: &PeerId,
         challenge_id: u64,
         commitment_hash: &[u8; 32],
         nonce: &[u8; 32],
-    ) -> bool {
+    ) -> Option<PointerBindings> {
         let mut sessions = self.sessions.write().await;
         let matches = sessions.get(&(*source, challenge_id)).is_some_and(|e| {
             Instant::now().duration_since(e.inserted) < SUBTREE_SESSION_TTL
@@ -4852,17 +5060,21 @@ impl SubtreeRound1Limiter {
                 && &e.nonce == nonce
         });
         if matches {
-            sessions.remove(&(*source, challenge_id));
+            sessions
+                .remove(&(*source, challenge_id))
+                .map(|e| e.pointer_bindings)
+        } else {
+            None
         }
-        matches
     }
 }
 
 /// Outcome of admitting a round-2 slice challenge.
 enum SliceAdmission {
     /// Admitted: the guard holds the global permit and the per-peer slot, and
-    /// the single-use round-1 session has been consumed.
-    Admitted(AuditResponderGuard),
+    /// the single-use round-1 session has been consumed, yielding what its
+    /// round 1 bound for each pointer.
+    Admitted(AuditResponderGuard, PointerBindings),
     /// Refused at a responder ceiling. The round-1 session is left INTACT.
     Capacity(AuditResponderAdmissionFailure),
     /// No live round-1 session matched this challenge.
@@ -4903,7 +5115,7 @@ async fn admit_slice_challenge(
             Ok(guard) => guard,
             Err(failure) => return SliceAdmission::Capacity(failure),
         };
-    if !round1
+    let Some(pointer_bindings) = round1
         .consume_session(
             source,
             challenge.challenge_id,
@@ -4911,13 +5123,13 @@ async fn admit_slice_challenge(
             &challenge.nonce,
         )
         .await
-    {
+    else {
         // Release the permit and per-peer slot before the caller replies: no
         // chunk work follows, so holding them would shrink the pool for nothing.
         drop(guard);
         return SliceAdmission::NoSession;
-    }
-    SliceAdmission::Admitted(guard)
+    };
+    SliceAdmission::Admitted(guard, pointer_bindings)
 }
 
 /// Try to admit one audit-responder task for `source`: take a global permit AND
@@ -5258,16 +5470,42 @@ async fn handle_replication_message(
                 // A round-1 proof authorizes exactly one matching round 2: open a
                 // single-use session so a slice challenge cannot be served without
                 // a live round-1 exchange.
+                let mut response = response;
                 if let crate::replication::protocol::SubtreeAuditResponse::Proof { .. } = &response
                 {
-                    subtree_round1
+                    let opened = subtree_round1
                         .open_session(
                             source,
                             challenge.challenge_id,
                             challenge.expected_commitment_hash,
                             challenge.nonce,
+                            storage_commitment_audit::pointer_bindings(&response),
                         )
                         .await;
+                    // A proof round 2 could not be answered for is not sent.
+                    // The node says so instead, as for a local read error: the
+                    // auditor's timeout lane, with no trust penalty, where
+                    // silence would read as a peer that did not answer
+                    // (ADR-0019).
+                    if !opened {
+                        protocol::record_audit_drop(protocol::AuditDropKind::Subtree);
+                        warn!(
+                            target: "ant_node::replication::audit_responder",
+                            event = "admission_dropped",
+                            kind = "subtree",
+                            responder_class = class.as_str(),
+                            source = %source,
+                            challenge_id = challenge.challenge_id,
+                            request_response = rr_message_id.is_some(),
+                            reason = "pointer_binding_budget",
+                            "Audit responder admission dropped"
+                        );
+                        response = crate::replication::protocol::SubtreeAuditResponse::Rejected {
+                            challenge_id: challenge.challenge_id,
+                            kind: protocol::RejectKind::Transient,
+                            reason: "pointer binding budget full".to_string(),
+                        };
+                    }
                 }
                 let response_kind = subtree_audit_response_kind(&response);
                 let work_items = subtree_audit_response_work_items(&response);
@@ -5310,7 +5548,7 @@ async fn handle_replication_message(
                 "Audit challenge received: kind=slice source={source} request_response={}",
                 rr_message_id.is_some(),
             );
-            let guard = match admit_slice_challenge(
+            let (guard, pointer_bindings) = match admit_slice_challenge(
                 &ctx.audit_responder_semaphore,
                 &ctx.audit_responder_inflight,
                 &ctx.subtree_round1,
@@ -5319,7 +5557,7 @@ async fn handle_replication_message(
             )
             .await
             {
-                SliceAdmission::Admitted(guard) => guard,
+                SliceAdmission::Admitted(guard, pointer_bindings) => (guard, pointer_bindings),
                 SliceAdmission::Capacity(failure) => {
                     protocol::record_audit_drop(protocol::AuditDropKind::Slice);
                     audit_metrics::record_admission_drop(class);
@@ -5415,10 +5653,11 @@ async fn handle_replication_message(
                 let worker_started = Instant::now();
                 let processing_started = Instant::now();
                 let response =
-                    storage_commitment_audit::handle_subtree_slice_challenge_with_pointers(
+                    storage_commitment_audit::handle_subtree_slice_challenge_with_pointer_bindings(
                         &challenge,
                         &storage,
                         pointer_store.as_ref(),
+                        &pointer_bindings,
                         p2p_node.peer_id(),
                         bootstrapping,
                         Some(&my_commitment_state),
@@ -5759,7 +5998,7 @@ fn fresh_offer_structural_rejection(
 
 /// Tell `source` its offer for `key` was not taken.
 ///
-/// Note the sender does not currently read this: `fresh::replicate_fresh` uses
+/// Note the sender does not currently read this: `fresh::send_fresh_offers` uses
 /// one-way `send_message`, so the refusal is observed only as a later absence by
 /// the delayed possession check. Recorded in ADR-0005 as a known gap.
 async fn refuse_fresh_offer(
@@ -10747,15 +10986,156 @@ mod tests {
         // Session: opened by round 1, consumed exactly once by the matching round 2.
         let hash = [7u8; 32];
         let nonce = [9u8; 32];
-        limiter.open_session(peer, 42, hash, nonce).await;
+        assert!(
+            limiter
+                .open_session(peer, 42, hash, nonce, PointerBindings::new())
+                .await
+        );
         // Wrong nonce / commitment does not match.
-        assert!(!limiter.consume_session(&peer, 42, &hash, &[0u8; 32]).await);
-        assert!(!limiter.consume_session(&peer, 42, &[0u8; 32], &nonce).await);
+        assert!(limiter
+            .consume_session(&peer, 42, &hash, &[0u8; 32])
+            .await
+            .is_none());
+        assert!(limiter
+            .consume_session(&peer, 42, &[0u8; 32], &nonce)
+            .await
+            .is_none());
         // A round 2 with no prior round 1 (wrong challenge_id) misses.
-        assert!(!limiter.consume_session(&peer, 99, &hash, &nonce).await);
+        assert!(limiter
+            .consume_session(&peer, 99, &hash, &nonce)
+            .await
+            .is_none());
         // The matching round 2 consumes it — and only once (single-use).
-        assert!(limiter.consume_session(&peer, 42, &hash, &nonce).await);
-        assert!(!limiter.consume_session(&peer, 42, &hash, &nonce).await);
+        assert!(limiter
+            .consume_session(&peer, 42, &hash, &nonce)
+            .await
+            .is_some());
+        assert!(limiter
+            .consume_session(&peer, 42, &hash, &nonce)
+            .await
+            .is_none());
+    }
+
+    // A session carries what its round 1 bound for each pointer to round 2,
+    // and every live session together stays under the binding budget. A
+    // session that does not fit is refused, and no session already opened
+    // gives up its bindings or its place for it.
+    #[tokio::test]
+    async fn subtree_session_carries_pointer_bindings_within_the_budget() {
+        let limiter = SubtreeRound1Limiter::new(Duration::ZERO, 1);
+        let (hash, nonce) = ([1u8; 32], [2u8; 32]);
+        let bindings = |from: u64, count: usize| -> PointerBindings {
+            (from..)
+                .take(count)
+                .map(|i| {
+                    let mut key = [0u8; 32];
+                    key[..8].copy_from_slice(&i.to_le_bytes());
+                    (key, [0xAB; 32])
+                })
+                .collect()
+        };
+
+        let half = MAX_SESSION_POINTER_BINDINGS / 2;
+        let first = bindings(0, half);
+        assert!(
+            limiter
+                .open_session(test_peer(1), 1, hash, nonce, first.clone())
+                .await
+        );
+        assert!(
+            limiter
+                .open_session(test_peer(2), 2, hash, nonce, bindings(1 << 40, half))
+                .await
+        );
+        // The budget is full: one more binding is refused, but a round 1 with
+        // no pointers in it still opens.
+        assert!(
+            !limiter
+                .open_session(test_peer(3), 3, hash, nonce, bindings(1 << 41, 1))
+                .await
+        );
+        assert!(
+            limiter
+                .open_session(test_peer(4), 4, hash, nonce, PointerBindings::new())
+                .await
+        );
+
+        assert_eq!(
+            limiter
+                .consume_session(&test_peer(1), 1, &hash, &nonce)
+                .await,
+            Some(first.clone()),
+            "an opened session keeps every binding it was given"
+        );
+        assert!(
+            limiter
+                .consume_session(&test_peer(3), 3, &hash, &nonce)
+                .await
+                .is_none(),
+            "a refused session was never opened"
+        );
+        assert_eq!(
+            limiter
+                .consume_session(&test_peer(2), 2, &hash, &nonce)
+                .await
+                .map(|b| b.len()),
+            Some(half)
+        );
+
+        // Consumed sessions free their room.
+        assert!(
+            limiter
+                .open_session(test_peer(5), 5, hash, nonce, bindings(1 << 42, half))
+                .await
+        );
+    }
+
+    // A session refused for the binding budget is refused before the session
+    // cap evicts anything: with both full, the refusal costs no session its
+    // place.
+    #[tokio::test]
+    async fn a_session_refused_for_bindings_evicts_no_other_session() {
+        let limiter = SubtreeRound1Limiter::new(Duration::ZERO, 1);
+        let (hash, nonce) = ([1u8; 32], [2u8; 32]);
+        let full: PointerBindings = (0u64..)
+            .take(MAX_SESSION_POINTER_BINDINGS)
+            .map(|i| {
+                let mut key = [0u8; 32];
+                key[..8].copy_from_slice(&i.to_le_bytes());
+                (key, [0xCD; 32])
+            })
+            .collect();
+        assert!(
+            limiter
+                .open_session(test_peer(0), 0, hash, nonce, full)
+                .await
+        );
+        for id in 1..MAX_SUBTREE_SESSIONS as u64 {
+            assert!(
+                limiter
+                    .open_session(test_peer(1), id, hash, nonce, PointerBindings::new())
+                    .await
+            );
+        }
+
+        let one: PointerBindings = std::iter::once(([0xEE; 32], [0xEE; 32])).collect();
+        assert!(
+            !limiter
+                .open_session(test_peer(2), u64::MAX, hash, nonce, one)
+                .await
+        );
+        assert_eq!(
+            limiter.sessions.read().await.len(),
+            MAX_SUBTREE_SESSIONS,
+            "every session is still there"
+        );
+        assert!(
+            limiter
+                .consume_session(&test_peer(0), 0, &hash, &nonce)
+                .await
+                .is_some(),
+            "including the oldest"
+        );
     }
 
     // The concurrency pool and the per-peer cooldown are both keyed by peer id,
@@ -10969,7 +11349,11 @@ mod tests {
         let (id, hash, nonce) = (77u64, [3u8; 32], [4u8; 32]);
         let challenge = slice_challenge(id, hash, nonce);
 
-        round1.open_session(peer, id, hash, nonce).await;
+        assert!(
+            round1
+                .open_session(peer, id, hash, nonce, PointerBindings::new())
+                .await
+        );
 
         // Saturate this peer's share so the next admission must be refused.
         let mut hold = Vec::new();
@@ -10994,7 +11378,7 @@ mod tests {
         let retried =
             admit_slice_challenge(&semaphore, &inflight, &round1, &peer, &challenge).await;
         assert!(
-            matches!(retried, SliceAdmission::Admitted(_)),
+            matches!(retried, SliceAdmission::Admitted(..)),
             "the round-1 session must survive a capacity refusal so the retry succeeds"
         );
 

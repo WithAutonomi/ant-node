@@ -24,7 +24,11 @@
 )]
 
 use ant_node::storage::migration::{MigrationPhase, MIN_RETIRE_DELAY_HOURS};
-use ant_node::storage::{ChunkStore, ChunkStoreConfig, LmdbStorage, LmdbStorageConfig};
+use ant_node::storage::{
+    ChunkStore, ChunkStoreConfig, LmdbStorage, LmdbStorageConfig, LEGACY_ENV_DIR,
+};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -86,8 +90,53 @@ fn walk(path: &Path, size: &dyn Fn(&std::fs::Metadata) -> u64) -> u64 {
 /// disappearing proves nothing: unlink a file that something still holds open and every
 /// name is gone while every block is still spoken for, which is a fair description of the
 /// bug that started all this.
+///
+/// On Linux, read only once the filesystem has committed what it has been given. The free
+/// space btrfs reports can lag what it has allocated and freed until its transaction
+/// commits, every 30 seconds by default, and the fsync after each chunk file does not
+/// commit it. Read straight after the copy, the peak has missed up to 28 MB of the file
+/// store, and the recovery measured from it then came up short however much space came
+/// back. `syncfs` is Linux only, so other targets read straight away, as before.
 fn free_space(path: &Path) -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        let committed = commit_filesystem(path);
+        assert!(
+            committed.is_ok(),
+            "could not commit the filesystem before reading it: {committed:?}"
+        );
+    }
     fs2::available_space(path).expect("the filesystem should report its free space")
+}
+
+/// `syncfs(2)` on the filesystem holding `path`. It returns once that filesystem has
+/// written out its pending changes, which on btrfs means once the running transaction
+/// has committed.
+#[cfg(target_os = "linux")]
+fn commit_filesystem(path: &Path) -> std::io::Result<()> {
+    let dir = std::fs::File::open(path)?;
+    // SAFETY: `dir` is open for the whole call, so its descriptor is valid, and `syncfs`
+    // only reads the descriptor and keeps nothing.
+    #[allow(clippy::undocumented_unsafe_blocks, unsafe_code)]
+    let synced = unsafe { libc::syncfs(dir.as_raw_fd()) };
+    if synced == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// What is left under `root` of the legacy environment: the environment itself, and any
+/// tombstone retirement renamed it to.
+fn legacy_entries(root: &Path) -> std::io::Result<Vec<String>> {
+    let mut left = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        if name.starts_with(LEGACY_ENV_DIR) {
+            left.push(name);
+        }
+    }
+    Ok(left)
 }
 
 /// Deterministic content for chunk `n`, filled so it does not compress to nothing.
@@ -250,16 +299,23 @@ async fn retiring_the_legacy_environment_returns_its_bytes_to_the_filesystem() {
     assert_eq!(store.migration_phase(), MigrationPhase::FilesOnly);
     assert!(freed > 0, "retirement reported no bytes freed");
 
-    // The deletion runs on a detached thread so the node can serve while it happens.
-    for _ in 0..400 {
-        if !environment.exists() && allocated_bytes(&root) < environment_blocks + payload {
+    // The deletion runs on a detached thread so the node can serve while it happens. The
+    // thread renames the environment to a tombstone first and removes the tombstone last,
+    // so the old name is gone before anything is deleted and only the tombstone going says
+    // the deletion is over. Space read before then comes back in pieces: on btrfs, a
+    // reading taken mid-delete has seen half the environment back. The wait is up to 80
+    // seconds, as long as the old wait and the space poll after it gave the deletion
+    // between them, which leaves room for the thread to retry after 10, 30 and 60 seconds.
+    for _ in 0..1600 {
+        if legacy_entries(&root).is_ok_and(|left| left.is_empty()) {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+    let left = legacy_entries(&root);
     assert!(
-        !environment.exists(),
-        "the environment directory is still on disk"
+        left.as_ref().is_ok_and(Vec::is_empty),
+        "the environment is still on disk: {left:?}"
     );
 
     // Dropping the store closes every handle. A file that is unlinked while something

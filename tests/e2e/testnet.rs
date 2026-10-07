@@ -23,6 +23,7 @@ use ant_node::payment::{
     QuotingMetricsTracker,
 };
 use ant_node::replication::config::MAX_REPLICATION_MESSAGE_SIZE;
+use ant_node::replication::fresh::FreshWriteEvent;
 use ant_node::storage::{AntProtocol, ChunkStore, ChunkStoreConfig};
 use ant_node::{ReplicationConfig, ReplicationEngine};
 use bytes::Bytes;
@@ -101,7 +102,7 @@ const SMALL_STABILIZATION_TIMEOUT_SECS: u64 = 60;
 /// conservative; the happy path completes in well under a second on
 /// loopback, so the larger budget only shows up on flakes. Test-only —
 /// no production code path reads this constant.
-const DEFAULT_CHUNK_OPERATION_TIMEOUT_SECS: u64 = 90;
+pub const DEFAULT_CHUNK_OPERATION_TIMEOUT_SECS: u64 = 90;
 
 /// Short node-level network timeout for E2E test harness.
 ///
@@ -439,6 +440,11 @@ pub struct TestNode {
 
     /// Shutdown token for the replication engine.
     pub replication_shutdown: Option<CancellationToken>,
+
+    /// Fresh-write events from this node's PUT handler, waiting for the
+    /// replication engine that `start_node` creates to take them. The sender
+    /// half lives in `ant_protocol`, as it does in a real node.
+    pub fresh_write_rx: Option<tokio::sync::mpsc::UnboundedReceiver<FreshWriteEvent>>,
 }
 
 impl TestNode {
@@ -1082,13 +1088,17 @@ impl TestNetwork {
             .get(&index)
             .copied()
             .unwrap_or_default();
-        let ant_protocol = Self::create_ant_protocol_with_disk_reserve(
+        let mut ant_protocol = Self::create_ant_protocol_with_disk_reserve(
             &data_dir,
             self.config.evm_network.clone(),
             storage_disk_reserve,
             &identity,
         )
         .await?;
+        // Wired as a real node wires it, so a PUT through the handler feeds
+        // the replication engine's fresh-write pipeline.
+        let (fresh_write_tx, fresh_write_rx) = tokio::sync::mpsc::unbounded_channel();
+        ant_protocol.set_fresh_write_sender(fresh_write_tx);
 
         Ok(TestNode {
             index,
@@ -1104,6 +1114,7 @@ impl TestNetwork {
             protocol_task: None,
             replication_engine: None,
             replication_shutdown: None,
+            fresh_write_rx: Some(fresh_write_rx),
         })
     }
 
@@ -1348,15 +1359,21 @@ impl TestNetwork {
         }
 
         // Start replication engine for this node. A node without an identity
-        // skips ONLY the engine (no early return — the node must still be
-        // tracked in `self.nodes` below, or its already-started P2P/protocol
-        // tasks would keep running untracked by the harness).
-        if let (Some(ref p2p), Some(ref protocol), Some(ref id)) =
-            (&node.p2p_node, &node.ant_protocol, &node.node_identity)
-        {
+        // or a fresh-write channel skips ONLY the engine (no early return —
+        // the node must still be tracked in `self.nodes` below, or its
+        // already-started P2P/protocol tasks would keep running untracked by
+        // the harness). `create_node` fills the channel and each node is
+        // started once, so it is missing only if that invariant breaks.
+        let fresh_write_rx = node.fresh_write_rx.take();
+        let has_fresh_writes = fresh_write_rx.is_some();
+        if let (Some(ref p2p), Some(ref protocol), Some(ref id), Some(fresh_rx)) = (
+            &node.p2p_node,
+            &node.ant_protocol,
+            &node.node_identity,
+            fresh_write_rx,
+        ) {
             let shutdown = CancellationToken::new();
             let repl_config = self.config.replication_config.clone().unwrap_or_default();
-            let (_fresh_tx, fresh_rx) = tokio::sync::mpsc::unbounded_channel();
             let node_identity = Arc::clone(id);
             match ReplicationEngine::new(
                 repl_config,
@@ -1393,6 +1410,12 @@ impl TestNetwork {
         } else if node.node_identity.is_none() {
             warn!(
                 "Node {} has no identity; skipping replication engine",
+                node.index
+            );
+        } else if !has_fresh_writes {
+            warn!(
+                "Node {} has no fresh-write channel (started twice?); skipping \
+                 replication engine",
                 node.index
             );
         }
