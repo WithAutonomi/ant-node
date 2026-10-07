@@ -38,3 +38,4 @@ See [`TOOLING.md`](./TOOLING.md) for `adrs`, `adr-kit`, and AI harness setup.
 - [ADR-0016: Pointers — paid mutable references with an immutable owner](./ADR-0016-pointers-immutable-owner.md)
 - [ADR-0017: Bounded fresh-replication offers and copy-free message sends](./ADR-0017-bounded-fresh-offers-and-copy-free-sends.md)
 - [ADR-0019: Pointer audits serve the record round 1 bound](./ADR-0019-pointer-audits-serve-the-record-round-one-bound.md)
+- [ADR-0020: Kademlia-style chunk GET: return the chunk or closer peers](./ADR-0020-kademlia-chunk-get-or-closer.md)
