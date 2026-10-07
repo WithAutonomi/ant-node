@@ -237,7 +237,12 @@ webrtc-direct = [
 # Copy-free sends (ADR-0017): saorsa-core's `send_message` takes
 # `impl Into<Bytes>`, and saorsa-transport writes owned buffers to QUIC
 # streams without copying. Drop both once releases include them.
-saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core", rev = "c0022b871961c7f373f2ccde815385816962de98" }
+# V2-1358 / ADR-0020 stack, built against sibling checkouts until the
+# saorsa-core and ant-protocol branches are released: saorsa-core's
+# closer-peers encoding (on top of the copy-free-send rev above) and
+# ant-protocol's get-or-closer request.
+saorsa-core = { path = "../saorsa-core-v2-1358-kad" }
+ant-protocol = { path = "../ant-protocol-v2-1358-kad" }
 saorsa-transport = { git = "https://github.com/WithAutonomi/saorsa-transport", rev = "1e6eb1a3bc5b8b7f51c6773b11a152ae50d87320" }
 
 [profile.release]

@@ -36,6 +36,7 @@ use std::time::Duration;
 use saorsa_core::P2PNode;
 use tokio_util::sync::CancellationToken;
 
+use crate::ant_protocol::GET_OR_CLOSER_AGENT_TOKEN;
 use crate::logging::{info, warn};
 
 /// How often a node says where it is and what it can see.
@@ -234,13 +235,23 @@ fn classify(dir: &Path) -> Leftover {
 /// Keeps the `node/` prefix `saorsa-core` gates DHT membership on, reports this build's
 /// version rather than the transport's, because that is the one a release decision is made
 /// about, and carries the migration state as its own token.
+///
+/// A node that serves chunks also carries the get-or-closer token (ADR-0020). Native peers
+/// exchange no capabilities, and a node built before that request drops it without a reply,
+/// so this token is how a client knows it may send one. A node with storage switched off
+/// never answers chunk requests, so it does not announce it.
 #[must_use]
-pub fn user_agent(signal: MigrationSignal) -> String {
-    format!(
+pub fn user_agent(signal: MigrationSignal, serves_chunks: bool) -> String {
+    let agent = format!(
         "node/{} {SIGNAL_PREFIX}{}",
         env!("CARGO_PKG_VERSION"),
         signal.token()
-    )
+    );
+    if serves_chunks {
+        format!("{agent} {GET_OR_CLOSER_AGENT_TOKEN}")
+    } else {
+        agent
+    }
 }
 
 /// What a peer's user agent says about that peer.
@@ -710,6 +721,23 @@ mod tests {
     }
 
     #[test]
+    fn user_agent_advertises_get_or_closer_only_when_serving_chunks() {
+        for signal in [
+            MigrationSignal::Legacy,
+            MigrationSignal::Files,
+            MigrationSignal::Unknown,
+        ] {
+            assert!(crate::ant_protocol::advertises_get_or_closer(&user_agent(
+                signal, true
+            )));
+            assert!(!crate::ant_protocol::advertises_get_or_closer(&user_agent(
+                signal, false
+            )));
+            assert!(user_agent(signal, false).starts_with("node/"));
+        }
+    }
+
+    #[test]
     fn the_user_agent_keeps_the_prefix_that_gates_dht_membership() {
         // saorsa-core decides whether a peer is a DHT participant by this prefix alone. A
         // node that loses it stops being routed to, which is a much worse outcome than not
@@ -719,22 +747,22 @@ mod tests {
             MigrationSignal::Files,
             MigrationSignal::Unknown,
         ] {
-            assert!(user_agent(signal).starts_with("node/"));
+            assert!(user_agent(signal, true).starts_with("node/"));
         }
     }
 
     #[test]
     fn a_peer_reads_back_what_a_node_announced() {
         assert_eq!(
-            peer_state(&user_agent(MigrationSignal::Legacy)),
+            peer_state(&user_agent(MigrationSignal::Legacy, true)),
             PeerMigrationState::Legacy
         );
         assert_eq!(
-            peer_state(&user_agent(MigrationSignal::Files)),
+            peer_state(&user_agent(MigrationSignal::Files, true)),
             PeerMigrationState::Files
         );
         assert_eq!(
-            peer_state(&user_agent(MigrationSignal::Unknown)),
+            peer_state(&user_agent(MigrationSignal::Unknown, true)),
             PeerMigrationState::Unknown
         );
     }
