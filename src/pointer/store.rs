@@ -45,7 +45,9 @@
 //! lock file under `{root}/pointers/` keeps two processes from keeping two
 //! indexes over one set of files.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+
+use bytes::Bytes;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -81,15 +83,34 @@ const SHARD_COUNT: u16 = 256;
 ///
 /// A storage audit binds the record a node holds in its first round and asks
 /// for it in the second (ADR-0016). An owner updating the pointer between the
-/// two would otherwise fail the honest node that took the update, so the
-/// record the update replaced stays servable for longer than an audit session
-/// lives.
-pub const SUPERSEDED_RETENTION: Duration = Duration::from_mins(5);
+/// two would otherwise fail the honest node that took the update, so every
+/// record an update replaces stays servable, however many updates follow it
+/// (ADR-0019), for longer than the slowest audit takes with the default
+/// configuration: a round 1 over the largest subtree an auditor will wait
+/// for, then the session its round 2 must arrive within. Round 1 can read a
+/// pointer at its very start and take that long to finish, so the time counts
+/// from the read, not from the session.
+pub const SUPERSEDED_RETENTION: Duration = Duration::from_mins(10);
 
-/// Most replaced records kept at once, about 11 MB at the cap. Past it the
-/// oldest goes first; reaching it inside [`SUPERSEDED_RETENTION`] takes that
-/// many paid updates to pointers this node holds.
+/// Most replaced records kept at once, across every address, about 11 MB at
+/// the cap. Past it the oldest goes first; reaching it inside
+/// [`SUPERSEDED_RETENTION`] takes that many paid updates to pointers this
+/// node holds.
 const MAX_SUPERSEDED: usize = 2048;
+
+/// Every record a recent update replaced, by address, oldest first, each with
+/// when it was replaced (see [`SUPERSEDED_RETENTION`]). Held as [`Bytes`] so
+/// handing them out copies nothing.
+type Superseded = HashMap<XorName, VecDeque<(Instant, Bytes)>>;
+
+/// Drop every kept record older than [`SUPERSEDED_RETENTION`] at `now`, and
+/// every address left with none.
+fn drop_expired(superseded: &mut Superseded, now: Instant) {
+    superseded.retain(|_, kept| {
+        kept.retain(|(at, _)| now.saturating_duration_since(*at) < SUPERSEDED_RETENTION);
+        !kept.is_empty()
+    });
+}
 
 /// The name of the shard directory `address` lives in: its last byte in hex.
 fn shard_name(address: &XorName) -> String {
@@ -258,9 +279,8 @@ struct Inner {
     generation: AtomicU64,
     /// What the store has done, for telemetry.
     counters: Counters,
-    /// The record each recent update replaced, by address, with when (see
-    /// [`SUPERSEDED_RETENTION`]).
-    superseded: Mutex<HashMap<XorName, (Instant, Vec<u8>)>>,
+    /// Every record a recent update replaced (see [`Superseded`]).
+    superseded: Mutex<Superseded>,
     /// Held for the store's lifetime; releasing it releases the directory.
     _lock_file: File,
 }
@@ -519,17 +539,43 @@ impl PointerStore {
             .map(|entry| entry.state.state_id)
     }
 
-    /// The record an update at `address` replaced within the last
-    /// [`SUPERSEDED_RETENTION`], if any: what a storage audit that bound it
-    /// before the update is still owed.
+    /// The record the last update at `address` replaced, within the last
+    /// [`SUPERSEDED_RETENTION`], if any. See [`Self::superseded_all`] for
+    /// every one kept.
     #[must_use]
     pub fn superseded(&self, address: &XorName) -> Option<Vec<u8>> {
+        self.superseded_all(address)
+            .into_iter()
+            .next()
+            .map(|bytes| bytes.to_vec())
+    }
+
+    /// Every record updates at `address` replaced within the last
+    /// [`SUPERSEDED_RETENTION`], newest first: what a storage audit that bound
+    /// one of them before the updates is still owed (ADR-0019).
+    #[must_use]
+    pub fn superseded_all(&self, address: &XorName) -> Vec<Bytes> {
         self.inner
             .superseded
             .lock()
             .get(address)
-            .filter(|(at, _)| at.elapsed() < SUPERSEDED_RETENTION)
-            .map(|(_, bytes)| bytes.clone())
+            .map(|kept| {
+                kept.iter()
+                    .rev()
+                    .filter(|(at, _)| at.elapsed() < SUPERSEDED_RETENTION)
+                    .map(|(_, bytes)| bytes.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Forget every replaced record older than [`SUPERSEDED_RETENTION`].
+    ///
+    /// Updates do this as they keep a record; this is for when none come, so
+    /// memory goes back within a pass of the retention running out rather
+    /// than at the next update, which may never come.
+    pub fn drop_expired_superseded(&self) {
+        drop_expired(&mut self.inner.superseded.lock(), Instant::now());
     }
 
     /// The bytes of the record held at `address`, read from disk without
@@ -738,23 +784,59 @@ impl PointerStore {
 }
 
 impl Inner {
-    /// Keep `bytes` as the record just replaced at `address`, dropping what
-    /// has aged out and, past the cap, the oldest.
+    /// Keep `bytes` beside whatever else was recently replaced at `address`,
+    /// dropping what has aged out.
+    ///
+    /// Nothing is evicted to make room here: the update that replaced it may
+    /// yet fail, and a record evicted for an update that never happened would
+    /// be lost for nothing. [`Self::trim_superseded`] does that once it has.
     fn keep_superseded(&self, address: XorName, bytes: Vec<u8>) {
         let now = Instant::now();
         let mut superseded = self.superseded.lock();
-        superseded.retain(|_, (at, _)| now.duration_since(*at) < SUPERSEDED_RETENTION);
-        while superseded.len() >= MAX_SUPERSEDED {
+        drop_expired(&mut superseded, now);
+        superseded
+            .entry(address)
+            .or_default()
+            .push_back((now, Bytes::from(bytes)));
+    }
+
+    /// Past the cap, drop the oldest kept records, wherever they are.
+    fn trim_superseded(&self) {
+        let mut superseded = self.superseded.lock();
+        let mut held: usize = superseded.values().map(VecDeque::len).sum();
+        while held > MAX_SUPERSEDED {
+            // Each address keeps its records oldest first, so the oldest
+            // anywhere is the first of one of them.
             let Some(oldest) = superseded
                 .iter()
-                .min_by_key(|(_, (at, _))| *at)
-                .map(|(address, _)| *address)
+                .filter_map(|(address, kept)| kept.front().map(|(at, _)| (*at, *address)))
+                .min()
+                .map(|(_, address)| address)
             else {
                 break;
             };
-            superseded.remove(&oldest);
+            if let Some(kept) = superseded.get_mut(&oldest) {
+                kept.pop_front();
+                if kept.is_empty() {
+                    superseded.remove(&oldest);
+                }
+            }
+            held = held.saturating_sub(1);
         }
-        superseded.insert(address, (now, bytes));
+        drop(superseded);
+    }
+
+    /// Take back the record [`Self::keep_superseded`] just kept for `address`,
+    /// when the update that replaced it did not happen after all. Called under
+    /// the index lock that kept it, so nothing was kept for `address` since.
+    fn unkeep_superseded(&self, address: &XorName) {
+        let mut superseded = self.superseded.lock();
+        if let Some(kept) = superseded.get_mut(address) {
+            kept.pop_back();
+            if kept.is_empty() {
+                superseded.remove(address);
+            }
+        }
     }
 
     /// Remove the file and the index entry for `address` under one lock, so a
@@ -863,18 +945,26 @@ impl Inner {
             }
 
             // What this replaces, read under the lock so it is the record the
-            // index names. Kept for an audit that bound it; a record that
-            // cannot be read is not kept, and an audit owed it fails as it
-            // would have on the lost file.
-            let previous = if replacing {
-                read_record_file(&path).ok().flatten()
-            } else {
-                None
-            };
+            // index names. Kept for an audit that bound it, and kept before
+            // the rename makes the new record visible, so a round 2 reading
+            // the new record always finds the old one kept beside it. A record
+            // that cannot be read is not kept, and an audit owed it fails as
+            // it would have on the lost file.
+            let mut kept = false;
+            if replacing {
+                if let Some(previous) = read_record_file(&path).ok().flatten() {
+                    self.keep_superseded(address, previous);
+                    kept = true;
+                }
+            }
 
             // The rename is the commit point: nothing fallible happens between
             // it and the index update, and both are under this one lock.
             if let Err(e) = rename_with_retry(&temp, &path) {
+                // Nothing was replaced, so nothing replaced is kept.
+                if kept {
+                    self.unkeep_superseded(&address);
+                }
                 if std::fs::remove_file(&temp).is_err() {
                     settle(reservation);
                 }
@@ -884,11 +974,11 @@ impl Inner {
                     path.display()
                 )));
             }
+            if kept {
+                self.trim_superseded();
+            }
             let generation = self.generation.fetch_add(1, Ordering::Relaxed);
             index.insert(address, IndexEntry::of(record, generation));
-            if let Some(previous) = previous {
-                self.keep_superseded(address, previous);
-            }
             // A file is on the disk now. Charge it whether or not this replaced
             // one: telling those apart would mean trusting an observation taken
             // before the rename, and that observation can be wrong in the one
@@ -1276,9 +1366,8 @@ mod tests {
         let (store, _dir) = store().await;
         let first = signed(1, 1, 1);
         store.put_bytes(&first.to_bytes()).await.expect("put");
-        assert_eq!(
-            store.superseded(&first.address()),
-            None,
+        assert!(
+            store.superseded_all(&first.address()).is_empty(),
             "a creation replaces nothing"
         );
 
@@ -1288,8 +1377,8 @@ mod tests {
             PutOutcome::Changed
         );
         assert_eq!(
-            store.superseded(&first.address()),
-            Some(first.to_bytes()),
+            store.superseded_all(&first.address()),
+            vec![Bytes::from(first.to_bytes())],
             "the replaced record, exactly as it was held"
         );
         assert_eq!(
@@ -1300,7 +1389,116 @@ mod tests {
 
         // A stale arrival replaces nothing, so it keeps nothing.
         store.put_bytes(&first.to_bytes()).await.expect("put");
-        assert_eq!(store.superseded(&first.address()), Some(first.to_bytes()));
+        assert_eq!(
+            store.superseded_all(&first.address()),
+            vec![Bytes::from(first.to_bytes())]
+        );
+
+        // A later update keeps the one before it too, newest first: an audit
+        // may have bound either.
+        let third = signed(1, 3, 3);
+        store.put_bytes(&third.to_bytes()).await.expect("put");
+        assert_eq!(
+            store.superseded_all(&first.address()),
+            vec![
+                Bytes::from(second.to_bytes()),
+                Bytes::from(first.to_bytes())
+            ]
+        );
+        assert_eq!(
+            store.superseded(&first.address()),
+            Some(second.to_bytes()),
+            "the earlier accessor still answers with the record last replaced"
+        );
+    }
+
+    /// Past the cap the oldest record kept goes first, whichever address it
+    /// is for, and an address whose last record goes is forgotten.
+    /// Keeping a record evicts nothing: an update that then fails takes back
+    /// what it kept and leaves every other kept record where it was.
+    #[tokio::test]
+    async fn a_record_kept_for_an_update_that_fails_costs_no_other_record() {
+        let (store, _dir) = store().await;
+        let (owed, failing) = ([1u8; 32], [2u8; 32]);
+        store.inner.keep_superseded(owed, vec![1]);
+        for i in 0..MAX_SUPERSEDED - 1 {
+            store
+                .inner
+                .keep_superseded(failing, (i as u64).to_le_bytes().to_vec());
+        }
+        // The cap is full. The next update keeps its record first ...
+        store.inner.keep_superseded(failing, vec![0xFF]);
+        // ... and its rename fails, so it takes that record back.
+        store.inner.unkeep_superseded(&failing);
+        assert_eq!(
+            store.superseded_all(&owed),
+            vec![Bytes::from(vec![1])],
+            "the record an audit may be owed is still kept"
+        );
+        assert_eq!(store.superseded_all(&failing).len(), MAX_SUPERSEDED - 1);
+    }
+
+    /// A replaced record past its retention is forgotten even if no update
+    /// comes to do it.
+    #[tokio::test]
+    async fn expired_replaced_records_are_dropped_without_another_update() {
+        let (store, _dir) = store().await;
+        let old = Instant::now()
+            .checked_sub(SUPERSEDED_RETENTION + Duration::from_secs(1))
+            .expect("the clock is past one retention");
+        store
+            .inner
+            .superseded
+            .lock()
+            .insert([3u8; 32], VecDeque::from([(old, Bytes::from(vec![3]))]));
+        store.inner.keep_superseded([4u8; 32], vec![4]);
+        store.drop_expired_superseded();
+        assert!(
+            store.superseded_all(&[3u8; 32]).is_empty()
+                && !store.inner.superseded.lock().contains_key(&[3u8; 32]),
+            "the expired record is gone"
+        );
+        assert!(
+            store.inner.superseded.lock().contains_key(&[4u8; 32]),
+            "a fresh one stays"
+        );
+    }
+
+    #[tokio::test]
+    async fn past_the_cap_the_oldest_replaced_record_anywhere_goes_first() {
+        let (store, _dir) = store().await;
+        let (first, second) = ([1u8; 32], [2u8; 32]);
+        let keep = |address: XorName, bytes: Vec<u8>| {
+            store.inner.keep_superseded(address, bytes);
+            store.inner.trim_superseded();
+        };
+        keep(first, vec![1]);
+        for i in 0..MAX_SUPERSEDED - 1 {
+            keep(second, (i as u64).to_le_bytes().to_vec());
+        }
+        assert_eq!(store.superseded_all(&first), vec![Bytes::from(vec![1])]);
+        assert_eq!(store.superseded_all(&second).len(), MAX_SUPERSEDED - 1);
+
+        // One more: the first address held the oldest record, so it goes.
+        keep(second, vec![0xFF]);
+        let evicted = store.superseded_all(&first);
+        assert!(
+            evicted.is_empty(),
+            "expected the oldest address evicted, got {evicted:?}"
+        );
+        assert!(!store.inner.superseded.lock().contains_key(&first));
+        assert_eq!(store.superseded_all(&second).len(), MAX_SUPERSEDED);
+
+        // And the next goes from the front of the second address's history.
+        keep(first, vec![2]);
+        let kept = store.superseded_all(&second);
+        assert_eq!(kept.len(), MAX_SUPERSEDED - 1);
+        assert_eq!(kept.first(), Some(&Bytes::from(vec![0xFF])), "newest first");
+        assert_eq!(
+            kept.last(),
+            Some(&Bytes::from(1u64.to_le_bytes().to_vec())),
+            "the oldest of them went"
+        );
     }
 
     #[tokio::test]

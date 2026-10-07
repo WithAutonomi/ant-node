@@ -1200,7 +1200,7 @@ pub enum AuditResponse {
 /// commitment, or a [`SubtreeAuditResponse::Rejected`] if it genuinely cannot
 /// (for a recently gossiped pinned commitment a rejection is a confirmed
 /// failure, since the responder retains its recently gossiped commitments for a
-/// bounded TTL window).
+/// bounded TTL window, unless it is [`RejectKind::Transient`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubtreeAuditChallenge {
     /// Unique challenge identifier.
@@ -1287,9 +1287,11 @@ pub enum RejectKind {
     /// retention and in-window auditing this is provable repudiation of a root
     /// the node published → CONFIRMED failure.
     UnknownCommitment,
-    /// A transient, recoverable local condition (e.g. a storage read error),
-    /// emitted only after the responder's read retries failed. Routed to the
-    /// timeout lane (holder credit revoked, no trust penalty).
+    /// A transient, recoverable local condition: a storage read error the
+    /// responder's read retries did not clear, a round 1 refused because its
+    /// pointer roots would not fit the session budget, or a pointer record
+    /// round 1 bound that is no longer kept (ADR-0019). Routed to the timeout
+    /// lane (holder credit revoked, no trust penalty).
     Transient,
     /// Any other rejection (wrong target peer, no commitment state, malformed
     /// proof plan, oversized slice challenge, …). CONFIRMED failure.
@@ -1391,16 +1393,18 @@ pub enum SubtreeSliceItem {
     PointerRecord {
         /// The requested key: the pointer's address.
         key: XorName,
-        /// The record held now, and the one an update replaced since round 1
-        /// if there was one, each in its canonical encoding. At most
-        /// [`MAX_POINTER_RECORDS_PER_ITEM`]: round 1 bound one of them, and
-        /// the responder cannot tell which without keeping round 1's answer.
+        /// The record round 1 read, in its canonical encoding, found by the
+        /// nonced root round 1 reported over it (ADR-0019). At most
+        /// [`MAX_POINTER_RECORDS_PER_ITEM`], and the auditor accepts whichever
+        /// reproduces that root.
         records: Vec<Vec<u8>>,
     },
 }
 
-/// Most records one [`SubtreeSliceItem::PointerRecord`] may carry: the one
-/// held now and the one it replaced.
+/// Most records one [`SubtreeSliceItem::PointerRecord`] may carry.
+///
+/// A responder that keeps what round 1 bound serves one. Before it did, it
+/// served the record held now and the one an update last replaced (ADR-0016).
 pub const MAX_POINTER_RECORDS_PER_ITEM: usize = 2;
 
 /// Response to a [`SubtreeSliceChallenge`] (round 2).
