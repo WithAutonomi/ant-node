@@ -382,8 +382,8 @@ pub struct PaymentConfig {
     #[serde(default)]
     pub evm_network: EvmNetworkConfig,
 
-    /// Metrics port for Prometheus scraping.
-    /// Set to 0 to disable metrics endpoint.
+    /// Loopback health JSON and Prometheus port.
+    /// 0 = off (default); set e.g. 9100 to enable.
     #[serde(default = "default_metrics_port")]
     pub metrics_port: u16,
 }
@@ -400,7 +400,7 @@ impl Default for PaymentConfig {
 }
 
 const fn default_metrics_port() -> u16 {
-    9100
+    0
 }
 
 const fn default_cache_capacity() -> usize {
@@ -778,6 +778,15 @@ mod tests {
     fn test_default_config_has_cache_capacity() {
         let config = PaymentConfig::default();
         assert!(config.cache_capacity > 0, "Cache capacity must be positive");
+    }
+
+    #[test]
+    fn metrics_endpoint_defaults_to_off() {
+        assert_eq!(PaymentConfig::default().metrics_port, 0);
+        let absent: NodeConfig = toml::from_str("").unwrap();
+        let partial: NodeConfig = toml::from_str("[payment]\ncache_capacity = 123").unwrap();
+        assert_eq!(absent.payment.metrics_port, 0);
+        assert_eq!(partial.payment.metrics_port, 0);
     }
 
     #[test]

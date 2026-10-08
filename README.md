@@ -918,6 +918,59 @@ You can also specify bootstrap peers explicitly:
 
 ---
 
+## Health Endpoint
+
+The local health endpoint is **off by default**. Enable it with `--metrics-port 9100`
+or `ANT_METRICS_PORT=9100`; `payment.metrics_port` is the configuration setting.
+Set it to `0` and restart to disable it. It binds only to IPv4 loopback
+(`127.0.0.1`), not the node's public address. If the port is busy, the node warns
+and continues without the endpoint; failure to publish its port also does not
+prevent the node from running. Logging must be enabled to see these warnings.
+
+- `/health` is JSON for people and programs: `curl http://127.0.0.1:9100/health`.
+- `/metrics` is Prometheus text for monitoring systems scraping on the same machine.
+- `{root_dir}/metrics.port` contains the bound port followed by a newline. It is
+  cleaned up best-effort on orderly shutdown, when disabled, or when binding fails.
+  A crash or filesystem error can leave it behind: treat it as discovery, not
+  proof, and verify the response's `peer_id` before trusting it.
+
+Both endpoints read the same existing node state when requested. `peer_id` (hex)
+and `version` are descriptive JSON strings and labels on all Prometheus series.
+The remaining JSON fields and matching metrics are:
+
+| JSON field | Prometheus metric | Meaning |
+|-----------|-------------------|---------|
+| `uptime_secs` | `ant_uptime_seconds` | Seconds since the P2P node was constructed |
+| `bootstrapped` | `p2p_health_status` | Initial bootstrap completed, **not** a verdict that the node is healthy |
+| `peer_count` | `p2p_network_peer_count` | Currently connected authenticated peers |
+| `routing_table_size` | `p2p_dht_routing_table_size` | Current peer entries in the routing table |
+| `storage_enabled` | `ant_storage_enabled` | Whether this node provides storage |
+| `chunks_current` | `ant_chunks_current` | Chunks currently persisted, including existing chunks after restart |
+| `chunks_written_total` | `ant_chunks_written_total` | Successful chunk writes since process start |
+| `bytes_written_total` | `ant_bytes_written_total` | Bytes written since process start |
+| `chunks_served_total` | `ant_chunks_served_total` | Storage reads since process start, not completed client downloads |
+| `bytes_served_total` | `ant_bytes_served_total` | Bytes read from storage since process start |
+
+`_total` fields are process-lifetime activity counters and reset on restart;
+other numeric and boolean fields report current state. Fields are additive.
+JSON uses booleans for `bootstrapped` and `storage_enabled`; Prometheus uses
+gauges with `0`/`1`. Other live measurements are gauges and `_total` metrics are
+counters. Storage measurements are zero when storage is disabled. Activity
+counters reflect the file store; they do not include legacy-store activity during
+migration. No live stored-byte metric is emitted.
+
+The inherited `p2p_` and `ant_` names match existing local deployment tooling
+where meanings agree. Remote Prometheus worker-IP targets cannot reach this
+loopback listener, and dashboard panels for deferred metrics remain empty.
+Requests are read-only, served one at a time with bounded headers and a timeout;
+shutdown cancels active requests. A single `Host` header must name `127.0.0.1` or
+`localhost`, optionally followed by the bound port. Missing, duplicate or other
+host values return `403` without health data; this also rejects website hostnames
+that resolve to loopback. Normal curl and Prometheus requests supply this header.
+For trusted hosts, only `GET /health` and `GET /metrics` are supported; other paths
+return `404`, other methods `405` with `Allow: GET`. Responses close the connection,
+disable caching, and have no CORS header.
+
 ## CLI Reference
 
 ```
