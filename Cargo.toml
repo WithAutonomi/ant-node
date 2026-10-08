@@ -1,6 +1,6 @@
 [package]
 name = "ant-node"
-version = "0.21.0"
+version = "0.22.0-rc.1"
 edition = "2021"
 authors = ["David Irvine <david.irvine@maidsafe.net>"]
 description = "Pure quantum-proof network node for the Autonomi decentralized network"
@@ -35,10 +35,10 @@ mimalloc = "0.1"
 # node-only DHT internals (DHTNode, TrustEvent, DhtNetworkEvent), which
 # Cargo unifies with ant-protocol's version constraint.
 #
-ant-protocol = "3.1.0"
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", branch = "rc-2026.10.1" }
 
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
-saorsa-core = "0.28.0"
+saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core", branch = "rc-2026.10.1" }
 saorsa-pqc = "0.5.2"
 
 # Payment verification - autonomi network lookup + EVM payment
@@ -115,7 +115,7 @@ bao = "0.13.1"
 
 # Shared portable browser profile. The native listener is enabled separately
 # by the `webrtc-direct` feature.
-saorsa-transport = { version = "0.37.0", default-features = false, features = ["webrtc"] }
+saorsa-transport = { git = "https://github.com/WithAutonomi/saorsa-transport", branch = "rc-2026.10.1", default-features = false, features = ["webrtc"] }
 # Only the test-utils devnet helper that seeds public files for browser tests
 # uses it, so release builds do not link it.
 self_encryption = { version = "0.36", optional = true }
@@ -232,13 +232,6 @@ webrtc-direct = [
     "saorsa-transport/default",
     "saorsa-transport/webrtc-direct",
 ]
-
-[patch.crates-io]
-# Copy-free sends (ADR-0017): saorsa-core's `send_message` takes
-# `impl Into<Bytes>`, and saorsa-transport writes owned buffers to QUIC
-# streams without copying. Drop both once releases include them.
-saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core", rev = "c0022b871961c7f373f2ccde815385816962de98" }
-saorsa-transport = { git = "https://github.com/WithAutonomi/saorsa-transport", rev = "1e6eb1a3bc5b8b7f51c6773b11a152ae50d87320" }
 
 [profile.release]
 lto = true
