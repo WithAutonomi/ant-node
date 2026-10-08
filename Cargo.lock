@@ -826,7 +826,7 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "alloy",
  "ant-protocol",
@@ -883,9 +883,9 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "3.1.0"
+version = "4.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb1f2e060c4283457a718c094d5fd594efd1d4eeec7cc6ca3ea113df17cce382"
+checksum = "c269f3a7c2e117cf444b97a8326d3583a8b016b3ce688c39ec5310bdebc367c5"
 dependencies = [
  "blake3",
  "bytes",
@@ -5305,8 +5305,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.28.0"
-source = "git+https://github.com/WithAutonomi/saorsa-core?rev=c0022b871961c7f373f2ccde815385816962de98#c0022b871961c7f373f2ccde815385816962de98"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "efd8c6152246053fa3497fa5e5d1ddc49ec1882fe24cf1ef3e529b03562c3c6a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5373,8 +5374,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-transport"
-version = "0.37.0"
-source = "git+https://github.com/WithAutonomi/saorsa-transport?rev=1e6eb1a3bc5b8b7f51c6773b11a152ae50d87320#1e6eb1a3bc5b8b7f51c6773b11a152ae50d87320"
+version = "0.38.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f201fce78c610eda6da22ee8d9ad7a84c4a7ffe8e91b5603b6c025f53742ce73"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7103,7 +7105,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
