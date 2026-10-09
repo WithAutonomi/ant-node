@@ -358,7 +358,10 @@ impl NodeBuilder {
         // restarts, which overstates how much is left rather than understating it, and is
         // the direction a release gate should err in.
         let signal = crate::storage::migration_signal::MigrationSignal::from_disk(&config.root_dir);
-        core_config.custom_user_agent = Some(crate::storage::migration_signal::user_agent(signal));
+        core_config.custom_user_agent = Some(crate::storage::migration_signal::user_agent(
+            signal,
+            config.storage.enabled,
+        ));
 
         // Persist close group peers + trust scores across restarts.
         // Default to root_dir (alongside node_identity.key) when not explicitly set.
@@ -1097,11 +1100,10 @@ impl RunningNode {
         let handled = protocol
             .try_handle_request_with_context(
                 data,
-                Some(ChunkRequestContext::new(
-                    source.to_string(),
-                    received_at,
-                    queue_wait,
-                )),
+                Some(
+                    ChunkRequestContext::new(source.to_string(), received_at, queue_wait)
+                        .with_requester(*source),
+                ),
             )
             .await;
         let telemetry = handled.get_telemetry;
