@@ -3,7 +3,7 @@
 //!
 //! These spin a real multi-node testnet and drive the SHIPPED audit over the
 //! live wire (real `handle_subtree_challenge` responder + `run_subtree_audit`
-//! auditor + real LMDB storage), via the test-only `audit_peer_now` /
+//! auditor + a real chunk store), via the test-only `audit_peer_now` /
 //! `rebuild_commitment_now` engine hooks. They prove the two outcomes that
 //! matter for a testnet:
 //!
@@ -20,7 +20,7 @@ use std::time::{Duration, SystemTime};
 use super::TestHarness;
 use ant_node::replication::audit::AuditTickResult;
 use ant_node::replication::{FirstAuditStats, MonetizedPinEvent, ReplicationEngine};
-use ant_node::storage::file_store::CHUNKS_DIR_NAME;
+use ant_node::storage::chunk_store::CHUNKS_DIR_NAME;
 use serial_test::serial;
 use tokio::time::sleep;
 

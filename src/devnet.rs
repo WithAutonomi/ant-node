@@ -642,7 +642,7 @@ impl Devnet {
     /// The file is split using the same `self_encryption` crate as `ant-client`.
     /// Every encrypted data chunk and the public `MessagePack` `DataMap` are then
     /// submitted through each node's ordinary chunk PUT handler. Address
-    /// verification, DHT responsibility, payment-cache admission, and LMDB
+    /// verification, DHT responsibility, payment-cache admission, and chunk
     /// integrity checks therefore remain active.
     ///
     /// # Errors
@@ -944,7 +944,7 @@ impl Devnet {
         };
         let storage = ChunkStore::new(storage_config)
             .await
-            .map_err(|e| DevnetError::Core(format!("Failed to create LMDB storage: {e}")))?;
+            .map_err(|e| DevnetError::Core(format!("Failed to create the chunk store: {e}")))?;
 
         let evm_config = EvmVerifierConfig {
             network: config

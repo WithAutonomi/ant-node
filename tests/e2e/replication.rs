@@ -683,7 +683,7 @@ async fn wait_until_every(
 /// eviction acts on), via `P2PNode::peer_trust`.
 #[tokio::test]
 #[serial]
-async fn possession_check_penalises_absent_peer_only_and_obeys_the_release_switch() {
+async fn possession_check_penalises_absent_peer_only() {
     let harness = TestHarness::setup_small().await.expect("setup");
     harness.warmup_dht().await.expect("warmup");
 
@@ -741,10 +741,6 @@ async fn possession_check_penalises_absent_peer_only_and_obeys_the_release_switc
         "precondition: C must hold the chunk"
     );
 
-    // Switched on explicitly, so this half keeps testing the possession mechanism rather
-    // than whichever release it happens to be compiled against.
-    ant_node::replication::config::set_close_group_storage_penalty_suspended(false);
-
     let trust_b_before = p2p_a.peer_trust(&peer_b);
     let trust_c_before = p2p_a.peer_trust(&peer_c);
 
@@ -764,25 +760,6 @@ async fn possession_check_penalises_absent_peer_only_and_obeys_the_release_switc
     assert!(
         trust_c_after >= trust_c_before - f64::EPSILON,
         "present peer C must not be penalised: {trust_c_before} -> {trust_c_after}"
-    );
-
-    // And the other half of the contract, on the same harness. The release that moves
-    // nodes off the legacy chunk store withholds exactly this penalty: a node short of
-    // disk cannot avoid answering "absent" while it moves its chunks out of a store that
-    // never returns space, and it cannot stop its peers penalising it for that, because
-    // the penalty is the auditor's decision. So the auditors stop one release ahead.
-    ant_node::replication::config::set_close_group_storage_penalty_suspended(true);
-    let trust_b_suspended_before = p2p_a.peer_trust(&peer_b);
-    engine_a
-        .run_possession_check_now(address, vec![peer_b, peer_c])
-        .await;
-    let trust_b_suspended_after = p2p_a.peer_trust(&peer_b);
-    ant_node::replication::config::set_close_group_storage_penalty_suspended(false);
-
-    assert!(
-        trust_b_suspended_after >= trust_b_suspended_before - f64::EPSILON,
-        "an absent peer must not be penalised while the release withholds that penalty: \
-         {trust_b_suspended_before} -> {trust_b_suspended_after}"
     );
 
     harness.teardown().await.expect("teardown");
@@ -830,11 +807,6 @@ async fn possession_scheduler_penalises_absent_close_peer_after_delay() {
         .map(|n| n.peer_id)
         .collect();
     assert!(!close_group.is_empty(), "expected a non-empty close group");
-
-    // Switched on explicitly. The release that moves nodes off the legacy chunk store
-    // withholds this penalty by default, so a test that asserts it must say so, or it
-    // silently starts asserting whichever release it is compiled against.
-    ant_node::replication::config::set_close_group_storage_penalty_suspended(false);
 
     let trust_before: Vec<f64> = close_group.iter().map(|p| p2p_a.peer_trust(p)).collect();
 
@@ -998,11 +970,6 @@ async fn full_close_group_node_rejects_replica_and_is_penalised_as_absent() {
         .await
         .expect("put on checker");
 
-    // Switched on explicitly. The release that moves nodes off the legacy chunk store
-    // withholds this penalty by default, so a test that asserts it must say so, or it
-    // silently starts asserting whichever release it is compiled against.
-    ant_node::replication::config::set_close_group_storage_penalty_suspended(false);
-
     let trust_before = checker_p2p.peer_trust(&full_peer);
     checker_engine
         .replicate_fresh(&address, &content, &dummy_proof)
@@ -1143,7 +1110,7 @@ async fn test_paid_list_persistence() {
         dir
     };
 
-    // Shut down the replication engine so the LMDB env is released
+    // Shut down the replication engine so the chunk store is released
     {
         let node = harness.network_mut().node_mut(3).expect("node");
         if let Some(ref mut engine) = node.replication_engine {
@@ -2572,11 +2539,6 @@ async fn scenario_11_repeated_failures_decrease_trust() {
     let peer_b = *p2p_b.peer_id();
 
     // Get initial trust score for node B (should be neutral ~0.5)
-    // Switched on explicitly. The release that moves nodes off the legacy chunk store
-    // withholds this penalty by default, so a test that asserts it must say so, or it
-    // silently starts asserting whichever release it is compiled against.
-    ant_node::replication::config::set_close_group_storage_penalty_suspended(false);
-
     let initial_trust = p2p_a.peer_trust(&peer_b);
 
     // Report multiple application failures
@@ -3307,7 +3269,7 @@ async fn scenario_43_paid_list_persists_across_restart() {
         dir
     };
 
-    // Shut down the replication engine so the LMDB env is released
+    // Shut down the replication engine so the chunk store is released
     {
         let node = harness.network_mut().node_mut(3).expect("node");
         if let Some(ref mut engine) = node.replication_engine {
