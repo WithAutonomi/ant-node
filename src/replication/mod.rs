@@ -2171,13 +2171,22 @@ impl ReplicationEngine {
     /// The only guard left standing is the per-attempt recheck inside
     /// `execute_single_fetch` — exactly the gate e2e tests use this seam to
     /// exercise.
+    ///
+    /// A replica hint for `key` that reached pending verification first is
+    /// dropped, so the key enters the fetch queue as it would have without
+    /// it. Callers host the chunk on a holder before calling this, which makes
+    /// it advertisable, and a change to the holder's closest peers starts a
+    /// neighbour-sync round at once. Left in place, the hint's entry made
+    /// `enqueue_fetch` refuse the key, and with one holder and no paid-list
+    /// entry it does not reach a quorum, so the key was not fetched that way
+    /// either. A key already in the fetch queue or in flight, or a full fetch
+    /// queue, still returns `false`.
     #[cfg(any(test, feature = "test-utils"))]
     pub async fn enqueue_fetch_for_test(&self, key: XorName, sources: Vec<PeerId>) -> bool {
         let distance = crate::client::xor_distance(&key, self.p2p_node.peer_id().as_bytes());
-        self.queues
-            .write()
-            .await
-            .enqueue_fetch(key, distance, sources)
+        let mut queues = self.queues.write().await;
+        queues.remove_pending(&key);
+        queues.enqueue_fetch(key, distance, sources)
     }
 
     /// Test-only: whether `key` is still tracked in any fetch-pipeline stage
@@ -2185,6 +2194,21 @@ impl ReplicationEngine {
     #[cfg(any(test, feature = "test-utils"))]
     pub async fn fetch_pipeline_contains_for_test(&self, key: &XorName) -> bool {
         self.queues.read().await.contains_key(key)
+    }
+
+    /// Test-only: whether `key` is in the fetch queue or in flight, which is
+    /// where a candidate placed by [`Self::enqueue_fetch_for_test`] stays
+    /// until it resolves.
+    ///
+    /// Such a candidate carries no verification retry metadata, so it is never
+    /// requeued for verification: once it leaves these two stages it is done.
+    /// Pending verification is left out on purpose. The chunk the test hosted
+    /// stays advertisable, so a replica hint can put the key there after the
+    /// candidate resolved, and counting that entry would hold a test's wait
+    /// loop until its deadline.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn fetch_queued_or_in_flight_for_test(&self, key: &XorName) -> bool {
+        self.queues.read().await.fetch_queued_or_in_flight(key)
     }
 
     /// Test-only: place `key` into pending verification as though `hinter` had
@@ -2300,6 +2324,8 @@ impl ReplicationEngine {
         info!("Starting replication engine");
 
         self.start_message_handler();
+        // Takes out of service the rotted chunks that round-1 proofs report.
+        self.start_corrupt_recheck_worker();
         self.start_neighbor_sync_loop();
         self.start_self_lookup_loop();
         // Audit #2 (responsible-chunk): periodic tick auditing peers for the
@@ -3482,6 +3508,22 @@ impl ReplicationEngine {
             debug!("Self-lookup loop shut down");
         });
         self.task_handles.push(handle);
+    }
+
+    /// Spawn the one task that takes chunks audits found rotted out of service.
+    ///
+    /// One, so that the rechecks hold at most one blocking thread between them however
+    /// many audits report rot; see [`ChunkStore::run_corrupt_rechecks`]. Tracked with
+    /// the detached storage work rather than the engine's loops, because shutdown aborts
+    /// a loop that outlasts its drain timeout and a recheck must not be dropped part-way.
+    /// The worker itself stops at the shutdown token, between rechecks.
+    fn start_corrupt_recheck_worker(&self) {
+        let storage = Arc::clone(&self.storage);
+        let shutdown = self.shutdown.clone();
+        self.detached_task_tracker.spawn(async move {
+            storage.run_corrupt_rechecks(&shutdown).await;
+            debug!("Corrupt-chunk recheck worker shut down");
+        });
     }
 
     /// Periodic responsible-chunk audit loop (audit #2): every
@@ -5418,6 +5460,7 @@ async fn handle_replication_message(
                 let storage_commitment_audit::Round1Work {
                     response,
                     content_bytes,
+                    corrupt_keys,
                 } = storage_commitment_audit::handle_subtree_challenge_measured_with_pointers(
                     &challenge,
                     &storage,
@@ -5428,6 +5471,11 @@ async fn handle_replication_message(
                 )
                 .await;
                 let processing = processing_started.elapsed();
+                // Committed chunks this proof found rotted go to the chunk store's
+                // single recheck worker. Queueing never waits, so no number of
+                // audits over a rotted chunk can pile up cleanup work outside this
+                // task's admission.
+                storage.report_corrupt(&corrupt_keys);
                 // Charge the work actually done, on EVERY outcome.
                 //
                 // This used to charge only the `Proof` arm, reasoning that the
@@ -5788,23 +5836,27 @@ async fn handle_replication_message(
         }
         ReplicationMessageBody::PointerFetchRequest(request) => {
             if let Some(pointers) = &ctx.pointers {
-                pointers.serve_fetch_detached(
-                    *source,
-                    request,
-                    msg.request_id,
-                    rr_message_id.map(ToOwned::to_owned),
-                );
+                pointers
+                    .serve_fetch_detached(
+                        *source,
+                        request,
+                        msg.request_id,
+                        rr_message_id.map(ToOwned::to_owned),
+                    )
+                    .await;
             }
             Ok(())
         }
         ReplicationMessageBody::PointerStateRequest(request) => {
             if let Some(pointers) = &ctx.pointers {
-                pointers.serve_state_detached(
-                    *source,
-                    request,
-                    msg.request_id,
-                    rr_message_id.map(ToOwned::to_owned),
-                );
+                pointers
+                    .serve_state_detached(
+                        *source,
+                        request,
+                        msg.request_id,
+                        rr_message_id.map(ToOwned::to_owned),
+                    )
+                    .await;
             }
             Ok(())
         }
@@ -6775,12 +6827,6 @@ async fn dispatch_neighbor_sync_request(
     received_at: Instant,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
-    // A peer syncing with us gets our pointer hints as well — including a
-    // node that is bootstrapping, which is how it learns the pointers it
-    // should hold.
-    if let Some(pointers) = &ctx.pointers {
-        pointers.push_hints_detached(vec![source]);
-    }
     let guard = match admit_bounded_responder(
         &ctx.neighbor_sync_responder_admission_semaphore,
         &ctx.neighbor_sync_responder_inflight,
@@ -6804,7 +6850,7 @@ async fn dispatch_neighbor_sync_request(
             return Ok(());
         }
     };
-
+    let pointers = ctx.pointers.clone();
     let worker_semaphore = Arc::clone(&ctx.neighbor_sync_responder_worker_semaphore);
     let p2p_node = Arc::clone(&ctx.p2p_node);
     let storage = Arc::clone(&ctx.storage);
@@ -6836,6 +6882,14 @@ async fn dispatch_neighbor_sync_request(
                 "Stale neighbor-sync request shed at dequeue"
             );
             return;
+        }
+        // A peer whose sync request is admitted and fresh gets our pointer
+        // hints as well, including a node that is bootstrapping, which is how
+        // it learns the pointers it should hold. Only such a request: each
+        // answer scans every pointer held, and a refused or stale one must
+        // cost nothing.
+        if let Some(pointers) = &pointers {
+            pointers.answer_sync_with_hints(source);
         }
         if let Err(e) = handle_neighbor_sync_request(
             &source,

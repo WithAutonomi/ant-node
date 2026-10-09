@@ -1414,6 +1414,14 @@ impl ReplicationQueues {
             || self.in_flight_fetch.contains_key(key)
     }
 
+    /// Test-only: whether a key is in the fetch queue or in flight, leaving
+    /// pending verification out.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn fetch_queued_or_in_flight(&self, key: &XorName) -> bool {
+        self.fetch_payloads.contains_key(key) || self.in_flight_fetch.contains_key(key)
+    }
+
     /// Check if all bootstrap-related work is done.
     ///
     /// Returns `true` when none of the given bootstrap keys remain in any queue.
