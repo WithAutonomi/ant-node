@@ -127,7 +127,7 @@ async fn stale_fetch_candidate_is_declined_at_download_time() {
 
     let deadline = tokio::time::Instant::now() + OBSERVATION_WINDOW;
     while target_engine
-        .fetch_pipeline_contains_for_test(&key_out)
+        .fetch_queued_or_in_flight_for_test(&key_out)
         .await
     {
         assert!(
@@ -172,7 +172,7 @@ async fn stale_fetch_candidate_is_declined_at_download_time() {
     }
     let deadline = tokio::time::Instant::now() + OBSERVATION_WINDOW;
     while target_engine
-        .fetch_pipeline_contains_for_test(&key_in)
+        .fetch_queued_or_in_flight_for_test(&key_in)
         .await
     {
         assert!(

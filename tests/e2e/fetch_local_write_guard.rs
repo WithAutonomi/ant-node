@@ -198,7 +198,7 @@ async fn write_blocked_node_neither_probes_nor_dials() {
     );
 
     let deadline = tokio::time::Instant::now() + OBSERVATION_WINDOW;
-    while target_engine.fetch_pipeline_contains_for_test(&key).await {
+    while target_engine.fetch_queued_or_in_flight_for_test(&key).await {
         assert!(
             tokio::time::Instant::now() < deadline,
             "the candidate never resolved; a key stuck in the fetch pipeline \
@@ -476,7 +476,7 @@ async fn already_held_key_is_not_fetched_again() {
     );
     let deadline = tokio::time::Instant::now() + OBSERVATION_WINDOW;
     while target_engine
-        .fetch_pipeline_contains_for_test(&held_key)
+        .fetch_queued_or_in_flight_for_test(&held_key)
         .await
     {
         assert!(
