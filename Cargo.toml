@@ -237,7 +237,7 @@ webrtc-direct = [
 # ADR-0020 (V2-1358): saorsa-core's closer-peers encoding and
 # ant-protocol's get-or-closer request. Drop both once releases include
 # them.
-saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core", rev = "4deab7562ea48ee9c2152ea8b69d5d644fa92721" }
+saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core", rev = "fd37775478afa6d17fcc86aa03a0791fb9358e58" }
 ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "69a031bacd106100376f1914718bfbd44bb1e955" }
 
 [profile.release]
