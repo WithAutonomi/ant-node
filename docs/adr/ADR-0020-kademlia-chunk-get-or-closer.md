@@ -160,8 +160,10 @@ For each peer the lookup queries, the client:
    the lookup's own request would need anyway. It then reads the peer's user
    agent.
 2. **If the peer advertises `get-or-closer/1`,** sends `GetOrCloserRequest`:
-   - `Found`: verify the content hash, then stop the read.
-   - `Closer`: `decode_closer_peers` supplies the lookup candidates.
+   - `Found`: verify the address and the content hash, then stop the read.
+   - `Closer`: `decode_closer_peers` supplies the lookup candidates. It
+     rejects a payload over the 64 KiB FIND_NODE limit before parsing it,
+     although the chunk message carrying it may be up to 5 MiB.
 3. **Otherwise,** sends FIND_NODE (`DhtNetworkManager::find_node_on_peer`) and
    a GET at the same time. FIND_NODE supplies the candidates, and a `Success`
    from the GET stops the read.
@@ -173,9 +175,13 @@ The round's grace window therefore never cancels a chunk transfer that is
 still arriving. Conflicting reports about a peer are resolved with
 `client_routing::compute_winner`, as in both existing lookups.
 
+- **A peer whose content fails verification only drops out of the lookup.**
+  Every queried peer is asked for the chunk, not just the close group. Ending
+  the read on one bad answer would therefore let any dishonest node on a
+  lookup path fail reads.
 - **When the lookup ends without a chunk,** or fails, the client runs today's
-  read path (`retrieve_progressive`) unchanged. Its absence rule and retry
-  round are unchanged.
+  read path (`retrieve_progressive`) unchanged. Its absence rule, retry round
+  and rule that bad content ends the read are unchanged.
 - **Browser clients keep today's read path.** Supporting this request there
   needs a portable decoder for the peer format and a HELLO capability.
 
@@ -216,6 +222,10 @@ still arriving. Conflicting reports about a peer are resolved with
   connection anyway.
 - **A second chunk response shape** to maintain, with its own traffic
   accounting.
+- **Every queried peer can send content,** not only peers near the chunk.
+  Each answer is bounded by the 5 MiB chunk message limit, as a GET answer is
+  today, and is verified before use. A peer whose answer fails verification
+  costs the client that transfer and nothing more.
 
 ### Neutral / Operational
 
@@ -235,6 +245,8 @@ still arriving. Conflicting reports about a peer are resolved with
   - `encode_closer_peers` / `decode_closer_peers` return the same trusted
     candidates as a FIND_NODE answer for the same key.
   - `find_node_on_peer` and `connect_lookup_peer` behave against a live peer.
+  - `decode_closer_peers` rejects a payload over the FIND_NODE size limit
+    before parsing it, and reads one of exactly that size.
 - **ant-node**
   - The handler answers `Found` for a held chunk and `Closer`, with decodable
     peers, otherwise.
@@ -244,7 +256,7 @@ still arriving. Conflicting reports about a peer are resolved with
     - stop at the first verified chunk
     - fall back per peer for legacy peers
     - handle a mixed network
-    - treat a hash mismatch as an error
+    - drop a peer whose content fails verification, and keep reading
     - keep a transfer alive past its lookup round's grace window
     - fall back to today's path when the lookup finds nothing
   - In-process test networks:
