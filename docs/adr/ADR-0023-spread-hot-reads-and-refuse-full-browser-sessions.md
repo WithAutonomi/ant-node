@@ -112,10 +112,14 @@ useful.
 
 ### 1. Spread first reads across the close group (ant-client)
 
-For every record, the read order is:
-1. the close group, meaning the `CLOSE_GROUP_SIZE` nearest candidates known
-   at that moment, in uniformly random order;
+For every chunk read, the read order is:
+1. the close group, meaning the `CLOSE_GROUP_SIZE` nearest candidates that
+   discovery has found so far, in uniformly random order;
 2. then the remaining candidates, nearest first.
+
+Known-peer fallbacks, used when discovery comes up short, keep nearest-first
+order. Pointer reads are unaffected: they already ask the whole close group
+at once.
 
 How each read path applies this:
 - **Early reads during discovery** choose uniformly among the unattempted
@@ -153,8 +157,11 @@ admitted it.
 - is never larger than the request it answers. If it would be, it is not
   sent.
 
-**What stays silent.** Duplicates of an association already being built.
-Answering one would fail that browser's live candidate pair.
+**What stays silent.**
+- Duplicates of an association already being built. Answering one would fail
+  that browser's live candidate pair.
+- Attempts that arrive while the listener is shutting down (its accept queue
+  is closed). That is not capacity.
 
 **Counters.** Refusals are counted in `rejected_connections`, as silent
 rejections were.
@@ -173,11 +180,12 @@ amplification bound.
 
 **What counts as `Refused`.** A failed fresh dial is `Refused` when the node
 answered it and turned it away:
-- **Transport refusal:** ICE never connected, and the browser declared the
-  association failed within `REFUSAL_DETECTION_WINDOW` (3 s) of its ICE checks
-  starting. The test is "ICE never connected" rather than "ICE reads failed",
-  because Chromium declares the association failed while its legacy
-  `iceConnectionState` still reads "checking". Or:
+- **Transport refusal:** the browser declared the association failed within
+  `REFUSAL_DETECTION_WINDOW` (3 s) of its ICE checks starting, without it ever
+  reaching connected, and with ICE not connected at that moment. The test is
+  "ICE not connected" rather than "ICE reads failed", because Chromium declares
+  the association failed while its legacy `iceConnectionState` still reads
+  "checking". Or:
 - **Application refusal:** ICE and DTLS completed, and the node then closed
   the channel, or the association died, before the post-quantum session was
   established.
@@ -189,8 +197,8 @@ answered it and turned it away:
 - an authentication failure with the channel still open;
 - a lane the client closed itself because the node sent malformed data.
 
-A full failure cache evicts whichever record expires first, so a refusal
-never pushes out a longer failure.
+A full failure cache evicts the stored record that expires soonest, so a
+stored refusal is dropped before any longer-lived failure.
 
 **Waiting less.** The channel-open wait now ends as soon as the browser
 declares the association dead, instead of running out its 10-second timeout.
@@ -222,8 +230,10 @@ leave.
   state, and it is sent only to a source that has proved reachability, at most
   once per returned cookie.
 - **Mixed deployments behave at least as well as today:**
-  - New client, old node: the old node stays silent, and the client times out
-    and applies the 30-minute cooldown exactly as before.
+  - New client, old node: at transport capacity the old node stays silent, and
+    the client times out and applies the 30-minute cooldown exactly as before.
+    Application-level closes behave the same on old and new nodes, so they get
+    the 15 s cooldown either way.
   - Old client, new node: the browser fails the association at once, but the
     old client still waits for its channel-open timeout and records a 30-minute
     failure, as before.
@@ -274,11 +284,12 @@ leave.
 ## Validation
 
 **Unit and regression tests.**
-- saorsa-transport, `webrtc::direct`:
+- saorsa-transport, `webrtc::direct::admission`:
   - A refusal echoes the request's transaction, passes the listener
     credential's integrity check and fingerprint, and is no larger than the
     request.
   - An unparseable request is never answered.
+- saorsa-transport, `webrtc::direct`:
   - A listener at capacity and one at its source quota both answer a proven
     check with 486 and their own reason phrase. In both cases
     `rejected_connections` increments and no association is admitted.
@@ -293,8 +304,8 @@ leave.
 - ant-client, `wasm-tests/capacity-refusal.test.mjs`:
   - A mock node that refuses at its transport, and one that closes during the
     handshake, both fail the dial in under 2 s.
-  - Both are suppressed inside the cooldown, and both are dialled again and
-    connect after it.
+  - Both are suppressed inside the cooldown, both are dialled again after it,
+    and the client connects.
   - A third mock node that fails DTLS after ICE connected is not dialled again.
   - With refusal detection disabled, or with the earlier "dead and fast" test
     that ignored ICE state, this test fails.
