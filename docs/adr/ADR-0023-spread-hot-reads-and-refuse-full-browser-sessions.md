@@ -173,23 +173,31 @@ amplification bound.
 
 **What counts as `Refused`.** A failed fresh dial is `Refused` when the node
 answered it and turned it away:
-- **Transport refusal:** the association never connected, and the browser
-  declared it failed within `REFUSAL_DETECTION_WINDOW` (3 s) of its ICE checks
-  starting; or
+- **Transport refusal:** ICE never connected, and the browser declared the
+  association failed within `REFUSAL_DETECTION_WINDOW` (3 s) of its ICE checks
+  starting. The test is "ICE never connected" rather than "ICE reads failed",
+  because Chromium declares the association failed while its legacy
+  `iceConnectionState` still reads "checking". Or:
 - **Application refusal:** ICE and DTLS completed, and the node then closed
-  the channel or association before the post-quantum session was established.
+  the channel, or the association died, before the post-quantum session was
+  established.
 
 **Cooldowns.** A refused endpoint is suppressed for `ENDPOINT_REFUSAL_COOLDOWN`
-(15 s). Every other dial failure keeps the 30-minute cooldown. That includes
-an association that connected and then failed authentication with its channel
-still open.
+(15 s). Every other dial failure keeps the 30-minute cooldown. That includes:
+- DTLS failing after ICE connected, which means a different node answered at
+  the endpoint;
+- an authentication failure with the channel still open;
+- a lane the client closed itself because the node sent malformed data.
+
+A full failure cache evicts whichever record expires first, so a refusal
+never pushes out a longer failure.
 
 **Waiting less.** The channel-open wait now ends as soon as the browser
 declares the association dead, instead of running out its 10-second timeout.
 
 **Why the window separates the two cases.** A refusal arrives within a few
-round trips, one cookie round trip plus one retransmitted check: 66 ms in
-Chromium and 100 ms in WebKit on loopback. Against a node that never answered
+round trips, one cookie round trip plus one retransmitted check: 67 ms in
+Chromium and 54 ms in WebKit on loopback. Against a node that never answered
 (the baseline below), both browsers were still checking when the client's
 10-second channel-open timeout fired. Playwright Firefox reported its failed
 dials after 5.0 s, which is also outside the window.
@@ -206,7 +214,7 @@ leave.
 - **Up to seven times the serving capacity for a hot record,** with no
   protocol change. First reads land evenly on its holders instead of on one.
 - **A full node costs a browser a round trip, not ten seconds.** Local
-  Chromium and WebKit measurements (Validation) show 66–100 ms instead of
+  Chromium and WebKit measurements (Validation) show 54–67 ms instead of
   10.0 s.
 - **A full node rejoins rotation after 15 s instead of 30 minutes,** so
   overload no longer shrinks the network a client can see.
@@ -235,6 +243,16 @@ leave.
   usable local candidate for the endpoint's address family or a client that
   just went offline, is also classed `Refused` and gets 15 s instead of 30
   minutes. Those dials fail at once, so the extra retries are cheap.
+- **A browser replacing its own association can hit its source quota.** Its
+  stale association still holds a slot until ICE closes it or the 10 s pending
+  expiry runs. Before, a silent listener could admit the retry once that slot
+  freed, if that happened before the client's 10 s timeout. Now the retry is
+  refused at once and the client tries again after 15 s.
+- **Only the request that completes admission is refused.** A retransmission
+  of it that arrives later meets a fresh reachability challenge rather than
+  the same error. Chromium and WebKit failed the dial on the first refusal,
+  and the client closes the peer connection as soon as it is reported dead,
+  so later challenges reach a closed connection.
 - **A node or network that drops mid-handshake** after DTLS is also classed
   `Refused`. That is acceptable: the node was demonstrably up seconds earlier.
 - **Application refusals still cost the node a DTLS handshake** per attempt,
@@ -277,8 +295,9 @@ leave.
     handshake, both fail the dial in under 2 s.
   - Both are suppressed inside the cooldown, and both are dialled again and
     connect after it.
-  - With refusal detection disabled, this test fails: both nodes stay
-    suppressed.
+  - A third mock node that fails DTLS after ICE connected is not dialled again.
+  - With refusal detection disabled, or with the earlier "dead and fast" test
+    that ignored ICE state, this test fails.
 
 **Real browsers (2026-10-12).**
 - **Setup:** a local 7-node devnet with `max_connections` = 2 and
@@ -290,8 +309,8 @@ leave.
 
   | Browser | Refused after (baseline → this ADR) | Error shown | After 16 s, holder gone |
   |---|---|---|---|
-  | Chromium | 10,011 ms → **66 ms** | "DataChannel opening timed out" → "peer connection failed" | still suppressed → **connects in 140 ms** |
-  | WebKit | 10,005 ms → **100 ms** | same | still suppressed → **connects in 122 ms** |
+  | Chromium | 10,011 ms → **67 ms** | "DataChannel opening timed out" → "peer connection failed" | still suppressed → **connects in 132 ms** |
+  | WebKit | 10,005 ms → **54 ms** | same | still suppressed → **connects in 115 ms** |
 
 - **Firefox:** Playwright Firefox does not establish WebRTC Direct sessions
   with local nodes at all, even with loopback ICE enabled. This is independent
