@@ -231,13 +231,12 @@ async fn report_possession_confirmed_failure(
         "Possession check: {peer} failed to prove possession for {key_hex} ({}); recorded at audit severity",
         failure_reason.as_str()
     );
-    crate::replication::config::penalise_unheld_close_group_chunk(
-        p2p_node,
-        peer,
-        AuditType::Possession.as_str(),
-        AUDIT_FAILURE_TRUST_WEIGHT,
-    )
-    .await;
+    p2p_node
+        .report_trust_event(
+            peer,
+            TrustEvent::ApplicationFailure(AUDIT_FAILURE_TRUST_WEIGHT),
+        )
+        .await;
 }
 
 async fn report_possession_audit_failure(
@@ -255,13 +254,12 @@ async fn report_possession_audit_failure(
         "Possession check: {peer} {} for {key_hex}; recorded at audit severity",
         failure_class.as_str()
     );
-    crate::replication::config::penalise_unheld_close_group_chunk(
-        p2p_node,
-        peer,
-        AuditType::Possession.as_str(),
-        AUDIT_FAILURE_TRUST_WEIGHT,
-    )
-    .await;
+    p2p_node
+        .report_trust_event(
+            peer,
+            TrustEvent::ApplicationFailure(AUDIT_FAILURE_TRUST_WEIGHT),
+        )
+        .await;
 }
 
 async fn handle_possession_bootstrap_claim(

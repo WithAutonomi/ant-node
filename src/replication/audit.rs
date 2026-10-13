@@ -34,7 +34,7 @@ use crate::replication::config::REPAIR_HINT_MIN_AGE;
 #[cfg(test)]
 use crate::replication::types::{BootstrapClaimObservation, NeighborSyncState};
 #[cfg(test)]
-use crate::storage::file_store::CHUNKS_DIR_NAME;
+use crate::storage::chunk_store::CHUNKS_DIR_NAME;
 #[cfg(test)]
 use crate::storage::ChunkStoreConfig;
 #[cfg(test)]
@@ -954,9 +954,7 @@ mod tests {
         let config = ChunkStoreConfig {
             root_dir: temp_dir.path().to_path_buf(),
             verify_on_read: false,
-            max_map_size: 0,
             disk_reserve: 0,
-            ..ChunkStoreConfig::test_default()
         };
         let storage = ChunkStore::new(config).await.expect("create storage");
         (storage, temp_dir)

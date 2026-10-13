@@ -360,7 +360,7 @@ async fn committed_key_with_missing_bytes_is_rejected() {
 /// A successful proof reports what it read and hashed, at a floor per leaf.
 /// Anchors the rejection case below: it fixes what the measurement means.
 ///
-/// A leaf costs more than its bytes — an LMDB lookup and a blocking-task round
+/// A leaf costs more than its bytes — a store lookup and a blocking-task round
 /// trip are owed whatever its size — and nothing bounds a chunk from below, so
 /// the charge is `max(content, floor)` per leaf. These test records are 1 KiB,
 /// well under the floor, which is the case that used to be nearly free: the

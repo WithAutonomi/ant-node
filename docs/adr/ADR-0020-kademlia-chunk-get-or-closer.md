@@ -142,8 +142,8 @@ FIND_NODE today.
 - **Otherwise it answers `Closer`,** using `encode_closer_peers` with the
   authenticated sender as the requester.
 - **It advertises support** with the user-agent token `get-or-closer/1`
-  (`ant_protocol::GET_OR_CLOSER_AGENT_TOKEN`), after the existing migration
-  token. The `node/` prefix that saorsa-core gates DHT membership on is kept.
+  (`ant_protocol::GET_OR_CLOSER_AGENT_TOKEN`), after `node/<version>`. The
+  `node/` prefix that saorsa-core gates DHT membership on is kept.
 - **It does not advertise support to browsers.** Browsers cannot decode the
   native peer format. The WebRTC Direct listener keeps refusing the request,
   and HELLO does not list it.
