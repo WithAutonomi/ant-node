@@ -144,7 +144,7 @@ FIND_NODE today.
 - **It advertises support** with the user-agent token `get-or-closer/1`
   (`ant_protocol::GET_OR_CLOSER_AGENT_TOKEN`), after the existing migration
   token. The `node/` prefix that saorsa-core gates DHT membership on is kept.
-- **It does not advertise support to browsers yet.** Browsers cannot decode the
+- **It does not advertise support to browsers.** Browsers cannot decode the
   native peer format. The WebRTC Direct listener keeps refusing the request,
   and HELLO does not list it.
 
@@ -182,8 +182,14 @@ still arriving. Conflicting reports about a peer are resolved with
 - **When the lookup ends without a chunk,** or fails, the client runs today's
   read path (`retrieve_progressive`) unchanged. Its absence rule, retry round
   and rule that bad content ends the read are unchanged.
-- **Browser clients keep today's read path.** Supporting this request there
-  needs a portable decoder for the peer format and a HELLO capability.
+- **Browser clients keep today's read path.** A browser variant was built and
+  measured on a 60-node testnet (2026-10-12). Nodes took the request inside
+  `chunk_protocol` and listed it in HELLO, and answered a missing chunk with
+  their browser `find_node` reply. Against today's browser read it was 17%
+  slower from fra1 and 5% faster from syd1, neither significant. A warm
+  browser there already holds sessions with the chunk's close group, so
+  today's read sends its first GET to a holder, and a lookup cannot start
+  sooner than that.
 
 ## Consequences
 
@@ -267,8 +273,8 @@ still arriving. Conflicting reports about a peer are resolved with
     peer and stays within the measured latency of option 3.
 - **Review triggers**
   - Node egress for reads rises enough to matter: add the "have it" variant.
-  - Browser reads need this request: add the portable decoder and a HELLO
-    capability.
+  - Browsers spend their reads finding a holder, because they no longer hold
+    sessions with the close group: revisit the browser variant above.
   - saorsa-core changes its native lookup parameters: mirror them in the
     client lookup.
 
