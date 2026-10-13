@@ -255,11 +255,11 @@ const fn default_webrtc_direct_max_channels_per_connection() -> usize {
 }
 
 const fn default_webrtc_direct_max_channels() -> usize {
-    256
+    512
 }
 
 const fn default_webrtc_direct_max_concurrent_requests() -> usize {
-    128
+    512
 }
 
 const fn default_webrtc_direct_max_requests_per_second() -> usize {

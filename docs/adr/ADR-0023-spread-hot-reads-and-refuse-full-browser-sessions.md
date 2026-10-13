@@ -223,17 +223,23 @@ leave.
 | Setting | Before | Now |
 |---|---:|---:|
 | `max_connections` | 32 | 256 |
-| `max_channels` | 32 | 256 |
-| `max_concurrent_requests` | 16 | 128 |
+| `max_channels` | 32 | 512 |
+| `max_concurrent_requests` | 16 | 512 |
 
 - **256 sessions is the transport's ceiling** (`MAX_PENDING_ASSOCIATIONS`).
-  Going higher needs a saorsa-transport change and the load test below.
+  Going higher needs a saorsa-transport change and a load test beyond the
+  one below.
 - **Sessions alone would not help.** A session that opens a channel needs a
   channel slot. The post-quantum handshake and every request take a request
-  slot, and when none is free the node closes the channel. With 16 request
-  slots, a node already turns away new channels once 16 GETs are queued. The
-  channel and request limits therefore keep their ratio to sessions: one
-  channel and half a request slot per session.
+  slot. When either kind of slot runs out, the node closes the channel.
+- **Two channels and two request slots per session.** A browser opens up to
+  `max_channels_per_connection` (2) channels per session. On the testnet,
+  sessions held 1.4 channels at the median and 1.9 at p90.
+  - The old 32 channels ran out at 18–23 sessions, before the 32-session
+    limit, so channel slots, not sessions, turned browsers away.
+  - With 192 browsers, the busiest node in each round used about 360
+    channels and 280 request slots. Limits of 256 channels and 128 request
+    slots both filled while sessions peaked at 194 of 256 (Validation).
 - **What does not change:** the per-IP session quota (4), channels per session
   (2), every rate bucket, and both in-flight byte budgets.
   - Frame and response memory is bounded by the byte budgets, not by slot
@@ -243,7 +249,8 @@ leave.
   - The rate buckets bound handshake and request CPU.
 - **What grows** is per-association state outside those budgets: ICE, DTLS and
   SCTP state and tasks for each session, and one handler task per channel.
-  The network A/B measures node memory and CPU at the new limits.
+  On the testnet this cost about 0.5 MiB per session. A node peaked at
+  184 MiB with 32 sessions and 268–271 MiB with 192.
 - A node whose `--config` file sets these limits keeps its values.
 
 ## Consequences
@@ -252,13 +259,17 @@ leave.
 
 - **Up to seven times the serving capacity for a hot record,** with no
   protocol change. First reads land evenly on its holders instead of on one.
+  On the testnet, the share of a chunk's first reads that went to its most
+  popular holder fell from 48% to 18–21%.
 - **A full node costs a browser a round trip, not ten seconds.** Local
   Chromium and WebKit measurements (Validation) show 54–67 ms instead of
   10.0 s.
 - **A full node rejoins rotation after 15 s instead of 30 minutes,** so
   overload no longer shrinks the network a client can see.
-- **Eight times the browser sessions per node by default,** with the request
-  slots to serve them, under the same memory and rate budgets.
+- **Eight times the browser sessions per node by default,** with the channel
+  and request slots to use them, under the same memory and rate budgets. On
+  the testnet this turned 64 synchronised downloads from 61–66% complete into
+  100% complete.
 - **Refusing costs the node almost nothing.** A STUN refusal allocates no RTC
   state, and it is sent only to a source that has proved reachability, at most
   once per returned cookie.
@@ -275,8 +286,9 @@ leave.
 
 - **A random holder may not have the record yet,** for example a node that
   just joined the close group and has not finished replicating. That costs one
-  `NotFound` round trip, and possibly a dial, before the next holder. The
-  network A/B in Validation measures it.
+  `NotFound` round trip, and possibly a dial, before the next holder. On the
+  testnet, `NotFound` answers per chunk rose from 1.05 to 1.39 with spreading
+  and the new limits, and GETs per chunk from 3.37 to 3.45.
 - **Spreading changes which node a client reads each record from.** It does
   not change how many it reads from: one per record, plus the hedge.
   Connection reuse may change slightly, because the nearest holder is no
@@ -300,9 +312,25 @@ leave.
   `Refused`. That is acceptable: the node was demonstrably up seconds earlier.
 - **Application refusals still cost the node a DTLS handshake** per attempt,
   as today. Only transport refusals are cheaper.
-- **A saturated node holds more per-session state.** At 256 sessions each
-  association's ICE, DTLS and SCTP state and tasks sit outside the byte
-  budgets. Until the network A/B measures it, that cost is an estimate.
+- **A saturated node holds more per-session state.** Each association's ICE,
+  DTLS and SCTP state and tasks sit outside the byte budgets. The testnet
+  measured about 0.5 MiB per session, so a full listener costs about 130 MiB
+  more than an idle one. That matters to operators who run many nodes on one
+  host.
+- **A read still gives up before a refusal's cooldown ends.** If no holder
+  answers, the read engine retries the close group once, after 1 s, and the
+  browser then reports the record as not found. A holder that refused is
+  suppressed for 15 s, so the faster cooldown does not help a read already in
+  flight. Wherever nodes fill, a busy holder still surfaces as a false "record
+  not found":
+  - on the testnet at the old limits, 34–39% of synchronised downloads failed
+    this way, with today's client and with this one alike;
+  - at the adopted limits none of 1,152 downloads failed. With 256 channels
+    and 128 request slots, which filled before sessions did at 192 browsers,
+    6 of 768 failed this way.
+
+  Distinguishing "no holder answered" from "absent", and waiting out the
+  shortest refusal cooldown before giving up, is follow-up client work.
 - **None of these changes adds capacity for finding 2.** Synchronised demand
   for one chunk still outruns seven uplinks; more sessions only queue more
   viewers on the same uplink. Spreading and fast refusal make the best use of
@@ -311,8 +339,8 @@ leave.
 ### Neutral / Operational
 
 - The new defaults reach nodes on upgrade. Raising the transport's 256
-  ceiling is a separate decision, based on the per-session cost the network
-  A/B measures.
+  ceiling is a separate decision, based on the per-session cost measured in
+  Validation.
 - `rejected_connections` now counts answered refusals. An operator who sees
   it rise knows browsers are being turned away, and no longer silently dropped.
 - Once ADR-0020 (get-or-closer) lands, its holder choice should follow the
@@ -366,16 +394,72 @@ leave.
   reported after 5.0 s, outside the 3 s window, and were correctly kept at the
   30-minute cooldown.
 
-**On a network, before Accepted.**
-- Run an A/B with the WASM benchmark harness: one hot file read by N clients.
-  Compare the per-holder GET distribution, chunk read latency p50/p95, GETs per
-  chunk (the `NotFound` cost), and nodes' `rejected_connections`.
-- In the same run, measure node memory and CPU with sessions near the new
-  limits.
+**On a network (2026-10-13).**
+- **Setup:**
+  - A 60-node testnet across 9 regions. 18 nodes sit behind symmetric NAT,
+    where browsers cannot reach them.
+  - 64 browser droplets in lon1, nyc1, sfo3 and sgp1, each running one
+    headless Chromium on its own IP.
+  - In each round every browser downloads the same 50 MiB private file
+    (16 chunks) with a fresh client, all starting within the same 10 s.
+    Three files rotate between rounds. Half the browsers run a traced build.
+  - Arms ran in blocks of three rounds, in the order A B C C B A. Each block
+    follows a restart of every node.
+  - Nodes logged their listener counters every 5 s. This logging was in the
+    test build only.
+  - Scripts and raw data: `ant-testnet/state/comparisons/v2-1508-hot-reads-ab-1013`.
+
+  | 64 browsers | A: today | C: new code, old limits | B: new code, 256 sessions |
+  |---|--:|--:|--:|
+  | Downloads completed | 252/384 (66%) | 236/384 (61%) | 384/384 |
+  | Most popular holder's share of a chunk's first reads | 48% | 18% | 21% |
+  | Channels a full node closed (traced browsers) | 2,477 | 1,953 | 0 |
+  | Silent transport drops / refusals per round | 1,413 | 238 | 0 |
+  | Channel / request rejections per round | 842 / 108 | 714 / 64 | 0 / 10 |
+  | Node peak memory / CPU | 184 MiB / 1.25 cores | 177 MiB / 1.04 | 203 MiB / 1.19 |
+
+  B ran with 256 channels and 128 request slots, below the adopted 512.
+- **Scale:** 192 browsers (three per droplet), with arms in the order B D D B
+  and two rounds per block:
+
+  | 192 browsers, 256 sessions | 256 channels / 128 requests | 512 / 512 (adopted) |
+  |---|--:|--:|
+  | Downloads completed | 762/768 | 768/768 |
+  | Peak sessions / channels / requests in use | 194 / 256 / 128 | 192 / 362 / 284 |
+  | Channel / request rejections per round | 1,583 / 707 | 0 / 0 |
+  | Node peak memory / CPU | 271 MiB / 1.22 cores | 268 MiB / 1.28 cores |
+
+- **What the run showed:**
+  - Every failed download ended in a false "record not found" (Negative /
+    Trade-offs). Two browsers reading the same files on their own finished in
+    19 s and 54 s.
+  - At the old limits, channel slots ran out before sessions. Today's client
+    and the new one failed at the same rate.
+  - Spreading cut the most popular holder's share of a chunk's first reads
+    from 48% to 18–21%. Per-node bytes barely changed: the most-loaded node
+    sent 5–7% of a round's bytes in every arm, because a 16-chunk file
+    already spans many close groups.
+  - Fast transport refusal did little at this scale. Full nodes mostly turned
+    browsers away at the channel limit, after DTLS, where the client already
+    saw a fast close.
+  - Dials that timed out after 10 s went to nodes behind NAT: 1,951 of 1,952
+    in A and all 3,302 in B. Those nodes advertise WebRTC endpoints that
+    browsers cannot reach, the testnet counterpart of the mainnet endpoints
+    that "time out when dialled".
+  - A restart of every node penalises the next round. Arm A's first round,
+    90 s after a restart, completed 23 of 64. Every later block waited 240 s.
+    Without that round, A completed 229 of 320 (72%).
+  - Unrelated to this ADR, in every arm: under load, a seed node occasionally
+    returned an ML-DSA-65 handshake signature that the browser rejected
+    (102 of 148,755 traced connects).
+
+**Before Accepted.**
 - Check mainnet nodes' `rejected_connections` to learn how many of the
   endpoints that "time out when dialled" were full. The node binary does not
   log or serve its listener diagnostics today, so this needs them exported
   first.
+- Decide the client follow-up for reads that end while their holders are
+  refusing (Negative / Trade-offs).
 
 **Review triggers.**
 - A browser changes how it handles STUN error responses to connectivity
