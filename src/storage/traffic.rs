@@ -12,7 +12,9 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::ant_protocol::{ChunkGetResponse, ChunkMessageBody, ChunkPutResponse};
+use crate::ant_protocol::{
+    ChunkGetOrCloserResponse, ChunkGetResponse, ChunkMessageBody, ChunkPutResponse,
+};
 use ant_protocol::chunk::{PointerGetResponse, PointerPutResponse};
 
 /// Kind of an inbound chunk message, for the rx table.
@@ -31,10 +33,12 @@ pub enum ChunkRequestKind {
     Other,
     /// Bytes that failed `ChunkMessage::decode`.
     DecodeError,
+    /// A get-or-closer request (ADR-0020).
+    GetOrCloser,
 }
 
 impl ChunkRequestKind {
-    const N: usize = 10;
+    const N: usize = 11;
 
     const fn index(self) -> usize {
         match self {
@@ -48,6 +52,7 @@ impl ChunkRequestKind {
             Self::PointerPut => 7,
             Self::Other => 8,
             Self::DecodeError => 9,
+            Self::GetOrCloser => 10,
         }
     }
 }
@@ -77,10 +82,13 @@ pub enum ChunkResponseKey {
     /// A response variant this table does not itemise (e.g. an `Other`
     /// outcome on a `#[non_exhaustive]` enum).
     Other,
+    GetOrCloserFound,
+    GetOrCloserCloser,
+    GetOrCloserError,
 }
 
 impl ChunkResponseKey {
-    const N: usize = 20;
+    const N: usize = 23;
 
     const fn index(self) -> usize {
         match self {
@@ -104,6 +112,9 @@ impl ChunkResponseKey {
             Self::PointerPutPaymentRequired => 17,
             Self::PointerPutError => 18,
             Self::Other => 19,
+            Self::GetOrCloserFound => 20,
+            Self::GetOrCloserCloser => 21,
+            Self::GetOrCloserError => 22,
         }
     }
 }
@@ -120,6 +131,7 @@ impl ChunkRequestKind {
             ChunkMessageBody::MerkleCandidateQuoteRequestV2(_) => Self::MerkleQuoteV2,
             ChunkMessageBody::PointerGetRequest(_) => Self::PointerGet,
             ChunkMessageBody::PointerPutRequest(_) => Self::PointerPut,
+            ChunkMessageBody::GetOrCloserRequest(_) => Self::GetOrCloser,
             _ => Self::Other,
         }
     }
@@ -127,6 +139,15 @@ impl ChunkRequestKind {
 
 impl ChunkResponseKey {
     /// Classify a GET response by outcome.
+    pub fn of_get_or_closer(response: &ChunkGetOrCloserResponse) -> Self {
+        match response {
+            ChunkGetOrCloserResponse::Found { .. } => Self::GetOrCloserFound,
+            ChunkGetOrCloserResponse::Closer { .. } => Self::GetOrCloserCloser,
+            ChunkGetOrCloserResponse::Error(_) => Self::GetOrCloserError,
+            _ => Self::Other,
+        }
+    }
+
     pub fn of_get(response: &ChunkGetResponse) -> Self {
         match response {
             ChunkGetResponse::Success { .. } => Self::GetSuccess,
@@ -211,11 +232,12 @@ pub fn record_send_failed(bytes: usize) {
 /// Emit the cumulative chunk-RPC traffic as INFO summary lines, target
 /// `ant_node::storage::traffic`.
 ///
-/// Flat snake-case keys like the replication summary. Three lines sharing the
+/// Flat snake-case keys like the replication summary. Four lines sharing the
 /// same target and message, distinguished by `group`: rx by request kind
-/// (`group = 1`), chunk and quote tx by kind × outcome (`group = 2`), and
-/// pointer tx by kind × outcome (`group = 3`). Pointers take a line of their
-/// own because `group = 2` is already close to `tracing`'s 32-field cap.
+/// (`group = 1`), chunk and quote tx by kind × outcome (`group = 2`), pointer
+/// tx by kind × outcome (`group = 3`), and get-or-closer rx and tx
+/// (`group = 4`). Pointers and get-or-closer take lines of their own because
+/// `group = 2` is already close to `tracing`'s 32-field cap.
 pub fn log_chunk_rpc_traffic_summary() {
     use ChunkRequestKind as Q;
     use ChunkResponseKey as R;
@@ -286,6 +308,20 @@ pub fn log_chunk_rpc_traffic_summary() {
         pointer_put_error_tx_count = tc(R::PointerPutError),
         "chunk rpc traffic summary (cumulative)"
     );
+
+    crate::logging::info!(
+        target: "ant_node::storage::traffic",
+        group = 4,
+        get_or_closer_rx_bytes = rb(Q::GetOrCloser),
+        get_or_closer_rx_count = rc(Q::GetOrCloser),
+        get_or_closer_found_tx_bytes = tb(R::GetOrCloserFound),
+        get_or_closer_found_tx_count = tc(R::GetOrCloserFound),
+        get_or_closer_closer_tx_bytes = tb(R::GetOrCloserCloser),
+        get_or_closer_closer_tx_count = tc(R::GetOrCloserCloser),
+        get_or_closer_error_tx_bytes = tb(R::GetOrCloserError),
+        get_or_closer_error_tx_count = tc(R::GetOrCloserError),
+        "chunk rpc traffic summary (cumulative)"
+    );
 }
 
 #[cfg(test)]
@@ -305,6 +341,7 @@ mod tests {
             ChunkRequestKind::PointerPut,
             ChunkRequestKind::Other,
             ChunkRequestKind::DecodeError,
+            ChunkRequestKind::GetOrCloser,
         ];
         let mut seen = std::collections::HashSet::new();
         for k in req {
@@ -332,6 +369,9 @@ mod tests {
             ChunkResponseKey::PointerPutPaymentRequired,
             ChunkResponseKey::PointerPutError,
             ChunkResponseKey::Other,
+            ChunkResponseKey::GetOrCloserFound,
+            ChunkResponseKey::GetOrCloserCloser,
+            ChunkResponseKey::GetOrCloserError,
         ];
         let mut seen = std::collections::HashSet::new();
         for k in resp {
