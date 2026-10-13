@@ -7,7 +7,7 @@
 - **Supersedes:** none
 - **Superseded by:** none
 - **Related:** [ADR-0015](./ADR-0015-direct-browser-clients-over-webrtc-direct.md)
-  (amends its capacity-rejection rule),
+  (amends its capacity-rejection rule and three listener defaults),
   ADR-0020 (get-or-closer chunk reads, open in #249),
   ant-client ADR-0004 (direct browser read client),
   [RFC 8489 §6.3.4](https://www.rfc-editor.org/rfc/rfc8489#section-6.3.4) (STUN error responses),
@@ -20,12 +20,13 @@ browser clients who all want the same chunks at once, for example because they
 are watching the same film?
 
 A node admits a bounded number of browser sessions (ADR-0015, "Public-listener
-resource isolation"):
+resource isolation"). Before this ADR the defaults were:
 
 | Setting | Default |
 |---|---:|
 | `max_connections` | 32 |
 | `max_connections_per_ip` | 4 |
+| `max_channels` | 32 |
 | `max_concurrent_requests` | 16 |
 | `max_requests_per_second` | 256 |
 
@@ -85,8 +86,9 @@ unverified, but each node's `rejected_connections` diagnostic can show it.
 
 1. **Raise the per-node limits only.** Rejected as the sole measure. It is
    capped at 256 by the transport, and it fixes neither single-holder
-   concentration nor full nodes looking dead. Raising the limits after a load
-   test remains worthwhile and is left to a separate decision.
+   concentration nor full nodes looking dead. Raising the session-shaped
+   limits alongside the other changes is cheap, so we do that too (Decision,
+   section 4).
 2. **Spread reads across the close group.** A client-only change to read order.
 3. **An explicit "busy" signal.** Three ways to send one:
    1. *A new browser-protocol status.* This needs a wire change across
@@ -108,7 +110,8 @@ unverified, but each node's `rejected_connections` diagnostic can show it.
 ## Decision
 
 We adopt options 2 and 3.2, and the client classification that makes 3.2
-useful.
+useful. We also raise the listener's session-shaped defaults (option 1, not
+as the sole measure).
 
 ### 1. Spread first reads across the close group (ant-client)
 
@@ -215,6 +218,34 @@ a stream, since a 4 MiB chunk plays for several seconds at video bit rates. It
 is short enough that the node rejoins lookups and reads soon after viewers
 leave.
 
+### 4. Raise the session-shaped listener defaults (ant-node)
+
+| Setting | Before | Now |
+|---|---:|---:|
+| `max_connections` | 32 | 256 |
+| `max_channels` | 32 | 256 |
+| `max_concurrent_requests` | 16 | 128 |
+
+- **256 sessions is the transport's ceiling** (`MAX_PENDING_ASSOCIATIONS`).
+  Going higher needs a saorsa-transport change and the load test below.
+- **Sessions alone would not help.** A session that opens a channel needs a
+  channel slot. The post-quantum handshake and every request take a request
+  slot, and when none is free the node closes the channel. With 16 request
+  slots, a node already turns away new channels once 16 GETs are queued. The
+  channel and request limits therefore keep their ratio to sessions: one
+  channel and half a request slot per session.
+- **What does not change:** the per-IP session quota (4), channels per session
+  (2), every rate bucket, and both in-flight byte budgets.
+  - Frame and response memory is bounded by the byte budgets, not by slot
+    counts. A GET builds its response only while it holds one of the four
+    bulk-response slots that the 64 MiB budget allows. While it waits for one
+    it holds only its small request frame.
+  - The rate buckets bound handshake and request CPU.
+- **What grows** is per-association state outside those budgets: ICE, DTLS and
+  SCTP state and tasks for each session, and one handler task per channel.
+  The network A/B measures node memory and CPU at the new limits.
+- A node whose `--config` file sets these limits keeps its values.
+
 ## Consequences
 
 ### Positive
@@ -226,6 +257,8 @@ leave.
   10.0 s.
 - **A full node rejoins rotation after 15 s instead of 30 minutes,** so
   overload no longer shrinks the network a client can see.
+- **Eight times the browser sessions per node by default,** with the request
+  slots to serve them, under the same memory and rate budgets.
 - **Refusing costs the node almost nothing.** A STUN refusal allocates no RTC
   state, and it is sent only to a source that has proved reachability, at most
   once per returned cookie.
@@ -267,15 +300,19 @@ leave.
   `Refused`. That is acceptable: the node was demonstrably up seconds earlier.
 - **Application refusals still cost the node a DTLS handshake** per attempt,
   as today. Only transport refusals are cheaper.
-- **Neither change adds capacity for finding 2.** Synchronised demand for one
-  chunk still outruns seven uplinks. Spreading and fast refusal make the best
-  use of the holders that exist. More holders need the deferred options.
+- **A saturated node holds more per-session state.** At 256 sessions each
+  association's ICE, DTLS and SCTP state and tasks sit outside the byte
+  budgets. Until the network A/B measures it, that cost is an estimate.
+- **None of these changes adds capacity for finding 2.** Synchronised demand
+  for one chunk still outruns seven uplinks; more sessions only queue more
+  viewers on the same uplink. Spreading and fast refusal make the best use of
+  the holders that exist. More holders need the deferred options.
 
 ### Neutral / Operational
 
-- No limit changes here. Raising `max_connections`,
-  `max_concurrent_requests` and the transport's 256 ceiling is a separate
-  decision, based on a load test of CPU and memory per session.
+- The new defaults reach nodes on upgrade. Raising the transport's 256
+  ceiling is a separate decision, based on the per-session cost the network
+  A/B measures.
 - `rejected_connections` now counts answered refusals. An operator who sees
   it rise knows browsers are being turned away, and no longer silently dropped.
 - Once ADR-0020 (get-or-closer) lands, its holder choice should follow the
@@ -333,8 +370,12 @@ leave.
 - Run an A/B with the WASM benchmark harness: one hot file read by N clients.
   Compare the per-holder GET distribution, chunk read latency p50/p95, GETs per
   chunk (the `NotFound` cost), and nodes' `rejected_connections`.
+- In the same run, measure node memory and CPU with sessions near the new
+  limits.
 - Check mainnet nodes' `rejected_connections` to learn how many of the
-  endpoints that "time out when dialled" were full.
+  endpoints that "time out when dialled" were full. The node binary does not
+  log or serve its listener diagnostics today, so this needs them exported
+  first.
 
 **Review triggers.**
 - A browser changes how it handles STUN error responses to connectivity

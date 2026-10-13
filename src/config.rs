@@ -243,7 +243,7 @@ fn default_webrtc_direct_bind() -> SocketAddr {
 }
 
 const fn default_webrtc_direct_max_connections() -> usize {
-    32
+    256
 }
 
 const fn default_webrtc_direct_max_connections_per_ip() -> usize {
@@ -255,11 +255,11 @@ const fn default_webrtc_direct_max_channels_per_connection() -> usize {
 }
 
 const fn default_webrtc_direct_max_channels() -> usize {
-    32
+    256
 }
 
 const fn default_webrtc_direct_max_concurrent_requests() -> usize {
-    16
+    128
 }
 
 const fn default_webrtc_direct_max_requests_per_second() -> usize {
