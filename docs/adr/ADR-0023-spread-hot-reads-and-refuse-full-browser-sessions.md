@@ -12,6 +12,8 @@
   ant-client ADR-0004 (direct browser read client),
   [RFC 8489 §6.3.4](https://www.rfc-editor.org/rfc/rfc8489#section-6.3.4) (STUN error responses),
   [RFC 8445 §7.2.5.2.4](https://www.rfc-editor.org/rfc/rfc8445#section-7.2.5.2.4) (connectivity-check failure)
+- **Implementation:** ant-client #225 (sections 1, 3 and 5),
+  saorsa-transport #183 (section 2), ant-node #250 (section 4)
 
 ## Context
 
@@ -111,7 +113,9 @@ unverified, but each node's `rejected_connections` diagnostic can show it.
 
 We adopt options 2 and 3.2, and the client classification that makes 3.2
 useful. We also raise the listener's session-shaped defaults (option 1, not
-as the sole measure).
+as the sole measure). Finally, a read waits out a holder's refusal before it
+reports the record absent, so a busy holder is not mistaken for a missing
+record.
 
 ### 1. Spread first reads across the close group (ant-client)
 
@@ -253,6 +257,39 @@ leave.
   184 MiB with 32 sessions and 268–271 MiB with 192.
 - A node whose `--config` file sets these limits keeps its values.
 
+### 5. Wait out a holder's refusal before reporting a record absent (ant-client)
+
+**The problem.** A refused holder is suppressed for 15 s (section 3), and a
+suppressed peer is left out of every lookup and read. A read that finds no
+holder retries the close group once, after 1 s, and then reports the record
+not found. So a read that starts while the holders it can find are refusing
+reports a false "record not found", and it can even meet the absence rule,
+because only the peers left in view are counted. On the testnet at the old
+limits, every failed download ended this way (Validation).
+
+**What changes.** When a round ends without the record, the read engine asks
+the client which peers it is suppressing for a refusal, and how long each has
+left. A refused peer may hold the record unless it answered `NotFound` itself,
+or `CLOSE_GROUP_SIZE` peers nearer the record did. The test counts peers
+refused when the round started as well as at its end. A refusal that ended
+during the round counts as ready now.
+
+While any refused peer may hold the record:
+- the read does not report the record absent, even if the absence rule holds;
+- it waits until the first such refusal ends, and at least the usual 1 s,
+  then runs another round;
+- after `MAX_REFUSAL_WAITS` (3) waits it fails with an error saying the nodes
+  that may hold the record are busy, rather than that the record was not found.
+
+Otherwise the read keeps today's rule: one retry after 1 s, then absence.
+
+**Cost.** At most 45 s and three lookups more, and only for a read that would
+otherwise have failed.
+
+**Scope.** Only the browser client classifies refusals, so native reads are
+unchanged. The browser client's network adapter gains a `refused_peers()`
+hook, which defaults to none.
+
 ## Consequences
 
 ### Positive
@@ -266,6 +303,10 @@ leave.
   10.0 s.
 - **A full node rejoins rotation after 15 s instead of 30 minutes,** so
   overload no longer shrinks the network a client can see.
+- **A busy holder no longer looks like a missing record.** A read waits for
+  refused holders to return, and if they keep refusing it reports them busy.
+  In a mock network whose only holder refuses once, the download completes
+  after 15 s instead of failing with "record not found" (Validation).
 - **Eight times the browser sessions per node by default,** with the channel
   and request slots to use them, under the same memory and rate budgets. On
   the testnet this turned 64 synchronised downloads from 61–66% complete into
@@ -281,6 +322,8 @@ leave.
   - Old client, new node: the browser fails the association at once, but the
     old client still waits for its channel-open timeout and records a 30-minute
     failure, as before.
+  - Section 5 needs only the client. It applies to every refusal the client
+    classifies, including application-level closes from old nodes.
 
 ### Negative / Trade-offs
 
@@ -317,20 +360,18 @@ leave.
   measured about 0.5 MiB per session, so a full listener costs about 130 MiB
   more than an idle one. That matters to operators who run many nodes on one
   host.
-- **A read still gives up before a refusal's cooldown ends.** If no holder
-  answers, the read engine retries the close group once, after 1 s, and the
-  browser then reports the record as not found. A holder that refused is
-  suppressed for 15 s, so the faster cooldown does not help a read already in
-  flight. Wherever nodes fill, a busy holder still surfaces as a false "record
-  not found":
-  - on the testnet at the old limits, 34–39% of synchronised downloads failed
-    this way, with today's client and with this one alike;
-  - at the adopted limits none of 1,152 downloads failed. With 256 channels
+- **A read whose holders keep refusing takes up to 45 s longer to fail**
+  (section 5), and the application must still retry later or show the "busy"
+  error. The wait cannot tell a full holder from one that has lost the
+  record, so a read may wait for a refused peer that turns out not to have it.
+- **Wherever holders stay full, reads still fail.** Section 5 changes how they
+  fail, not whether. On the testnet, before section 5, every failed download
+  was a busy holder reported as a false "record not found":
+  - at the old limits, 34–39% of synchronised downloads failed this way, with
+    today's client and with sections 1 and 3 alike;
+  - at the adopted limits, none of 1,152 downloads failed. With 256 channels
     and 128 request slots, which filled before sessions did at 192 browsers,
     6 of 768 failed this way.
-
-  Distinguishing "no holder answered" from "absent", and waiting out the
-  shortest refusal cooldown before giving up, is follow-up client work.
 - **None of these changes adds capacity for finding 2.** Synchronised demand
   for one chunk still outruns seven uplinks; more sessions only queue more
   viewers on the same uplink. Spreading and fast refusal make the best use of
@@ -365,7 +406,16 @@ leave.
     nearest-first.
   - An out-of-range choice stays inside the close group.
 - ant-client, `EndpointFailureCache`: a refusal expires after its shorter
-  cooldown while a failure does not.
+  cooldown while a failure does not, and only unexpired refusals are listed
+  with their remaining time.
+- ant-client, `client_engine::read` (section 5), on a simulated clock:
+  - A read whose holder is refused and hidden from discovery waits out the
+    15 s refusal and reads the record.
+  - A refusal that ends during a round is retried after the usual 1 s.
+  - A holder that keeps refusing makes the read fail as busy after three
+    waits of 15 s, not as absent.
+  - A refused peer with a close group of nearer `NotFound` answers does not
+    delay absence.
 - ant-client, `wasm-tests/capacity-refusal.test.mjs`:
   - A mock node that refuses at its transport, and one that closes during the
     handshake, both fail the dial in under 2 s.
@@ -374,6 +424,13 @@ leave.
   - A third mock node that fails DTLS after ICE connected is not dialled again.
   - With refusal detection disabled, or with the earlier "dead and fast" test
     that ignored ICE state, this test fails.
+- ant-client, `wasm-tests/refused-holder.test.mjs` (section 5): a client
+  whose seed points at a single holder that declines its first dial:
+  - downloads the file after about 15 s;
+  - when the holder declines every dial, fails after about 45 s with an error
+    that says "busy" and not "not found";
+  - without section 5, fails with "record … not found", the error the
+    testnet's failed downloads ended with.
 
 **Real browsers (2026-10-12).**
 - **Setup:** a local 7-node devnet with `max_connections` = 2 and
@@ -430,9 +487,9 @@ leave.
   | Node peak memory / CPU | 271 MiB / 1.22 cores | 268 MiB / 1.28 cores |
 
 - **What the run showed:**
-  - Every failed download ended in a false "record not found" (Negative /
-    Trade-offs). Two browsers reading the same files on their own finished in
-    19 s and 54 s.
+  - Every failed download ended in a false "record not found". Two browsers
+    reading the same files on their own finished in 19 s and 54 s. Section 5
+    addresses this. It came after this run and has not run on a network.
   - At the old limits, channel slots ran out before sessions. Today's client
     and the new one failed at the same rate.
   - Spreading cut the most popular holder's share of a chunk's first reads
@@ -458,8 +515,9 @@ leave.
   endpoints that "time out when dialled" were full. The node binary does not
   log or serve its listener diagnostics today, so this needs them exported
   first.
-- Decide the client follow-up for reads that end while their holders are
-  refusing (Negative / Trade-offs).
+- Run section 5 on a network. Re-run the old-limits arm (C) with it, and
+  check that downloads which failed with "record not found" now complete or
+  report busy.
 
 **Review triggers.**
 - A browser changes how it handles STUN error responses to connectivity
