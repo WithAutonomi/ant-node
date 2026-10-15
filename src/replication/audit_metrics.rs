@@ -400,6 +400,21 @@ static RESPONDER_ADMISSION_DROPS: [AtomicU64; N_RESPONDER_CLASSES * N_ADMISSION_
 static RESPONDER_STALENESS_SHEDS: [AtomicU64; N_RESPONDER_CLASSES] =
     [const { AtomicU64::new(0) }; N_RESPONDER_CLASSES];
 
+/// Fetch admission refusals by what became of the busy reply, indexed by
+/// [`FetchBusyReplyOutcome::index`].
+static FETCH_BUSY_REPLIES: [AtomicU64; FetchBusyReplyOutcome::COUNT] =
+    [const { AtomicU64::new(0) }; FetchBusyReplyOutcome::COUNT];
+
+/// Busy answers this node received to its own fetches.
+static FETCH_BUSY_RECEIVED: AtomicU64 = AtomicU64::new(0);
+
+/// Times this node, choosing where to start or retry a fetch, passed over a
+/// holder that had recently answered it busy.
+static FETCH_BUSY_COOLING_SKIPS: AtomicU64 = AtomicU64::new(0);
+
+/// Holders this node currently remembers as having answered it busy.
+static FETCH_BUSY_SOURCES_TRACKED: AtomicU64 = AtomicU64::new(0);
+
 static SERIAL_QUEUE_OVERFLOW_DROPS: [AtomicU64; protocol::N_REPLICATION_VARIANTS] =
     [const { AtomicU64::new(0) }; protocol::N_REPLICATION_VARIANTS];
 
@@ -532,6 +547,98 @@ pub fn record_responder_staleness_shed(class: ReplicationResponderClass) {
     }
 }
 
+/// What became of a fetch refused at admission, as far as a busy reply goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchBusyReplyOutcome {
+    /// The requester did not ask for busy replies (an older node): silence,
+    /// as before.
+    NotAsked,
+    /// Every busy-reply send permit was in use: silence.
+    SendPoolFull,
+    /// Over the per-peer or global busy-reply rate: silence.
+    RateLimited,
+    /// A busy reply to the same peer was still being sent: silence.
+    PeerInFlight,
+    /// The busy reply was handed to the transport.
+    Sent,
+    /// The transport refused the busy reply.
+    SendFailed,
+    /// The transport did not take the busy reply in time; abandoned.
+    TimedOut,
+    /// Shutdown began before the busy reply was sent.
+    Cancelled,
+}
+
+impl FetchBusyReplyOutcome {
+    const COUNT: usize = 8;
+
+    const fn index(self) -> usize {
+        match self {
+            Self::NotAsked => 0,
+            Self::SendPoolFull => 1,
+            Self::RateLimited => 2,
+            Self::PeerInFlight => 3,
+            Self::Sent => 4,
+            Self::SendFailed => 5,
+            Self::TimedOut => 6,
+            Self::Cancelled => 7,
+        }
+    }
+}
+
+/// Count what became of one fetch refusal's busy reply.
+pub fn record_fetch_busy_reply(outcome: FetchBusyReplyOutcome) {
+    if let Some(counter) = FETCH_BUSY_REPLIES.get(outcome.index()) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Fetch refusals with this busy-reply outcome since process start.
+#[must_use]
+#[cfg_attr(not(feature = "logging"), allow(dead_code))]
+pub fn fetch_busy_replies_total(outcome: FetchBusyReplyOutcome) -> u64 {
+    FETCH_BUSY_REPLIES
+        .get(outcome.index())
+        .map_or(0, |counter| counter.load(Ordering::Relaxed))
+}
+
+/// Count a busy answer to one of this node's own fetches.
+pub fn record_fetch_busy_received() {
+    FETCH_BUSY_RECEIVED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Busy answers to this node's own fetches since process start.
+#[must_use]
+#[cfg_attr(not(feature = "logging"), allow(dead_code))]
+pub fn fetch_busy_received_total() -> u64 {
+    FETCH_BUSY_RECEIVED.load(Ordering::Relaxed)
+}
+
+/// Count a fetch started or retried on a later holder because an earlier one
+/// had recently answered busy.
+pub fn record_fetch_busy_cooling_skip() {
+    FETCH_BUSY_COOLING_SKIPS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Fetches started or retried past a cooling holder since process start.
+#[must_use]
+#[cfg_attr(not(feature = "logging"), allow(dead_code))]
+pub fn fetch_busy_cooling_skips_total() -> u64 {
+    FETCH_BUSY_COOLING_SKIPS.load(Ordering::Relaxed)
+}
+
+/// Set how many holders this node remembers as having answered it busy.
+pub fn set_fetch_busy_sources_tracked(count: usize) {
+    FETCH_BUSY_SOURCES_TRACKED.store(u64::try_from(count).unwrap_or(u64::MAX), Ordering::Relaxed);
+}
+
+/// Holders this node remembers as having answered it busy.
+#[must_use]
+#[cfg_attr(not(feature = "logging"), allow(dead_code))]
+pub fn fetch_busy_sources_tracked() -> u64 {
+    FETCH_BUSY_SOURCES_TRACKED.load(Ordering::Relaxed)
+}
+
 /// One class's admission pressure, read together for a summary line.
 #[cfg_attr(not(feature = "logging"), allow(dead_code))]
 struct ResponderAdmissionSnapshot {
@@ -640,6 +747,20 @@ pub fn log_responder_admission_summary() {
         fetch_admission_dropped_global_pool = fetch.global_pool,
         fetch_admission_dropped_per_peer_share = fetch.per_peer_share,
         fetch_staleness_shed = fetch.staleness_shed,
+        fetch_busy_reply_not_asked = fetch_busy_replies_total(FetchBusyReplyOutcome::NotAsked),
+        fetch_busy_reply_send_pool_full =
+            fetch_busy_replies_total(FetchBusyReplyOutcome::SendPoolFull),
+        fetch_busy_reply_rate_limited =
+            fetch_busy_replies_total(FetchBusyReplyOutcome::RateLimited),
+        fetch_busy_reply_peer_in_flight =
+            fetch_busy_replies_total(FetchBusyReplyOutcome::PeerInFlight),
+        fetch_busy_reply_sent = fetch_busy_replies_total(FetchBusyReplyOutcome::Sent),
+        fetch_busy_reply_send_failed = fetch_busy_replies_total(FetchBusyReplyOutcome::SendFailed),
+        fetch_busy_reply_timed_out = fetch_busy_replies_total(FetchBusyReplyOutcome::TimedOut),
+        fetch_busy_reply_cancelled = fetch_busy_replies_total(FetchBusyReplyOutcome::Cancelled),
+        fetch_busy_received = fetch_busy_received_total(),
+        fetch_busy_cooling_skips = fetch_busy_cooling_skips_total(),
+        fetch_busy_sources_tracked = fetch_busy_sources_tracked(),
         verification_admission_dropped_global_pool = verification.global_pool,
         verification_admission_dropped_per_peer_share = verification.per_peer_share,
         verification_staleness_shed = verification.staleness_shed,

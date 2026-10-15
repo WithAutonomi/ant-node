@@ -40,3 +40,4 @@ See [`TOOLING.md`](./TOOLING.md) for `adrs`, `adr-kit`, and AI harness setup.
 - [ADR-0018: Pointer ownership transfer by final redirection](./ADR-0018-pointer-transfer-by-final-redirection.md)
 - [ADR-0019: Pointer audits serve the record round 1 bound](./ADR-0019-pointer-audits-serve-the-record-round-one-bound.md)
 - [ADR-0022: Remove the LMDB Chunk Store](./ADR-0022-remove-the-lmdb-chunk-store.md)
+- [ADR-0025: Tell a fetch requester "busy" instead of refusing silently](./ADR-0025-fetch-busy-reply.md)
