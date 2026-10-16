@@ -325,8 +325,9 @@ impl SourceBusyTracker {
     /// Record a busy answer from `source` at `now`. `wait` is the busy wait
     /// before any cap from the attempt's own timeout. Returns how long the
     /// source is now put last: `wait` the first time, doubling with each further
-    /// busy answer before it serves again, up to a minute. A
-    /// cooldown already running is never shortened.
+    /// busy answer before it serves again, up to a minute. A cooldown already
+    /// running is never shortened, so when it outlasts the new one, what is
+    /// left of it is returned.
     pub fn record_busy(&self, source: &PeerId, now: Instant, wait: Duration) -> Duration {
         let mut sources = self.sources.lock();
         if sources
@@ -363,8 +364,9 @@ impl SourceBusyTracker {
         let until = now.checked_add(cooldown).unwrap_or(now);
         record.cooling_until = record.cooling_until.max(until);
         record.last_busy = now;
+        let cooling_for = record.cooling_until.saturating_duration_since(now);
         audit_metrics::set_fetch_busy_sources_tracked(sources.len());
-        cooldown
+        cooling_for
     }
 
     /// `source` served this requester: forget its busy record.
@@ -687,8 +689,12 @@ mod tests {
             tracker.record_busy(&a, t0, Duration::from_secs(10));
         }
         // Cooling until t0 + 60 s now. A later busy answer with a tiny wait
-        // would end far sooner; the running cooldown stands.
-        tracker.record_busy(&a, t0 + Duration::from_secs(1), Duration::from_millis(1));
+        // would end far sooner; the running cooldown stands, and what is left
+        // of it is what the caller is told.
+        assert_eq!(
+            tracker.record_busy(&a, t0 + Duration::from_secs(1), Duration::from_millis(1)),
+            Duration::from_secs(59)
+        );
         assert!(tracker.is_cooling(&a, t0 + Duration::from_secs(59)));
     }
 

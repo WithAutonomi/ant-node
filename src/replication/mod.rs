@@ -9660,7 +9660,7 @@ async fn execute_single_fetch(
                     let cooldown = busy_sources.record_busy(&source, Instant::now(), full_wait);
                     debug!(
                         "Fetch: source {source} busy for {}; moving on in {} ms, \
-                         passing it over for new keys for {} ms",
+                         putting it last for {} ms",
                         hex::encode(key),
                         wait.as_millis(),
                         cooldown.as_millis()
