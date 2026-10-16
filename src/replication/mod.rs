@@ -22,6 +22,7 @@ pub mod bootstrap;
 pub mod commitment;
 pub mod commitment_state;
 pub mod config;
+pub mod fetch_busy;
 pub mod fresh;
 pub mod neighbor_sync;
 pub mod paid_list;
@@ -42,6 +43,8 @@ use std::fmt;
 use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
+#[cfg(any(test, feature = "test-utils"))]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -56,7 +59,7 @@ use parking_lot::Mutex;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use tokio::sync::broadcast::error::RecvError;
-use tokio::sync::{mpsc, Notify, RwLock, Semaphore};
+use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -72,7 +75,7 @@ use crate::pointer::{FinalStateWitness, PointerService};
 use crate::replication::audit::AuditTickResult;
 use crate::replication::audit_coordinator::AuditChallengeCoordinator;
 use crate::replication::audit_metrics::{
-    AuditResponderClass, AuditResponderDropReason, AuditResponderMetrics,
+    AuditResponderClass, AuditResponderDropReason, AuditResponderMetrics, FetchBusyReplyOutcome,
     ReplicationResponderClass, ResponderAdmissionCeiling,
 };
 use crate::replication::commitment::{commitment_hash, StorageCommitment};
@@ -87,6 +90,10 @@ use crate::replication::config::{
     MAX_SUBTREE_SESSIONS, MAX_VERIFICATION_KEYS_PER_CYCLE, REPLICATION_PROTOCOL_ID,
     SUBTREE_AUDIT_PROTOCOL_ID, SUBTREE_ROUND1_WORK_BURST_BYTES,
     SUBTREE_ROUND1_WORK_REFILL_BYTES_PER_SEC, SUBTREE_SESSION_TTL,
+};
+use crate::replication::fetch_busy::{
+    busy_wait, BusyReplyDenied, BusyReplyGrant, FetchBusyReplyLimiter, SourceBusyTracker,
+    FETCH_BUSY_REPLY_SEND_TIMEOUT, FETCH_BUSY_WAIT_SPREAD,
 };
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
@@ -1129,6 +1136,14 @@ const FETCH_RESPONDER_MAX_OUTSTANDING: usize = FETCH_RESPONDER_WORKER_LIMIT * 4;
 /// of the three workers available to other peers under a single-source flood.
 const FETCH_RESPONDER_MAX_OUTSTANDING_PER_PEER: u32 = 2;
 
+/// Maximum busy replies being sent at once.
+///
+/// [`FetchBusyReplyLimiter`] bounds how often busy replies are sent; this
+/// bounds how many sends are open at once, so peers that are slow to take a
+/// reply cannot pile up send tasks. Past it, a refusal falls back to the
+/// silence every refusal got before busy replies existed.
+const FETCH_BUSY_REPLY_MAX_OUTSTANDING: usize = FETCH_RESPONDER_MAX_OUTSTANDING * 4;
+
 /// Maximum verification batches served concurrently.
 ///
 /// Point lookups are fast, but a batch can contain 8,192 of them. Two
@@ -1787,6 +1802,20 @@ pub struct ReplicationEngine {
     fetch_responder_admission_semaphore: Arc<Semaphore>,
     /// Per-source fetch responder counts for flood-fair admission.
     fetch_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    /// Test-only hold on serving admitted fetch requests.
+    #[cfg(any(test, feature = "test-utils"))]
+    fetch_serve_gate: Arc<FetchServeGate>,
+    /// Test-only count of this engine's fetch refusals because its admission
+    /// pool was full.
+    #[cfg(any(test, feature = "test-utils"))]
+    fetch_pool_full_refusals: Arc<AtomicU64>,
+    /// Permits for busy replies being sent to fetch requests refused at
+    /// admission.
+    fetch_busy_reply_semaphore: Arc<Semaphore>,
+    /// Per-peer and global rate bound on those busy replies.
+    fetch_busy_reply_limiter: Arc<FetchBusyReplyLimiter>,
+    /// Sources that recently answered this node's own fetches busy.
+    fetch_busy_sources: Arc<SourceBusyTracker>,
     /// Worker permits for lookup-heavy verification batches.
     verification_responder_worker_semaphore: Arc<Semaphore>,
     /// Admission permits bounding verification workers and queued waiters.
@@ -1940,6 +1969,13 @@ impl ReplicationEngine {
                 FETCH_RESPONDER_MAX_OUTSTANDING,
             )),
             fetch_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(any(test, feature = "test-utils"))]
+            fetch_serve_gate: Arc::new(FetchServeGate::default()),
+            #[cfg(any(test, feature = "test-utils"))]
+            fetch_pool_full_refusals: Arc::new(AtomicU64::new(0)),
+            fetch_busy_reply_semaphore: Arc::new(Semaphore::new(FETCH_BUSY_REPLY_MAX_OUTSTANDING)),
+            fetch_busy_reply_limiter: Arc::new(FetchBusyReplyLimiter::new()),
+            fetch_busy_sources: Arc::new(SourceBusyTracker::new()),
             verification_responder_worker_semaphore: Arc::new(Semaphore::new(
                 VERIFICATION_RESPONDER_WORKER_LIMIT,
             )),
@@ -2170,6 +2206,53 @@ impl ReplicationEngine {
         let mut queues = self.queues.write().await;
         queues.remove_pending(&key);
         queues.enqueue_fetch(key, distance, sources)
+    }
+
+    /// Test-only: hold this engine's admitted fetch requests before they are
+    /// served, until [`Self::open_fetch_serve_gate_for_test`].
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn close_fetch_serve_gate_for_test(&self) {
+        self.fetch_serve_gate.close();
+    }
+
+    /// Test-only: release this engine's held fetch requests and stop holding
+    /// new ones.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn open_fetch_serve_gate_for_test(&self) {
+        self.fetch_serve_gate.open();
+    }
+
+    /// Test-only: whether this engine puts `source` last when choosing where
+    /// to start or retry a fetch, because it recently answered busy.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn fetch_source_cooling_for_test(&self, source: &PeerId) -> bool {
+        self.fetch_busy_sources.is_cooling(source, Instant::now())
+    }
+
+    /// Test-only: when `source` last answered this engine's fetches busy, if
+    /// it is still remembered.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn fetch_source_last_busy_for_test(&self, source: &PeerId) -> Option<Instant> {
+        self.fetch_busy_sources.last_busy(source)
+    }
+
+    /// Test-only: fetch requests this engine has admitted and not yet finished
+    /// serving.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn fetch_admitted_for_test(&self) -> usize {
+        FETCH_RESPONDER_MAX_OUTSTANDING
+            .saturating_sub(self.fetch_responder_admission_semaphore.available_permits())
+    }
+
+    /// Test-only: fetch requests this engine has refused because its
+    /// admission pool was full.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn fetch_pool_full_refusals_for_test(&self) -> u64 {
+        self.fetch_pool_full_refusals.load(Ordering::Relaxed)
     }
 
     /// Test-only: whether `key` is still tracked in any fetch-pipeline stage
@@ -2433,6 +2516,12 @@ impl ReplicationEngine {
                 }
             }
         }
+
+        // A test may shut down with the fetch serve gate still closed. The
+        // requests it holds wait on the gate before they reach a worker pool,
+        // so release them, or the drain below never finishes.
+        #[cfg(any(test, feature = "test-utils"))]
+        self.fetch_serve_gate.open();
 
         // Close the responder worker pools. Detached tasks still queued for a
         // worker take the `Err` arm of `acquire_owned()` and exit immediately
@@ -3063,6 +3152,12 @@ impl ReplicationEngine {
         let fetch_responder_admission_semaphore =
             Arc::clone(&self.fetch_responder_admission_semaphore);
         let fetch_responder_inflight = Arc::clone(&self.fetch_responder_inflight);
+        #[cfg(any(test, feature = "test-utils"))]
+        let fetch_serve_gate = Arc::clone(&self.fetch_serve_gate);
+        #[cfg(any(test, feature = "test-utils"))]
+        let fetch_pool_full_refusals = Arc::clone(&self.fetch_pool_full_refusals);
+        let fetch_busy_reply_semaphore = Arc::clone(&self.fetch_busy_reply_semaphore);
+        let fetch_busy_reply_limiter = Arc::clone(&self.fetch_busy_reply_limiter);
         let verification_responder_worker_semaphore =
             Arc::clone(&self.verification_responder_worker_semaphore);
         let verification_responder_admission_semaphore =
@@ -3119,6 +3214,12 @@ impl ReplicationEngine {
             fetch_responder_worker_semaphore,
             fetch_responder_admission_semaphore,
             fetch_responder_inflight,
+            #[cfg(any(test, feature = "test-utils"))]
+            fetch_serve_gate,
+            #[cfg(any(test, feature = "test-utils"))]
+            fetch_pool_full_refusals,
+            fetch_busy_reply_semaphore,
+            fetch_busy_reply_limiter,
             verification_responder_worker_semaphore,
             verification_responder_admission_semaphore,
             verification_responder_inflight,
@@ -3881,6 +3982,7 @@ impl ReplicationEngine {
         let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
         let bootstrap_complete_notify = Arc::clone(&self.bootstrap_complete_notify);
         let detached_task_tracker = self.detached_task_tracker.clone();
+        let busy_sources = Arc::clone(&self.fetch_busy_sources);
         let concurrency = max_parallel_fetch();
 
         info!("Fetch worker concurrency set to {concurrency} (hardware threads)");
@@ -3899,7 +4001,11 @@ impl ReplicationEngine {
                             break;
                         };
                         let fetch_key = candidate.key;
-                        let Some(&source) = candidate.sources.first() else {
+                        // A source that just answered this node busy is the
+                        // worst place to start a new key; start on the first
+                        // that is not cooling down, or the first if all are.
+                        let Some(&source) = busy_sources.choose(&candidate.sources, Instant::now())
+                        else {
                             warn!(
                                 "Fetch candidate {} has no sources; requeueing for verification",
                                 hex::encode(fetch_key)
@@ -3915,6 +4021,7 @@ impl ReplicationEngine {
                         let p2p = Arc::clone(&p2p);
                         let storage = Arc::clone(&storage);
                         let config = Arc::clone(&config);
+                        let busy_sources = Arc::clone(&busy_sources);
                         let token = shutdown.clone();
                         let tracker = detached_task_tracker.clone();
                         in_flight.push(Box::pin(async move {
@@ -3930,7 +4037,7 @@ impl ReplicationEngine {
                                         result: FetchResult::SourceFailed,
                                     },
                                     outcome = execute_single_fetch(
-                                        p2p, storage, config, fetch_key, source,
+                                        p2p, storage, config, busy_sources, fetch_key, source,
                                     ) => outcome,
                                 }
                             });
@@ -3969,6 +4076,7 @@ impl ReplicationEngine {
                                 &key,
                                 &outcome.result,
                                 config.verification_request_timeout,
+                                &busy_sources,
                             ) {
                                 FetchFollowUp::Terminal => true,
                                 FetchFollowUp::RequeuedForVerification => false,
@@ -3977,6 +4085,7 @@ impl ReplicationEngine {
                                     let p2p = Arc::clone(&p2p);
                                     let storage = Arc::clone(&storage);
                                     let config = Arc::clone(&config);
+                                    let busy_sources = Arc::clone(&busy_sources);
                                     let token = shutdown.clone();
                                     let tracker = detached_task_tracker.clone();
                                     let fetch_key = key;
@@ -3990,7 +4099,12 @@ impl ReplicationEngine {
                                                     result: FetchResult::SourceFailed,
                                                 },
                                                 outcome = execute_single_fetch(
-                                                    p2p, storage, config, fetch_key, next_peer,
+                                                    p2p,
+                                                    storage,
+                                                    config,
+                                                    busy_sources,
+                                                    fetch_key,
+                                                    next_peer,
                                                 ) => outcome,
                                             }
                                         });
@@ -4589,6 +4703,15 @@ struct ReplicationMessageHandlerContext {
     fetch_responder_worker_semaphore: Arc<Semaphore>,
     fetch_responder_admission_semaphore: Arc<Semaphore>,
     fetch_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    /// Test-only hold on serving admitted fetch requests.
+    #[cfg(any(test, feature = "test-utils"))]
+    fetch_serve_gate: Arc<FetchServeGate>,
+    /// Test-only count of this engine's fetch refusals because its admission
+    /// pool was full.
+    #[cfg(any(test, feature = "test-utils"))]
+    fetch_pool_full_refusals: Arc<AtomicU64>,
+    fetch_busy_reply_semaphore: Arc<Semaphore>,
+    fetch_busy_reply_limiter: Arc<FetchBusyReplyLimiter>,
     verification_responder_worker_semaphore: Arc<Semaphore>,
     verification_responder_admission_semaphore: Arc<Semaphore>,
     verification_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
@@ -7112,6 +7235,45 @@ pub fn verification_requests_for_key_from_for_test(requester: &PeerId, key: &Xor
     })
 }
 
+/// Test-only: holds an engine's admitted fetch requests before they are served.
+///
+/// A held request keeps its admission slot and its requester's per-peer share,
+/// exactly as a request waiting for a worker does, so a test can read what a
+/// requester has outstanding without racing the speed at which the host serves
+/// a chunk. One per engine, so closing it affects no other node or test.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Debug, Default)]
+struct FetchServeGate {
+    closed: AtomicBool,
+    opened: Notify,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl FetchServeGate {
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+
+    fn open(&self) {
+        self.closed.store(false, Ordering::Release);
+        self.opened.notify_waiters();
+    }
+
+    /// Wait while the gate is closed. The wakeup is registered before the flag
+    /// is read, so an open that lands between the two is not missed.
+    async fn wait_open(&self) {
+        loop {
+            let opened = self.opened.notified();
+            tokio::pin!(opened);
+            opened.as_mut().enable();
+            if !self.closed.load(Ordering::Acquire) {
+                return;
+            }
+            opened.await;
+        }
+    }
+}
+
 async fn handle_verification_request(
     source: &PeerId,
     request: &protocol::VerificationRequest,
@@ -7351,11 +7513,42 @@ async fn dispatch_fetch_request(
                 ReplicationResponderClass::Fetch,
                 failure.reason.into(),
             );
+            #[cfg(any(test, feature = "test-utils"))]
+            if failure.reason == ResponderRejectReason::GlobalPoolFull {
+                ctx.fetch_pool_full_refusals.fetch_add(1, Ordering::Relaxed);
+            }
+            let busy_reply = fetch_busy_reply_permit(&source, request.busy_reply, ctx);
+            let capability = if request.busy_reply {
+                "asked"
+            } else {
+                "not_asked"
+            };
+            let reply = if busy_reply.is_some() {
+                "scheduled"
+            } else {
+                "none"
+            };
+            // Same line and counter as before busy replies existed, so the
+            // existing refusal counts carry on. `capability` says whether the
+            // requester asked for a busy reply, and `reply` whether one was
+            // scheduled; whether it was delivered is in the busy-reply counters.
             warn!(
                 responder_class = "fetch",
                 source = %source,
+                capability,
+                reply,
                 "Fetch response dropped at admission: {failure}"
             );
+            if let Some((permit, grant)) = busy_reply {
+                send_fetch_busy_reply(
+                    source,
+                    request.key,
+                    ctx,
+                    request_id,
+                    rr_message_id,
+                    (permit, grant),
+                );
+            }
             return Ok(());
         }
     };
@@ -7365,8 +7558,12 @@ async fn dispatch_fetch_request(
     let p2p_node = Arc::clone(&ctx.p2p_node);
     let request_timeout = ctx.config.fetch_request_timeout;
     let rr_message_id = rr_message_id.map(ToOwned::to_owned);
+    #[cfg(any(test, feature = "test-utils"))]
+    let serve_gate = Arc::clone(&ctx.fetch_serve_gate);
     ctx.detached_task_tracker.spawn(async move {
         let _guard = guard;
+        #[cfg(any(test, feature = "test-utils"))]
+        serve_gate.wait_open().await;
         let Ok(_worker_permit) = worker_semaphore.acquire_owned().await else {
             debug!(
                 responder_class = "fetch",
@@ -7400,6 +7597,91 @@ async fn dispatch_fetch_request(
     });
 
     Ok(())
+}
+
+/// Whether a fetch refused at admission may be answered `Busy`: the send
+/// permit and the limiter's grant to do it with.
+///
+/// Only a requester that asked for busy replies gets one, and only while a
+/// send permit is free, within the limiter's per-peer and global allowances,
+/// and while fewer than the limiter's in-flight limit of busy replies to that
+/// peer (two) are still being sent. Every other
+/// refusal stays silent, exactly as all of them were before busy replies
+/// existed.
+fn fetch_busy_reply_permit(
+    source: &PeerId,
+    busy_reply: bool,
+    ctx: &ReplicationMessageHandlerContext,
+) -> Option<(OwnedSemaphorePermit, BusyReplyGrant)> {
+    if !busy_reply {
+        audit_metrics::record_fetch_busy_reply(FetchBusyReplyOutcome::NotAsked);
+        return None;
+    }
+    // The send permit first: if none is free, the reply would not be sent, so
+    // the rate allowance is left unspent.
+    let Ok(permit) = Arc::clone(&ctx.fetch_busy_reply_semaphore).try_acquire_owned() else {
+        audit_metrics::record_fetch_busy_reply(FetchBusyReplyOutcome::SendPoolFull);
+        return None;
+    };
+    match ctx
+        .fetch_busy_reply_limiter
+        .try_acquire(source, Instant::now())
+    {
+        Ok(grant) => Some((permit, grant)),
+        Err(denied) => {
+            audit_metrics::record_fetch_busy_reply(match denied {
+                BusyReplyDenied::RateLimited => FetchBusyReplyOutcome::RateLimited,
+                BusyReplyDenied::PeerInFlight => FetchBusyReplyOutcome::PeerInFlight,
+            });
+            None
+        }
+    }
+}
+
+/// Tell a requester its fetch was refused at admission, off the serial message
+/// loop.
+///
+/// The send runs on the detached task tracker, holding the send permit and
+/// one of the peer's in-flight places until it ends, so a slow or stalled peer
+/// can neither block other replication traffic nor hold more permits than its
+/// in-flight limit (two). It
+/// is abandoned after [`FETCH_BUSY_REPLY_SEND_TIMEOUT`], and it races the
+/// engine's shutdown, so `shutdown()` never waits on a peer that is slow to
+/// take the reply.
+fn send_fetch_busy_reply(
+    source: PeerId,
+    key: XorName,
+    ctx: &ReplicationMessageHandlerContext,
+    request_id: u64,
+    rr_message_id: Option<&str>,
+    held: (OwnedSemaphorePermit, BusyReplyGrant),
+) {
+    let p2p_node = Arc::clone(&ctx.p2p_node);
+    let shutdown = ctx.shutdown.clone();
+    let rr_message_id = rr_message_id.map(ToOwned::to_owned);
+    ctx.detached_task_tracker.spawn(async move {
+        let _held = held;
+        let delivery = tokio::time::timeout(
+            FETCH_BUSY_REPLY_SEND_TIMEOUT,
+            send_replication_response_checked(
+                &source,
+                &p2p_node,
+                request_id,
+                ReplicationMessageBody::FetchResponse(protocol::FetchResponse::Busy { key }),
+                rr_message_id.as_deref(),
+                None,
+            ),
+        );
+        let outcome = tokio::select! {
+            () = shutdown.cancelled() => FetchBusyReplyOutcome::Cancelled,
+            sent = delivery => match sent {
+                Ok(true) => FetchBusyReplyOutcome::Sent,
+                Ok(false) => FetchBusyReplyOutcome::SendFailed,
+                Err(_) => FetchBusyReplyOutcome::TimedOut,
+            },
+        };
+        audit_metrics::record_fetch_busy_reply(outcome);
+    });
 }
 
 fn request_is_stale(received_at: Instant, timeout: Duration) -> bool {
@@ -7666,15 +7948,7 @@ async fn send_replication_response_checked(
             return false;
         }
     };
-    // V2-684: per-peer served-bytes attribution for the heavy serve paths.
-    // `FetchResponse` carries ~99% of served bytes; `NeighborSyncResponse` is
-    // included for completeness. Other response variants (verification/audit/
-    // commitment) are intentionally excluded — the round-2 audit reply is now a
-    // few-KB verified slice (V2-685), not a full-chunk transfer, so it is light.
-    if matches!(
-        msg.body,
-        ReplicationMessageBody::FetchResponse(_) | ReplicationMessageBody::NeighborSyncResponse(_)
-    ) {
+    if counts_as_served(&msg.body) {
         protocol::record_served(peer, encoded.len());
     }
     let protocol = protocol.unwrap_or_else(|| response_protocol_for(&msg.body));
@@ -7690,6 +7964,26 @@ async fn send_replication_response_checked(
         return false;
     }
     true
+}
+
+/// Whether a response's bytes count towards the peer it is sent to in the
+/// per-peer served-bytes attribution (V2-684).
+///
+/// That attribution covers the heavy serve paths. `FetchResponse` carries ~99%
+/// of served bytes; `NeighborSyncResponse` is included for completeness. Other
+/// response variants (verification/audit/commitment) are intentionally
+/// excluded — the round-2 audit reply is now a few-KB verified slice (V2-685),
+/// not a full-chunk transfer, so it is light. A busy reply serves nothing, so
+/// it is left out too.
+const fn counts_as_served(body: &ReplicationMessageBody) -> bool {
+    matches!(
+        body,
+        ReplicationMessageBody::FetchResponse(
+            protocol::FetchResponse::Success { .. }
+                | protocol::FetchResponse::NotFound { .. }
+                | protocol::FetchResponse::Error { .. }
+        ) | ReplicationMessageBody::NeighborSyncResponse(_)
+    )
 }
 
 async fn record_sent_replica_hints(
@@ -9013,6 +9307,7 @@ fn apply_fetch_result(
     key: &XorName,
     result: &FetchResult,
     verification_retry_after: Duration,
+    busy_sources: &SourceBusyTracker,
 ) -> FetchFollowUp {
     match result {
         FetchResult::Stored | FetchResult::NoLongerResponsible | FetchResult::AlreadyHeld => {
@@ -9020,7 +9315,12 @@ fn apply_fetch_result(
             FetchFollowUp::Terminal
         }
         FetchResult::IntegrityFailed | FetchResult::SourceFailed => {
-            if let Some(next_peer) = q.retry_fetch(key) {
+            // The next untried source in preference order, passing over any
+            // that recently answered this node busy unless all of them have.
+            let now = Instant::now();
+            if let Some(next_peer) =
+                q.retry_fetch_with(key, |untried| busy_sources.choose(untried, now).copied())
+            {
                 FetchFollowUp::RetryFrom(next_peer)
             } else if q.requeue_fetch_for_verification(key, verification_retry_after) {
                 FetchFollowUp::RequeuedForVerification
@@ -9090,6 +9390,7 @@ async fn execute_single_fetch(
     p2p_node: Arc<P2PNode>,
     storage: Arc<ChunkStore>,
     config: Arc<ReplicationConfig>,
+    busy_sources: Arc<SourceBusyTracker>,
     key: XorName,
     source: PeerId,
 ) -> FetchOutcome {
@@ -9147,7 +9448,10 @@ async fn execute_single_fetch(
         };
     }
 
-    let request = protocol::FetchRequest { key };
+    let request = protocol::FetchRequest {
+        key,
+        busy_reply: true,
+    };
     let msg = ReplicationMessage {
         request_id: rand::thread_rng().gen::<u64>(),
         body: ReplicationMessageBody::FetchRequest(request),
@@ -9164,6 +9468,7 @@ async fn execute_single_fetch(
         }
     };
 
+    let sent_at = Instant::now();
     let result = p2p_node
         .send_request(
             &source,
@@ -9257,6 +9562,10 @@ async fn execute_single_fetch(
                         };
                     }
 
+                    // It served a valid chunk, so any earlier busy answers no
+                    // longer count against it when choosing where to start.
+                    busy_sources.record_served(&source);
+
                     // Responsibility can lapse during the network round-trip.
                     // The bandwidth is already spent; declining the write is
                     // what still avoids the disk write and the later
@@ -9325,8 +9634,46 @@ async fn execute_single_fetch(
                         result: FetchResult::SourceFailed,
                     }
                 }
+                ReplicationMessageBody::FetchResponse(protocol::FetchResponse::Busy {
+                    key: resp_key,
+                }) if resp_key == key => {
+                    // The source refused at admission and said so, where it
+                    // used to stay silent. That is an honest, prompt answer, so
+                    // it carries no trust event. Waiting here, still holding
+                    // this fetch slot, before the key moves on is what keeps a
+                    // busy answer from becoming a fast retry loop: this slot asks
+                    // at most once per wait, where silence made it once per fetch
+                    // timeout. The attempt then ends exactly as that timeout
+                    // did, so nothing downstream changes. The worker races this
+                    // whole task against shutdown, so the wait does not delay it.
+                    audit_metrics::record_fetch_busy_received();
+                    let jitter =
+                        rand::thread_rng().gen_range(Duration::ZERO..=FETCH_BUSY_WAIT_SPREAD);
+                    // The holder is put last for at least the full jittered
+                    // wait, even when this attempt's own deadline cuts the
+                    // sleep short.
+                    let full_wait = busy_wait(Duration::MAX, jitter);
+                    let remaining = config
+                        .fetch_request_timeout
+                        .saturating_sub(sent_at.elapsed());
+                    let wait = full_wait.min(remaining);
+                    let cooldown = busy_sources.record_busy(&source, Instant::now(), full_wait);
+                    debug!(
+                        "Fetch: source {source} busy for {}; moving on in {} ms, \
+                         putting it last for {} ms",
+                        hex::encode(key),
+                        wait.as_millis(),
+                        cooldown.as_millis()
+                    );
+                    tokio::time::sleep(wait).await;
+                    FetchOutcome {
+                        key,
+                        result: FetchResult::SourceFailed,
+                    }
+                }
                 _ => {
-                    // Unexpected message type — treat as malformed.
+                    // Unexpected message type, or a busy answer for another
+                    // key — treat as malformed.
                     p2p_node
                         .report_trust_event(
                             &source,
@@ -13287,6 +13634,7 @@ mod tests {
                 request_id: 1,
                 body: ReplicationMessageBody::FetchRequest(protocol::FetchRequest {
                     key: test_key(1),
+                    busy_reply: true,
                 }),
             },
             rr_message_id: None,
@@ -13779,8 +14127,13 @@ mod tests {
         drive_key_in_flight(&mut q, key, vec![test_peer(0x01), test_peer(0x02)]);
         assert_eq!(q.retry_reserved_slot_count(), 1);
 
-        let follow_up =
-            apply_fetch_result(&mut q, &key, &FetchResult::NoLongerResponsible, RETRY_AFTER);
+        let follow_up = apply_fetch_result(
+            &mut q,
+            &key,
+            &FetchResult::NoLongerResponsible,
+            RETRY_AFTER,
+            &SourceBusyTracker::new(),
+        );
 
         assert_eq!(
             follow_up,
@@ -13815,7 +14168,13 @@ mod tests {
             let key = test_key(0xCD);
             drive_key_in_flight(&mut q, key, vec![test_peer(0x03)]);
 
-            let follow_up = apply_fetch_result(&mut q, &key, &result, RETRY_AFTER);
+            let follow_up = apply_fetch_result(
+                &mut q,
+                &key,
+                &result,
+                RETRY_AFTER,
+                &SourceBusyTracker::new(),
+            );
 
             assert_eq!(follow_up, FetchFollowUp::Terminal);
             assert!(!q.contains_key(&key));
@@ -13833,7 +14192,13 @@ mod tests {
         let second = test_peer(0x05);
         drive_key_in_flight(&mut q, key, vec![first, second]);
 
-        let follow_up = apply_fetch_result(&mut q, &key, &FetchResult::SourceFailed, RETRY_AFTER);
+        let follow_up = apply_fetch_result(
+            &mut q,
+            &key,
+            &FetchResult::SourceFailed,
+            RETRY_AFTER,
+            &SourceBusyTracker::new(),
+        );
         assert_eq!(
             follow_up,
             FetchFollowUp::RetryFrom(second),
@@ -13841,7 +14206,13 @@ mod tests {
         );
         assert_eq!(q.in_flight_count(), 1, "retry keeps the key in flight");
 
-        let follow_up = apply_fetch_result(&mut q, &key, &FetchResult::SourceFailed, RETRY_AFTER);
+        let follow_up = apply_fetch_result(
+            &mut q,
+            &key,
+            &FetchResult::SourceFailed,
+            RETRY_AFTER,
+            &SourceBusyTracker::new(),
+        );
         assert_eq!(
             follow_up,
             FetchFollowUp::RequeuedForVerification,
@@ -13853,6 +14224,91 @@ mod tests {
             0,
             "the reservation converts back into the pending entry itself"
         );
+    }
+
+    /// A retry passes over an untried source that recently answered busy when
+    /// another untried source is free, and still takes it when it is the only
+    /// one left: busy holders go last, never out.
+    #[test]
+    fn source_failure_retries_on_a_holder_that_is_not_cooling_first() {
+        const RETRY_AFTER: Duration = Duration::from_mins(1);
+
+        let mut q = ReplicationQueues::new();
+        let key = test_key(0xE1);
+        let (first, cooling, free) = (test_peer(0x11), test_peer(0x12), test_peer(0x13));
+        drive_key_in_flight(&mut q, key, vec![first, cooling, free]);
+        let busy_sources = SourceBusyTracker::new();
+        busy_sources.record_busy(&cooling, Instant::now(), Duration::from_mins(1));
+
+        let follow_up = apply_fetch_result(
+            &mut q,
+            &key,
+            &FetchResult::SourceFailed,
+            RETRY_AFTER,
+            &busy_sources,
+        );
+        assert_eq!(follow_up, FetchFollowUp::RetryFrom(free));
+
+        let follow_up = apply_fetch_result(
+            &mut q,
+            &key,
+            &FetchResult::SourceFailed,
+            RETRY_AFTER,
+            &busy_sources,
+        );
+        assert_eq!(
+            follow_up,
+            FetchFollowUp::RetryFrom(cooling),
+            "a cooling holder is still tried once it is the last untried one"
+        );
+
+        let follow_up = apply_fetch_result(
+            &mut q,
+            &key,
+            &FetchResult::SourceFailed,
+            RETRY_AFTER,
+            &busy_sources,
+        );
+        assert_eq!(follow_up, FetchFollowUp::RequeuedForVerification);
+    }
+
+    /// A busy reply serves nothing, so it never counts as served bytes; the
+    /// answers that did before still do.
+    #[test]
+    fn a_busy_reply_is_not_counted_as_served() {
+        let key = test_key(0x77);
+        assert!(!counts_as_served(&ReplicationMessageBody::FetchResponse(
+            protocol::FetchResponse::Busy { key }
+        )));
+        for response in [
+            protocol::FetchResponse::Success {
+                key,
+                data: vec![1, 2, 3],
+            },
+            protocol::FetchResponse::NotFound { key },
+            protocol::FetchResponse::Error {
+                key,
+                reason: "io".to_string(),
+            },
+        ] {
+            assert!(counts_as_served(&ReplicationMessageBody::FetchResponse(
+                response
+            )));
+        }
+        assert!(counts_as_served(
+            &ReplicationMessageBody::NeighborSyncResponse(protocol::NeighborSyncResponse {
+                replica_hints: vec![],
+                paid_hints: vec![],
+                bootstrapping: false,
+                rejected_keys: vec![],
+                commitment: None,
+            })
+        ));
+        assert!(!counts_as_served(
+            &ReplicationMessageBody::VerificationResponse(protocol::VerificationResponse {
+                results: vec![],
+            })
+        ));
     }
 
     #[test]
@@ -13868,7 +14324,13 @@ mod tests {
         let candidate = q.dequeue_fetch().expect("enqueued key must dequeue");
         q.start_dequeued_fetch(candidate, source);
 
-        let follow_up = apply_fetch_result(&mut q, &key, &FetchResult::SourceFailed, RETRY_AFTER);
+        let follow_up = apply_fetch_result(
+            &mut q,
+            &key,
+            &FetchResult::SourceFailed,
+            RETRY_AFTER,
+            &SourceBusyTracker::new(),
+        );
 
         assert_eq!(follow_up, FetchFollowUp::Terminal);
         assert!(!q.contains_key(&key));
@@ -13883,7 +14345,13 @@ mod tests {
         let source = test_peer(0x0B);
         drive_key_in_flight(&mut q, key, vec![source, test_peer(0x0C)]);
 
-        let follow_up = apply_fetch_result(&mut q, &key, &FetchResult::AlreadyHeld, RETRY_AFTER);
+        let follow_up = apply_fetch_result(
+            &mut q,
+            &key,
+            &FetchResult::AlreadyHeld,
+            RETRY_AFTER,
+            &SourceBusyTracker::new(),
+        );
 
         assert_eq!(
             follow_up,
@@ -13912,8 +14380,13 @@ mod tests {
         let third = test_peer(0x09);
         drive_key_in_flight(&mut q, key, vec![first, second, third]);
 
-        let follow_up =
-            apply_fetch_result(&mut q, &key, &FetchResult::LocalWriteFailed, RETRY_AFTER);
+        let follow_up = apply_fetch_result(
+            &mut q,
+            &key,
+            &FetchResult::LocalWriteFailed,
+            RETRY_AFTER,
+            &SourceBusyTracker::new(),
+        );
 
         assert_eq!(
             follow_up,
@@ -13946,8 +14419,13 @@ mod tests {
         let candidate = q.dequeue_fetch().expect("enqueued key must dequeue");
         q.start_dequeued_fetch(candidate, source);
 
-        let follow_up =
-            apply_fetch_result(&mut q, &key, &FetchResult::LocalWriteFailed, RETRY_AFTER);
+        let follow_up = apply_fetch_result(
+            &mut q,
+            &key,
+            &FetchResult::LocalWriteFailed,
+            RETRY_AFTER,
+            &SourceBusyTracker::new(),
+        );
 
         assert_eq!(follow_up, FetchFollowUp::Terminal);
         assert!(!q.contains_key(&key));

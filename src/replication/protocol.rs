@@ -22,6 +22,35 @@ use super::config::MAX_SUBTREE_AUDIT_MESSAGE_SIZE;
 /// Used in [`AuditResponse::Digests`] for keys the peer does not hold.
 pub const ABSENT_KEY_DIGEST: [u8; 32] = [0u8; 32];
 
+/// Opens the fetch capability trailer that may follow an encoded
+/// [`FetchRequest`] message.
+///
+/// A requester states what it understands here, after the end of the postcard
+/// message, because every older node decodes with postcard's `from_bytes`,
+/// which ignores whatever follows the message. A field inside the message
+/// would instead shift or break their decoding. The magic keeps a stray byte
+/// after a message from ever reading as a capability.
+pub const FETCH_CAPABILITY_MAGIC: [u8; 4] = *b"antf";
+
+/// Bit in the fetch capability flags byte: the requester understands
+/// [`FetchResponse::Busy`].
+pub const FETCH_CAPABILITY_BUSY_REPLY: u8 = 0b0000_0001;
+
+/// Length of the fetch capability trailer: the magic and one flags byte.
+const FETCH_CAPABILITY_TRAILER_LEN: usize = FETCH_CAPABILITY_MAGIC.len() + 1;
+
+/// The fetch capability flags in `trailer`, the bytes after a decoded message.
+///
+/// Zero unless `trailer` opens with [`FETCH_CAPABILITY_MAGIC`] and has a flags
+/// byte after it. Bytes after the flags byte are reserved and ignored, so a
+/// later version can extend the trailer without this one rejecting it.
+fn fetch_capability_flags(trailer: &[u8]) -> u8 {
+    match trailer.strip_prefix(FETCH_CAPABILITY_MAGIC.as_slice()) {
+        Some([flags, ..]) => *flags,
+        _ => 0,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Top-level envelope
 // ---------------------------------------------------------------------------
@@ -68,8 +97,24 @@ impl ReplicationMessage {
         // The buffer is sized exactly, and an oversized body is refused
         // before anything is allocated. Chunk-carrying bodies run to several
         // MiB and are held while they are sent.
-        let max_size = ceiling_for(family_of_variant(self.body.variant_index()));
-        let bytes = encode_exact(self, max_size).map_err(|e| match e {
+        // A fetch request that asks for busy replies carries the capability
+        // trailer after the message, so its message must leave room for it
+        // under the same ceiling the decoder applies to the whole input.
+        let asks_busy_reply = matches!(
+            &self.body,
+            ReplicationMessageBody::FetchRequest(FetchRequest {
+                busy_reply: true,
+                ..
+            })
+        );
+        let trailer_len = if asks_busy_reply {
+            FETCH_CAPABILITY_TRAILER_LEN
+        } else {
+            0
+        };
+        let max_size =
+            ceiling_for(family_of_variant(self.body.variant_index())).saturating_sub(trailer_len);
+        let mut bytes = encode_exact(self, max_size).map_err(|e| match e {
             ExactEncodeError::Serialize(e) => {
                 ReplicationProtocolError::SerializationFailed(e.to_string())
             }
@@ -80,6 +125,14 @@ impl ReplicationMessage {
                 }
             }
         })?;
+
+        // The capability trailer goes immediately after the message, where
+        // older decoders never look.
+        if asks_busy_reply {
+            bytes.reserve_exact(trailer_len);
+            bytes.extend_from_slice(&FETCH_CAPABILITY_MAGIC);
+            bytes.push(FETCH_CAPABILITY_BUSY_REPLY);
+        }
 
         // V2-623: cumulative per-variant tx accounting. Every replication send
         // funnels through here, so this is the single tx choke point.
@@ -120,8 +173,14 @@ impl ReplicationMessage {
                 max_size,
             });
         }
-        let message: Self = postcard::from_bytes(data)
+        // `take_from_bytes` rather than `from_bytes` only to see what follows
+        // the message. Both ignore it otherwise, so nothing that decoded before
+        // decodes differently now.
+        let (mut message, trailer): (Self, &[u8]) = postcard::take_from_bytes(data)
             .map_err(|e| ReplicationProtocolError::DeserializationFailed(e.to_string()))?;
+        if let ReplicationMessageBody::FetchRequest(request) = &mut message.body {
+            request.busy_reply = fetch_capability_flags(trailer) & FETCH_CAPABILITY_BUSY_REPLY != 0;
+        }
 
         // V2-623: cumulative per-variant rx accounting. Every replication
         // receive funnels through here, so this is the single rx choke point.
@@ -977,6 +1036,18 @@ pub struct VerificationResponse {
 pub struct FetchRequest {
     /// The key of the record to fetch.
     pub key: XorName,
+    /// Whether the requester understands [`FetchResponse::Busy`].
+    ///
+    /// Not part of the serialized struct, whose layout is unchanged since the
+    /// first release: it travels in the fetch capability trailer that
+    /// [`ReplicationMessage::encode`] appends after the whole message, and
+    /// [`ReplicationMessage::decode`] reads back. Older nodes decode with
+    /// postcard's `from_bytes`, which stops at the end of the message and never
+    /// sees the trailer, so they keep refusing silently. A responder answers
+    /// `Busy` only when this is set, so an older requester, which never sends
+    /// the trailer, is never sent a variant it cannot decode.
+    #[serde(skip)]
+    pub busy_reply: bool,
 }
 
 /// Response to a fetch request.
@@ -1003,6 +1074,16 @@ pub enum FetchResponse {
         key: XorName,
         /// Human-readable error description.
         reason: String,
+    },
+    /// The responder could not admit the request right now and did not
+    /// serve it. Nothing is implied about whether it holds the record.
+    ///
+    /// APPENDED so the discriminants of the variants above are unchanged. Sent
+    /// only in answer to a [`FetchRequest`] with `busy_reply` set; an older
+    /// requester never sets it, so it is never sent a value it cannot decode.
+    Busy {
+        /// The requested key.
+        key: XorName,
     },
 }
 
@@ -1740,7 +1821,10 @@ mod tests {
                 paid_list_check_indices: vec![],
             }),
             ReplicationMessageBody::VerificationResponse(VerificationResponse { results: vec![] }),
-            ReplicationMessageBody::FetchRequest(FetchRequest { key: z }),
+            ReplicationMessageBody::FetchRequest(FetchRequest {
+                key: z,
+                busy_reply: true,
+            }),
             ReplicationMessageBody::FetchResponse(FetchResponse::NotFound { key: z }),
             ReplicationMessageBody::AuditChallenge(AuditChallenge {
                 challenge_id: 1,
@@ -2392,7 +2476,10 @@ mod tests {
     fn fetch_request_roundtrip() {
         let msg = ReplicationMessage {
             request_id: 9,
-            body: ReplicationMessageBody::FetchRequest(FetchRequest { key: [0x40; 32] }),
+            body: ReplicationMessageBody::FetchRequest(FetchRequest {
+                key: [0x40; 32],
+                busy_reply: true,
+            }),
         };
         let encoded = msg.encode().expect("encode should succeed");
         let decoded = ReplicationMessage::decode(&encoded).expect("decode should succeed");
@@ -2400,6 +2487,7 @@ mod tests {
         assert_eq!(decoded.request_id, 9);
         if let ReplicationMessageBody::FetchRequest(req) = decoded.body {
             assert_eq!(req.key, [0x40; 32]);
+            assert!(req.busy_reply);
         } else {
             panic!("expected FetchRequest");
         }
@@ -2469,6 +2557,283 @@ mod tests {
         } else {
             panic!("expected FetchResponse::Error");
         }
+    }
+
+    #[test]
+    fn fetch_response_busy_roundtrip() {
+        let msg = ReplicationMessage {
+            request_id: 13,
+            body: ReplicationMessageBody::FetchResponse(FetchResponse::Busy { key: [0x71; 32] }),
+        };
+        let encoded = msg.encode().expect("encode should succeed");
+        let decoded = ReplicationMessage::decode(&encoded).expect("decode should succeed");
+
+        assert_eq!(decoded.request_id, 13);
+        if let ReplicationMessageBody::FetchResponse(FetchResponse::Busy { key }) = decoded.body {
+            assert_eq!(key, [0x71; 32]);
+        } else {
+            panic!("expected FetchResponse::Busy");
+        }
+    }
+
+    // -- the fetch busy reply across versions -------------------------------
+    //
+    // `Legacy*` mirror the fetch types and the envelope as every release
+    // before the busy reply encoded them. The seven unit variants stand in for
+    // the body variants before `FetchRequest`; only their count matters, since
+    // postcard writes an enum as its variant index followed by the payload.
+
+    #[derive(Serialize, Deserialize)]
+    struct LegacyFetchRequest {
+        key: XorName,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    enum LegacyFetchResponse {
+        Success {
+            key: XorName,
+            #[serde(with = "serde_bytes")]
+            data: Vec<u8>,
+        },
+        NotFound {
+            key: XorName,
+        },
+        Error {
+            key: XorName,
+            reason: String,
+        },
+    }
+
+    #[derive(Serialize, Deserialize)]
+    enum LegacyBody {
+        V0,
+        V1,
+        V2,
+        V3,
+        V4,
+        V5,
+        V6,
+        FetchRequest(LegacyFetchRequest),
+        FetchResponse(LegacyFetchResponse),
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct LegacyMessage {
+        request_id: u64,
+        body: LegacyBody,
+    }
+
+    fn legacy_fetch_request_bytes(key: XorName) -> Vec<u8> {
+        postcard::to_stdvec(&LegacyMessage {
+            request_id: 21,
+            body: LegacyBody::FetchRequest(LegacyFetchRequest { key }),
+        })
+        .expect("encode")
+    }
+
+    /// The mirror must match the real layout, or every test below proves
+    /// nothing. A current request is an older one's bytes exactly, plus the
+    /// capability trailer when it asks for a busy reply.
+    #[test]
+    fn legacy_mirror_matches_the_current_layout() {
+        let legacy = legacy_fetch_request_bytes([0x22; 32]);
+        let plain = ReplicationMessage {
+            request_id: 21,
+            body: ReplicationMessageBody::FetchRequest(FetchRequest {
+                key: [0x22; 32],
+                busy_reply: false,
+            }),
+        }
+        .encode()
+        .expect("encode");
+        assert_eq!(plain, legacy);
+
+        let asking = ReplicationMessage {
+            request_id: 21,
+            body: ReplicationMessageBody::FetchRequest(FetchRequest {
+                key: [0x22; 32],
+                busy_reply: true,
+            }),
+        }
+        .encode()
+        .expect("encode");
+        let mut expected = legacy;
+        expected.extend_from_slice(&FETCH_CAPABILITY_MAGIC);
+        expected.push(FETCH_CAPABILITY_BUSY_REPLY);
+        assert_eq!(asking, expected);
+    }
+
+    /// An older responder decodes a current request: the trailer comes after
+    /// the message, which `from_bytes` never reads, so it sees the key and
+    /// keeps refusing silently.
+    #[test]
+    fn older_responder_decodes_a_busy_aware_request() {
+        let encoded = ReplicationMessage {
+            request_id: 22,
+            body: ReplicationMessageBody::FetchRequest(FetchRequest {
+                key: [0x23; 32],
+                busy_reply: true,
+            }),
+        }
+        .encode()
+        .expect("encode");
+        let decoded: LegacyMessage = postcard::from_bytes(&encoded).expect("older decoder accepts");
+        assert_eq!(decoded.request_id, 22);
+        match decoded.body {
+            LegacyBody::FetchRequest(LegacyFetchRequest { key }) => assert_eq!(key, [0x23; 32]),
+            _ => panic!("expected the legacy FetchRequest variant"),
+        }
+    }
+
+    /// A current responder decodes an older requester's request, which has no
+    /// trailer, as one that did not ask for a busy reply.
+    #[test]
+    fn older_request_decodes_without_busy_reply() {
+        let decoded = ReplicationMessage::decode(&legacy_fetch_request_bytes([0x24; 32]))
+            .expect("current decoder accepts an older request");
+        match decoded.body {
+            ReplicationMessageBody::FetchRequest(FetchRequest { key, busy_reply }) => {
+                assert_eq!(key, [0x24; 32]);
+                assert!(!busy_reply);
+            }
+            _ => panic!("expected FetchRequest"),
+        }
+    }
+
+    /// Only the magic followed by a flags byte with the busy bit set asks for a
+    /// busy reply. Unknown flag bits and bytes after the flags are reserved and
+    /// ignored; anything else after the message reads as no capability, as it
+    /// always has.
+    #[test]
+    fn only_the_trailer_with_the_busy_bit_asks_for_a_busy_reply() {
+        let magic = FETCH_CAPABILITY_MAGIC.to_vec();
+        let with = |tail: &[u8]| {
+            let mut t = magic.clone();
+            t.extend_from_slice(tail);
+            t
+        };
+        let base = legacy_fetch_request_bytes([0x25; 32]);
+        for (trailer, expected) in [
+            (vec![], false),
+            (with(&[FETCH_CAPABILITY_BUSY_REPLY]), true),
+            (with(&[0]), false),
+            (with(&[0b1111_1111]), true),
+            (with(&[0b1111_1110]), false),
+            (with(&[FETCH_CAPABILITY_BUSY_REPLY, 0xAA, 0xBB]), true),
+            (magic.clone(), false),
+            (magic.get(..3).expect("short magic").to_vec(), false),
+            (
+                vec![b'a', b'n', b't', b'g', FETCH_CAPABILITY_BUSY_REPLY],
+                false,
+            ),
+            (vec![FETCH_CAPABILITY_BUSY_REPLY], false),
+            (vec![0u8; 64], false),
+        ] {
+            let mut bytes = base.clone();
+            bytes.extend_from_slice(&trailer);
+            let decoded = ReplicationMessage::decode(&bytes).expect("decodes");
+            match decoded.body {
+                ReplicationMessageBody::FetchRequest(req) => {
+                    assert_eq!(req.key, [0x25; 32]);
+                    assert_eq!(req.busy_reply, expected, "trailer {trailer:?}");
+                }
+                _ => panic!("expected FetchRequest"),
+            }
+        }
+    }
+
+    /// The trailer means something only after a fetch request. After any other
+    /// body it is ignored exactly like every other trailing byte.
+    #[test]
+    fn other_bodies_ignore_a_capability_trailer() {
+        let mut bytes = ReplicationMessage {
+            request_id: 25,
+            body: ReplicationMessageBody::FetchResponse(FetchResponse::NotFound {
+                key: [0x29; 32],
+            }),
+        }
+        .encode()
+        .expect("encode");
+        bytes.extend_from_slice(&FETCH_CAPABILITY_MAGIC);
+        bytes.push(FETCH_CAPABILITY_BUSY_REPLY);
+        let decoded = ReplicationMessage::decode(&bytes).expect("decodes");
+        assert_eq!(decoded.request_id, 25);
+        assert!(matches!(
+            decoded.body,
+            ReplicationMessageBody::FetchResponse(FetchResponse::NotFound { key }) if key == [0x29; 32]
+        ));
+    }
+
+    /// A request cut short inside the key is still malformed.
+    #[test]
+    fn a_truncated_key_is_still_rejected() {
+        let bytes = legacy_fetch_request_bytes([0x26; 32]);
+        let truncated = bytes.get(..bytes.len() - 1).expect("non-empty");
+        assert!(ReplicationMessage::decode(truncated).is_err());
+    }
+
+    /// The pre-existing answers keep their discriminants, so an older requester
+    /// still decodes every answer it is ever sent.
+    #[test]
+    fn older_requester_decodes_the_unchanged_answers() {
+        for (body, check) in [
+            (
+                FetchResponse::Success {
+                    key: [0x27; 32],
+                    data: vec![1, 2, 3],
+                },
+                0u8,
+            ),
+            (FetchResponse::NotFound { key: [0x27; 32] }, 1),
+            (
+                FetchResponse::Error {
+                    key: [0x27; 32],
+                    reason: "io".to_string(),
+                },
+                2,
+            ),
+        ] {
+            let encoded = ReplicationMessage {
+                request_id: 23,
+                body: ReplicationMessageBody::FetchResponse(body),
+            }
+            .encode()
+            .expect("encode");
+            let decoded: LegacyMessage =
+                postcard::from_bytes(&encoded).expect("older decoder accepts");
+            let got = match decoded.body {
+                LegacyBody::FetchResponse(LegacyFetchResponse::Success { key, data }) => {
+                    assert_eq!(key, [0x27; 32]);
+                    assert_eq!(data, vec![1, 2, 3]);
+                    0
+                }
+                LegacyBody::FetchResponse(LegacyFetchResponse::NotFound { key }) => {
+                    assert_eq!(key, [0x27; 32]);
+                    1
+                }
+                LegacyBody::FetchResponse(LegacyFetchResponse::Error { key, reason }) => {
+                    assert_eq!(key, [0x27; 32]);
+                    assert_eq!(reason, "io");
+                    2
+                }
+                _ => panic!("expected a legacy FetchResponse"),
+            };
+            assert_eq!(got, check);
+        }
+    }
+
+    /// Why the responder gates `Busy` on the request's flag: an older requester
+    /// cannot decode it, and an undecodable answer costs the responder a trust
+    /// event at that requester.
+    #[test]
+    fn older_requester_cannot_decode_busy() {
+        let encoded = ReplicationMessage {
+            request_id: 24,
+            body: ReplicationMessageBody::FetchResponse(FetchResponse::Busy { key: [0x28; 32] }),
+        }
+        .encode()
+        .expect("encode");
+        assert!(postcard::from_bytes::<LegacyMessage>(&encoded).is_err());
     }
 
     // === Audit roundtrips ===
@@ -2620,7 +2985,10 @@ mod tests {
         // fetched chunk needs.
         let mut core_body = ReplicationMessage {
             request_id: 1,
-            body: ReplicationMessageBody::FetchRequest(FetchRequest { key: [0u8; 32] }),
+            body: ReplicationMessageBody::FetchRequest(FetchRequest {
+                key: [0u8; 32],
+                busy_reply: false,
+            }),
         }
         .encode()
         .expect("a small core body encodes");

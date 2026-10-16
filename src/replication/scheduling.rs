@@ -1311,14 +1311,29 @@ impl ReplicationQueues {
     /// Returns the next source peer if one is available, or `None` if all
     /// sources have been exhausted.
     pub fn retry_fetch(&mut self, key: &XorName) -> Option<PeerId> {
+        self.retry_fetch_with(key, |untried| untried.first().copied())
+    }
+
+    /// Like [`Self::retry_fetch`], with `choose` picking the next source from
+    /// the untried ones, given in source-preference order. A pick that is not
+    /// among them is ignored and the first untried source is used instead, so
+    /// `choose` can reorder the untried sources but never revive a tried one.
+    pub fn retry_fetch_with<F>(&mut self, key: &XorName, choose: F) -> Option<PeerId>
+    where
+        F: FnOnce(&[PeerId]) -> Option<PeerId>,
+    {
         let entry = self.in_flight_fetch.get_mut(key)?;
         entry.tried.insert(entry.source);
 
-        let next = entry
+        let untried: Vec<PeerId> = entry
             .all_sources
             .iter()
-            .find(|p| !entry.tried.contains(p))
-            .copied();
+            .filter(|p| !entry.tried.contains(p))
+            .copied()
+            .collect();
+        let next = choose(&untried)
+            .filter(|pick| untried.contains(pick))
+            .or_else(|| untried.first().copied());
 
         if let Some(next_peer) = next {
             entry.source = next_peer;
