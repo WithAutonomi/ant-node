@@ -214,6 +214,11 @@ webrtc-direct = [
     "saorsa-transport/webrtc-direct",
 ]
 
+# Keep ADR-0023 testnet builds on the reviewed transport branch tip, including
+# the transitive saorsa-core transport dependency. Remove after publication.
+[patch.crates-io]
+saorsa-transport = { git = "https://github.com/WithAutonomi/saorsa-transport", rev = "520dd3ef7540b1743e644ecdd8a74f2b58ec43a9" }
+
 [profile.release]
 lto = true
 codegen-units = 1
