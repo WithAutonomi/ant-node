@@ -96,7 +96,7 @@ serde_json = "1"
 # Archive extraction for auto-upgrade
 flate2 = "1"
 tar = "0.4"
-zip = "2"
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 
 # SHA-256 hashing for binary cache integrity
 sha2 = "0.10"
