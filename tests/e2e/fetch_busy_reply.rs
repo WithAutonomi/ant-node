@@ -38,7 +38,7 @@ const REQUESTER_INDEX: usize = 4;
 const SHARE: usize = 2;
 /// Long enough that a held request is never timed out before the test opens
 /// the gate; a timeout would charge the holder and spoil the trust checks.
-const HELD_TIMEOUT: Duration = Duration::from_secs(60);
+const HELD_TIMEOUT: Duration = Duration::from_mins(1);
 /// How long a request that should be refused silently is given.
 const SILENCE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Bound on how long anything that must happen promptly may take.

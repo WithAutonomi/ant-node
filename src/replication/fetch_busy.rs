@@ -129,7 +129,7 @@ const GLOBAL_INTERVAL: Duration = Duration::from_micros(62_500);
 const MAX_TRACKED_PEERS: usize = 4096;
 
 /// Longest a source that keeps answering busy is put last.
-const MAX_SOURCE_COOLDOWN: Duration = Duration::from_secs(60);
+const MAX_SOURCE_COOLDOWN: Duration = Duration::from_mins(1);
 
 /// Busy answers after which a source's cooldown stops doubling: the wait,
 /// then two, four and eight times it, capped at [`MAX_SOURCE_COOLDOWN`].
@@ -139,7 +139,7 @@ const MAX_COOLDOWN_DOUBLINGS: u32 = 3;
 /// with its next busy answer: its cooldown starts again from the wait, so one
 /// busy spell is not held against its scheduling for good. What it owes
 /// against its neutral allowance does not start again.
-const BUSY_SPELL_GAP: Duration = Duration::from_secs(600);
+const BUSY_SPELL_GAP: Duration = Duration::from_mins(10);
 
 /// Most sources whose busy record is kept at once.
 ///
@@ -553,7 +553,7 @@ mod tests {
         );
         // Jitter past the spread is clamped, not added.
         assert_eq!(
-            busy_wait(remaining, Duration::from_secs(3600)),
+            busy_wait(remaining, Duration::from_hours(1)),
             FETCH_BUSY_WAIT_MAX
         );
     }
@@ -746,7 +746,7 @@ mod tests {
         }
         // Long after, everyone else is idle and a full table sheds them, but
         // never the peer whose reply is still in flight.
-        let later = now + Duration::from_secs(3600);
+        let later = now + Duration::from_hours(1);
         assert!(grant(&limiter, &peer(u32::MAX), later));
         assert_eq!(
             limiter.try_acquire(&peer(0), later).err(),

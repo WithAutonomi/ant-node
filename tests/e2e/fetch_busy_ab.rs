@@ -136,7 +136,7 @@ const POOL_GATE_HOLD: Duration = Duration::from_secs(2);
 /// A holder's fetch admission pool: `FETCH_RESPONDER_MAX_OUTSTANDING`.
 const POOL_SLOTS: usize = 12;
 /// Bound on reaching the precondition before measuring.
-const POOL_SETUP_DEADLINE: Duration = Duration::from_secs(60);
+const POOL_SETUP_DEADLINE: Duration = Duration::from_mins(1);
 
 #[tokio::test]
 #[serial]
