@@ -408,6 +408,10 @@ static FETCH_BUSY_REPLIES: [AtomicU64; FetchBusyReplyOutcome::COUNT] =
 /// Busy answers this node received to its own fetches.
 static FETCH_BUSY_RECEIVED: AtomicU64 = AtomicU64::new(0);
 
+/// Busy answers this node charged, because their source had used up its
+/// neutral allowance without serving it.
+static FETCH_BUSY_CHARGED: AtomicU64 = AtomicU64::new(0);
+
 /// Times this node, choosing where to start or retry a fetch, passed over a
 /// holder that had recently answered it busy.
 static FETCH_BUSY_COOLING_SKIPS: AtomicU64 = AtomicU64::new(0);
@@ -614,6 +618,19 @@ pub fn fetch_busy_received_total() -> u64 {
     FETCH_BUSY_RECEIVED.load(Ordering::Relaxed)
 }
 
+/// Count a busy answer charged because its source was past its neutral
+/// allowance.
+pub fn record_fetch_busy_charged() {
+    FETCH_BUSY_CHARGED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Busy answers this node charged since process start.
+#[must_use]
+#[cfg_attr(not(feature = "logging"), allow(dead_code))]
+pub fn fetch_busy_charged_total() -> u64 {
+    FETCH_BUSY_CHARGED.load(Ordering::Relaxed)
+}
+
 /// Count a fetch started or retried on a later holder because an earlier one
 /// had recently answered busy.
 pub fn record_fetch_busy_cooling_skip() {
@@ -759,6 +776,7 @@ pub fn log_responder_admission_summary() {
         fetch_busy_reply_timed_out = fetch_busy_replies_total(FetchBusyReplyOutcome::TimedOut),
         fetch_busy_reply_cancelled = fetch_busy_replies_total(FetchBusyReplyOutcome::Cancelled),
         fetch_busy_received = fetch_busy_received_total(),
+        fetch_busy_charged = fetch_busy_charged_total(),
         fetch_busy_cooling_skips = fetch_busy_cooling_skips_total(),
         fetch_busy_sources_tracked = fetch_busy_sources_tracked(),
         verification_admission_dropped_global_pool = verification.global_pool,

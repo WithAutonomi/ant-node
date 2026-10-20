@@ -20,10 +20,20 @@
 //!   [`busy_wait`] keeps the attempt, and so its fetch slot, for a few seconds
 //!   before the key moves on, so a requester asks at most once per wait per
 //!   slot instead of as fast as answers come back. The attempt then ends as a
-//!   source failure, exactly as the silent timeout did, minus the trust charge.
+//!   source failure, exactly as the silent timeout did, minus the trust charge
+//!   while the source is within its neutral allowance (see below).
 //!   [`SourceBusyTracker`] also puts a busy source last when choosing where to
 //!   start or retry a key, for longer each time it stays busy, so a requester
 //!   does not keep picking a holder that just said it cannot take more.
+//!
+//! A busy answer costs no trust only while it can still be passing overload.
+//! A source gets [`FETCH_BUSY_NEUTRAL_ALLOWANCE`] busy answers in a row, across
+//! all keys, before it next serves this requester. Past that, until it serves
+//! once, each busy answer is handled as the silent refusal it replaces: the
+//! attempt holds its slot until its fetch timeout runs out, and the source is
+//! then charged the same trust.
+//! Without that bound a holder could keep the data, answer its storage audits
+//! and say busy to every fetch for good, at no cost.
 //!
 //! [`FetchResponse::Busy`]: crate::replication::protocol::FetchResponse::Busy
 
@@ -54,6 +64,27 @@ pub const FETCH_BUSY_WAIT_MAX: Duration = Duration::from_secs(10);
 /// zero to this, inclusive.
 pub const FETCH_BUSY_WAIT_SPREAD: Duration =
     FETCH_BUSY_WAIT_MAX.saturating_sub(FETCH_BUSY_WAIT_MIN);
+
+/// Busy answers in a row that a source may give this requester, before it
+/// next serves it, at no trust cost.
+///
+/// Honest overload passes: a share frees in seconds. A source that keeps
+/// answering busy cannot be told apart from one that keeps the data and will
+/// not serve it. So past this many, until the source serves this requester
+/// once, each busy answer is handled as the silent refusal it replaces: the
+/// attempt holds its slot until its fetch timeout, counted from when it
+/// began, runs out, and the source is then charged the same trust. Silence's
+/// timeout starts once any dial is done, so after a cold dial the charge can
+/// come up to that dial's time sooner. Only serving restores the allowance;
+/// time does not.
+///
+/// The count lives in memory, so a restart of the requester starts every
+/// source afresh: at most this many free busy answers per source per run.
+///
+/// With two answers a round, one for each request in a peer's reply burst,
+/// eight is four rounds of being put last: minutes, when the requester has
+/// other holders to ask, and well under a minute when it has none.
+pub const FETCH_BUSY_NEUTRAL_ALLOWANCE: u32 = 8;
 
 /// Longest a responder spends handing one busy reply to the transport.
 ///
@@ -104,12 +135,18 @@ const MAX_SOURCE_COOLDOWN: Duration = Duration::from_secs(60);
 /// then two, four and eight times it, capped at [`MAX_SOURCE_COOLDOWN`].
 const MAX_COOLDOWN_DOUBLINGS: u32 = 3;
 
-/// How long a source's busy record is kept after its last busy answer. Long
-/// enough to remember a holder that stays busy across many cooldowns; short
-/// enough that one busy spell is not held against it for good.
-const SOURCE_RECORD_TTL: Duration = Duration::from_secs(600);
+/// A source that has not answered busy for this long starts a new busy spell
+/// with its next busy answer: its cooldown starts again from the wait, so one
+/// busy spell is not held against its scheduling for good. What it owes
+/// against its neutral allowance does not start again.
+const BUSY_SPELL_GAP: Duration = Duration::from_secs(600);
 
 /// Most sources whose busy record is kept at once.
+///
+/// Records go only when their source serves, so a full table forgets nothing
+/// to make room. A source it does not already hold is then charged for every
+/// busy answer, as for silence, and is not put last. A node fetches from its
+/// neighbourhood, far fewer peers than this, and the table empties on restart.
 const MAX_TRACKED_SOURCES: usize = 4096;
 
 /// How long to wait after a busy answer, given `remaining`, the time left
@@ -125,6 +162,25 @@ pub fn busy_wait(remaining: Duration, jitter: Duration) -> Duration {
     FETCH_BUSY_WAIT_MIN
         .saturating_add(jitter.min(FETCH_BUSY_WAIT_SPREAD))
         .min(remaining)
+}
+
+/// When an attempt answered busy at `now` lets go of its fetch slot, given
+/// `wait`, the busy wait drawn for it, and `deadline`, when the attempt's fetch
+/// timeout runs out.
+///
+/// Within the neutral allowance it is once the busy wait is over; past it, at
+/// the deadline, as silence would have held it. Either way it is never after
+/// `deadline`, so however late a busy answer comes, the slot is held no longer
+/// than silence would have held it. A fixed time rather than a length, so
+/// nothing between the answer and the sleep can stretch it.
+#[must_use]
+pub fn busy_wake(answer: BusyAnswer, wait: Duration, now: Instant, deadline: Instant) -> Instant {
+    if answer.charged {
+        deadline
+    } else {
+        now.checked_add(wait)
+            .map_or(deadline, |done| done.min(deadline))
+    }
 }
 
 /// A generic cell rate limiter: `burst` events back to back, then one per
@@ -277,11 +333,24 @@ impl Drop for BusyReplyGrant {
     }
 }
 
-/// One source's recent busy answers to this requester.
+/// What one busy answer means for its source at this requester.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BusyAnswer {
+    /// How long the source is now put last.
+    pub cooling_for: Duration,
+    /// Whether the answer is past the source's neutral allowance, and so is
+    /// handled as the silent refusal it replaces.
+    pub charged: bool,
+}
+
+/// One source's busy answers to this requester since it last served it.
 #[derive(Debug, Clone, Copy)]
 struct SourceBusy {
-    /// Busy answers since it last served this requester.
+    /// Busy answers in its current busy spell, which set its cooldown.
     strikes: u32,
+    /// Busy answers since it last served this requester, however long ago:
+    /// what spends its neutral allowance.
+    unserved: u32,
     /// Until when it is put last.
     cooling_until: Instant,
     /// When it last answered busy.
@@ -293,23 +362,29 @@ impl SourceBusy {
         now < self.cooling_until
     }
 
-    fn expired(self, now: Instant) -> bool {
-        !self.is_cooling(now) && now.saturating_duration_since(self.last_busy) >= SOURCE_RECORD_TTL
+    fn spell_over(self, now: Instant) -> bool {
+        !self.is_cooling(now) && now.saturating_duration_since(self.last_busy) >= BUSY_SPELL_GAP
     }
 }
 
-/// Which sources recently answered this requester busy, and until when they
-/// should be asked last.
+/// Which sources recently answered this requester busy, until when they
+/// should be asked last, and which have used up their neutral allowance.
 ///
-/// A busy answer is not a fault, so nothing here touches trust. It is local
-/// scheduling: a holder that just refused is the worst place to send the next
-/// fetch, and one that keeps refusing is put last for longer each time.
-/// Serving once clears its record. It orders sources and never withholds one:
-/// a key whose every holder is cooling still starts on the first of them, and
-/// then waits out that holder's busy answer like any other. So per requester
-/// it lowers how often a busy holder is asked; the hard bound is the busy wait
-/// per fetch slot. Synchronous and short, so it is safe to consult while
-/// holding the fetch queues lock.
+/// Mostly local scheduling: a holder that just refused is the worst place to
+/// send the next fetch, and one that keeps refusing is put last for longer
+/// each time. It orders sources and never withholds one: a key whose every
+/// holder is cooling still starts on the first of them, and then waits out
+/// that holder's busy answer like any other. So per requester it lowers how
+/// often a busy holder is asked; the hard bound is the busy wait per fetch
+/// slot.
+///
+/// The same record counts a source's busy answers in a row, across all keys,
+/// against [`FETCH_BUSY_NEUTRAL_ALLOWANCE`]. It does not touch trust itself;
+/// it tells the caller which busy answer is past the allowance. Only serving
+/// clears the record, and so restores the allowance: neither time nor a full
+/// table does. The table is not saved, so a restart clears it.
+/// Synchronous and short, so it is safe to consult while holding the fetch
+/// queues lock.
 #[derive(Debug, Default)]
 pub struct SourceBusyTracker {
     sources: Mutex<HashMap<PeerId, SourceBusy>>,
@@ -323,40 +398,36 @@ impl SourceBusyTracker {
     }
 
     /// Record a busy answer from `source` at `now`. `wait` is the busy wait
-    /// before any cap from the attempt's own timeout. Returns how long the
-    /// source is now put last: `wait` the first time, doubling with each further
-    /// busy answer before it serves again, up to a minute. A cooldown already
-    /// running is never shortened, so when it outlasts the new one, what is
-    /// left of it is returned.
-    pub fn record_busy(&self, source: &PeerId, now: Instant, wait: Duration) -> Duration {
+    /// before any cap from the attempt's own timeout.
+    ///
+    /// Returns how long the source is now put last: `wait` the first time,
+    /// doubling with each further busy answer in the same busy spell, up to a
+    /// minute. A cooldown already running is never shortened, so when it
+    /// outlasts the new one, what is left of it is returned. Also returns
+    /// whether this answer is past the source's
+    /// [`FETCH_BUSY_NEUTRAL_ALLOWANCE`]. When the table is full and holds no
+    /// record of `source`, the answer is charged and nothing is recorded.
+    pub fn record_busy(&self, source: &PeerId, now: Instant, wait: Duration) -> BusyAnswer {
         let mut sources = self.sources.lock();
-        if sources
-            .get(source)
-            .is_some_and(|record| record.expired(now))
-        {
-            sources.remove(source);
-        }
         if !sources.contains_key(source) && sources.len() >= MAX_TRACKED_SOURCES {
-            sources.retain(|_, record| !record.expired(now));
-            if sources.len() >= MAX_TRACKED_SOURCES {
-                // Prefer to forget a source that is not cooling. Forgetting
-                // one that is ends its cooldown early; the busy wait still
-                // bounds how often it is asked.
-                let victim = sources
-                    .iter()
-                    .min_by_key(|(_, record)| (record.is_cooling(now), record.cooling_until))
-                    .map(|(peer, _)| *peer);
-                if let Some(peer) = victim {
-                    sources.remove(&peer);
-                }
-            }
+            // Forgetting any record would restore its source's allowance, so
+            // with no room this answer gets none.
+            return BusyAnswer {
+                cooling_for: Duration::ZERO,
+                charged: true,
+            };
         }
         let record = sources.entry(*source).or_insert(SourceBusy {
             strikes: 0,
+            unserved: 0,
             cooling_until: now,
             last_busy: now,
         });
+        if record.spell_over(now) {
+            record.strikes = 0;
+        }
         record.strikes = record.strikes.saturating_add(1);
+        record.unserved = record.unserved.saturating_add(1);
         let doublings = record.strikes.saturating_sub(1).min(MAX_COOLDOWN_DOUBLINGS);
         let cooldown = wait
             .saturating_mul(1u32 << doublings)
@@ -364,12 +435,16 @@ impl SourceBusyTracker {
         let until = now.checked_add(cooldown).unwrap_or(now);
         record.cooling_until = record.cooling_until.max(until);
         record.last_busy = now;
-        let cooling_for = record.cooling_until.saturating_duration_since(now);
+        let answer = BusyAnswer {
+            cooling_for: record.cooling_until.saturating_duration_since(now),
+            charged: record.unserved > FETCH_BUSY_NEUTRAL_ALLOWANCE,
+        };
         audit_metrics::set_fetch_busy_sources_tracked(sources.len());
-        cooling_for
+        answer
     }
 
-    /// `source` served this requester: forget its busy record.
+    /// `source` served this requester: forget its busy record, which restores
+    /// its neutral allowance.
     pub fn record_served(&self, source: &PeerId) {
         let mut sources = self.sources.lock();
         if sources.remove(source).is_some() {
@@ -408,6 +483,16 @@ impl SourceBusyTracker {
             }
         }
         first
+    }
+
+    /// Busy answers from `source` since it last served this requester, as far
+    /// as it is remembered.
+    #[must_use]
+    pub fn unserved_busy(&self, source: &PeerId) -> u32 {
+        self.sources
+            .lock()
+            .get(source)
+            .map_or(0, |record| record.unserved)
     }
 
     /// When `source` last answered busy, if it is still remembered.
@@ -483,6 +568,43 @@ mod tests {
             busy_wait(Duration::ZERO, FETCH_BUSY_WAIT_SPREAD),
             Duration::ZERO
         );
+    }
+
+    #[test]
+    fn a_busy_answer_never_holds_the_slot_past_the_fetch_timeout() {
+        let neutral = BusyAnswer {
+            cooling_for: FETCH_BUSY_WAIT_MIN,
+            charged: false,
+        };
+        let charged = BusyAnswer {
+            cooling_for: FETCH_BUSY_WAIT_MIN,
+            charged: true,
+        };
+        let sent = Instant::now();
+        let deadline = sent + Duration::from_secs(30);
+        // A prompt answer: the busy wait within the allowance, the rest of the
+        // timeout past it.
+        assert_eq!(
+            busy_wake(neutral, FETCH_BUSY_WAIT_MAX, sent, deadline),
+            sent + FETCH_BUSY_WAIT_MAX
+        );
+        assert_eq!(
+            busy_wake(charged, FETCH_BUSY_WAIT_MAX, sent, deadline),
+            deadline
+        );
+        // A late answer, a second before the deadline, holds the slot for that
+        // second and no more; one after it, not at all.
+        for now in [
+            sent + Duration::from_secs(29),
+            deadline + Duration::from_secs(5),
+        ] {
+            for answer in [neutral, charged] {
+                assert_eq!(
+                    busy_wake(answer, FETCH_BUSY_WAIT_MAX, now, deadline),
+                    deadline
+                );
+            }
+        }
     }
 
     #[test]
@@ -643,7 +765,7 @@ mod tests {
         let sources = [a, b, c];
         let t0 = Instant::now();
         assert_eq!(tracker.choose(&sources, t0), Some(&a));
-        assert_eq!(tracker.record_busy(&a, t0, WAIT), WAIT);
+        assert_eq!(tracker.record_busy(&a, t0, WAIT).cooling_for, WAIT);
         assert!(tracker.is_cooling(&a, t0));
         assert_eq!(tracker.choose(&sources, t0), Some(&b));
         // Cooling ends after the wait.
@@ -666,7 +788,9 @@ mod tests {
         let tracker = SourceBusyTracker::new();
         let a = peer(1);
         let t0 = Instant::now();
-        let cooldowns: Vec<Duration> = (0..6).map(|_| tracker.record_busy(&a, t0, WAIT)).collect();
+        let cooldowns: Vec<Duration> = (0..6)
+            .map(|_| tracker.record_busy(&a, t0, WAIT).cooling_for)
+            .collect();
         assert_eq!(
             cooldowns,
             vec![WAIT, WAIT * 2, WAIT * 4, WAIT * 8, WAIT * 8, WAIT * 8]
@@ -677,7 +801,10 @@ mod tests {
         for _ in 0..4 {
             tracker.record_busy(&b, t0, long);
         }
-        assert_eq!(tracker.record_busy(&b, t0, long), MAX_SOURCE_COOLDOWN);
+        assert_eq!(
+            tracker.record_busy(&b, t0, long).cooling_for,
+            MAX_SOURCE_COOLDOWN
+        );
     }
 
     #[test]
@@ -692,7 +819,9 @@ mod tests {
         // would end far sooner; the running cooldown stands, and what is left
         // of it is what the caller is told.
         assert_eq!(
-            tracker.record_busy(&a, t0 + Duration::from_secs(1), Duration::from_millis(1)),
+            tracker
+                .record_busy(&a, t0 + Duration::from_secs(1), Duration::from_millis(1))
+                .cooling_for,
             Duration::from_secs(59)
         );
         assert!(tracker.is_cooling(&a, t0 + Duration::from_secs(59)));
@@ -709,43 +838,157 @@ mod tests {
         tracker.record_served(&a);
         assert!(!tracker.is_cooling(&a, t0));
         assert!(tracker.is_empty());
-        assert_eq!(tracker.record_busy(&a, t0, WAIT), WAIT);
+        assert_eq!(tracker.record_busy(&a, t0, WAIT).cooling_for, WAIT);
     }
 
     #[test]
-    fn a_stale_record_starts_over() {
+    fn a_new_busy_spell_starts_the_cooldown_over() {
         let tracker = SourceBusyTracker::new();
         let a = peer(1);
         let t0 = Instant::now();
         for _ in 0..3 {
             tracker.record_busy(&a, t0, WAIT);
         }
-        // Long after its last busy answer, the next one counts as the first.
-        let later = t0 + SOURCE_RECORD_TTL + MAX_SOURCE_COOLDOWN;
-        assert_eq!(tracker.record_busy(&a, later, WAIT), WAIT);
+        // Long after its last busy answer, the next one starts a new spell:
+        // its cooldown is the first one's again.
+        let later = t0 + BUSY_SPELL_GAP + MAX_SOURCE_COOLDOWN;
+        assert_eq!(tracker.record_busy(&a, later, WAIT).cooling_for, WAIT);
+        assert_eq!(tracker.unserved_busy(&a), 4);
     }
 
+    /// A holder that keeps the data but answers busy to every fetch, one
+    /// every busy wait for over an hour, as the sole holder of each key. The
+    /// record is per source, so these answers count together whichever keys
+    /// they answer. It is never withheld, but only its first
+    /// `FETCH_BUSY_NEUTRAL_ALLOWANCE` answers are free.
     #[test]
-    fn the_source_table_stays_bounded_and_spares_cooling_sources() {
+    fn a_holder_that_never_serves_is_charged_past_its_allowance() {
+        let tracker = SourceBusyTracker::new();
+        let holder = peer(1);
+        let t0 = Instant::now();
+        let neutral = usize::try_from(FETCH_BUSY_NEUTRAL_ALLOWANCE).unwrap();
+        let charged: Vec<bool> = (0..1_000u32)
+            .map(|i| {
+                let now = t0 + WAIT * i;
+                assert_eq!(tracker.choose(&[holder], now), Some(&holder));
+                tracker.record_busy(&holder, now, WAIT).charged
+            })
+            .collect();
+        assert!(charged.iter().take(neutral).all(|c| !c));
+        assert!(charged.iter().skip(neutral).all(|c| *c));
+    }
+
+    /// Two answers at once, one for each request in the reply burst, spend
+    /// two of the allowance: it counts answers, not rounds.
+    #[test]
+    fn answers_that_arrive_together_each_spend_the_allowance() {
+        let tracker = SourceBusyTracker::new();
+        let holder = peer(1);
+        let t0 = Instant::now();
+        for _ in 0..FETCH_BUSY_NEUTRAL_ALLOWANCE {
+            assert!(!tracker.record_busy(&holder, t0, WAIT).charged);
+        }
+        assert!(tracker.record_busy(&holder, t0, WAIT).charged);
+    }
+
+    /// Honest overload comes and goes: a holder that serves this requester
+    /// once between busy spells, each as long as the allowance, is never
+    /// charged however many spells there are.
+    #[test]
+    fn a_holder_that_serves_between_busy_spells_is_never_charged() {
+        let tracker = SourceBusyTracker::new();
+        let holder = peer(1);
+        let mut now = Instant::now();
+        for _ in 0..100 {
+            for _ in 0..FETCH_BUSY_NEUTRAL_ALLOWANCE {
+                assert!(!tracker.record_busy(&holder, now, WAIT).charged);
+                now += WAIT;
+            }
+            tracker.record_served(&holder);
+        }
+    }
+
+    /// Serving once restores the whole allowance, and another source serving
+    /// does not.
+    #[test]
+    fn serving_once_restores_the_allowance() {
+        let tracker = SourceBusyTracker::new();
+        let (holder, other) = (peer(1), peer(2));
+        let t0 = Instant::now();
+        for _ in 0..FETCH_BUSY_NEUTRAL_ALLOWANCE {
+            tracker.record_busy(&holder, t0, WAIT);
+        }
+        // Another holder serving changes nothing for this one.
+        tracker.record_served(&other);
+        assert!(tracker.record_busy(&holder, t0, WAIT).charged);
+        tracker.record_served(&holder);
+        for _ in 0..FETCH_BUSY_NEUTRAL_ALLOWANCE {
+            assert!(!tracker.record_busy(&holder, t0, WAIT).charged);
+        }
+        assert!(tracker.record_busy(&holder, t0, WAIT).charged);
+    }
+
+    /// Time does not restore the allowance: a holder asked only rarely, long
+    /// after each busy spell has ended, still uses it up across spells and is
+    /// charged until it serves.
+    #[test]
+    fn time_alone_never_restores_the_allowance() {
+        let tracker = SourceBusyTracker::new();
+        let holder = peer(1);
+        let t0 = Instant::now();
+        let apart = BUSY_SPELL_GAP * 6;
+        let charged: Vec<bool> = (0..=FETCH_BUSY_NEUTRAL_ALLOWANCE + 2)
+            .map(|i| {
+                let answer = tracker.record_busy(&holder, t0 + apart * i, WAIT);
+                // Every answer starts a new spell, so each cools only the wait.
+                assert_eq!(answer.cooling_for, WAIT);
+                answer.charged
+            })
+            .collect();
+        let neutral = usize::try_from(FETCH_BUSY_NEUTRAL_ALLOWANCE).unwrap();
+        assert!(charged.iter().take(neutral).all(|c| !c));
+        assert!(charged.iter().skip(neutral).all(|c| *c));
+    }
+
+    /// A full table forgets nothing, so many holders taking turns to answer
+    /// busy cannot push one another's records out to start again. A newcomer
+    /// is charged instead, and a tracked holder keeps counting.
+    #[test]
+    fn a_full_table_forgets_nothing_and_charges_newcomers() {
         let tracker = SourceBusyTracker::new();
         let t0 = Instant::now();
-        // One source whose cooldown has ended, the rest still cooling.
-        tracker.record_busy(&peer(0), t0, Duration::from_millis(1));
-        let t1 = t0 + Duration::from_secs(1);
         let max = u32::try_from(MAX_TRACKED_SOURCES).unwrap();
-        for i in 1..max {
-            tracker.record_busy(&peer(i), t1, WAIT);
+        for i in 0..max {
+            assert!(!tracker.record_busy(&peer(i), t0, WAIT).charged);
         }
         assert_eq!(tracker.len(), MAX_TRACKED_SOURCES);
-        let newcomer = peer(u32::MAX);
-        tracker.record_busy(&newcomer, t1, WAIT);
+        // One more holder than the table holds, all taking turns, long apart:
+        // every later round is charged for the newcomer, and nobody's count
+        // starts again.
+        let newcomer = peer(max);
+        let mut now = t0;
+        for _ in 0..=FETCH_BUSY_NEUTRAL_ALLOWANCE {
+            now += BUSY_SPELL_GAP * 2;
+            assert_eq!(
+                tracker.record_busy(&newcomer, now, WAIT),
+                BusyAnswer {
+                    cooling_for: Duration::ZERO,
+                    charged: true,
+                }
+            );
+            for i in 0..max {
+                tracker.record_busy(&peer(i), now, WAIT);
+            }
+        }
         assert_eq!(tracker.len(), MAX_TRACKED_SOURCES);
-        assert!(tracker.is_cooling(&newcomer, t1));
-        // The one that had stopped cooling made room; every cooling one stayed.
-        assert!((1..max).all(|i| tracker.is_cooling(&peer(i), t1)));
-        // Long after, expired records make room before anything is displaced.
-        let later = t1 + SOURCE_RECORD_TTL + MAX_SOURCE_COOLDOWN;
-        tracker.record_busy(&peer(u32::MAX - 1), later, WAIT);
-        assert_eq!(tracker.len(), 1);
+        assert!(!tracker.is_cooling(&newcomer, now));
+        assert_eq!(tracker.unserved_busy(&newcomer), 0);
+        assert!(
+            (0..max).all(|i| tracker.unserved_busy(&peer(i)) == FETCH_BUSY_NEUTRAL_ALLOWANCE + 2)
+        );
+        assert!(tracker.record_busy(&peer(0), now, WAIT).charged);
+        // Serving makes room again.
+        tracker.record_served(&peer(0));
+        assert!(!tracker.record_busy(&newcomer, now, WAIT).charged);
     }
 }

@@ -43,8 +43,10 @@ as a wire change with its own rollout.
 
 - Most peers run older versions for weeks after any release. An old node must decode the same
   messages it always did and never be sent a `Busy` it cannot decode.
-- A delivered `Busy` must not cost an honest responder trust; a refusal that cannot be answered
-  stays the old silence.
+- A delivered `Busy` within its sender's neutral allowance must not cost it trust; a refusal that
+  cannot be answered stays the old silence.
+- A holder must not be able to keep the data, pass its storage audits and answer `Busy` to every
+  fetch for good at no cost: neutrality has to be bounded per holder, across keys.
 - The added reply traffic must be bounded: no request storm from requesters retrying on every busy
   answer, and no echo amplification at responders.
 - No new requester scheduling state that would collide with #252's per-source scheduler.
@@ -67,6 +69,10 @@ as a wire change with its own rollout.
    busy answer turns each refusal into an immediate new request, so a requester whose holders all
    refuse asks once per round trip instead of once per fetch timeout; it competes with `tried`
    state; and charging at budget expiry punishes honest overloaded holders once per key per cycle.
+6. **Busy trust-neutral without a limit.** The first version of this change. Rejected in review: a
+   holder could answer `Busy` forever, putting off every fetch at no trust cost while it kept
+   answering storage audits. A per-key retry limit or a longer cooldown does not fix that, because
+   the same holder can be asked about any number of keys.
 
 ## Decision
 
@@ -95,10 +101,23 @@ otherwise it refuses silently, exactly as before. The `Fetch response dropped at
 WARN line and its counters are unchanged, with `capability=asked|not_asked` and
 `reply=scheduled|none` fields added.
 
-**Requester.** Every fetch request this node's fetch worker sends asks for busy replies. A `Busy` for the requested key carries
-no trust event. The attempt then waits 5-10 s (uniform jitter), never past its own fetch timeout,
-still holding its fetch slot, and ends as `SourceFailed`, so the queue moves on to the next untried
-holder exactly as after a timeout. `SourceBusyTracker` remembers the busy holder: a new key starts,
+**Requester.** Every fetch request this node's fetch worker sends asks for busy replies. A `Busy`
+for the requested key carries no trust event while its holder is within its neutral allowance
+(`FETCH_BUSY_NEUTRAL_ALLOWANCE`): eight busy answers in a row to this requester, counted across all
+keys, since the holder last served it. The attempt then waits 5-10 s (uniform jitter), never past
+its own fetch timeout, still holding its fetch slot, and ends as `SourceFailed`, so the queue moves
+on to the next untried holder exactly as after a timeout. Past the allowance, each further busy
+answer is handled as the silent refusal it replaces: the attempt holds its slot until its fetch
+timeout, counted from when it began, runs out, never longer however late the answer came, and
+then the requester records one `ApplicationFailure` of weight 1.0, which saorsa-core scores
+exactly as the `ConnectionTimeout` a silent refusal earned (one failed response of unit weight).
+An attempt cancelled by shutdown before then is not charged. Silence's timeout starts once any
+dial is done, so after a cold dial the charge can come up to that dial's time sooner than
+silence's would have. Only serving this requester once, with a chunk that passes its integrity
+checks, restores the allowance; time does not, so a holder asked only rarely still uses it up.
+The allowance is per requester: each node judges only its own fetches.
+
+`SourceBusyTracker` remembers the busy holder: a new key starts,
 and a failed key retries, on the first holder in preference order that is not cooling down,
 falling back to the first when all are. It reorders and never withholds, so it lowers how often a
 busy holder is asked but is not a hard per-holder bound; the hard bound is the busy wait per fetch
@@ -106,24 +125,28 @@ slot. The cooldown is 1, 2, 4, then 8 times the full jittered wait drawn for tha
 the multiplier rising with each further busy answer before the holder next serves this
 requester, capped at 60 s, and a later busy answer never shortens a running cooldown; once it
 runs out the holder is no longer put last. Serving once clears the holder's record, so its next
-busy answer starts the multiplier again; a record with no busy answer for 10 minutes does the
-same. When the 4096-entry table is full, a holder that is no longer cooling is forgotten first,
-or, if every holder in it is cooling, the one whose cooldown ends soonest. A `Busy` for any
-other key is treated as malformed, like every other key mismatch.
+busy answer starts the multiplier again; after 10 minutes without a busy answer, the next one
+starts the multiplier again too, but leaves what the holder owes against its allowance as it was.
+Records go only when their holder serves: not for age, and not to make room. When the
+4096-entry table is full, a holder it does not already track is charged for each busy answer,
+as for silence, and is not put last. A `Busy` for any other key is treated as malformed, like
+every other key mismatch.
 
 **Order.** This is merged after #252. #252's per-source share is what removes most per-peer
 over-share and bounds how many fetches one requester has open at one answering holder; without
 it, a requester with many fetch slots still over-shares, and most of those refusals exceed the
-per-peer busy allowance and stay silent. On rebase, #252's source choice also puts cooling holders
-last. The two changes conflict in `src/replication/mod.rs` and have not yet been built or measured
-together; the gates and the real-node measurements below will be rerun on the rebased change.
+per-peer busy-reply allowance and stay silent. On rebase, #252's source choice also puts cooling
+holders last. The two changes conflict in `src/replication/mod.rs` and have not yet been built or
+measured together; the gates and the real-node measurements below will be rerun on the rebased
+change.
 
 ## Consequences
 
 ### Positive
 
-- When a refused requester receives `Busy`, it moves on after 5-10 s, or sooner if its own fetch
-  timeout runs out first, instead of 30 s, without charging the responder.
+- When a refused requester receives `Busy` within the responder's neutral allowance, it moves on
+  after 5-10 s, or sooner if its own fetch timeout runs out first, instead of 30 s, without
+  charging the responder.
 - A holder that just refused is not handed this requester's next keys while another holder that is
   not cooling exists.
 - Old nodes decode exactly the messages they always did: a request carries 5 bytes after the
@@ -142,16 +165,26 @@ together; the gates and the real-node measurements below will be rerun on the re
   fetch timeout `T`: at most `C / min(5 s, T)` small requests with `C` hardware-thread fetch
   slots, against `C / T` today, in the case where every holder refuses everything; with the
   default 30 s timeout, `C / 5 s` against `C / 30 s`. Capping `C` is a separate decision.
-- Refusals beyond the per-peer busy allowance stay silent and are still charged by saorsa-core.
+- Refusals beyond the per-peer busy-reply allowance stay silent and are still charged by saorsa-core.
   Without #252, a requester that over-shares by more than two requests at once still meets some
   silence.
-- Busy is trust-neutral. A holder that tries to answer busy to everything can still be charged when
-  a request did not ask, a reply was suppressed, or a scheduled send did not complete; otherwise,
-  when this requester starts or retries a key, it is put behind every holder that is not cooling
-  (when all are cooling, the first is still tried), for up to 60 s at a time, and remains subject
-  to storage audits.
-  Penalising "never serves" would need a service audit with reserved capacity, which is not part
-  of this decision.
+- Busy is trust-neutral only within the allowance. A holder that never serves gets eight free busy
+  answers in a row per requester, then each further refusal costs it what silence cost, so past
+  the allowance it does no better than before this change. An honest holder that stays overloaded
+  past the allowance is likewise charged per refusal, as it was before this change. A holder that
+  serves one fetch in nine is never charged: bounding selective service more tightly would need a
+  service audit with reserved capacity, which is not part of this decision.
+- The count does not decay with time. An honest holder that, over any length of time, answers one
+  requester busy nine times without serving it once in between is charged for the ninth, as
+  silence would have charged every one.
+- The count lives in memory, so a requester restart starts every holder afresh: at most eight free
+  busy answers per holder per run of the requester. Keeping it across restarts would need a new
+  on-disk format. A holder does not control when a requester restarts.
+- A full table keeps every count, so it charges holders it does not track yet from their first
+  busy answer, as silence did. That takes 4096 holders each answering this requester busy
+  without serving it since; a node fetches from its neighbourhood, far fewer peers, and the table
+  empties on restart. As with the global busy-reply allowance, what identities filling it on
+  purpose win is the old silence for everyone else, not a new failure.
 - Sixteen identities each spending their per-peer second can use up the global allowance and
   deny busy replies to everyone else, and stalled peers can hold the 48 send permits for up to
   2 s each. What they win is the old silence for those peers, not a new failure. The global
@@ -163,7 +196,8 @@ together; the gates and the real-node measurements below will be rerun on the re
 - New fields on the `replication responder admission summary (cumulative)` line: the cumulative
   counters
   `fetch_busy_reply_{not_asked,send_pool_full,rate_limited,peer_in_flight,sent,send_failed,timed_out,cancelled}`,
-  `fetch_busy_received` and `fetch_busy_cooling_skips`, and the gauge `fetch_busy_sources_tracked`,
+  `fetch_busy_received`, `fetch_busy_charged` (busy answers charged past the neutral allowance) and
+  `fetch_busy_cooling_skips`, and the gauge `fetch_busy_sources_tracked`,
   the current size of the requester's busy-holder table.
   `not_asked` against the rest is the share of refused requests that did not ask for a busy reply:
   a proxy, and an upper bound, for how much refused traffic still comes from older versions (a
@@ -177,9 +211,16 @@ together; the gates and the real-node measurements below will be rerun on the re
   - trailer parsing: exact, wrong magic, truncated, unknown bits, reserved bytes, padding;
   - an older requester cannot decode `Busy`;
   - limiter: burst, refill, global cap, no spend on a denial, in-flight limit, bounded table;
-  - the busy wait's range and its cap at the fetch timeout;
+  - the busy wait's range and its cap at the fetch timeout, and that a busy answer, however late
+    and whether charged or not, never holds the slot past the attempt's fetch timeout;
   - tracker: cooldown, escalation, cap, not shortened by a later busy answer, reset, expiry,
     bounded table;
+  - neutral allowance: a sole holder that answers busy every 5 s for over an hour without serving
+    is still chosen each time, and every answer after the eighth is charged; two answers at once
+    spend two; a holder that serves once between spells of eight is never charged; serving
+    restores the whole allowance and another holder serving does not; answers an hour apart
+    still use it up; a full table forgets no count while one more holder than it holds takes
+    turns with the rest, charges that newcomer instead, and makes room once a holder serves;
   - a retry passes over a cooling holder but still takes it last;
   - a busy reply is not counted as served bytes.
 - End to end on a local network, made deterministic with a test-only fetch serve gate (the same
@@ -189,16 +230,22 @@ together; the gates and the real-node measurements below will be rerun on the re
   - the held requests are served once the gate opens;
   - the requester's own fetch worker, refused because its two-request share at the holder is
     full, records the holder as cooling, keeps the attempt for at least the minimum busy wait,
-    then gives the key up, and the holder's trust at the requester never drops.
+    then gives the key up, and the holder's trust at the requester never drops;
+  - a holder that keeps refusing the requester's fetch worker, one new key after another, costs
+    nothing at the requester for eight busy answers, and is charged for the ninth only as that
+    attempt's fetch timeout runs out; once it serves the worker a chunk, what it owes is
+    cleared.
 - Measured on real nodes against upstream main a6e3388e with the same test-only gate, in
-  `tests/e2e/fetch_busy_ab.rs` (opt-in):
+  `tests/e2e/fetch_busy_ab.rs` (opt-in), with the neutral allowance in place:
   - 20 requesters each within their two-request share, the first of five holders with its
-    12-slot pool full for 2 s (26 refusals with this change, 28 on main), one of the refusal
-    cases left after #252: all 40 chunks in 10.5 s, no holder charged, against 90.3 s with 14,
-    9, 9, 4 and 3 requesters charging the five holders (one run each; on the previous main
-    8d25f0c3 it was 60.4 s with 14 and 4 requesters charging the first two);
-  - one requester with 8 fetch slots over-asking three holders, which #252 removes: 38.1 s, 39.2 s
-    and 37.2 s with only the first holder charged (4 charges), against 90.2 s, 90.2 s and 90.3 s
+    12-slot pool full for 2 s (26 to 28 refusals with this change, 28 on main), one of the
+    refusal cases left after #252: all 40 chunks in 10.1 s, 10.1 s and 9.4 s, no holder charged,
+    against one run on main at 90.3 s with 14, 9, 9, 4 and 3 requesters charging the five
+    holders (on the previous main 8d25f0c3 it was 60.4 s with 14 and 4 requesters charging the
+    first two). Two more runs with this change stopped before measuring, at the test's check that
+    every key was newly queued (39 of 40);
+  - one requester with 8 fetch slots over-asking three holders, which #252 removes: 38.3 s, 38.9 s
+    and 35.4 s with only the first holder charged (4 charges), against 90.2 s, 90.2 s and 90.3 s
     with all three charged (6 charges on the first, 1 to 4 on the others).
 - A local, unpublished discrete-event model of the 177-node join wave and 24 more scenarios
   informed the design, including the 5-10 s wait. Its source and raw output are not part of this
@@ -206,7 +253,9 @@ together; the gates and the real-node measurements below will be rerun on the re
 - In production:
   - `fetch_busy_reply_sent` against `fetch_admission_dropped_*`;
   - the fall in `connection_timeout` trust events between fleet nodes;
-  - `fetch_busy_reply_rate_limited` and `fetch_busy_reply_send_pool_full` staying small.
+  - `fetch_busy_reply_rate_limited` and `fetch_busy_reply_send_pool_full` staying small;
+  - `fetch_busy_charged` against `fetch_busy_received`: how often holders stay busy past the
+    neutral allowance.
 
   Revisit the 5-10 s wait and the allowances against measured admission hold times.
 

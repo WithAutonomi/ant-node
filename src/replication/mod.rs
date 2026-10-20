@@ -92,8 +92,8 @@ use crate::replication::config::{
     SUBTREE_ROUND1_WORK_REFILL_BYTES_PER_SEC, SUBTREE_SESSION_TTL,
 };
 use crate::replication::fetch_busy::{
-    busy_wait, BusyReplyDenied, BusyReplyGrant, FetchBusyReplyLimiter, SourceBusyTracker,
-    FETCH_BUSY_REPLY_SEND_TIMEOUT, FETCH_BUSY_WAIT_SPREAD,
+    busy_wait, busy_wake, BusyReplyDenied, BusyReplyGrant, FetchBusyReplyLimiter,
+    SourceBusyTracker, FETCH_BUSY_REPLY_SEND_TIMEOUT, FETCH_BUSY_WAIT_SPREAD,
 };
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
@@ -2238,6 +2238,14 @@ impl ReplicationEngine {
         self.fetch_busy_sources.last_busy(source)
     }
 
+    /// Test-only: busy answers `source` has given this engine's fetches since
+    /// it last served one, which spend its neutral allowance.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn fetch_source_unserved_busy_for_test(&self, source: &PeerId) -> u32 {
+        self.fetch_busy_sources.unserved_busy(source)
+    }
+
     /// Test-only: fetch requests this engine has admitted and not yet finished
     /// serving.
     #[cfg(any(test, feature = "test-utils"))]
@@ -4031,7 +4039,11 @@ impl ReplicationEngine {
                             // not outlive the engine.
                             let handle = tracker.spawn(async move {
                                 // Cancel-aware: abort when the engine shuts down.
+                                // Shutdown is checked first, so a fetch that is
+                                // ready to charge a busy source at the same
+                                // moment is cancelled uncharged instead.
                                 tokio::select! {
+                                    biased;
                                     () = token.cancelled() => FetchOutcome {
                                         key: fetch_key,
                                         result: FetchResult::SourceFailed,
@@ -4094,6 +4106,7 @@ impl ReplicationEngine {
                                         // initial fetch spawn above.
                                         let handle = tracker.spawn(async move {
                                             tokio::select! {
+                                                biased;
                                                 () = token.cancelled() => FetchOutcome {
                                                     key: fetch_key,
                                                     result: FetchResult::SourceFailed,
@@ -9638,11 +9651,11 @@ async fn execute_single_fetch(
                     key: resp_key,
                 }) if resp_key == key => {
                     // The source refused at admission and said so, where it
-                    // used to stay silent. That is an honest, prompt answer, so
-                    // it carries no trust event. Waiting here, still holding
-                    // this fetch slot, before the key moves on is what keeps a
-                    // busy answer from becoming a fast retry loop: this slot asks
-                    // at most once per wait, where silence made it once per fetch
+                    // used to stay silent. A prompt answer to passing overload
+                    // carries no trust event. Waiting here, still holding this
+                    // fetch slot, before the key moves on is what keeps a busy
+                    // answer from becoming a fast retry loop: this slot asks at
+                    // most once per wait, where silence made it once per fetch
                     // timeout. The attempt then ends exactly as that timeout
                     // did, so nothing downstream changes. The worker races this
                     // whole task against shutdown, so the wait does not delay it.
@@ -9653,19 +9666,37 @@ async fn execute_single_fetch(
                     // wait, even when this attempt's own deadline cuts the
                     // sleep short.
                     let full_wait = busy_wait(Duration::MAX, jitter);
-                    let remaining = config
-                        .fetch_request_timeout
-                        .saturating_sub(sent_at.elapsed());
-                    let wait = full_wait.min(remaining);
-                    let cooldown = busy_sources.record_busy(&source, Instant::now(), full_wait);
+                    let answer = busy_sources.record_busy(&source, Instant::now(), full_wait);
+                    // Past its neutral allowance, a source that keeps saying
+                    // busy without serving is handled as the silence it
+                    // replaces: the attempt holds its slot until its fetch
+                    // timeout runs out, never longer, however late the answer
+                    // came, and only then is the source charged the unit-weight
+                    // failure saorsa-core records for a timeout. A fetch
+                    // cancelled by shutdown before then is not charged.
+                    let deadline = sent_at
+                        .checked_add(config.fetch_request_timeout)
+                        .unwrap_or(sent_at);
+                    let now = Instant::now();
+                    let wake = busy_wake(answer, full_wait, now, deadline);
+                    let charged = answer.charged;
                     debug!(
                         "Fetch: source {source} busy for {}; moving on in {} ms, \
-                         putting it last for {} ms",
+                         putting it last for {} ms, charged: {charged}",
                         hex::encode(key),
-                        wait.as_millis(),
-                        cooldown.as_millis()
+                        wake.saturating_duration_since(now).as_millis(),
+                        answer.cooling_for.as_millis()
                     );
-                    tokio::time::sleep(wait).await;
+                    tokio::time::sleep_until(wake.into()).await;
+                    if charged {
+                        audit_metrics::record_fetch_busy_charged();
+                        p2p_node
+                            .report_trust_event(
+                                &source,
+                                TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
+                            )
+                            .await;
+                    }
                     FetchOutcome {
                         key,
                         result: FetchResult::SourceFailed,
