@@ -1,22 +1,18 @@
-//! Opt-in measurement, not a pass/fail gate: how long one node takes to fetch
-//! a batch of chunks whose holders it over-asks, and what that costs the
-//! holders in the requester's trust table.
+//! Opt-in measurement, not a pass/fail gate: how long requesters take to
+//! fetch a batch of chunks while the first of their holders keeps its whole
+//! fetch admission pool full, and what that costs the holders in the
+//! requesters' trust tables.
 //!
-//! The requester fetches every chunk with the same three holders in the same
-//! order, so its fetch worker, one slot per hardware thread, sends more than a
-//! holder's two-request share to the first holder at once. That is the
-//! over-share the busy reply answers. The file uses only test hooks that exist
-//! on `main` too, so the same file measures a build without the busy reply and
-//! a build with it.
-//!
-//! A second measurement, [`fetch_busy_ab_pool`], has every requester stay
-//! within its share, as #252 makes them, and fills the first holder's
-//! twelve-slot pool instead: the refusals that remain after #252.
+//! Every requester stays within its two-request share at each holder, as
+//! #252's per-source scheduler keeps it, so the refusals measured are the ones
+//! left after #252: a holder whose twelve-slot pool is full of other peers'
+//! requests. The file uses only the test-only fetch serve gate, which #252
+//! has too, so the same file measures #252 without the busy reply and with
+//! it.
 //!
 //! Run with `ANT_FETCH_BUSY_AB=1 cargo test --test e2e --features test-utils
-//! fetch_busy_ab -- --nocapture --test-threads=1`. Without the variable both
-//! return at once. The pool measurement uses the test-only fetch serve gate,
-//! which a build without the busy reply needs patched in to compare.
+//! fetch_busy_ab -- --nocapture --test-threads=1`. Without the variable it
+//! returns at once.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -27,98 +23,8 @@ use ant_node::ReplicationConfig;
 use serial_test::serial;
 use std::time::{Duration, Instant};
 
-const REQUESTER_INDEX: usize = 4;
-const HOLDER_INDICES: [usize; 3] = [1, 2, 3];
-const CHUNKS: usize = 48;
-const CHUNK_LEN: usize = 256 * 1024;
 const FILL_DEADLINE: Duration = Duration::from_mins(15);
 const POLL: Duration = Duration::from_millis(100);
-
-#[tokio::test]
-#[serial]
-async fn fetch_busy_ab() {
-    if std::env::var("ANT_FETCH_BUSY_AB").is_err() {
-        return;
-    }
-    let harness = TestHarness::setup_minimal().await.expect("setup");
-    harness.warmup_dht().await.expect("warmup");
-
-    let holders: Vec<_> = HOLDER_INDICES
-        .iter()
-        .map(|&i| {
-            *harness
-                .test_node(i)
-                .and_then(|n| n.p2p_node.as_ref())
-                .expect("holder p2p")
-                .peer_id()
-        })
-        .collect();
-
-    let mut keys = Vec::with_capacity(CHUNKS);
-    for c in 0..CHUNKS {
-        let content: Vec<u8> = (0..CHUNK_LEN)
-            .map(|i| u8::try_from((i * 31 + c * 7) % 251).unwrap())
-            .collect();
-        let key = compute_address(&content);
-        for &h in &HOLDER_INDICES {
-            harness
-                .test_node(h)
-                .and_then(|n| n.ant_protocol.as_ref())
-                .expect("holder protocol")
-                .storage()
-                .put(&key, &content)
-                .await
-                .expect("put");
-        }
-        keys.push(key);
-    }
-
-    let requester = harness.test_node(REQUESTER_INDEX).expect("requester");
-    let p2p = requester.p2p_node.as_ref().expect("requester p2p");
-    let engine = requester
-        .replication_engine
-        .as_ref()
-        .expect("requester engine");
-    let storage = requester
-        .ant_protocol
-        .as_ref()
-        .expect("requester protocol")
-        .storage();
-
-    let trust_before: Vec<f64> = holders.iter().map(|h| p2p.peer_trust(h)).collect();
-    let started = Instant::now();
-    let mut enqueued = 0usize;
-    for key in &keys {
-        if engine.enqueue_fetch_for_test(*key, holders.clone()).await {
-            enqueued += 1;
-        }
-    }
-
-    let mut stored = 0usize;
-    while started.elapsed() < FILL_DEADLINE {
-        stored = 0;
-        for key in &keys {
-            if storage.exists(key).unwrap_or(false) {
-                stored += 1;
-            }
-        }
-        if stored == CHUNKS {
-            break;
-        }
-        tokio::time::sleep(POLL).await;
-    }
-    let elapsed = started.elapsed();
-    let trust_after: Vec<f64> = holders.iter().map(|h| p2p.peer_trust(h)).collect();
-
-    println!(
-        "FETCH_BUSY_AB slots={} chunks={CHUNKS} enqueued={enqueued} stored={stored} \
-         elapsed_ms={} trust_before={trust_before:?} trust_after={trust_after:?}",
-        std::thread::available_parallelism().map_or(0, std::num::NonZero::get),
-        elapsed.as_millis(),
-    );
-
-    harness.teardown().await.expect("teardown");
-}
 
 /// Nodes in the pool measurement's network.
 const POOL_NODES: usize = 25;
