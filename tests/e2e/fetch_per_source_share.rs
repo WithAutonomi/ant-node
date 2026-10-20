@@ -2,8 +2,10 @@
 //! holder than that holder will admit from it.
 //!
 //! A fetch responder admits two outstanding requests per requesting peer and
-//! answers a third with nothing at all, so a requester that sends more than two
-//! at once to one holder loses the rest to its own fetch timeout. The fetch
+//! refuses a third. Before busy replies it answered that third with nothing
+//! at all, and it still does when it cannot send a busy reply, so a requester
+//! that sends more than two at once to one holder can lose the rest to its own
+//! fetch timeout. The fetch
 //! worker used to do exactly that: it ran one fetch per slot and sent every one
 //! to the first verified holder of its key, so a node whose queued keys shared
 //! one holder had all of them outstanding there at once.
@@ -113,8 +115,10 @@ async fn a_holder_that_stops_answering_is_fetched_from_past_its_share() {
 
     wait_until_fetch_pipeline_is_quiet(requester_engine).await;
 
-    // The holder answers none of these fetches, ever.
+    // The holder answers none of these fetches, ever: it holds the ones it
+    // admits, and refuses the rest without even a busy reply.
     holder_engine.close_fetch_serve_gate_for_test();
+    holder_engine.turn_off_fetch_busy_replies_for_test();
     let started = Instant::now();
     for key in &keys {
         assert!(

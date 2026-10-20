@@ -1846,6 +1846,10 @@ pub struct ReplicationEngine {
     /// pool was full.
     #[cfg(any(test, feature = "test-utils"))]
     fetch_pool_full_refusals: Arc<AtomicU64>,
+    /// Test-only: refuse every fetch past admission silently, without a busy
+    /// reply, as a holder that has stopped answering would.
+    #[cfg(any(test, feature = "test-utils"))]
+    fetch_busy_replies_off: Arc<AtomicBool>,
     /// Permits for busy replies being sent to fetch requests refused at
     /// admission.
     fetch_busy_reply_semaphore: Arc<Semaphore>,
@@ -2022,6 +2026,8 @@ impl ReplicationEngine {
             fetch_serve_gate: Arc::new(FetchServeGate::default()),
             #[cfg(any(test, feature = "test-utils"))]
             fetch_pool_full_refusals: Arc::new(AtomicU64::new(0)),
+            #[cfg(any(test, feature = "test-utils"))]
+            fetch_busy_replies_off: Arc::new(AtomicBool::new(false)),
             fetch_busy_reply_semaphore: Arc::new(Semaphore::new(FETCH_BUSY_REPLY_MAX_OUTSTANDING)),
             fetch_busy_reply_limiter: Arc::new(FetchBusyReplyLimiter::new()),
             fetch_busy_sources,
@@ -2296,6 +2302,13 @@ impl ReplicationEngine {
     #[must_use]
     pub fn fetch_pool_full_refusals_for_test(&self) -> u64 {
         self.fetch_pool_full_refusals.load(Ordering::Relaxed)
+    }
+
+    /// Test-only: from now on, refuse fetches past admission silently, with no
+    /// busy reply, as a holder that has stopped answering would.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn turn_off_fetch_busy_replies_for_test(&self) {
+        self.fetch_busy_replies_off.store(true, Ordering::Relaxed);
     }
 
     /// Test-only: whether `key` is still tracked in any fetch-pipeline stage
@@ -3228,6 +3241,8 @@ impl ReplicationEngine {
         let fetch_serve_gate = Arc::clone(&self.fetch_serve_gate);
         #[cfg(any(test, feature = "test-utils"))]
         let fetch_pool_full_refusals = Arc::clone(&self.fetch_pool_full_refusals);
+        #[cfg(any(test, feature = "test-utils"))]
+        let fetch_busy_replies_off = Arc::clone(&self.fetch_busy_replies_off);
         let fetch_busy_reply_semaphore = Arc::clone(&self.fetch_busy_reply_semaphore);
         let fetch_busy_reply_limiter = Arc::clone(&self.fetch_busy_reply_limiter);
         let verification_responder_worker_semaphore =
@@ -3290,6 +3305,8 @@ impl ReplicationEngine {
             fetch_serve_gate,
             #[cfg(any(test, feature = "test-utils"))]
             fetch_pool_full_refusals,
+            #[cfg(any(test, feature = "test-utils"))]
+            fetch_busy_replies_off,
             fetch_busy_reply_semaphore,
             fetch_busy_reply_limiter,
             verification_responder_worker_semaphore,
@@ -4839,6 +4856,9 @@ struct ReplicationMessageHandlerContext {
     /// pool was full.
     #[cfg(any(test, feature = "test-utils"))]
     fetch_pool_full_refusals: Arc<AtomicU64>,
+    /// Test-only: refuse silently, without busy replies.
+    #[cfg(any(test, feature = "test-utils"))]
+    fetch_busy_replies_off: Arc<AtomicBool>,
     fetch_busy_reply_semaphore: Arc<Semaphore>,
     fetch_busy_reply_limiter: Arc<FetchBusyReplyLimiter>,
     verification_responder_worker_semaphore: Arc<Semaphore>,
@@ -7744,6 +7764,10 @@ fn fetch_busy_reply_permit(
 ) -> Option<(OwnedSemaphorePermit, BusyReplyGrant)> {
     if !busy_reply {
         audit_metrics::record_fetch_busy_reply(FetchBusyReplyOutcome::NotAsked);
+        return None;
+    }
+    #[cfg(any(test, feature = "test-utils"))]
+    if ctx.fetch_busy_replies_off.load(Ordering::Relaxed) {
         return None;
     }
     // The send permit first: if none is free, the reply would not be sent, so

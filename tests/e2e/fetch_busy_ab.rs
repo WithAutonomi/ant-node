@@ -6,9 +6,10 @@
 //! Every requester stays within its two-request share at each holder, as
 //! #252's per-source scheduler keeps it, so the refusals measured are the ones
 //! left after #252: a holder whose twelve-slot pool is full of other peers'
-//! requests. The file uses only the test-only fetch serve gate, which #252
-//! has too, so the same file measures #252 without the busy reply and with
-//! it.
+//! requests. Besides the test-only fetch serve gate, which #252 has too, it
+//! reads two test-only counters, `fetch_admitted_for_test` and
+//! `fetch_pool_full_refusals_for_test`. With those two patched in, the same
+//! file measures #252 without the busy reply and with it.
 //!
 //! Run with `ANT_FETCH_BUSY_AB=1 cargo test --test e2e --features test-utils
 //! fetch_busy_ab -- --nocapture --test-threads=1`. Without the variable it
