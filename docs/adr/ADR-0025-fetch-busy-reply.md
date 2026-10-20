@@ -238,19 +238,26 @@ busy-reply allowance and stay silent. In the combined build:
   - a holder that keeps refusing the requester's fetch worker, one new key after another, costs
     nothing at the requester for eight busy answers, and is charged for the ninth only as that
     attempt's fetch timeout runs out; once it serves the worker a chunk, what it owes is
-    cleared.
-- Measured on real nodes against upstream main a6e3388e with the same test-only gate, in
-  `tests/e2e/fetch_busy_ab.rs` (opt-in), with the neutral allowance in place:
-  - 20 requesters each within their two-request share, the first of five holders with its
-    12-slot pool full for 2 s (26 to 28 refusals with this change, 28 on main), one of the
-    refusal cases left after #252: all 40 chunks in 10.1 s, 10.1 s and 9.4 s, no holder charged,
-    against one run on main at 90.3 s with 14, 9, 9, 4 and 3 requesters charging the five
-    holders (on the previous main 8d25f0c3 it was 60.4 s with 14 and 4 requesters charging the
-    first two). Two more runs with this change stopped before measuring, at the test's check that
-    every key was newly queued (39 of 40);
-  - one requester with 8 fetch slots over-asking three holders, which #252 removes: 38.3 s, 38.9 s
-    and 35.4 s with only the first holder charged (4 charges), against 90.2 s, 90.2 s and 90.3 s
-    with all three charged (6 charges on the first, 1 to 4 on the others).
+    cleared;
+  - #252's two per-source share tests pass on the combined build. Its silent-holder test turns
+    off that holder's busy replies with a test-only switch, so it still models a holder that
+    answers nothing: one that answers busy is answering, and stays under #252's cap.
+- Measured on real nodes with the test-only gate, in `tests/e2e/fetch_busy_ab.rs` (opt-in): 20
+  requesters each within their two-request share, and the first of five holders with its 12-slot
+  pool full for 2 s, the refusal case left after #252, with 28 refusals in every run below:
+  - the combined #252 + #253 build, on main b0e29c32: all 40 chunks in 10.1 s, 10.2 s and
+    10.2 s, no holder charged;
+  - #252 alone (447c000d, with the file's two test-only counters added): 60.4 s, 60.5 s and
+    60.8 s, with 14 requesters charging the first holder and 8 the second each time, and 0 to 7
+    the others.
+
+  One more run of each stopped before measuring, at the test's check that every key was newly
+  queued (38 of 40).
+- Earlier, without #252, on main a6e3388e: the same pool case took 90.3 s on that main
+  (2026-10-16), with 14, 9, 9, 4 and 3 requesters charging the five holders, and 9.4 s to 10.5 s
+  with no holder charged with this change alone (2026-10-16 and 2026-10-20). A single requester
+  over-asking three holders, the case #252 removes, took 90.2 s on that main and 35 s to 39 s
+  with this change alone; that measurement left the file once #252 made the case impossible.
 - A local, unpublished discrete-event model of the 177-node join wave and 24 more scenarios
   informed the design, including the 5-10 s wait. Its source and raw output are not part of this
   change, so its results are not offered as validation.
