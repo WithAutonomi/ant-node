@@ -82,6 +82,9 @@ mod fetch_local_write_guard;
 mod fetch_responsibility_recheck;
 
 #[cfg(test)]
+mod fetch_per_source_share;
+
+#[cfg(test)]
 mod first_audit_ab;
 
 #[cfg(test)]

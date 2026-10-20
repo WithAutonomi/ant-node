@@ -1,6 +1,6 @@
 [package]
 name = "ant-node"
-version = "0.22.0"
+version = "0.23.0"
 edition = "2021"
 authors = ["David Irvine <david.irvine@maidsafe.net>"]
 description = "Pure quantum-proof network node for the Autonomi decentralized network"
@@ -35,10 +35,10 @@ mimalloc = "0.1"
 # node-only DHT internals (DHTNode, TrustEvent, DhtNetworkEvent), which
 # Cargo unifies with ant-protocol's version constraint.
 #
-ant-protocol = "4.0.0"
+ant-protocol = "5.0.0"
 
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
-saorsa-core = "0.29.0"
+saorsa-core = "0.29.1"
 saorsa-pqc = "0.5.2"
 
 # Payment verification - autonomi network lookup + EVM payment
@@ -96,7 +96,7 @@ serde_json = "1"
 # Archive extraction for auto-upgrade
 flate2 = "1"
 tar = "0.4"
-zip = "2"
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 
 # SHA-256 hashing for binary cache integrity
 sha2 = "0.10"
@@ -113,7 +113,7 @@ bao = "0.13.1"
 
 # Shared portable browser profile. The native listener is enabled separately
 # by the `webrtc-direct` feature.
-saorsa-transport = { version = "0.38.0", default-features = false, features = ["webrtc"] }
+saorsa-transport = { version = "0.38.1", default-features = false, features = ["webrtc"] }
 # Only the test-utils devnet helper that seeds public files for browser tests
 # uses it, so release builds do not link it.
 self_encryption = { version = "0.36", optional = true }
@@ -213,13 +213,6 @@ webrtc-direct = [
     "saorsa-transport/default",
     "saorsa-transport/webrtc-direct",
 ]
-
-[patch.crates-io]
-# The published 4.0.0 carries pointers (ADR-0016) but not the final state this
-# change relies on (ADR-0018). A rev, not a branch, so the pin is immutable.
-# Drop it once a release includes the companion change. Versions are bumped at
-# release.
-ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "718f60682bb3704b68fbba0bea34f2a0416fa876" }
 
 [profile.release]
 lto = true

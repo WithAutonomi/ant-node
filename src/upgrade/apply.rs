@@ -776,13 +776,22 @@ mod tests {
 
     /// Helper: create a zip archive containing a fake binary.
     fn create_zip_archive(dir: &Path, binary_name: &str, content: &[u8]) -> PathBuf {
+        create_zip_archive_with_method(dir, binary_name, content, zip::CompressionMethod::Stored)
+    }
+
+    /// Helper: create a zip archive containing a fake binary compressed with `method`.
+    fn create_zip_archive_with_method(
+        dir: &Path,
+        binary_name: &str,
+        content: &[u8],
+        method: zip::CompressionMethod,
+    ) -> PathBuf {
         use std::io::Write;
 
         let archive_path = dir.join("test.zip");
         let file = File::create(&archive_path).unwrap();
         let mut zip_writer = zip::ZipWriter::new(file);
-        let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
+        let options = zip::write::SimpleFileOptions::default().compression_method(method);
         zip_writer.start_file(binary_name, options).unwrap();
         zip_writer.write_all(content).unwrap();
         zip_writer.finish().unwrap();
@@ -832,6 +841,33 @@ mod tests {
 
         let extracted = result.unwrap();
         assert!(extracted.exists());
+        assert_eq!(fs::read(&extracted).unwrap(), content);
+    }
+
+    #[test]
+    fn test_extract_binary_from_deflated_zip() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = b"fake-deflated-binary-content".repeat(1024);
+        let archive = create_zip_archive_with_method(
+            dir.path(),
+            "ant-node",
+            &content,
+            zip::CompressionMethod::Deflated,
+        );
+
+        // Release zips use Deflate, so check the entry really is compressed.
+        {
+            let mut zip_archive = zip::ZipArchive::new(File::open(&archive).unwrap()).unwrap();
+            let entry = zip_archive.by_index(0).unwrap();
+            assert_eq!(entry.compression(), zip::CompressionMethod::Deflated);
+            assert!(entry.compressed_size() < entry.size());
+        }
+
+        let dest = tempfile::tempdir().unwrap();
+        let result = AutoApplyUpgrader::extract_binary(&archive, dest.path());
+        assert!(result.is_ok());
+
+        let extracted = result.unwrap();
         assert_eq!(fs::read(&extracted).unwrap(), content);
     }
 

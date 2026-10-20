@@ -372,11 +372,11 @@ impl SourceBusy {
 ///
 /// Mostly local scheduling: a holder that just refused is the worst place to
 /// send the next fetch, and one that keeps refusing is put last for longer
-/// each time. It orders sources and never withholds one: a key whose every
-/// holder is cooling still starts on the first of them, and then waits out
-/// that holder's busy answer like any other. So per requester it lowers how
-/// often a busy holder is asked; the hard bound is the busy wait per fetch
-/// slot.
+/// each time. The fetch scheduler reads it to start or retry a key on another
+/// free holder first, and never to withhold one: a key whose every free holder
+/// is cooling still starts on the first of them, and then waits out that
+/// holder's busy answer like any other. So per requester it lowers how often
+/// a busy holder is asked; the hard bound is the busy wait per fetch slot.
 ///
 /// The same record counts a source's busy answers in a row, across all keys,
 /// against [`FETCH_BUSY_NEUTRAL_ALLOWANCE`]. It does not touch trust itself;
@@ -459,30 +459,6 @@ impl SourceBusyTracker {
             .lock()
             .get(source)
             .is_some_and(|record| record.is_cooling(now))
-    }
-
-    /// Of `candidates`, in their order of preference, the first that is not
-    /// cooling at `now`, or the first of them when all are. Counts a skip when
-    /// that passes over the first candidate.
-    pub fn choose<'a, I>(&self, candidates: I, now: Instant) -> Option<&'a PeerId>
-    where
-        I: IntoIterator<Item = &'a PeerId>,
-    {
-        let tracked = self.sources.lock();
-        let mut first = None;
-        for candidate in candidates {
-            let first_seen = *first.get_or_insert(candidate);
-            if tracked
-                .get(candidate)
-                .is_none_or(|record| !record.is_cooling(now))
-            {
-                if !std::ptr::eq(first_seen, candidate) {
-                    audit_metrics::record_fetch_busy_cooling_skip();
-                }
-                return Some(candidate);
-            }
-        }
-        first
     }
 
     /// Busy answers from `source` since it last served this requester, as far
@@ -759,28 +735,16 @@ mod tests {
     const WAIT: Duration = Duration::from_secs(5);
 
     #[test]
-    fn a_busy_source_is_put_last_while_it_cools() {
-        let tracker = SourceBusyTracker::new();
-        let (a, b, c) = (peer(1), peer(2), peer(3));
-        let sources = [a, b, c];
-        let t0 = Instant::now();
-        assert_eq!(tracker.choose(&sources, t0), Some(&a));
-        assert_eq!(tracker.record_busy(&a, t0, WAIT).cooling_for, WAIT);
-        assert!(tracker.is_cooling(&a, t0));
-        assert_eq!(tracker.choose(&sources, t0), Some(&b));
-        // Cooling ends after the wait.
-        assert_eq!(tracker.choose(&sources, t0 + WAIT), Some(&a));
-    }
-
-    #[test]
-    fn when_every_source_cools_the_first_is_still_chosen() {
+    fn a_busy_source_cools_for_the_wait() {
         let tracker = SourceBusyTracker::new();
         let (a, b) = (peer(1), peer(2));
         let t0 = Instant::now();
-        tracker.record_busy(&a, t0, WAIT);
-        tracker.record_busy(&b, t0, WAIT);
-        assert_eq!(tracker.choose(&[a, b], t0), Some(&a));
-        assert_eq!(tracker.choose(&[], t0), None);
+        assert!(!tracker.is_cooling(&a, t0));
+        assert_eq!(tracker.record_busy(&a, t0, WAIT).cooling_for, WAIT);
+        assert!(tracker.is_cooling(&a, t0));
+        assert!(!tracker.is_cooling(&b, t0));
+        // Cooling ends after the wait.
+        assert!(!tracker.is_cooling(&a, t0 + WAIT));
     }
 
     #[test]
@@ -857,9 +821,8 @@ mod tests {
     }
 
     /// A holder that keeps the data but answers busy to every fetch, one
-    /// every busy wait for over an hour, as the sole holder of each key. The
-    /// record is per source, so these answers count together whichever keys
-    /// they answer. It is never withheld, but only its first
+    /// every busy wait for over an hour. The record is per source, so these
+    /// answers count together whichever keys they answer. Only its first
     /// `FETCH_BUSY_NEUTRAL_ALLOWANCE` answers are free.
     #[test]
     fn a_holder_that_never_serves_is_charged_past_its_allowance() {
@@ -868,11 +831,7 @@ mod tests {
         let t0 = Instant::now();
         let neutral = usize::try_from(FETCH_BUSY_NEUTRAL_ALLOWANCE).unwrap();
         let charged: Vec<bool> = (0..1_000u32)
-            .map(|i| {
-                let now = t0 + WAIT * i;
-                assert_eq!(tracker.choose(&[holder], now), Some(&holder));
-                tracker.record_busy(&holder, now, WAIT).charged
-            })
+            .map(|i| tracker.record_busy(&holder, t0 + WAIT * i, WAIT).charged)
             .collect();
         assert!(charged.iter().take(neutral).all(|c| !c));
         assert!(charged.iter().skip(neutral).all(|c| *c));

@@ -49,7 +49,8 @@ as a wire change with its own rollout.
   fetch for good at no cost: neutrality has to be bounded per holder, across keys.
 - The added reply traffic must be bounded: no request storm from requesters retrying on every busy
   answer, and no echo amplification at responders.
-- No new requester scheduling state that would collide with #252's per-source scheduler.
+- One requester scheduler: #252's per-source scheduler reads which holders recently answered busy,
+  rather than a second scheduler choosing sources.
 
 ## Considered Options
 
@@ -117,11 +118,12 @@ silence's would have. Only serving this requester once, with a chunk that passes
 checks, restores the allowance; time does not, so a holder asked only rarely still uses it up.
 The allowance is per requester: each node judges only its own fetches.
 
-`SourceBusyTracker` remembers the busy holder: a new key starts,
-and a failed key retries, on the first holder in preference order that is not cooling down,
-falling back to the first when all are. It reorders and never withholds, so it lowers how often a
-busy holder is asked but is not a hard per-holder bound; the hard bound is the busy wait per fetch
-slot. The cooldown is 1, 2, 4, then 8 times the full jittered wait drawn for that busy answer,
+`SourceBusyTracker` remembers the busy holder, and #252's per-source scheduler reads it: a new key
+starts, and a failed key retries, on the first free holder in preference order (below this
+node's per-source share and not silent) that is not cooling down. A cooling holder comes after
+every other free holder, and still before a silent one, which costs a whole fetch timeout. It
+reorders and never withholds, so it lowers how often a busy holder is asked but is not a hard
+per-holder bound; the hard bound is the busy wait per fetch slot. The cooldown is 1, 2, 4, then 8 times the full jittered wait drawn for that busy answer,
 the multiplier rising with each further busy answer before the holder next serves this
 requester, capped at 60 s, and a later busy answer never shortens a running cooldown; once it
 runs out the holder is no longer put last. Serving once clears the holder's record, so its next
@@ -132,13 +134,14 @@ Records go only when their holder serves: not for age, and not to make room. Whe
 as for silence, and is not put last. A `Busy` for any other key is treated as malformed, like
 every other key mismatch.
 
-**Order.** This is merged after #252. #252's per-source share is what removes most per-peer
-over-share and bounds how many fetches one requester has open at one answering holder; without
-it, a requester with many fetch slots still over-shares, and most of those refusals exceed the
-per-peer busy-reply allowance and stay silent. On rebase, #252's source choice also puts cooling
-holders last. The two changes conflict in `src/replication/mod.rs` and have not yet been built or
-measured together; the gates and the real-node measurements below will be rerun on the rebased
-change.
+**Order.** This change is built on #252 and merges after it; until #252 merges, its branch
+carries #252's commit. #252's per-source share is what removes most per-peer over-share and
+bounds how many fetches one requester has open at one answering holder; without it, a requester
+with many fetch slots still over-shares, and most of those refusals exceed the per-peer
+busy-reply allowance and stay silent. In the combined build:
+- #252's source choice puts a cooling holder after every other free holder;
+- a busy answer counts as an answer for #252's silent-source tracking, as every answer does;
+- a busy wait keeps its attempt in flight, counted against the holder's share.
 
 ## Consequences
 
@@ -216,12 +219,13 @@ change.
   - tracker: cooldown, escalation, cap, not shortened by a later busy answer, reset, expiry,
     bounded table;
   - neutral allowance: a sole holder that answers busy every 5 s for over an hour without serving
-    is still chosen each time, and every answer after the eighth is charged; two answers at once
+    is charged for every answer after the eighth; two answers at once
     spend two; a holder that serves once between spells of eight is never charged; serving
     restores the whole allowance and another holder serving does not; answers an hour apart
     still use it up; a full table forgets no count while one more holder than it holds takes
     turns with the rest, charges that newcomer instead, and makes room once a holder serves;
-  - a retry passes over a cooling holder but still takes it last;
+  - #252's dispatch and retry pass over a cooling holder for another free one, still take it
+    before a silent one, and never withhold it;
   - a busy reply is not counted as served bytes.
 - End to end on a local network, made deterministic with a test-only fetch serve gate (the same
   one #252 adds):

@@ -5,13 +5,18 @@
 //! time, with strict dedup across all three stages.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::logging::debug;
 
-use crate::ant_protocol::XorName;
-use crate::replication::config::VERIFICATION_RETRY_BACKOFF_MAX;
+use crate::ant_protocol::{XorName, CLOSE_GROUP_SIZE};
+use crate::replication::audit_metrics;
+use crate::replication::config::{
+    FETCH_REQUEST_TIMEOUT, PAID_LIST_CLOSE_GROUP_SIZE, VERIFICATION_RETRY_BACKOFF_MAX,
+};
+use crate::replication::fetch_busy::SourceBusyTracker;
 use crate::replication::types::{
     FetchCandidate, FetchOrder, FetchPayload, VerificationEntry, VerificationState,
 };
@@ -94,6 +99,32 @@ pub const MAX_FETCH_QUEUE: usize = 131_072;
 /// decides *which* sources survive the cap.
 pub const MAX_HINT_SOURCES_PER_KEY: usize = 8;
 
+/// Maximum distinct source peers one key may be associated with while it is
+/// queued or in flight for fetch, counting the sources it was already fetched
+/// from this cycle, for the given close-group widths.
+///
+/// A verification round names at most its quorum targets and its paid-list
+/// targets as holders, and the replica-hint fallbacks added to them come from a
+/// pending entry already bounded by [`MAX_HINT_SOURCES_PER_KEY`], so this never
+/// truncates a source list a round produced. It bounds what later
+/// advertisements can merge into a queued or in-flight key, and with it the
+/// parked-fetch index, which holds one entry per untried source of each parked
+/// key.
+#[must_use]
+pub(crate) const fn fetch_source_limit(
+    close_group_size: usize,
+    paid_list_close_group_size: usize,
+) -> usize {
+    close_group_size
+        .saturating_add(paid_list_close_group_size)
+        .saturating_add(MAX_HINT_SOURCES_PER_KEY)
+}
+
+/// [`fetch_source_limit`] at the production close-group widths, and the limit
+/// [`ReplicationQueues::new`] starts with.
+pub(crate) const MAX_FETCH_SOURCES_PER_KEY: usize =
+    fetch_source_limit(CLOSE_GROUP_SIZE, PAID_LIST_CLOSE_GROUP_SIZE);
+
 /// Outcome of [`ReplicationQueues::add_pending_verify`].
 ///
 /// Distinguishes "the key is already being handled" from "the key was
@@ -174,14 +205,421 @@ pub struct InFlightEntry {
     pub key: XorName,
     /// The peer we are currently fetching from.
     pub source: PeerId,
-    /// When the fetch started.
+    /// When the current attempt started: the first, or under the per-source
+    /// scheduler the latest retry.
     pub started_at: Instant,
-    /// All verified sources for this key.
+    /// Verified sources for this key not yet tried before this episode's
+    /// current attempt. A key that was parked between attempts keeps the
+    /// sources it already tried only in `tried`, so everything the key is
+    /// associated with is the union of the two.
     pub all_sources: Vec<PeerId>,
     /// Sources already attempted (failed or in progress).
     pub tried: HashSet<PeerId>,
     /// Pending-verification entry to restore if all fetch sources fail.
     pub retry_verification: Option<VerificationEntry>,
+}
+
+// ---------------------------------------------------------------------------
+// Per-source fetch dispatch
+// ---------------------------------------------------------------------------
+
+/// A queued key none of whose untried sources had a free share when it was
+/// last considered for dispatch.
+///
+/// Its payload stays in `fetch_payloads`; only its place in line moves here
+/// from the fetch heap.
+#[derive(Debug, Clone)]
+struct ParkedFetch {
+    /// XOR distance from self to the key, its priority once startable again.
+    distance: XorName,
+    /// Untried sources whose next free share could start the key, in the
+    /// payload's source-preference order. Each one indexes the key in
+    /// `parked_by_source`.
+    wake_sources: Vec<PeerId>,
+    /// When the key was parked, for the dispatch summary's oldest-parked age.
+    parked_at: Instant,
+}
+
+/// Fetches started, and candidates found with no untried source, by one
+/// [`ReplicationQueues::dispatch_fetches`] pass.
+#[derive(Debug, Default)]
+pub(crate) struct FetchDispatch {
+    /// Each started key with the source it was sent to. Already in flight.
+    pub(crate) started: Vec<(XorName, PeerId)>,
+    /// Dequeued candidates with no untried source left. The caller decides
+    /// what to do with them, exactly as for a sourceless dequeue.
+    pub(crate) sourceless: Vec<FetchCandidate>,
+    /// Heap keys this pass parked because every untried source was full.
+    pub(crate) parked: usize,
+}
+
+/// The per-source scheduler's queue state, for its periodic summary.
+///
+/// Read only by that summary's log line, which a build without logging
+/// compiles out.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(feature = "logging"), allow(dead_code))]
+pub(crate) struct FetchDispatchStats {
+    /// Keys parked behind full sources.
+    pub(crate) parked: usize,
+    /// How long the longest-parked key has waited, if any is parked.
+    pub(crate) oldest_parked: Option<Duration>,
+    /// Keys queued for fetch, parked ones included.
+    pub(crate) queued: usize,
+    /// Fetches in flight.
+    pub(crate) in_flight: usize,
+    /// Sources holding at least the per-source cap of this node's fetches.
+    pub(crate) saturated_sources: usize,
+    /// Entries in the parked index: one per untried source of each parked key.
+    pub(crate) parked_associations: usize,
+    /// Longest parked-index maintenance after a departed source, since the last
+    /// read.
+    pub(crate) parked_maintenance_max: Duration,
+    /// Sources in the health table before the summary's purge.
+    pub(crate) tracked_sources: usize,
+    /// Tracked sources silent now.
+    pub(crate) silent_sources: usize,
+    /// Whether the health table is overflowing, so every untracked source
+    /// also counts as silent.
+    pub(crate) overflow_active: bool,
+    /// Source-health events since the last read.
+    pub(crate) health: SourceHealthCounters,
+}
+
+/// What [`ReplicationQueues::retry_or_park_fetch`] did with a failed fetch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FetchRetry {
+    /// Retry now from this untried source, which has a free share.
+    Next(PeerId),
+    /// Every untried source is at its share: the key went back to the fetch
+    /// queue, parked, keeping its tried sources and retry reservation.
+    Parked,
+    /// No untried source is left, or the fetch queue is full. The key stays
+    /// in flight, with its failed source now marked tried, for the caller's
+    /// verification requeue.
+    Exhausted,
+}
+
+// ---------------------------------------------------------------------------
+// Fetch source health
+// ---------------------------------------------------------------------------
+
+/// How many fetch timeouts a source stays silent after this node last learned
+/// of an unanswered request to it.
+const SILENCE_LIFETIME_TIMEOUTS: u32 = 2;
+
+/// Shortest time a mark lasts, whatever the fetch timeout, so a zero or
+/// tiny configured timeout cannot turn silent sources off.
+const MIN_SILENCE_LIFETIME: Duration = Duration::from_secs(1);
+
+/// Most fetch sources whose answering this node tracks at once.
+///
+/// Far above the sources one node fetches from within a silence lifetime. At
+/// the bound, entries that neither hold a mark nor guard an in-flight fetch
+/// are dropped. If that frees nothing, a source not in the table counts as
+/// silent for one silence lifetime: fetched from as it was before the
+/// per-source cap, never more slowly.
+const MAX_TRACKED_FETCH_SOURCES: usize = 8_192;
+
+/// Whether a fetch attempt reached its source.
+///
+/// Requests and answers carry their place in one process-wide sequence, taken
+/// as the request is sent and as its answer returns, so the table can tell
+/// which came first however the fetch worker orders their outcomes and
+/// whatever the clock reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Contact {
+    /// The attempt ended before a request was sent.
+    NotAttempted,
+    /// The source answered, whatever the answer then turned out to be.
+    Answered {
+        /// Where the answer's arrival falls in the sequence.
+        order: u64,
+    },
+    /// The request got no answer: a timeout or a connection failure.
+    Unreachable {
+        /// Where the request's sending falls in the sequence.
+        sent: u64,
+    },
+    /// The attempt was cancelled at shutdown, so nothing is known.
+    Unknown,
+}
+
+/// What this node has observed of one source's answering.
+#[derive(Debug, Clone, Copy, Default)]
+struct SourceHealth {
+    /// Sequence place of the latest answer from this source.
+    last_answer: Option<u64>,
+    /// Sequence place of the latest-sent request to this source that got no
+    /// answer.
+    last_unanswered: Option<u64>,
+    /// When this node learned of that request's failure, while the request is
+    /// newer than the latest answer and the mark has not expired.
+    marked_since: Option<Instant>,
+}
+
+impl SourceHealth {
+    /// Whether a request sent after this source's latest answer went
+    /// unanswered. It depends only on the two latest events, so it is the same
+    /// whatever order the outcomes were applied in.
+    fn unanswered_since_answer(&self) -> bool {
+        self.last_unanswered
+            .is_some_and(|sent| self.last_answer.is_none_or(|answer| sent > answer))
+    }
+}
+
+/// Source-health events since the dispatch summary last read them.
+///
+/// Read only by that summary's log line, which a build without logging
+/// compiles out.
+#[derive(Debug, Clone, Copy, Default)]
+#[cfg_attr(not(feature = "logging"), allow(dead_code))]
+pub(crate) struct SourceHealthCounters {
+    /// Attempts whose request got no answer.
+    pub(crate) unreachable: u64,
+    /// Sources that became silent.
+    pub(crate) marks: u64,
+    /// Marks cleared by an answer.
+    pub(crate) clears: u64,
+    /// Marks that ran out their lifetime.
+    pub(crate) expired_marks: u64,
+    /// Unanswered requests sent before their source's latest answer.
+    pub(crate) ignored_stale: u64,
+    /// Fetches started or retried on a silent source, outside the cap.
+    pub(crate) silent_starts: u64,
+    /// Times the table was full of marks and in-flight guards.
+    pub(crate) overflows: u64,
+    /// Most tracked sources silent at once.
+    pub(crate) silent_peak: usize,
+}
+
+/// What this node has observed of each fetch source's answering.
+///
+/// The per-source cap keeps this node within the admission share a responder
+/// grants it, and only a responder that answers has a share to keep within. A
+/// source is silent while the latest-sent request to it that went unanswered
+/// was sent after its latest answer: it is fetched from without the cap, as
+/// before the cap existed. Any answer received after that request was sent
+/// ends it. So does learning of no newer unanswered request for one silence
+/// lifetime, so a source this node has stopped trying is probed again under
+/// the cap.
+#[derive(Debug)]
+struct SourceHealthTable {
+    entries: HashMap<PeerId, SourceHealth>,
+    /// Every mark as `(marked_since, source)`, so marks expire in order.
+    marks_by_since: BTreeSet<(Instant, PeerId)>,
+    /// How long a mark lasts without newer evidence.
+    silence_lifetime: Duration,
+    /// When the table last overflowed. For one silence lifetime after, a
+    /// source not in the table counts as silent.
+    overflow_since: Option<Instant>,
+    counters: SourceHealthCounters,
+}
+
+impl SourceHealthTable {
+    fn new(fetch_request_timeout: Duration) -> Self {
+        Self {
+            entries: HashMap::new(),
+            marks_by_since: BTreeSet::new(),
+            silence_lifetime: fetch_request_timeout
+                .saturating_mul(SILENCE_LIFETIME_TIMEOUTS)
+                .max(MIN_SILENCE_LIFETIME),
+            overflow_since: None,
+            counters: SourceHealthCounters::default(),
+        }
+    }
+
+    /// Whether something that began at `since` is still within one silence
+    /// lifetime at `now`.
+    fn within_lifetime(&self, since: Instant, now: Instant) -> bool {
+        now.saturating_duration_since(since) < self.silence_lifetime
+    }
+
+    fn overflowing(&self, now: Instant) -> bool {
+        self.overflow_since
+            .is_some_and(|since| self.within_lifetime(since, now))
+    }
+
+    /// Whether `source` counts as silent at `now`.
+    fn is_silent(&self, source: &PeerId, now: Instant) -> bool {
+        self.entries.get(source).map_or_else(
+            || self.overflowing(now),
+            |health| {
+                health
+                    .marked_since
+                    .is_some_and(|since| self.within_lifetime(since, now))
+            },
+        )
+    }
+
+    /// Drop the marks that ran out their lifetime by `now`.
+    fn expire(&mut self, now: Instant) {
+        while let Some(&(since, source)) = self.marks_by_since.first() {
+            if self.within_lifetime(since, now) {
+                break;
+            }
+            self.marks_by_since.pop_first();
+            if let Some(health) = self.entries.get_mut(&source) {
+                if health.marked_since == Some(since) {
+                    health.marked_since = None;
+                }
+            }
+            self.counters.expired_marks += 1;
+        }
+    }
+
+    /// Drop every entry that neither holds a mark nor guards an in-flight
+    /// fetch to its source. Every contact, an answer reported ahead of its
+    /// fetch's outcome included, is applied while its own fetch is still in
+    /// flight, so none can arrive for a dropped source's past requests:
+    /// anything later is newer than all of its history. Call after
+    /// [`Self::expire`].
+    fn purge(&mut self, in_flight: &HashMap<XorName, InFlightEntry>) {
+        let guarded: HashSet<PeerId> = in_flight.values().map(|entry| entry.source).collect();
+        self.entries
+            .retain(|source, health| health.marked_since.is_some() || guarded.contains(source));
+    }
+
+    /// The entry for `source`, purging the table at the bound. `None` when the
+    /// table cannot take it, which starts an overflow.
+    fn entry(
+        &mut self,
+        source: PeerId,
+        now: Instant,
+        in_flight: &HashMap<XorName, InFlightEntry>,
+    ) -> Option<&mut SourceHealth> {
+        if !self.entries.contains_key(&source) && self.entries.len() >= MAX_TRACKED_FETCH_SOURCES {
+            if self.overflowing(now) {
+                return None;
+            }
+            self.purge(in_flight);
+            if self.entries.len() >= MAX_TRACKED_FETCH_SOURCES {
+                self.overflow_since = Some(now);
+                self.counters.overflows += 1;
+                return None;
+            }
+        }
+        Some(self.entries.entry(source).or_default())
+    }
+
+    /// Apply, at `now`, one attempt's contact with `source`.
+    fn record(
+        &mut self,
+        source: PeerId,
+        contact: Contact,
+        now: Instant,
+        in_flight: &HashMap<XorName, InFlightEntry>,
+    ) {
+        self.expire(now);
+        match contact {
+            Contact::NotAttempted | Contact::Unknown => {}
+            Contact::Answered { order } => {
+                let Some(health) = self.entry(source, now, in_flight) else {
+                    return;
+                };
+                health.last_answer = health.last_answer.max(Some(order));
+                let cleared = if health.unanswered_since_answer() {
+                    None
+                } else {
+                    health.marked_since.take()
+                };
+                if let Some(since) = cleared {
+                    self.marks_by_since.remove(&(since, source));
+                    self.counters.clears += 1;
+                }
+            }
+            Contact::Unreachable { sent } => {
+                self.counters.unreachable += 1;
+                let Some(health) = self.entry(source, now, in_flight) else {
+                    return;
+                };
+                let stale = health.last_answer.is_some_and(|answer| sent < answer);
+                let newest = health.last_unanswered.is_none_or(|latest| sent > latest);
+                if newest {
+                    health.last_unanswered = Some(sent);
+                }
+                // The newest unanswered request, if newer than every answer,
+                // marks the source from now: from when this node learned of it.
+                let (replaced, marked) = if newest && health.unanswered_since_answer() {
+                    (health.marked_since.replace(now), true)
+                } else {
+                    (None, false)
+                };
+                if stale {
+                    self.counters.ignored_stale += 1;
+                }
+                if marked {
+                    if let Some(since) = replaced {
+                        self.marks_by_since.remove(&(since, source));
+                    } else {
+                        self.counters.marks += 1;
+                    }
+                    self.marks_by_since.insert((now, source));
+                    self.counters.silent_peak =
+                        self.counters.silent_peak.max(self.marks_by_since.len());
+                }
+            }
+        }
+    }
+
+    /// The counters since the last call, and the table's size before the
+    /// purge that follows.
+    fn take_counters(
+        &mut self,
+        now: Instant,
+        in_flight: &HashMap<XorName, InFlightEntry>,
+    ) -> (SourceHealthCounters, usize) {
+        self.expire(now);
+        let tracked = self.entries.len();
+        self.purge(in_flight);
+        let counters = std::mem::take(&mut self.counters);
+        self.counters.silent_peak = self.marks_by_since.len();
+        (counters, tracked)
+    }
+}
+
+/// What lets a parked key start now: an untried source below the per-source
+/// cap, or a silent one.
+#[derive(Clone, Copy)]
+struct Startable<'a> {
+    in_flight: &'a HashMap<PeerId, usize>,
+    per_source_cap: usize,
+    now: Instant,
+}
+
+/// The next queued key, taken off the heap or out of the parked set.
+///
+/// Returned and matched at once, never stored, so the size gap between the
+/// variants costs nothing; boxing would add an allocation per dispatched fetch.
+#[allow(clippy::large_enum_variant)]
+enum TakenFetch {
+    /// The key, rejoined with its payload.
+    Candidate(FetchCandidate),
+    /// An inconsistent entry was dropped instead; try again.
+    Skipped,
+    /// The heap is empty and no parked key was asked for.
+    Empty,
+}
+
+/// How [`ReplicationQueues::dispatch_fetches`] may start one candidate.
+enum SourceChoice {
+    /// This untried source has a free share.
+    Start(PeerId),
+    /// Untried sources exist, but every one is at its share.
+    AllBusy,
+    /// No untried source is left.
+    NoSource,
+}
+
+/// Test-only: every key queued or parked for fetch, and every in-flight fetch
+/// with its source, read under one lock.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Debug, Clone, Default)]
+pub struct FetchPipelineSnapshot {
+    /// Keys queued for fetch, on the heap or parked.
+    pub queued: Vec<XorName>,
+    /// In-flight fetches with the source each one was sent to.
+    pub in_flight: Vec<(XorName, PeerId)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -205,10 +643,11 @@ pub struct ReplicationQueues {
     /// Capacity-bounded by [`MAX_PENDING_VERIFY`]. At capacity, max-min sender
     /// accounting reclaims borrowed entries before rejecting new work.
     pending_verify: HashMap<XorName, VerificationEntry>,
-    /// Nearest-first priority order over the keys in `fetch_payloads`.
+    /// Nearest-first priority order over the queued keys that are not parked.
     ///
     /// Holds ordering data only: every entry has exactly one matching
-    /// `fetch_payloads` entry, and vice versa. Splitting the mutable half of a
+    /// `fetch_payloads` entry, and every `fetch_payloads` entry is represented
+    /// exactly once, here or in `fetch_parked`. Splitting the mutable half of a
     /// queued fetch out into `fetch_payloads` keeps this heap's ordering
     /// immutable for as long as a key is queued, so a source merge never has
     /// to rebuild it.
@@ -221,8 +660,34 @@ pub struct ReplicationQueues {
     /// Capacity-bounded by [`MAX_FETCH_QUEUE`]: enqueues are dropped once
     /// full, preventing unbounded growth under a network hint flood.
     fetch_payloads: HashMap<XorName, FetchPayload>,
+    /// Queued keys taken off `fetch_queue` because every untried source was at
+    /// its per-source share. Every key in `fetch_payloads` is in exactly one of
+    /// `fetch_queue` and this map.
+    fetch_parked: HashMap<XorName, ParkedFetch>,
+    /// Exact reverse index over `fetch_parked`: `(distance, key)` is in the set
+    /// for `source` if and only if `key` is parked with `source` among its
+    /// wake sources. Ordered so the nearest parked key per source is `first()`;
+    /// empty sets are removed.
+    parked_by_source: HashMap<PeerId, BTreeSet<(XorName, XorName)>>,
+    /// Sources a queued key was already fetched from in the current
+    /// verification cycle. Present only for a key that went back to the queue
+    /// from flight, and carried into its next in-flight entry.
+    fetch_tried: HashMap<XorName, HashSet<PeerId>>,
     /// Active downloads keyed by `XorName`.
     in_flight_fetch: HashMap<XorName, InFlightEntry>,
+    /// Most distinct sources a queued or in-flight key may be associated with,
+    /// tried ones included. See [`fetch_source_limit`].
+    max_fetch_sources: usize,
+    /// Longest parked-index maintenance after a departed source since the
+    /// dispatch summary last read it.
+    parked_maintenance_max: Duration,
+    /// Which fetch sources stopped answering, so the per-source cap can leave
+    /// them out.
+    source_health: SourceHealthTable,
+    /// Which fetch sources recently answered busy, so a key starts or retries
+    /// on another free source first. Shared with the fetches that record the
+    /// busy answers.
+    busy_sources: Arc<SourceBusyTracker>,
     /// Reverse index for removing a departed peer from every pending hint
     /// without scanning the entire pending table.
     pending_keys_by_source: HashMap<PeerId, HashSet<XorName>>,
@@ -272,7 +737,14 @@ impl ReplicationQueues {
             pending_verify: HashMap::new(),
             fetch_queue: BinaryHeap::new(),
             fetch_payloads: HashMap::new(),
+            fetch_parked: HashMap::new(),
+            parked_by_source: HashMap::new(),
+            fetch_tried: HashMap::new(),
             in_flight_fetch: HashMap::new(),
+            max_fetch_sources: MAX_FETCH_SOURCES_PER_KEY,
+            parked_maintenance_max: Duration::ZERO,
+            source_health: SourceHealthTable::new(FETCH_REQUEST_TIMEOUT),
+            busy_sources: Arc::new(SourceBusyTracker::new()),
             pending_keys_by_source: HashMap::new(),
             capacity_owner_by_key: HashMap::new(),
             pending_keys_by_owner: HashMap::new(),
@@ -284,6 +756,53 @@ impl ReplicationQueues {
             retry_reserved_slots: 0,
             retry_reserved_by_owner: HashMap::new(),
         }
+    }
+
+    /// Use `limit` as the most distinct sources a queued or in-flight key may
+    /// be associated with, for close-group widths other than the production
+    /// ones. See [`fetch_source_limit`].
+    #[must_use]
+    pub(crate) fn with_fetch_source_limit(mut self, limit: usize) -> Self {
+        self.set_fetch_source_limit(limit);
+        self
+    }
+
+    /// Change the source limit. Only for queues no key has entered yet, such
+    /// as an engine's before it starts.
+    pub(crate) fn set_fetch_source_limit(&mut self, limit: usize) {
+        self.max_fetch_sources = limit.max(1);
+    }
+
+    /// Use `timeout`, the fetch request timeout, to time how long a source
+    /// that stopped answering stays silent. Only for queues no fetch has
+    /// resolved in yet.
+    #[must_use]
+    pub(crate) fn with_fetch_request_timeout(mut self, timeout: Duration) -> Self {
+        self.source_health = SourceHealthTable::new(timeout);
+        self
+    }
+
+    /// Read which sources recently answered busy from `busy_sources`, the
+    /// tracker this node's fetches record those answers in.
+    #[must_use]
+    pub(crate) fn with_busy_sources(mut self, busy_sources: Arc<SourceBusyTracker>) -> Self {
+        self.busy_sources = busy_sources;
+        self
+    }
+
+    /// The tracker of sources that recently answered busy.
+    #[cfg(test)]
+    pub(crate) fn busy_sources(&self) -> &SourceBusyTracker {
+        &self.busy_sources
+    }
+
+    /// Apply whether a fetch attempt's `source` answered. Called for every
+    /// resolved attempt, before the attempt's result moves its key on, and for
+    /// an answer as soon as it arrives, while its attempt is still in flight.
+    /// Applying the same answer twice changes nothing.
+    pub(crate) fn record_fetch_contact(&mut self, source: PeerId, contact: Contact) {
+        self.source_health
+            .record(source, contact, Instant::now(), &self.in_flight_fetch);
     }
 
     // -----------------------------------------------------------------------
@@ -302,6 +821,7 @@ impl ReplicationQueues {
     ///   source-side retry) MUST treat this as still-outstanding work, not as
     ///   "done". Without this distinction a bootstrap snapshot whose hints
     ///   are capacity-rejected would silently mark itself drained.
+    #[allow(clippy::too_many_lines)]
     pub fn add_pending_verify(
         &mut self,
         key: XorName,
@@ -373,32 +893,66 @@ impl ReplicationQueues {
             return AdmissionResult::AlreadyPresent;
         }
         // Merging a source touches only `FetchPayload`, which no ordering
-        // reads, so the fetch heap is left completely untouched here.
+        // reads, so the fetch heap is left completely untouched here. A source
+        // this key was already fetched from this cycle is not merged back: it
+        // would be asked twice. A parked key can start from a merged source as
+        // soon as that source has a free share, so it is indexed there too.
         if let Some(payload) = self.fetch_payloads.get_mut(&key) {
+            let tried = self.fetch_tried.get(&key);
+            let mut merged = Vec::new();
             for source in &entry.replica_hint_sources {
-                if !payload.sources.contains(source) {
+                // Payload sources and tried sources are disjoint, so this is
+                // the size of everything the key has been associated with.
+                if payload.sources.len() + tried.map_or(0, HashSet::len) >= self.max_fetch_sources {
+                    break;
+                }
+                if !payload.sources.contains(source) && !tried.is_some_and(|t| t.contains(source)) {
                     payload.sources.push(*source);
+                    merged.push(*source);
+                }
+            }
+            if let Some(parked) = self.fetch_parked.get_mut(&key) {
+                for source in merged {
+                    parked.wake_sources.push(source);
+                    self.parked_by_source
+                        .entry(source)
+                        .or_default()
+                        .insert((parked.distance, key));
                 }
             }
             if let Some(retry) = &mut payload.retry_verification {
-                retry
-                    .replica_hint_sources
-                    .extend(entry.replica_hint_sources);
-                retry.hint_sources.extend(entry.hint_sources);
+                Self::merge_retry_hints(
+                    retry,
+                    &entry.replica_hint_sources,
+                    &entry.hint_sources,
+                    self.capacity_owner_by_key.get(&key).copied(),
+                );
             }
             return AdmissionResult::AlreadyPresent;
         }
         if let Some(in_flight) = self.in_flight_fetch.get_mut(&key) {
+            let mut associated = in_flight.all_sources.len()
+                + in_flight
+                    .tried
+                    .iter()
+                    .filter(|peer| !in_flight.all_sources.contains(peer))
+                    .count();
             for source in &entry.replica_hint_sources {
-                if !in_flight.all_sources.contains(source) {
+                if associated >= self.max_fetch_sources {
+                    break;
+                }
+                if !in_flight.all_sources.contains(source) && !in_flight.tried.contains(source) {
                     in_flight.all_sources.push(*source);
+                    associated += 1;
                 }
             }
             if let Some(retry) = &mut in_flight.retry_verification {
-                retry
-                    .replica_hint_sources
-                    .extend(entry.replica_hint_sources);
-                retry.hint_sources.extend(entry.hint_sources);
+                Self::merge_retry_hints(
+                    retry,
+                    &entry.replica_hint_sources,
+                    &entry.hint_sources,
+                    self.capacity_owner_by_key.get(&key).copied(),
+                );
             }
             return AdmissionResult::AlreadyPresent;
         }
@@ -652,10 +1206,7 @@ impl ReplicationQueues {
         key: &XorName,
         protected_owner: Option<PeerId>,
     ) -> bool {
-        let victim = entry.hint_sources.iter().copied().find(|source| {
-            !entry.replica_hint_sources.contains(source) && protected_owner != Some(*source)
-        });
-        let Some(victim) = victim else {
+        let Some(victim) = Self::paid_only_victim(entry, protected_owner) else {
             return false;
         };
         entry.hint_sources.remove(&victim);
@@ -666,6 +1217,53 @@ impl ReplicationQueues {
             }
         }
         true
+    }
+
+    /// The paid-only advertiser [`Self::displace_paid_only_source`] would drop
+    /// from `entry`: never a replica claimant, never `protected_owner`.
+    fn paid_only_victim(
+        entry: &VerificationEntry,
+        protected_owner: Option<PeerId>,
+    ) -> Option<PeerId> {
+        entry.hint_sources.iter().copied().find(|source| {
+            !entry.replica_hint_sources.contains(source) && protected_owner != Some(*source)
+        })
+    }
+
+    /// Merge a re-advertisement into the verification entry a fetch-stage key
+    /// keeps for a later retry, under the bound and in the order
+    /// [`Self::add_pending_verify`] applies to a pending entry: replica
+    /// claimants first, displacing paid-only advertisers other than
+    /// `protected_owner` when the set is full, then paid-only advertisers
+    /// while it is below [`MAX_HINT_SOURCES_PER_KEY`]. A fetch-stage key is in
+    /// no pending index, so only the entry changes.
+    fn merge_retry_hints(
+        retry: &mut VerificationEntry,
+        replica_hint_sources: &HashSet<PeerId>,
+        hint_sources: &HashSet<PeerId>,
+        protected_owner: Option<PeerId>,
+    ) {
+        for source in replica_hint_sources {
+            if retry.replica_hint_sources.contains(source) {
+                continue;
+            }
+            if !retry.hint_sources.contains(source)
+                && retry.hint_sources.len() >= MAX_HINT_SOURCES_PER_KEY
+            {
+                let Some(victim) = Self::paid_only_victim(retry, protected_owner) else {
+                    break;
+                };
+                retry.hint_sources.remove(&victim);
+            }
+            retry.replica_hint_sources.insert(*source);
+            retry.hint_sources.insert(*source);
+        }
+        for source in hint_sources {
+            if retry.hint_sources.len() >= MAX_HINT_SOURCES_PER_KEY {
+                break;
+            }
+            retry.hint_sources.insert(*source);
+        }
     }
 
     /// Reserve a pending slot for `key`, charged to its capacity owner.
@@ -951,8 +1549,9 @@ impl ReplicationQueues {
                 .retain(|key, _| !orphaned_fetch_keys.contains(key));
             self.fetch_queue
                 .retain(|order| !orphaned_fetch_keys.contains(&order.key));
-            orphaned.extend(orphaned_fetch_keys);
         }
+        self.drop_departed_source_from_parked(source, &orphaned_fetch_keys);
+        orphaned.extend(orphaned_fetch_keys);
 
         for entry in self.in_flight_fetch.values_mut() {
             entry.all_sources.retain(|peer| peer != source);
@@ -1114,7 +1713,7 @@ impl ReplicationQueues {
         &mut self,
         key: XorName,
         distance: XorName,
-        sources: Vec<PeerId>,
+        mut sources: Vec<PeerId>,
         retry_verification: Option<VerificationEntry>,
     ) -> bool {
         if self.pending_verify.contains_key(&key)
@@ -1130,6 +1729,7 @@ impl ReplicationQueues {
             );
             return false;
         }
+        sources.truncate(self.max_fetch_sources);
         self.fetch_payloads.insert(
             key,
             FetchPayload {
@@ -1138,6 +1738,10 @@ impl ReplicationQueues {
             },
         );
         self.fetch_queue.push(FetchOrder { key, distance });
+        // A fresh enqueue starts a new verification cycle's fetch, so nothing
+        // asked in an earlier cycle is excluded. Cleared only now, after the
+        // insert succeeded: a refused enqueue leaves an existing entry alone.
+        self.fetch_tried.remove(&key);
         true
     }
 
@@ -1184,39 +1788,84 @@ impl ReplicationQueues {
         enqueued
     }
 
-    /// Dequeue the nearest fetch candidate.
+    /// Dequeue the nearest fetch candidate, whether it is on the fetch heap or
+    /// parked.
     ///
     /// Returns `None` when the queue is empty.  Silently skips candidates
     /// that are somehow already in-flight.  Concurrency is enforced by the
     /// fetch worker, not by this method.
     ///
     /// A returned candidate may carry a live verification retry-slot
-    /// reservation. Callers must consume it with
-    /// [`Self::start_dequeued_fetch`], [`Self::discard_fetch_candidate`], or
+    /// reservation, and the sources it was already fetched from this cycle.
+    /// Callers must consume it with [`Self::start_dequeued_fetch`],
+    /// [`Self::discard_fetch_candidate`], or
     /// [`Self::requeue_candidate_for_verification`] so that reservation is
     /// either transferred, released, or restored to `pending_verify`.
     pub fn dequeue_fetch(&mut self) -> Option<FetchCandidate> {
-        while let Some(order) = self.fetch_queue.pop() {
-            let Some(payload) = self.fetch_payloads.remove(&order.key) else {
-                debug_assert!(
-                    false,
-                    "fetch order without payload for {}",
-                    hex::encode(order.key)
-                );
-                continue;
-            };
-            let candidate = FetchCandidate {
-                key: order.key,
-                distance: order.distance,
-                sources: payload.sources,
-                retry_verification: payload.retry_verification,
+        loop {
+            let parked = self.nearest_parked(None);
+            let candidate = match self.take_queued(self.parked_if_nearer(parked)) {
+                TakenFetch::Candidate(candidate) => candidate,
+                TakenFetch::Skipped => continue,
+                TakenFetch::Empty => return None,
             };
             if !self.in_flight_fetch.contains_key(&candidate.key) {
                 return Some(candidate);
             }
-            self.release_retry_slot_for_candidate(&candidate);
+            self.drop_duplicate_of_in_flight(&candidate);
         }
-        None
+    }
+
+    /// `parked`'s key when it is nearer than the heap head, or the heap is
+    /// empty; `None` to take the heap head.
+    fn parked_if_nearer(&self, parked: Option<(XorName, XorName)>) -> Option<XorName> {
+        let heap_head = self
+            .fetch_queue
+            .peek()
+            .map(|order| (order.distance, order.key));
+        match (heap_head, parked) {
+            (Some(head), Some(parked)) if parked < head => Some(parked.1),
+            (None, Some(parked)) => Some(parked.1),
+            _ => None,
+        }
+    }
+
+    /// Remove a queued key from where it waits, the parked key `parked` or
+    /// otherwise the heap head, and rejoin it with its payload.
+    fn take_queued(&mut self, parked: Option<XorName>) -> TakenFetch {
+        let (key, distance) = if let Some(key) = parked {
+            let Some(distance) = self.unpark(&key) else {
+                self.purge_parked_index_entry(&key);
+                return TakenFetch::Skipped;
+            };
+            (key, distance)
+        } else {
+            let Some(order) = self.fetch_queue.pop() else {
+                return TakenFetch::Empty;
+            };
+            (order.key, order.distance)
+        };
+        let Some(payload) = self.fetch_payloads.remove(&key) else {
+            debug_assert!(
+                false,
+                "queued fetch without payload for {}",
+                hex::encode(key)
+            );
+            return TakenFetch::Skipped;
+        };
+        TakenFetch::Candidate(FetchCandidate {
+            key,
+            distance,
+            sources: payload.sources,
+            retry_verification: payload.retry_verification,
+        })
+    }
+
+    /// Discard a dequeued candidate whose key is somehow already in flight,
+    /// releasing what it carried.
+    fn drop_duplicate_of_in_flight(&mut self, candidate: &FetchCandidate) {
+        self.release_retry_slot_for_candidate(candidate);
+        self.fetch_tried.remove(&candidate.key);
     }
 
     /// Number of keys waiting in the fetch queue.
@@ -1253,8 +1902,41 @@ impl ReplicationQueues {
         all_sources: Vec<PeerId>,
         retry_verification: Option<VerificationEntry>,
     ) {
-        let mut tried = HashSet::new();
+        self.start_fetch_after(key, source, all_sources, retry_verification, HashSet::new());
+    }
+
+    /// Start `key` from `source`, carrying the sources it was already fetched
+    /// from this cycle into the in-flight entry's tried set.
+    fn start_fetch_after(
+        &mut self,
+        key: XorName,
+        source: PeerId,
+        mut all_sources: Vec<PeerId>,
+        retry_verification: Option<VerificationEntry>,
+        mut tried: HashSet<PeerId>,
+    ) {
         tried.insert(source);
+        // Keep the distinct union of tried and listed sources within the
+        // limit by dropping untried sources from the end of the list. Every
+        // dispatched start is already within it; this binds direct starts.
+        let union = all_sources.len()
+            + tried
+                .iter()
+                .filter(|peer| !all_sources.contains(peer))
+                .count();
+        let mut excess = union.saturating_sub(self.max_fetch_sources);
+        if excess > 0 {
+            let mut kept = Vec::with_capacity(all_sources.len());
+            for peer in all_sources.into_iter().rev() {
+                if excess > 0 && !tried.contains(&peer) {
+                    excess -= 1;
+                } else {
+                    kept.push(peer);
+                }
+            }
+            kept.reverse();
+            all_sources = kept;
+        }
         let replaced = self.in_flight_fetch.insert(
             key,
             InFlightEntry {
@@ -1271,8 +1953,9 @@ impl ReplicationQueues {
         }
     }
 
-    /// Consume a dequeued fetch candidate and transfer its retry reservation
-    /// into the in-flight entry.
+    /// Consume a dequeued fetch candidate and transfer its retry reservation,
+    /// and the sources it was already fetched from this cycle, into the
+    /// in-flight entry.
     pub fn start_dequeued_fetch(&mut self, candidate: FetchCandidate, source: PeerId) {
         let FetchCandidate {
             key,
@@ -1280,7 +1963,8 @@ impl ReplicationQueues {
             retry_verification,
             ..
         } = candidate;
-        self.start_fetch_with_retry(key, source, sources, retry_verification);
+        let tried = self.fetch_tried.remove(&key).unwrap_or_default();
+        self.start_fetch_after(key, source, sources, retry_verification, tried);
     }
 
     /// Mark a fetch as completed (success or permanent failure).
@@ -1300,6 +1984,7 @@ impl ReplicationQueues {
             retry_verification,
             ..
         } = candidate;
+        self.fetch_tried.remove(&key);
         if retry_verification.is_some() {
             self.release_retry_slot(&key);
             self.capacity_owner_by_key.remove(&key);
@@ -1311,29 +1996,14 @@ impl ReplicationQueues {
     /// Returns the next source peer if one is available, or `None` if all
     /// sources have been exhausted.
     pub fn retry_fetch(&mut self, key: &XorName) -> Option<PeerId> {
-        self.retry_fetch_with(key, |untried| untried.first().copied())
-    }
-
-    /// Like [`Self::retry_fetch`], with `choose` picking the next source from
-    /// the untried ones, given in source-preference order. A pick that is not
-    /// among them is ignored and the first untried source is used instead, so
-    /// `choose` can reorder the untried sources but never revive a tried one.
-    pub fn retry_fetch_with<F>(&mut self, key: &XorName, choose: F) -> Option<PeerId>
-    where
-        F: FnOnce(&[PeerId]) -> Option<PeerId>,
-    {
         let entry = self.in_flight_fetch.get_mut(key)?;
         entry.tried.insert(entry.source);
 
-        let untried: Vec<PeerId> = entry
+        let next = entry
             .all_sources
             .iter()
-            .filter(|p| !entry.tried.contains(p))
-            .copied()
-            .collect();
-        let next = choose(&untried)
-            .filter(|pick| untried.contains(pick))
-            .or_else(|| untried.first().copied());
+            .find(|p| !entry.tried.contains(p))
+            .copied();
 
         if let Some(next_peer) = next {
             entry.source = next_peer;
@@ -1341,6 +2011,425 @@ impl ReplicationQueues {
             Some(next_peer)
         } else {
             None
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-source dispatch
+    // -----------------------------------------------------------------------
+
+    /// Start up to `slots` queued fetches without putting more than
+    /// `per_source_cap` of this node's fetches in flight to any one source
+    /// that is answering.
+    ///
+    /// Each slot goes to the nearest queued key that can start now: one with
+    /// an untried source below the cap, or an untried silent source. It starts
+    /// on the first untried source below the cap that is not silent, in its
+    /// source-preference order, one that recently answered busy only when no
+    /// other is below the cap, or else on its first untried silent source,
+    /// past the cap. A heap key that cannot start is parked under each of its
+    /// untried sources, so it leaves the heap once and a startable key behind
+    /// it is reached in the same pass; a parked key becomes a candidate again
+    /// as soon as one of those sources has a free share or falls silent, and
+    /// competes on distance with the heap.
+    ///
+    /// With `per_source_cap = usize::MAX` nothing parks and every key starts on
+    /// its first untried source that is not silent, in plain nearest-first
+    /// order.
+    pub(crate) fn dispatch_fetches(
+        &mut self,
+        slots: usize,
+        per_source_cap: usize,
+    ) -> FetchDispatch {
+        let now = Instant::now();
+        self.source_health.expire(now);
+        let mut dispatch = FetchDispatch::default();
+        let mut in_flight = self.in_flight_counts_by_source(None);
+        let mut best_parked = self.nearest_parked(Some(Startable {
+            in_flight: &in_flight,
+            per_source_cap,
+            now,
+        }));
+        while dispatch.started.len() < slots {
+            let from_parked = self.parked_if_nearer(best_parked);
+            let candidate = match self.take_queued(from_parked) {
+                TakenFetch::Candidate(candidate) => Some(candidate),
+                TakenFetch::Skipped => None,
+                TakenFetch::Empty => break,
+            };
+            let mut started = false;
+            if let Some(candidate) = candidate {
+                if self.in_flight_fetch.contains_key(&candidate.key) {
+                    self.drop_duplicate_of_in_flight(&candidate);
+                } else {
+                    let startable = Startable {
+                        in_flight: &in_flight,
+                        per_source_cap,
+                        now,
+                    };
+                    match self.first_startable_source(&candidate, startable) {
+                        SourceChoice::Start(source) => {
+                            if self.source_health.is_silent(&source, now) {
+                                self.source_health.counters.silent_starts += 1;
+                            }
+                            *in_flight.entry(source).or_default() += 1;
+                            dispatch.started.push((candidate.key, source));
+                            self.start_dequeued_fetch(candidate, source);
+                            started = true;
+                        }
+                        SourceChoice::NoSource => dispatch.sourceless.push(candidate),
+                        SourceChoice::AllBusy => {
+                            if from_parked.is_none() {
+                                dispatch.parked += 1;
+                            }
+                            self.park_candidate(candidate);
+                        }
+                    }
+                }
+            }
+            // A start changes the per-source counts, and a key taken from the
+            // parked set changes the set itself. A heap key that parked is
+            // indexed only under full sources that are not silent, so it
+            // cannot change the answer.
+            if started || from_parked.is_some() {
+                best_parked = self.nearest_parked(Some(Startable {
+                    in_flight: &in_flight,
+                    per_source_cap,
+                    now,
+                }));
+            }
+        }
+        dispatch
+    }
+
+    /// Put a dequeued candidate back in the queue, parked under its untried
+    /// sources.
+    fn park_candidate(&mut self, candidate: FetchCandidate) {
+        let FetchCandidate {
+            key,
+            distance,
+            sources,
+            retry_verification,
+        } = candidate;
+        self.fetch_payloads.insert(
+            key,
+            FetchPayload {
+                sources,
+                retry_verification,
+            },
+        );
+        self.park(key, distance);
+    }
+
+    /// Mark the current fetch attempt as failed and move `key` on, without
+    /// sending to a source that is answering and already has `per_source_cap`
+    /// of this node's fetches in flight.
+    ///
+    /// The next untried source with a free share that is not silent is
+    /// returned to retry from now, as [`Self::retry_fetch`] would, one that
+    /// recently answered busy only when no other is free, or else the first
+    /// untried silent source, past the cap. If every untried source is
+    /// answering and at its share, the key goes back to the fetch queue
+    /// parked, with only its untried sources and with its tried set kept, so
+    /// no source is asked twice this cycle; its retry reservation travels with
+    /// it. If no untried source is left, or the fetch queue is at
+    /// [`MAX_FETCH_QUEUE`], the in-flight entry is left for the caller's
+    /// verification requeue, which keeps `MAX_FETCH_QUEUE` a hard bound.
+    pub(crate) fn retry_or_park_fetch(
+        &mut self,
+        key: &XorName,
+        distance: XorName,
+        per_source_cap: usize,
+    ) -> FetchRetry {
+        let now = Instant::now();
+        self.source_health.expire(now);
+        let in_flight = self.in_flight_counts_by_source(Some(key));
+        let queue_full = self.fetch_payloads.len() >= MAX_FETCH_QUEUE;
+        let Some(entry) = self.in_flight_fetch.get_mut(key) else {
+            return FetchRetry::Exhausted;
+        };
+        entry.tried.insert(entry.source);
+        let untried: Vec<PeerId> = entry
+            .all_sources
+            .iter()
+            .filter(|peer| !entry.tried.contains(peer))
+            .copied()
+            .collect();
+        if untried.is_empty() {
+            return FetchRetry::Exhausted;
+        }
+        let health = &self.source_health;
+        let busy = &self.busy_sources;
+        let is_free = |peer: &PeerId| {
+            !health.is_silent(peer, now)
+                && in_flight.get(peer).copied().unwrap_or(0) < per_source_cap
+        };
+        // A free source that recently answered busy goes after every other
+        // free one, and still before a silent one.
+        let rested = untried
+            .iter()
+            .find(|peer| is_free(peer) && !busy.is_cooling(peer, now))
+            .copied();
+        if let Some(rested) = rested {
+            if untried
+                .iter()
+                .take_while(|peer| **peer != rested)
+                .any(&is_free)
+            {
+                audit_metrics::record_fetch_busy_cooling_skip();
+            }
+        }
+        let free = rested.or_else(|| untried.iter().find(|peer| is_free(peer)).copied());
+        let silent = || {
+            untried
+                .iter()
+                .find(|peer| health.is_silent(peer, now))
+                .copied()
+        };
+        let next = free.or_else(silent);
+        if let Some(next) = next {
+            if free.is_none() {
+                self.source_health.counters.silent_starts += 1;
+            }
+            entry.source = next;
+            entry.tried.insert(next);
+            entry.started_at = now;
+            return FetchRetry::Next(next);
+        }
+        if queue_full {
+            return FetchRetry::Exhausted;
+        }
+        let Some(entry) = self.in_flight_fetch.remove(key) else {
+            return FetchRetry::Exhausted;
+        };
+        self.fetch_payloads.insert(
+            *key,
+            FetchPayload {
+                sources: untried,
+                retry_verification: entry.retry_verification,
+            },
+        );
+        self.fetch_tried.insert(*key, entry.tried);
+        self.park(*key, distance);
+        FetchRetry::Parked
+    }
+
+    /// In-flight fetches per source, optionally leaving out `exclude`'s own
+    /// entry.
+    fn in_flight_counts_by_source(&self, exclude: Option<&XorName>) -> HashMap<PeerId, usize> {
+        let mut counts = HashMap::new();
+        for (key, entry) in &self.in_flight_fetch {
+            if exclude != Some(key) {
+                *counts.entry(entry.source).or_default() += 1;
+            }
+        }
+        counts
+    }
+
+    /// The first untried source of `candidate`, in its source-preference
+    /// order, that is not silent and is below the cap, or else its first
+    /// untried silent source. A source below the cap that recently answered
+    /// busy is passed over while another one below the cap is not cooling,
+    /// and still comes before a silent one: it answers, if only to say busy.
+    fn first_startable_source(
+        &self,
+        candidate: &FetchCandidate,
+        startable: Startable<'_>,
+    ) -> SourceChoice {
+        let tried = self.fetch_tried.get(&candidate.key);
+        let mut any_untried = false;
+        let mut first_silent = None;
+        let mut first_cooling = None;
+        for source in &candidate.sources {
+            if tried.is_some_and(|t| t.contains(source)) {
+                continue;
+            }
+            any_untried = true;
+            if self.source_health.is_silent(source, startable.now) {
+                first_silent = first_silent.or(Some(*source));
+            } else if startable.in_flight.get(source).copied().unwrap_or(0)
+                < startable.per_source_cap
+            {
+                if !self.busy_sources.is_cooling(source, startable.now) {
+                    if first_cooling.is_some() {
+                        audit_metrics::record_fetch_busy_cooling_skip();
+                    }
+                    return SourceChoice::Start(*source);
+                }
+                first_cooling = first_cooling.or(Some(*source));
+            }
+        }
+        match (first_cooling.or(first_silent), any_untried) {
+            (Some(source), _) => SourceChoice::Start(source),
+            (None, true) => SourceChoice::AllBusy,
+            (None, false) => SourceChoice::NoSource,
+        }
+    }
+
+    /// Park a queued key whose payload is in `fetch_payloads`, indexed under
+    /// each of its untried sources. A key with no untried source goes back on
+    /// the heap instead, so it is never parked with nothing to wake it.
+    fn park(&mut self, key: XorName, distance: XorName) {
+        self.unpark(&key);
+        let tried = self.fetch_tried.get(&key);
+        let wake_sources: Vec<PeerId> = self
+            .fetch_payloads
+            .get(&key)
+            .map(|payload| {
+                payload
+                    .sources
+                    .iter()
+                    .filter(|source| !tried.is_some_and(|t| t.contains(source)))
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default();
+        if wake_sources.is_empty() {
+            self.fetch_queue.push(FetchOrder { key, distance });
+            return;
+        }
+        for source in &wake_sources {
+            self.parked_by_source
+                .entry(*source)
+                .or_default()
+                .insert((distance, key));
+        }
+        self.fetch_parked.insert(
+            key,
+            ParkedFetch {
+                distance,
+                wake_sources,
+                parked_at: Instant::now(),
+            },
+        );
+    }
+
+    /// The per-source scheduler's state for its periodic summary, resetting
+    /// the maintenance maximum and source-health counters it reports and
+    /// purging the health table. Walks the parked set, the index's per-source
+    /// sets, the health table and the in-flight fetches once each.
+    pub(crate) fn take_fetch_dispatch_stats(
+        &mut self,
+        per_source_cap: usize,
+    ) -> FetchDispatchStats {
+        let now = Instant::now();
+        let parked_maintenance_max = std::mem::take(&mut self.parked_maintenance_max);
+        let (health, tracked_sources) =
+            self.source_health.take_counters(now, &self.in_flight_fetch);
+        FetchDispatchStats {
+            tracked_sources,
+            silent_sources: self.source_health.marks_by_since.len(),
+            overflow_active: self.source_health.overflowing(now),
+            health,
+            parked_associations: self.parked_by_source.values().map(BTreeSet::len).sum(),
+            parked_maintenance_max,
+            parked: self.fetch_parked.len(),
+            oldest_parked: self
+                .fetch_parked
+                .values()
+                .map(|parked| now.saturating_duration_since(parked.parked_at))
+                .max(),
+            queued: self.fetch_payloads.len(),
+            in_flight: self.in_flight_fetch.len(),
+            saturated_sources: self
+                .in_flight_counts_by_source(None)
+                .values()
+                .filter(|count| **count >= per_source_cap)
+                .count(),
+        }
+    }
+
+    /// The parked-state part of [`Self::remove_hint_source`]: orphaned keys
+    /// leave it entirely, and a parked key can no longer start from the
+    /// departed source. One left with no source to wake it goes back on the
+    /// heap, where dispatch hands it out as sourceless, exactly as a queued key
+    /// that lost its last source. Timed for the dispatch summary.
+    fn drop_departed_source_from_parked(
+        &mut self,
+        source: &PeerId,
+        orphaned_fetch_keys: &HashSet<XorName>,
+    ) {
+        if self.fetch_parked.is_empty() && self.fetch_tried.is_empty() {
+            return;
+        }
+        let started = Instant::now();
+        for key in orphaned_fetch_keys {
+            self.unpark(key);
+            self.fetch_tried.remove(key);
+        }
+        if let Some(parked_here) = self.parked_by_source.remove(source) {
+            for (distance, key) in parked_here {
+                let Some(parked) = self.fetch_parked.get_mut(&key) else {
+                    continue;
+                };
+                parked.wake_sources.retain(|peer| peer != source);
+                if parked.wake_sources.is_empty() {
+                    self.fetch_parked.remove(&key);
+                    self.fetch_queue.push(FetchOrder { key, distance });
+                }
+            }
+        }
+        self.parked_maintenance_max = self.parked_maintenance_max.max(started.elapsed());
+    }
+
+    /// Take `key` out of the parked state and the index, returning its
+    /// distance. The payload is left in `fetch_payloads`.
+    fn unpark(&mut self, key: &XorName) -> Option<XorName> {
+        let parked = self.fetch_parked.remove(key)?;
+        for source in &parked.wake_sources {
+            if let Some(keys) = self.parked_by_source.get_mut(source) {
+                keys.remove(&(parked.distance, *key));
+                if keys.is_empty() {
+                    self.parked_by_source.remove(source);
+                }
+            }
+        }
+        Some(parked.distance)
+    }
+
+    /// The nearest parked key, as `(distance, key)`. With `startable`, only
+    /// keys indexed under a source below the cap or silent count, so the
+    /// result is the nearest parked key that could start now.
+    fn nearest_parked(&self, startable: Option<Startable<'_>>) -> Option<(XorName, XorName)> {
+        self.parked_by_source
+            .iter()
+            .filter(|(source, _)| {
+                startable.is_none_or(|startable| {
+                    startable.in_flight.get(source).copied().unwrap_or(0) < startable.per_source_cap
+                        || self.source_health.is_silent(source, startable.now)
+                })
+            })
+            .filter_map(|(_, keys)| keys.first().copied())
+            .min()
+    }
+
+    /// Defensive: drop every index entry for `key` when the index names a key
+    /// that is not parked. Unreachable while the index stays exact; without it
+    /// such an entry would be offered forever.
+    fn purge_parked_index_entry(&mut self, key: &XorName) {
+        debug_assert!(
+            false,
+            "parked index names an unparked key {}",
+            hex::encode(key)
+        );
+        self.parked_by_source.retain(|_, keys| {
+            keys.retain(|(_, parked)| parked != key);
+            !keys.is_empty()
+        });
+    }
+
+    /// Test-only: every queued or parked key, and every in-flight fetch with
+    /// its source, read together.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn fetch_pipeline_snapshot(&self) -> FetchPipelineSnapshot {
+        FetchPipelineSnapshot {
+            queued: self.fetch_payloads.keys().copied().collect(),
+            in_flight: self
+                .in_flight_fetch
+                .iter()
+                .map(|(key, entry)| (*key, entry.source))
+                .collect(),
         }
     }
 
@@ -1356,6 +2445,7 @@ impl ReplicationQueues {
             retry_verification,
             ..
         } = candidate;
+        self.fetch_tried.remove(&key);
         let Some(mut verification) = retry_verification else {
             return false;
         };
@@ -1409,6 +2499,11 @@ impl ReplicationQueues {
         self.release_retry_slot(key);
         self.insert_pending_owned_unchecked(*key, verification, owner, true);
         true
+    }
+
+    /// When `key`'s current fetch attempt started, if it is in flight.
+    pub(crate) fn in_flight_started_at(&self, key: &XorName) -> Option<Instant> {
+        self.in_flight_fetch.get(key).map(|entry| entry.started_at)
     }
 
     /// Number of in-flight fetches.
@@ -1531,6 +2626,8 @@ fn max_min_allocations(
 mod tests {
     use super::*;
     use crate::replication::config::CAPACITY_BLOCKED_RETRY;
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
 
     /// Build a `PeerId` from a single byte (zero-padded to 32 bytes).
     fn peer_id_from_byte(b: u8) -> PeerId {
@@ -3040,5 +4137,1550 @@ mod tests {
             "the age limit, not the deferral, is what retires an entry"
         );
         assert_eq!(queues.pending_count(), 1);
+    }
+
+    // -- per-source fetch dispatch ---------------------------------------------
+
+    const CAP: usize = 2;
+
+    fn peer(b: u8) -> PeerId {
+        peer_id_from_byte(b)
+    }
+
+    /// A key whose byte order matches the numeric order of `distance`.
+    fn key_at(distance: u32) -> XorName {
+        let mut name = [0u8; 32];
+        name[..4].copy_from_slice(&distance.to_be_bytes());
+        name
+    }
+
+    /// Queue `key` at `distance` with `sources`, keyed at its own distance so
+    /// tests can reason about nearest-first order directly.
+    fn queue(queues: &mut ReplicationQueues, distance: u32, sources: &[PeerId]) -> XorName {
+        let key = key_at(distance);
+        assert!(queues.enqueue_fetch(key, key, sources.to_vec()));
+        key
+    }
+
+    /// Queue `key` through pending verification and promotion, so it carries a
+    /// verification retry reservation owned by `hinter`.
+    fn queue_promoted(
+        queues: &mut ReplicationQueues,
+        distance: u32,
+        hinter: u8,
+        sources: &[PeerId],
+    ) -> XorName {
+        let key = key_at(distance);
+        assert!(queues
+            .add_pending_verify(key, test_entry(hinter))
+            .admitted());
+        assert!(queues.promote_pending_to_fetch(key, key, sources.to_vec()));
+        key
+    }
+
+    fn in_flight_to(queues: &ReplicationQueues, source: &PeerId) -> usize {
+        queues
+            .in_flight_fetch
+            .values()
+            .filter(|entry| entry.source == *source)
+            .count()
+    }
+
+    fn heap_keys(queues: &ReplicationQueues) -> HashSet<XorName> {
+        queues.fetch_queue.iter().map(|order| order.key).collect()
+    }
+
+    /// I1 and I2: every queued payload is on the heap or parked, never both,
+    /// and the reverse index is exactly what `fetch_parked` implies.
+    fn assert_queue_invariants(queues: &ReplicationQueues) {
+        let heap = heap_keys(queues);
+        assert_eq!(heap.len(), queues.fetch_queue.len(), "duplicate heap entry");
+        for key in queues.fetch_payloads.keys() {
+            let on_heap = heap.contains(key);
+            let parked = queues.fetch_parked.contains_key(key);
+            assert!(
+                on_heap != parked,
+                "queued key must be on exactly one of heap/parked"
+            );
+        }
+        for key in heap.iter().chain(queues.fetch_parked.keys()) {
+            assert!(
+                queues.fetch_payloads.contains_key(key),
+                "order without payload"
+            );
+        }
+        let mut expected: HashMap<PeerId, BTreeSet<(XorName, XorName)>> = HashMap::new();
+        for (key, parked) in &queues.fetch_parked {
+            assert!(
+                !parked.wake_sources.is_empty(),
+                "parked key with nothing to wake it"
+            );
+            for source in &parked.wake_sources {
+                expected
+                    .entry(*source)
+                    .or_default()
+                    .insert((parked.distance, *key));
+            }
+        }
+        assert_eq!(
+            queues.parked_by_source, expected,
+            "parked index is not exact"
+        );
+        for key in queues.fetch_tried.keys() {
+            assert!(
+                queues.fetch_payloads.contains_key(key),
+                "tried sources kept for a key that is not queued"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_spreads_fetches_across_sources_within_the_cap() {
+        let mut queues = ReplicationQueues::new();
+        let (a, b, c) = (peer(1), peer(2), peer(3));
+        let keys: Vec<XorName> = (0..8).map(|d| queue(&mut queues, d, &[a, b, c])).collect();
+
+        let dispatch = queues.dispatch_fetches(8, CAP);
+
+        assert_eq!(dispatch.started.len(), 6, "two per source, three sources");
+        assert!(dispatch.sourceless.is_empty());
+        for source in [a, b, c] {
+            assert_eq!(in_flight_to(&queues, &source), CAP);
+        }
+        // Preference order is kept: the nearest keys take the first source.
+        let expected: Vec<(XorName, PeerId)> = keys
+            .iter()
+            .take(6)
+            .zip([a, a, b, b, c, c])
+            .map(|(key, source)| (*key, source))
+            .collect();
+        assert_eq!(dispatch.started, expected);
+        assert_eq!(queues.fetch_parked.len(), 2);
+        assert_queue_invariants(&queues);
+    }
+
+    #[test]
+    fn uncapped_dispatch_keeps_the_first_source_order() {
+        let mut queues = ReplicationQueues::new();
+        let (a, b) = (peer(1), peer(2));
+        for d in 0..5 {
+            queue(&mut queues, d, &[a, b]);
+        }
+
+        let dispatch = queues.dispatch_fetches(8, usize::MAX);
+
+        assert_eq!(dispatch.started.len(), 5);
+        assert!(dispatch.started.iter().all(|(_, source)| *source == a));
+        assert!(queues.fetch_parked.is_empty());
+        assert_queue_invariants(&queues);
+    }
+
+    #[test]
+    fn a_startable_key_behind_blocked_keys_starts_in_the_same_pass() {
+        let mut queues = ReplicationQueues::new();
+        let (a, b) = (peer(1), peer(2));
+        queue(&mut queues, 0, &[a]);
+        queue(&mut queues, 1, &[a]);
+        assert_eq!(queues.dispatch_fetches(8, CAP).started.len(), 2);
+        for d in 10..310 {
+            queue(&mut queues, d, &[a]);
+        }
+        let deeper = queue(&mut queues, 1_000, &[b]);
+
+        let dispatch = queues.dispatch_fetches(8, CAP);
+
+        assert_eq!(dispatch.started, vec![(deeper, b)]);
+        assert_eq!(
+            queues.fetch_parked.len(),
+            300,
+            "every blocked key left the heap"
+        );
+        assert!(queues.fetch_queue.is_empty());
+        assert_eq!(
+            queues.fetch_queue_count(),
+            300,
+            "parked keys are still queued"
+        );
+        assert_queue_invariants(&queues);
+    }
+
+    #[test]
+    fn a_freed_share_starts_the_nearest_parked_key_for_that_source() {
+        let mut queues = ReplicationQueues::new();
+        let a = peer(1);
+        let first = queue(&mut queues, 0, &[a]);
+        queue(&mut queues, 1, &[a]);
+        for d in [40, 20, 30] {
+            queue(&mut queues, d, &[a]);
+        }
+        assert_eq!(queues.dispatch_fetches(8, CAP).started.len(), 2);
+        assert_eq!(queues.fetch_parked.len(), 3);
+
+        queues.complete_fetch(&first);
+        let dispatch = queues.dispatch_fetches(8, CAP);
+
+        assert_eq!(dispatch.started, vec![(key_at(20), a)]);
+        assert_eq!(in_flight_to(&queues, &a), CAP);
+        assert_queue_invariants(&queues);
+    }
+
+    #[test]
+    fn the_nearest_startable_parked_key_wins_whatever_its_source() {
+        let mut queues = ReplicationQueues::new();
+        let sources: Vec<PeerId> = (1..=5).map(peer).collect();
+        // Saturate every source with two blockers, then park one key per source.
+        let mut blockers = Vec::new();
+        for (index, source) in sources.iter().enumerate() {
+            let base = u32::try_from(index).unwrap() * 2;
+            blockers.push(queue(&mut queues, base, &[*source]));
+            blockers.push(queue(&mut queues, base + 1, &[*source]));
+        }
+        assert_eq!(queues.dispatch_fetches(10, CAP).started.len(), 10);
+        let parked_distances = [500, 100, 400, 200, 300];
+        for (source, distance) in sources.iter().zip(parked_distances) {
+            queue(&mut queues, distance, &[*source]);
+        }
+        assert_eq!(queues.dispatch_fetches(5, CAP).started, Vec::new());
+        assert_eq!(queues.fetch_parked.len(), 5);
+
+        // Free one share on every source: the two slots go to the two nearest.
+        for pair in blockers.chunks(2) {
+            queues.complete_fetch(&pair[0]);
+        }
+        let dispatch = queues.dispatch_fetches(2, CAP);
+
+        assert_eq!(
+            dispatch.started,
+            vec![(key_at(100), sources[1]), (key_at(200), sources[3])]
+        );
+        assert_queue_invariants(&queues);
+    }
+
+    #[test]
+    fn a_parked_key_starts_on_its_preferred_free_source() {
+        let mut queues = ReplicationQueues::new();
+        let (a, b) = (peer(1), peer(2));
+        let blockers: Vec<XorName> = (0..4)
+            .map(|d| queue(&mut queues, d, &[if d < 2 { a } else { b }]))
+            .collect();
+        assert_eq!(queues.dispatch_fetches(4, CAP).started.len(), 4);
+        let key = queue(&mut queues, 50, &[a, b]);
+        assert_eq!(queues.dispatch_fetches(1, CAP).started, Vec::new());
+
+        // Free b first, then a: both have room when dispatch runs.
+        queues.complete_fetch(&blockers[2]);
+        queues.complete_fetch(&blockers[0]);
+        let dispatch = queues.dispatch_fetches(1, CAP);
+
+        assert_eq!(dispatch.started, vec![(key, a)]);
+        assert_queue_invariants(&queues);
+    }
+
+    #[test]
+    fn retry_moves_to_a_free_untried_source() {
+        let mut queues = ReplicationQueues::new();
+        let (a, b, c) = (peer(1), peer(2), peer(3));
+        queue(&mut queues, 10, &[b]);
+        queue(&mut queues, 11, &[b]);
+        let key = queue(&mut queues, 0, &[a, b, c]);
+        assert_eq!(queues.dispatch_fetches(3, CAP).started.len(), 3);
+        assert_eq!(queues.in_flight_fetch[&key].source, a);
+
+        let retry = queues.retry_or_park_fetch(&key, key, CAP);
+
+        assert_eq!(retry, FetchRetry::Next(c), "b is at its share");
+        let entry = &queues.in_flight_fetch[&key];
+        assert_eq!(entry.source, c);
+        assert_eq!(entry.tried, HashSet::from([a, c]));
+        assert_queue_invariants(&queues);
+    }
+
+    #[test]
+    fn retry_with_every_untried_source_full_parks_and_keeps_its_history() {
+        let mut queues = ReplicationQueues::new();
+        let (a, b, c) = (peer(1), peer(2), peer(3));
+        let key = queue_promoted(&mut queues, 0, 9, &[a, b, c]);
+        let blockers: Vec<XorName> = (10..14)
+            .map(|d| queue(&mut queues, d, &[if d < 12 { b } else { c }]))
+            .collect();
+        assert_eq!(queues.dispatch_fetches(5, CAP).started.len(), 5);
+        assert_eq!(queues.in_flight_fetch[&key].source, a);
+        let reserved = queues.retry_reserved_slot_count();
+        let owner = queues.capacity_owner_by_key.get(&key).copied();
+        let reserved_by_owner = queues.retry_reserved_by_owner.clone();
+        assert_eq!(reserved_by_owner.get(&peer(9)), Some(&1));
+
+        let retry = queues.retry_or_park_fetch(&key, key, CAP);
+
+        assert_eq!(retry, FetchRetry::Parked);
+        assert!(!queues.in_flight_fetch.contains_key(&key));
+        assert_eq!(queues.fetch_payloads[&key].sources, vec![b, c]);
+        assert!(queues.fetch_payloads[&key].retry_verification.is_some());
+        assert_eq!(queues.fetch_tried[&key], HashSet::from([a]));
+        assert_eq!(queues.fetch_parked[&key].wake_sources, vec![b, c]);
+        assert_eq!(queues.retry_reserved_slot_count(), reserved);
+        assert_eq!(queues.capacity_owner_by_key.get(&key).copied(), owner);
+        assert_eq!(queues.retry_reserved_by_owner, reserved_by_owner);
+        assert!(queues.contains_key(&key));
+        assert_queue_invariants(&queues);
+
+        // A share on b frees: the key restarts there, still remembering a.
+        queues.complete_fetch(&blockers[0]);
+        let dispatch = queues.dispatch_fetches(1, CAP);
+        assert_eq!(dispatch.started, vec![(key, b)]);
+        assert_eq!(queues.in_flight_fetch[&key].tried, HashSet::from([a, b]));
+        assert!(!queues.fetch_tried.contains_key(&key));
+        assert_eq!(queues.retry_reserved_slot_count(), reserved);
+        assert_eq!(queues.capacity_owner_by_key.get(&key).copied(), owner);
+        assert_eq!(queues.retry_reserved_by_owner, reserved_by_owner);
+        assert_queue_invariants(&queues);
+    }
+
+    #[test]
+    fn a_parked_key_wakes_through_any_of_its_sources_beyond_the_eighth() {
+        let mut queues = ReplicationQueues::new();
+        let sources: Vec<PeerId> = (1..=9).map(peer).collect();
+        let mut blockers = Vec::new();
+        for (index, source) in sources.iter().enumerate() {
+            let base = u32::try_from(index).unwrap() * 2;
+            blockers.push(queue(&mut queues, base, &[*source]));
+            blockers.push(queue(&mut queues, base + 1, &[*source]));
+        }
+        assert_eq!(queues.dispatch_fetches(18, CAP).started.len(), 18);
+        let key = queue(&mut queues, 100, &sources);
+        assert_eq!(queues.dispatch_fetches(1, CAP).started, Vec::new());
+        assert_eq!(queues.fetch_parked[&key].wake_sources, sources);
+
+        // Only the ninth source frees a share.
+        queues.complete_fetch(&blockers[16]);
+        let dispatch = queues.dispatch_fetches(1, CAP);
+
+        assert_eq!(dispatch.started, vec![(key, sources[8])]);
+        assert_queue_invariants(&queues);
+    }
+
+    #[test]
+    fn retry_with_no_untried_source_is_exhausted_and_left_in_flight() {
+        let mut queues = ReplicationQueues::new();
+        let a = peer(1);
+        let key = queue(&mut queues, 0, &[a]);
+        assert_eq!(queues.dispatch_fetches(1, CAP).started.len(), 1);
+
+        assert_eq!(
+            queues.retry_or_park_fetch(&key, key, CAP),
+            FetchRetry::Exhausted
+        );
+        assert!(queues.in_flight_fetch.contains_key(&key));
+        assert_queue_invariants(&queues);
+    }
+
+    #[test]
+    fn retry_with_a_full_fetch_queue_is_exhausted_rather_than_overfilling_it() {
+        let mut queues = ReplicationQueues::new();
+        let (a, b) = (peer(1), peer(2));
+        let key = queue(&mut queues, 0, &[a, b]);
+        queue(&mut queues, 1, &[b]);
+        queue(&mut queues, 2, &[b]);
+        assert_eq!(queues.dispatch_fetches(3, CAP).started.len(), 3);
+        let mut filler = 1_000_u32;
+        while queues.fetch_queue_count() < MAX_FETCH_QUEUE {
+            queue(&mut queues, filler, &[peer(7)]);
+            filler += 1;
+        }
+
+        assert_eq!(
+            queues.retry_or_park_fetch(&key, key, CAP),
+            FetchRetry::Exhausted
+        );
+        assert!(queues.in_flight_fetch.contains_key(&key));
+        assert_eq!(queues.fetch_queue_count(), MAX_FETCH_QUEUE);
+    }
+
+    /// Park `key` (sources a, b, c) with a already tried and b, c full.
+    fn park_after_trying_a(
+        queues: &mut ReplicationQueues,
+        a: PeerId,
+        b: PeerId,
+        c: PeerId,
+    ) -> XorName {
+        let key = queue(queues, 0, &[a, b, c]);
+        for d in 10..14 {
+            queue(queues, d, &[if d < 12 { b } else { c }]);
+        }
+        assert_eq!(queues.dispatch_fetches(5, CAP).started.len(), 5);
+        assert_eq!(
+            queues.retry_or_park_fetch(&key, key, CAP),
+            FetchRetry::Parked
+        );
+        key
+    }
+
+    #[test]
+    fn a_tried_source_readvertised_for_a_parked_key_is_not_merged_back() {
+        let mut queues = ReplicationQueues::new();
+        let (a, b, c) = (peer(1), peer(2), peer(3));
+        let key = park_after_trying_a(&mut queues, a, b, c);
+
+        let result = queues.add_pending_verify(key, test_entry(1));
+
+        assert_eq!(result, AdmissionResult::AlreadyPresent);
+        assert_eq!(queues.fetch_payloads[&key].sources, vec![b, c]);
+        assert_eq!(queues.fetch_parked[&key].wake_sources, vec![b, c]);
+        assert_queue_invariants(&queues);
+    }
+
+    #[test]
+    fn a_new_source_merged_into_a_parked_key_can_start_it() {
+        let mut queues = ReplicationQueues::new();
+        let (a, b, c, d) = (peer(1), peer(2), peer(3), peer(4));
+        let key = park_after_trying_a(&mut queues, a, b, c);
+
+        assert_eq!(
+            queues.add_pending_verify(key, test_entry(4)),
+            AdmissionResult::AlreadyPresent
+        );
+        assert_eq!(queues.fetch_parked[&key].wake_sources, vec![b, c, d]);
+        assert_queue_invariants(&queues);
+
+        let dispatch = queues.dispatch_fetches(1, CAP);
+        assert_eq!(dispatch.started, vec![(key, d)]);
+        assert_eq!(queues.in_flight_fetch[&key].tried, HashSet::from([a, d]));
+        assert_queue_invariants(&queues);
+    }
+
+    #[test]
+    fn an_in_flight_merge_skips_tried_sources_and_respects_the_limit() {
+        let mut queues = ReplicationQueues::new().with_fetch_source_limit(4);
+        let (a, b, c) = (peer(1), peer(2), peer(3));
+        let key = park_after_trying_a(&mut queues, a, b, c);
+        // Restart it on b, carrying a as tried: associated sources are a, b, c.
+        let blocker = queues
+            .in_flight_fetch
+            .iter()
+            .find(|(_, entry)| entry.source == b)
+            .map(|(key, _)| *key)
+            .unwrap();
+        queues.complete_fetch(&blocker);
+        assert_eq!(queues.dispatch_fetches(1, CAP).started, vec![(key, b)]);
+
+        // a was tried: not merged. 5 is new and fits (4 associated). 6 does not.
+        for hinter in [1, 5, 6] {
+            queues.add_pending_verify(key, test_entry(hinter));
+        }
+
+        assert_eq!(
+            queues.in_flight_fetch[&key].all_sources,
+            vec![b, c, peer(5)]
+        );
+        assert_queue_invariants(&queues);
+    }
+
+    /// A re-advertisement from `sender` that claims no replica.
+    fn paid_only_entry(sender: u8) -> VerificationEntry {
+        let mut entry = test_entry(sender);
+        entry.replica_hint_sources.clear();
+        entry
+    }
+
+    /// Every fetch-stage key's retry entry is within the hint bound, as a
+    /// pending entry is, and still holds the key's capacity owner.
+    fn assert_retry_entries_bounded(queues: &ReplicationQueues) {
+        let retries = queues
+            .fetch_payloads
+            .iter()
+            .filter_map(|(key, payload)| Some((key, payload.retry_verification.as_ref()?)))
+            .chain(
+                queues
+                    .in_flight_fetch
+                    .iter()
+                    .filter_map(|(key, entry)| Some((key, entry.retry_verification.as_ref()?))),
+            );
+        for (key, retry) in retries {
+            assert!(
+                retry.hint_sources.len() <= MAX_HINT_SOURCES_PER_KEY,
+                "{} retry entry over the hint bound",
+                hex::encode(key)
+            );
+            assert!(retry.replica_hint_sources.is_subset(&retry.hint_sources));
+            if let Some(owner) = queues.capacity_owner_by_key.get(key) {
+                assert!(
+                    retry.hint_sources.contains(owner),
+                    "{} retry entry lost its capacity owner",
+                    hex::encode(key)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn readvertisements_keep_a_fetch_stage_retry_entry_within_the_hint_bound() {
+        let mut queues = ReplicationQueues::new();
+        let (owner, holder) = (peer(1), peer(2));
+        let key = key_at(0);
+        // The owner advertised the key without claiming a replica, so only
+        // the capacity accounting keeps it in the set.
+        assert!(queues
+            .add_pending_verify(key, paid_only_entry(1))
+            .admitted());
+        assert!(queues.promote_pending_to_fetch(key, key, vec![holder]));
+
+        // Queued: paid-only advertisers fill the set to the bound, then replica
+        // claimants displace every one of them except the owner.
+        for sender in 20..40 {
+            queues.add_pending_verify(key, paid_only_entry(sender));
+        }
+        for sender in 40..60 {
+            queues.add_pending_verify(key, test_entry(sender));
+        }
+        assert_retry_entries_bounded(&queues);
+        let retry_sizes = queues
+            .fetch_payloads
+            .get(&key)
+            .and_then(|payload| payload.retry_verification.as_ref())
+            .map(|retry| (retry.hint_sources.len(), retry.replica_hint_sources.len()));
+        assert_eq!(
+            retry_sizes,
+            Some((MAX_HINT_SOURCES_PER_KEY, MAX_HINT_SOURCES_PER_KEY - 1)),
+            "a full set keeps the owner and fills the rest with replica claimants"
+        );
+
+        // In flight: the same bound.
+        assert_eq!(queues.dispatch_fetches(1, CAP).started, vec![(key, holder)]);
+        for sender in 60..80 {
+            queues.add_pending_verify(key, test_entry(sender));
+        }
+        assert_retry_entries_bounded(&queues);
+
+        // Back in pending verification, the restored entry keeps the bound and
+        // the owner its reservation was charged to.
+        assert!(queues.requeue_fetch_for_verification(&key, Duration::ZERO));
+        let pending = queues.get_pending(&key).map(|entry| {
+            (
+                entry.hint_sources.len(),
+                entry.hint_sources.contains(&owner),
+            )
+        });
+        assert_eq!(pending, Some((MAX_HINT_SOURCES_PER_KEY, true)));
+        assert_eq!(queues.capacity_owner_by_key.get(&key), Some(&owner));
+    }
+
+    #[test]
+    fn source_lists_are_capped_at_the_limit_including_tried_sources() {
+        let mut queues = ReplicationQueues::new().with_fetch_source_limit(3);
+        let sources: Vec<PeerId> = (1..=6).map(peer).collect();
+        let key = queue(&mut queues, 0, &sources);
+        assert_eq!(queues.fetch_payloads[&key].sources, sources[..3].to_vec());
+
+        // Park it with one tried source: payload b, c plus tried a is the limit.
+        let mut queues = ReplicationQueues::new().with_fetch_source_limit(3);
+        let (a, b, c) = (peer(1), peer(2), peer(3));
+        let key = park_after_trying_a(&mut queues, a, b, c);
+        queues.add_pending_verify(key, test_entry(4));
+        assert_eq!(queues.fetch_payloads[&key].sources, vec![b, c]);
+        assert_queue_invariants(&queues);
+
+        // A direct start with an oversized list is cut to the limit too.
+        let mut queues = ReplicationQueues::new().with_fetch_source_limit(2);
+        let direct = key_at(9);
+        queues.start_fetch(direct, sources[0], sources.clone());
+        assert_eq!(
+            queues.in_flight_fetch[&direct].all_sources,
+            sources[..2].to_vec()
+        );
+
+        // A start from a source outside the list counts that source too.
+        let mut queues = ReplicationQueues::new().with_fetch_source_limit(3);
+        let outside = peer(9);
+        queues.start_fetch(direct, outside, sources[..4].to_vec());
+        let entry = &queues.in_flight_fetch[&direct];
+        assert_eq!(entry.all_sources, sources[..2].to_vec());
+        let union: HashSet<&PeerId> = entry.all_sources.iter().chain(&entry.tried).collect();
+        assert_eq!(union.len(), 3);
+    }
+
+    #[test]
+    fn a_parked_key_that_loses_its_last_wake_source_returns_to_the_heap() {
+        let mut queues = ReplicationQueues::new();
+        let (b, c) = (peer(2), peer(3));
+        queue(&mut queues, 0, &[b]);
+        queue(&mut queues, 1, &[b]);
+        queue(&mut queues, 2, &[c]);
+        // Hinted by 9, so the retry metadata survives b leaving.
+        let key = queue_promoted(&mut queues, 10, 9, &[b]);
+        let started = queues.dispatch_fetches(4, CAP).started;
+        assert!(started.iter().all(|(started_key, _)| *started_key != key));
+        assert!(queues.fetch_parked.contains_key(&key));
+
+        let orphaned = queues.remove_hint_source(&b);
+
+        assert!(!orphaned.contains(&key));
+        assert!(!queues.fetch_parked.contains_key(&key));
+        assert!(heap_keys(&queues).contains(&key));
+        assert_queue_invariants(&queues);
+        let dispatch = queues.dispatch_fetches(4, CAP);
+        assert!(dispatch
+            .sourceless
+            .iter()
+            .any(|candidate| candidate.key == key));
+    }
+
+    #[test]
+    fn an_orphaned_parked_key_leaves_every_structure() {
+        let mut queues = ReplicationQueues::new();
+        let (a, b, c) = (peer(1), peer(2), peer(3));
+        let key = park_after_trying_a(&mut queues, a, b, c);
+        queues.remove_hint_source(&b);
+        assert!(
+            queues.fetch_parked.contains_key(&key),
+            "c can still wake it"
+        );
+
+        let orphaned = queues.remove_hint_source(&c);
+
+        assert!(orphaned.contains(&key));
+        assert!(!queues.fetch_payloads.contains_key(&key));
+        assert!(!queues.fetch_parked.contains_key(&key));
+        assert!(!queues.fetch_tried.contains_key(&key));
+        assert!(!queues.contains_key(&key));
+        assert_queue_invariants(&queues);
+    }
+
+    #[test]
+    fn tried_sources_survive_dequeue_and_move_into_the_next_start() {
+        let mut queues = ReplicationQueues::new();
+        let (a, b, c) = (peer(1), peer(2), peer(3));
+        let key = park_after_trying_a(&mut queues, a, b, c);
+
+        let candidate = queues.dequeue_fetch().unwrap();
+        assert_eq!(
+            candidate.key, key,
+            "the parked key is the nearest queued key"
+        );
+        assert!(queues.fetch_tried.contains_key(&key));
+        queues.start_dequeued_fetch(candidate, c);
+
+        assert_eq!(queues.in_flight_fetch[&key].tried, HashSet::from([a, c]));
+        assert!(!queues.fetch_tried.contains_key(&key));
+        assert_queue_invariants(&queues);
+    }
+
+    #[test]
+    fn tried_sources_are_dropped_with_a_discarded_or_requeued_candidate() {
+        for requeue in [false, true] {
+            let mut queues = ReplicationQueues::new();
+            let (a, b, c) = (peer(1), peer(2), peer(3));
+            let key = park_after_trying_a(&mut queues, a, b, c);
+            let candidate = queues.dequeue_fetch().unwrap();
+            assert_eq!(candidate.key, key);
+            if requeue {
+                queues.requeue_candidate_for_verification(candidate, Duration::from_secs(1));
+            } else {
+                queues.discard_fetch_candidate(candidate);
+            }
+            assert!(!queues.fetch_tried.contains_key(&key));
+            assert_queue_invariants(&queues);
+        }
+    }
+
+    #[test]
+    fn tried_sources_are_kept_by_a_refused_enqueue_and_cleared_by_a_fresh_one() {
+        let mut queues = ReplicationQueues::new();
+        let (a, b, c) = (peer(1), peer(2), peer(3));
+        let key = park_after_trying_a(&mut queues, a, b, c);
+        assert!(!queues.enqueue_fetch(key, key, vec![a]), "already queued");
+        assert_eq!(queues.fetch_tried[&key], HashSet::from([a]));
+
+        let stray = key_at(77);
+        queues.fetch_tried.insert(stray, HashSet::from([a]));
+        assert!(queues.enqueue_fetch(stray, stray, vec![a]));
+        assert!(!queues.fetch_tried.contains_key(&stray));
+    }
+
+    #[test]
+    fn a_duplicate_of_an_in_flight_key_is_dropped_with_its_tried_sources() {
+        let mut queues = ReplicationQueues::new();
+        let a = peer(1);
+        let key = key_at(3);
+        queues.start_fetch(key, a, vec![a]);
+        // Force the impossible state the defensive skip exists for.
+        queues.fetch_payloads.insert(
+            key,
+            FetchPayload {
+                sources: vec![a],
+                retry_verification: None,
+            },
+        );
+        queues.fetch_queue.push(FetchOrder { key, distance: key });
+        queues.fetch_tried.insert(key, HashSet::from([a]));
+
+        assert!(queues.dequeue_fetch().is_none());
+        assert!(!queues.fetch_tried.contains_key(&key));
+        assert!(queues.in_flight_fetch.contains_key(&key));
+    }
+
+    #[test]
+    fn dequeue_returns_a_parked_key_nearer_than_the_heap_head() {
+        let mut queues = ReplicationQueues::new();
+        let a = peer(1);
+        queue(&mut queues, 0, &[a]);
+        queue(&mut queues, 1, &[a]);
+        let parked = queue(&mut queues, 5, &[a]);
+        assert_eq!(queues.dispatch_fetches(3, CAP).started.len(), 2);
+        let farther = queue(&mut queues, 9, &[peer(2)]);
+
+        assert_eq!(queues.dequeue_fetch().map(|c| c.key), Some(parked));
+        assert_eq!(queues.dequeue_fetch().map(|c| c.key), Some(farther));
+    }
+
+    #[test]
+    fn a_parked_key_holds_bootstrap_drain_open() {
+        let mut queues = ReplicationQueues::new();
+        let a = peer(1);
+        queue(&mut queues, 0, &[a]);
+        queue(&mut queues, 1, &[a]);
+        let parked = queue(&mut queues, 2, &[a]);
+        queues.dispatch_fetches(3, CAP);
+        assert!(queues.fetch_parked.contains_key(&parked));
+
+        assert!(!queues.is_bootstrap_work_empty(&HashSet::from([parked])));
+    }
+
+    // -- silent sources ---------------------------------------------------------
+
+    /// A fetch request timeout for the table tests: a mark lasts twice this.
+    const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// A peer distinct from every `peer(b)` and every other index.
+    fn distinct_peer(index: u32) -> PeerId {
+        let mut bytes = [0xA5_u8; 32];
+        bytes[..4].copy_from_slice(&index.to_be_bytes());
+        PeerId::from_bytes(bytes)
+    }
+
+    /// `base` moved forward by `millis`.
+    fn at(base: Instant, millis: u64) -> Instant {
+        base + Duration::from_millis(millis)
+    }
+
+    fn unreachable(sent: u64) -> Contact {
+        Contact::Unreachable { sent }
+    }
+
+    fn answered(order: u64) -> Contact {
+        Contact::Answered { order }
+    }
+
+    /// Mark `source` silent from now with a request at sequence place `sent`.
+    fn silence(queues: &mut ReplicationQueues, source: PeerId, sent: u64) {
+        queues.record_fetch_contact(source, unreachable(sent));
+    }
+
+    fn in_flight_entry(key: XorName, source: PeerId, started_at: Instant) -> InFlightEntry {
+        InFlightEntry {
+            key,
+            source,
+            started_at,
+            all_sources: vec![source],
+            tried: HashSet::from([source]),
+            retry_verification: None,
+        }
+    }
+
+    /// The health table's mark index matches its entries exactly, and only a
+    /// source with an unanswered request since its latest answer is marked.
+    fn assert_health_invariants(table: &SourceHealthTable) {
+        assert!(table.entries.len() <= MAX_TRACKED_FETCH_SOURCES);
+        let marked: BTreeSet<(Instant, PeerId)> = table
+            .entries
+            .iter()
+            .filter_map(|(source, health)| health.marked_since.map(|since| (since, *source)))
+            .collect();
+        assert_eq!(table.marks_by_since, marked, "mark index is not exact");
+        for health in table.entries.values() {
+            assert!(
+                health.marked_since.is_none() || health.unanswered_since_answer(),
+                "a mark outlived the evidence for it"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unanswered_request_marks_its_source_until_the_mark_expires() {
+        let none = HashMap::new();
+        let a = peer(1);
+        let t0 = Instant::now();
+        let mut table = SourceHealthTable::new(TEST_TIMEOUT);
+
+        table.record(a, unreachable(1), at(t0, 100), &none);
+        assert!(table.is_silent(&a, at(t0, 100)));
+        assert!(table.is_silent(&a, at(t0, 20_099)));
+        assert!(
+            !table.is_silent(&a, at(t0, 20_100)),
+            "a mark lasts two fetch timeouts from when the failure was learned"
+        );
+
+        table.expire(at(t0, 20_100));
+        assert_eq!(table.counters.expired_marks, 1);
+        assert!(table.marks_by_since.is_empty());
+
+        // An older unanswered request learned after the expiry is not new
+        // evidence: the source stays under the cap for its probe.
+        table.record(a, unreachable(0), at(t0, 20_200), &none);
+        assert!(!table.is_silent(&a, at(t0, 20_200)));
+
+        // A request sent later that also goes unanswered marks it again.
+        table.record(a, unreachable(2), at(t0, 30_200), &none);
+        assert!(table.is_silent(&a, at(t0, 30_200)));
+        assert_eq!(table.counters.marks, 2);
+        assert_eq!(table.counters.unreachable, 3);
+        assert_health_invariants(&table);
+    }
+
+    #[test]
+    fn a_source_that_keeps_failing_stays_silent_past_one_lifetime() {
+        let none = HashMap::new();
+        let a = peer(1);
+        let t0 = Instant::now();
+        let mut table = SourceHealthTable::new(TEST_TIMEOUT);
+
+        for (sent, millis) in [(1, 0), (2, 15_000), (3, 30_000)] {
+            table.record(a, unreachable(sent), at(t0, millis), &none);
+        }
+
+        assert!(table.is_silent(&a, at(t0, 49_999)));
+        assert!(!table.is_silent(&a, at(t0, 50_000)));
+        assert_eq!(
+            table.counters.marks, 1,
+            "one mark, refreshed by newer failures"
+        );
+        assert_eq!(table.marks_by_since.len(), 1);
+        assert_health_invariants(&table);
+    }
+
+    #[test]
+    fn a_failure_learned_late_still_marks_for_a_whole_lifetime() {
+        let none = HashMap::new();
+        let a = peer(1);
+        let learned = at(Instant::now(), 600_000);
+        let mut table = SourceHealthTable::new(TEST_TIMEOUT);
+
+        table.record(a, unreachable(1), learned, &none);
+
+        assert!(table.is_silent(&a, learned));
+        assert!(table.is_silent(&a, at(learned, 19_999)));
+        assert!(!table.is_silent(&a, at(learned, 20_000)));
+    }
+
+    /// Every order of applying `events` to a fresh table, all learned at
+    /// `now`, so only the sequence places can decide.
+    fn apply_in_every_order(events: &[Contact], now: Instant) -> Vec<SourceHealthTable> {
+        let none = HashMap::new();
+        let a = peer(1);
+        let mut orders: Vec<Vec<usize>> = vec![Vec::new()];
+        for _ in events {
+            orders = orders
+                .into_iter()
+                .flat_map(|prefix| {
+                    (0..events.len())
+                        .filter(|index| !prefix.contains(index))
+                        .map(|index| {
+                            let mut next = prefix.clone();
+                            next.push(index);
+                            next
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+        }
+        orders
+            .iter()
+            .map(|order| {
+                let mut table = SourceHealthTable::new(TEST_TIMEOUT);
+                for event in order.iter().filter_map(|index| events.get(*index)) {
+                    table.record(a, *event, now, &none);
+                }
+                assert_health_invariants(&table);
+                table
+            })
+            .collect()
+    }
+
+    #[test]
+    fn whether_a_source_is_silent_does_not_depend_on_the_order_outcomes_arrive() {
+        let a = peer(1);
+        let now = Instant::now();
+        let lifetime_ms =
+            u64::try_from((TEST_TIMEOUT * SILENCE_LIFETIME_TIMEOUTS).as_millis()).unwrap();
+
+        // Unanswered at 1, an answer at 2, unanswered again at 3: silent, as
+        // the request sent after the answer went unanswered, for one lifetime.
+        let silent = [unreachable(1), answered(2), unreachable(3)];
+        let tables = apply_in_every_order(&silent, now);
+        assert_eq!(tables.len(), 6);
+        for table in &tables {
+            assert!(table.is_silent(&a, now));
+            assert!(table.is_silent(&a, at(now, lifetime_ms - 1)));
+            assert!(!table.is_silent(&a, at(now, lifetime_ms)));
+        }
+
+        // Unanswered at 1 and 2, then an answer at 3: answering.
+        let answering = [unreachable(1), unreachable(2), answered(3)];
+        for table in &apply_in_every_order(&answering, now) {
+            assert!(!table.is_silent(&a, now));
+        }
+    }
+
+    #[test]
+    fn an_answer_older_than_the_unanswered_request_neither_clears_nor_blocks_its_mark() {
+        let none = HashMap::new();
+        let a = peer(1);
+        let t0 = Instant::now();
+
+        let mut table = SourceHealthTable::new(TEST_TIMEOUT);
+        table.record(a, unreachable(5), t0, &none);
+        table.record(a, answered(4), t0, &none);
+        assert!(table.is_silent(&a, t0));
+        assert_eq!(table.counters.clears, 0);
+
+        let mut table = SourceHealthTable::new(TEST_TIMEOUT);
+        table.record(a, answered(4), t0, &none);
+        table.record(a, unreachable(5), t0, &none);
+        assert!(table.is_silent(&a, t0));
+        assert_eq!(table.counters.ignored_stale, 0);
+
+        // A request sent before the latest answer is stale and cannot mark.
+        let mut table = SourceHealthTable::new(TEST_TIMEOUT);
+        table.record(a, answered(6), t0, &none);
+        table.record(a, unreachable(5), t0, &none);
+        assert!(!table.is_silent(&a, t0));
+        assert_eq!((table.counters.marks, table.counters.ignored_stale), (0, 1));
+        assert_health_invariants(&table);
+    }
+
+    #[test]
+    fn an_expired_mark_is_kept_only_while_its_source_has_a_fetch_in_flight() {
+        let t0 = Instant::now();
+        let (guarded, idle) = (peer(1), peer(2));
+        let key = key_at(0);
+        let in_flight = HashMap::from([(key, in_flight_entry(key, guarded, t0))]);
+        let mut table = SourceHealthTable::new(TEST_TIMEOUT);
+        table.record(guarded, unreachable(1), t0, &in_flight);
+        table.record(idle, unreachable(2), t0, &in_flight);
+
+        let later = at(t0, 20_000);
+        let (counters, tracked) = table.take_counters(later, &in_flight);
+
+        assert_eq!((counters.marks, counters.expired_marks, tracked), (2, 2, 2));
+        assert!(table.entries.contains_key(&guarded));
+        assert!(!table.entries.contains_key(&idle));
+        // The guarded source keeps its history: its older request is no new
+        // evidence, its newer one marks it again.
+        table.record(guarded, unreachable(0), later, &in_flight);
+        assert!(!table.is_silent(&guarded, later));
+        table.record(guarded, unreachable(3), later, &in_flight);
+        assert!(table.is_silent(&guarded, later));
+        assert_health_invariants(&table);
+    }
+
+    #[test]
+    fn attempts_that_sent_nothing_or_were_cancelled_change_nothing() {
+        let none = HashMap::new();
+        let a = peer(1);
+        let t0 = Instant::now();
+        let mut table = SourceHealthTable::new(TEST_TIMEOUT);
+
+        table.record(a, Contact::NotAttempted, t0, &none);
+        table.record(a, Contact::Unknown, t0, &none);
+
+        assert!(table.entries.is_empty());
+        assert!(!table.is_silent(&a, t0));
+        assert_eq!(table.counters.unreachable, 0);
+    }
+
+    #[test]
+    fn a_zero_fetch_timeout_still_leaves_silent_sources_a_lifetime() {
+        let none = HashMap::new();
+        let a = peer(1);
+        let t0 = Instant::now();
+        let mut table = SourceHealthTable::new(Duration::ZERO);
+
+        table.record(a, unreachable(1), t0, &none);
+
+        assert!(table.is_silent(&a, t0));
+        assert!(table.is_silent(&a, at(t0, 999)));
+        assert!(!table.is_silent(&a, at(t0, 1_000)));
+    }
+
+    /// A table at its bound: `guarded` answered and has a fetch in flight,
+    /// `idle` answered and has none, and every other entry is marked.
+    fn full_table(
+        t0: Instant,
+        marked: usize,
+    ) -> (
+        SourceHealthTable,
+        HashMap<XorName, InFlightEntry>,
+        PeerId,
+        PeerId,
+    ) {
+        let mut table = SourceHealthTable::new(TEST_TIMEOUT);
+        let guarded = distinct_peer(0);
+        let idle = distinct_peer(1);
+        let key = key_at(0);
+        let in_flight = HashMap::from([(key, in_flight_entry(key, guarded, t0))]);
+        table.record(guarded, answered(1), t0, &in_flight);
+        if marked < MAX_TRACKED_FETCH_SOURCES - 1 {
+            table.record(idle, answered(1), t0, &in_flight);
+        }
+        for index in 0..marked {
+            let source = distinct_peer(u32::try_from(index).unwrap() + 2);
+            table.record(source, unreachable(1), t0, &in_flight);
+        }
+        assert_eq!(table.entries.len(), MAX_TRACKED_FETCH_SOURCES);
+        (table, in_flight, guarded, idle)
+    }
+
+    #[test]
+    fn a_full_table_makes_room_by_dropping_answers_that_guard_nothing() {
+        let t0 = Instant::now();
+        let (mut table, in_flight, guarded, idle) = full_table(t0, MAX_TRACKED_FETCH_SOURCES - 2);
+        let newcomer = distinct_peer(u32::MAX);
+
+        table.record(newcomer, unreachable(1), t0, &in_flight);
+
+        assert!(table.is_silent(&newcomer, t0));
+        assert!(
+            table.entries.contains_key(&guarded),
+            "an in-flight guard stays"
+        );
+        assert!(!table.entries.contains_key(&idle));
+        assert_eq!(table.counters.overflows, 0);
+        assert_health_invariants(&table);
+    }
+
+    #[test]
+    fn a_table_full_of_marks_and_guards_counts_untracked_sources_as_silent() {
+        let t0 = Instant::now();
+        let (mut table, in_flight, guarded, _) = full_table(t0, MAX_TRACKED_FETCH_SOURCES - 1);
+        let newcomer = distinct_peer(u32::MAX);
+        let bystander = distinct_peer(u32::MAX - 1);
+
+        table.record(newcomer, unreachable(1), t0, &in_flight);
+
+        assert_eq!(table.counters.overflows, 1);
+        assert!(!table.entries.contains_key(&newcomer));
+        assert!(
+            table.is_silent(&newcomer, t0),
+            "an untracked source that stopped answering is fetched from as before the cap"
+        );
+        assert!(table.is_silent(&bystander, t0));
+        assert!(
+            table.entries.contains_key(&guarded),
+            "an in-flight guard is never dropped"
+        );
+        assert!(
+            !table.is_silent(&guarded, t0),
+            "a tracked source keeps its own state"
+        );
+        let lifetime = TEST_TIMEOUT * SILENCE_LIFETIME_TIMEOUTS;
+        assert!(
+            !table.is_silent(&bystander, t0 + lifetime),
+            "the overflow lasts one silence lifetime"
+        );
+        assert_health_invariants(&table);
+    }
+
+    #[test]
+    fn a_silent_source_is_fetched_from_past_the_cap() {
+        let mut queues = ReplicationQueues::new();
+        let a = peer(1);
+        for d in 0..6 {
+            queue(&mut queues, d, &[a]);
+        }
+        assert_eq!(queues.dispatch_fetches(8, CAP).started.len(), CAP);
+        assert_eq!(queues.fetch_parked.len(), 4);
+
+        silence(&mut queues, a, 1);
+        let dispatch = queues.dispatch_fetches(8, CAP);
+
+        assert_eq!(
+            dispatch.started.len(),
+            4,
+            "every parked key starts on the silent source"
+        );
+        assert_eq!(in_flight_to(&queues, &a), 6);
+        assert!(queues.fetch_parked.is_empty());
+        assert_eq!(queues.source_health.counters.silent_starts, 4);
+        assert_queue_invariants(&queues);
+    }
+
+    #[test]
+    fn a_sole_silent_holder_drains_one_timeout_after_it_is_noticed() {
+        // Sixteen keys held only by `a`, eight fetch slots, and every request
+        // to `a` unanswered: one wave of two at the share, then the rest past
+        // it, eight per wave, as many waves as before the cap plus one.
+        let mut queues = ReplicationQueues::new();
+        let a = peer(1);
+        for d in 0..16 {
+            queue(&mut queues, d, &[a]);
+        }
+        let mut sequence = 0;
+        let mut waves = Vec::new();
+        loop {
+            let started = queues.dispatch_fetches(8, CAP).started;
+            if started.is_empty() {
+                break;
+            }
+            waves.push(started.len());
+            // Every request in the wave times out.
+            for (key, source) in started {
+                sequence += 1;
+                queues.record_fetch_contact(source, unreachable(sequence));
+                assert_eq!(
+                    queues.retry_or_park_fetch(&key, key, CAP),
+                    FetchRetry::Exhausted
+                );
+                queues.complete_fetch(&key);
+            }
+            assert_queue_invariants(&queues);
+        }
+        assert_eq!(waves, vec![2, 8, 6]);
+        assert_eq!(queues.fetch_queue_count(), 0);
+    }
+
+    #[test]
+    fn an_answering_source_with_room_is_preferred_over_a_silent_one() {
+        let mut queues = ReplicationQueues::new();
+        let (a, b) = (peer(1), peer(2));
+        silence(&mut queues, a, 1);
+        let keys: Vec<XorName> = (0..3).map(|d| queue(&mut queues, d, &[a, b])).collect();
+
+        let dispatch = queues.dispatch_fetches(8, CAP);
+
+        let expected: Vec<(XorName, PeerId)> = keys.iter().copied().zip([b, b, a]).collect();
+        assert_eq!(
+            dispatch.started, expected,
+            "b until its share is full, then the silent a rather than parking"
+        );
+        assert!(queues.fetch_parked.is_empty());
+        assert_queue_invariants(&queues);
+    }
+
+    #[test]
+    fn retry_prefers_an_answering_source_with_room_then_a_silent_one() {
+        let (a, b, c) = (peer(1), peer(2), peer(3));
+        for c_full in [false, true] {
+            let mut queues = ReplicationQueues::new();
+            let key = queue(&mut queues, 0, &[a, b, c]);
+            if c_full {
+                queue(&mut queues, 10, &[c]);
+                queue(&mut queues, 11, &[c]);
+            }
+            let started = if c_full { 3 } else { 1 };
+            assert_eq!(queues.dispatch_fetches(3, CAP).started.len(), started);
+            assert_eq!(
+                queues.in_flight_fetch.get(&key).map(|entry| entry.source),
+                Some(a)
+            );
+            silence(&mut queues, b, 1);
+
+            let retry = queues.retry_or_park_fetch(&key, key, CAP);
+
+            let expected = if c_full { b } else { c };
+            assert_eq!(retry, FetchRetry::Next(expected));
+            assert_eq!(
+                queues.source_health.counters.silent_starts,
+                u64::from(c_full)
+            );
+            assert_queue_invariants(&queues);
+        }
+    }
+
+    /// Record that `source` just answered this node busy.
+    fn cool(queues: &ReplicationQueues, source: PeerId) {
+        queues
+            .busy_sources
+            .record_busy(&source, Instant::now(), Duration::from_mins(1));
+    }
+
+    #[test]
+    fn dispatch_puts_a_source_that_answered_busy_after_the_other_free_ones() {
+        let mut queues = ReplicationQueues::new();
+        let (a, b, s) = (peer(1), peer(2), peer(3));
+        silence(&mut queues, s, 1);
+        cool(&queues, a);
+        let keys: Vec<XorName> = (0..5).map(|d| queue(&mut queues, d, &[a, b, s])).collect();
+
+        let dispatch = queues.dispatch_fetches(8, CAP);
+
+        let expected: Vec<(XorName, PeerId)> = keys.iter().copied().zip([b, b, a, a, s]).collect();
+        assert_eq!(
+            dispatch.started, expected,
+            "b until its share is full, then the busy a, never withheld, before the silent s"
+        );
+        assert!(queues.fetch_parked.is_empty());
+        assert_queue_invariants(&queues);
+    }
+
+    #[test]
+    fn retry_puts_a_source_that_answered_busy_after_the_other_free_ones() {
+        let mut queues = ReplicationQueues::new();
+        let (a, b, c, s) = (peer(1), peer(2), peer(3), peer(4));
+        let key = queue(&mut queues, 0, &[a, b, c, s]);
+        assert_eq!(queues.dispatch_fetches(1, CAP).started, vec![(key, a)]);
+        silence(&mut queues, s, 1);
+        cool(&queues, b);
+
+        assert_eq!(
+            queues.retry_or_park_fetch(&key, key, CAP),
+            FetchRetry::Next(c),
+            "the free c before the busy b"
+        );
+        assert_eq!(
+            queues.retry_or_park_fetch(&key, key, CAP),
+            FetchRetry::Next(b),
+            "the busy b, never withheld, before the silent s"
+        );
+        assert_eq!(
+            queues.retry_or_park_fetch(&key, key, CAP),
+            FetchRetry::Next(s)
+        );
+        assert_eq!(
+            queues.retry_or_park_fetch(&key, key, CAP),
+            FetchRetry::Exhausted
+        );
+        assert_queue_invariants(&queues);
+    }
+
+    #[test]
+    fn parked_keys_start_on_a_source_that_falls_silent_while_the_others_stay_full() {
+        let mut queues = ReplicationQueues::new();
+        let (a, b) = (peer(1), peer(2));
+        for d in 0..4 {
+            queue(&mut queues, d, &[if d < 2 { a } else { b }]);
+        }
+        assert_eq!(queues.dispatch_fetches(4, CAP).started.len(), 4);
+        let parked: Vec<XorName> = (10..20).map(|d| queue(&mut queues, d, &[a, b])).collect();
+        assert_eq!(queues.dispatch_fetches(8, CAP).started, Vec::new());
+        assert_eq!(queues.fetch_parked.len(), 10);
+
+        silence(&mut queues, b, 1);
+        let dispatch = queues.dispatch_fetches(8, CAP);
+
+        // a stays full and answering: every slot goes to b, and the pass ends.
+        let expected: Vec<(XorName, PeerId)> = parked.iter().take(8).map(|key| (*key, b)).collect();
+        assert_eq!(dispatch.started, expected);
+        assert_eq!(queues.fetch_parked.len(), 2);
+        assert_queue_invariants(&queues);
+    }
+
+    #[test]
+    fn an_answer_puts_a_silent_source_back_under_the_cap() {
+        let mut queues = ReplicationQueues::new();
+        let a = peer(1);
+        for d in 0..6 {
+            queue(&mut queues, d, &[a]);
+        }
+        silence(&mut queues, a, 1);
+        assert_eq!(queues.dispatch_fetches(3, CAP).started.len(), 3);
+
+        queues.record_fetch_contact(a, answered(2));
+        let dispatch = queues.dispatch_fetches(8, CAP);
+
+        assert_eq!(
+            dispatch.started,
+            Vec::new(),
+            "a answers again and already has three fetches in flight"
+        );
+        assert_eq!(queues.fetch_parked.len(), 3);
+        assert_queue_invariants(&queues);
+    }
+
+    #[test]
+    fn a_departure_keeps_what_was_observed_of_the_source() {
+        let mut queues = ReplicationQueues::new();
+        let a = peer(1);
+        let key = queue(&mut queues, 0, &[a]);
+        assert_eq!(queues.dispatch_fetches(1, CAP).started, vec![(key, a)]);
+        silence(&mut queues, a, 1);
+
+        queues.remove_hint_source(&a);
+
+        assert!(queues.source_health.is_silent(&a, Instant::now()));
+        // The attempt still in flight answers after the departure: applied
+        // like any other outcome.
+        queues.record_fetch_contact(a, answered(2));
+        assert!(!queues.source_health.is_silent(&a, Instant::now()));
+        // A late unanswered request sent before that answer cannot mark it.
+        queues.record_fetch_contact(a, unreachable(1));
+        assert!(!queues.source_health.is_silent(&a, Instant::now()));
+        assert_health_invariants(&queues.source_health);
+    }
+
+    #[test]
+    fn the_summary_drops_answers_that_guard_nothing_and_keeps_marks() {
+        let mut queues = ReplicationQueues::new();
+        let (a, b, c) = (peer(1), peer(2), peer(3));
+        let key = queue(&mut queues, 0, &[a]);
+        assert_eq!(queues.dispatch_fetches(1, CAP).started, vec![(key, a)]);
+        queues.record_fetch_contact(a, answered(1));
+        queues.record_fetch_contact(b, answered(2));
+        silence(&mut queues, c, 3);
+
+        let stats = queues.take_fetch_dispatch_stats(CAP);
+
+        assert_eq!(stats.tracked_sources, 3);
+        assert_eq!(stats.silent_sources, 1);
+        assert!(!stats.overflow_active);
+        assert_eq!(stats.health.marks, 1);
+        assert_eq!(stats.health.silent_peak, 1);
+        let kept: HashSet<PeerId> = queues.source_health.entries.keys().copied().collect();
+        assert_eq!(
+            kept,
+            HashSet::from([a, c]),
+            "a guards a fetch in flight and c is marked"
+        );
+        assert_eq!(queues.source_health.counters.marks, 0, "counters restart");
+        assert_eq!(
+            queues.source_health.counters.silent_peak, 1,
+            "the peak restarts at the sources silent now"
+        );
+        assert_health_invariants(&queues.source_health);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn queue_invariants_hold_under_random_operations() {
+        let mut rng = StdRng::seed_from_u64(0x1514);
+        let mut queues = ReplicationQueues::new().with_fetch_source_limit(5);
+        let sources: Vec<PeerId> = (1..=6).map(peer).collect();
+        let mut sequence = 0_u64;
+        for step in 0..4_000_u32 {
+            match rng.gen_range(0..10) {
+                0 | 1 => {
+                    let count = rng.gen_range(1..=4);
+                    let mut chosen: Vec<PeerId> = Vec::new();
+                    while chosen.len() < count {
+                        let source = sources[rng.gen_range(0..sources.len())];
+                        if !chosen.contains(&source) {
+                            chosen.push(source);
+                        }
+                    }
+                    let key = key_at(rng.gen_range(0..400));
+                    if rng.gen_bool(0.25) {
+                        // Through verification, so it carries a retry entry.
+                        let hinter = rng.gen_range(1..=30);
+                        if queues
+                            .add_pending_verify(key, test_entry(hinter))
+                            .admitted()
+                        {
+                            queues.promote_pending_to_fetch(key, key, chosen);
+                        }
+                    } else {
+                        queues.enqueue_fetch(key, key, chosen);
+                    }
+                }
+                2 => {
+                    // As the fetch worker does, a candidate with no untried
+                    // source goes back to verification.
+                    let dispatch = queues.dispatch_fetches(rng.gen_range(0..6), CAP);
+                    for candidate in dispatch.sourceless {
+                        queues.requeue_candidate_for_verification(candidate, Duration::ZERO);
+                    }
+                }
+                3 => {
+                    if let Some(key) = queues.in_flight_fetch.keys().min().copied() {
+                        queues.complete_fetch(&key);
+                    }
+                }
+                4 => {
+                    let mut in_flight: Vec<XorName> =
+                        queues.in_flight_fetch.keys().copied().collect();
+                    in_flight.sort_unstable();
+                    if !in_flight.is_empty() {
+                        let key = in_flight[rng.gen_range(0..in_flight.len())];
+                        if queues.retry_or_park_fetch(&key, key, CAP) == FetchRetry::Exhausted {
+                            queues.complete_fetch(&key);
+                        }
+                    }
+                }
+                5 => {
+                    let mut waiting: Vec<XorName> = queues.fetch_payloads.keys().copied().collect();
+                    waiting.sort_unstable();
+                    if !waiting.is_empty() {
+                        let key = waiting[rng.gen_range(0..waiting.len())];
+                        let hinter = rng.gen_range(1..=30);
+                        let entry = if rng.gen_bool(0.5) {
+                            test_entry(hinter)
+                        } else {
+                            paid_only_entry(hinter)
+                        };
+                        queues.add_pending_verify(key, entry);
+                    }
+                }
+                6 => {
+                    if rng.gen_range(0..10) == 0 {
+                        queues.remove_hint_source(&sources[rng.gen_range(0..sources.len())]);
+                    }
+                }
+                7 => {
+                    if let Some(candidate) = queues.dequeue_fetch() {
+                        match candidate.sources.first().copied() {
+                            Some(source) if rng.gen_bool(0.5) => {
+                                queues.start_dequeued_fetch(candidate, source);
+                            }
+                            _ => queues.discard_fetch_candidate(candidate),
+                        }
+                    }
+                }
+                _ => {
+                    // A source answers, or a request to it goes unanswered,
+                    // applied a little out of sequence order.
+                    if let Some(source) = sources.get(rng.gen_range(0..sources.len())).copied() {
+                        sequence += 1;
+                        let place = sequence.saturating_sub(rng.gen_range(0..4));
+                        let contact = if rng.gen_bool(0.5) {
+                            Contact::Answered { order: place }
+                        } else {
+                            Contact::Unreachable { sent: place }
+                        };
+                        queues.record_fetch_contact(source, contact);
+                    }
+                }
+            }
+            assert_queue_invariants(&queues);
+            assert_health_invariants(&queues.source_health);
+            assert_retry_entries_bounded(&queues);
+            for (key, entry) in &queues.in_flight_fetch {
+                let associated: HashSet<&PeerId> =
+                    entry.all_sources.iter().chain(entry.tried.iter()).collect();
+                assert!(
+                    associated.len() <= 5,
+                    "step {step}: {} over the source limit",
+                    hex::encode(key)
+                );
+            }
+            for (key, payload) in &queues.fetch_payloads {
+                let tried = queues.fetch_tried.get(key).map_or(0, HashSet::len);
+                assert!(
+                    payload.sources.len() + tried <= 5,
+                    "step {step}: queued over the limit"
+                );
+            }
+        }
+    }
+
+    /// Scale benchmark for the per-source scheduler at the fetch queue's hard
+    /// bound. Runs only when `ANT_FETCH_SCALE_BENCH` names a sources-per-key
+    /// count (it allocates hundreds of MiB and takes seconds); otherwise it
+    /// returns at once. One count per process, so `/usr/bin/time -l` reports
+    /// that scenario's peak memory:
+    ///
+    /// `ANT_FETCH_SCALE_BENCH=8 cargo test --release --features test-utils --lib
+    /// scale_benchmark -- --nocapture`
+    ///
+    /// Thresholds, declared before the release runs: one pass parking every key
+    /// holds the queue for at most 1 s at up to 8 sources per key and at most
+    /// 5 s at the 35-source limit; waking, the stats read and a departure each
+    /// stay under 250 ms; the process's peak RSS is at most 1 GiB at 8 sources
+    /// per key and 3 GiB at 35. Dropping the queues was first held to 250 ms
+    /// too, but measured 274 to 315 ms at 35 sources per key, and 226 to 295 ms
+    /// with the scheduler before the silent-source handling. It happens once,
+    /// when the engine shuts down, outside any lock, so it is held to 1 s.
+    #[test]
+    fn scale_benchmark_at_the_fetch_queue_bound() {
+        let Some(sources_per_key) = std::env::var("ANT_FETCH_SCALE_BENCH")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+        else {
+            return;
+        };
+        let park_limit = if sources_per_key <= 8 {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_secs(5)
+        };
+        {
+            let other_limit = Duration::from_millis(250);
+            let teardown_limit = Duration::from_secs(1);
+            let sources: Vec<PeerId> = (0..sources_per_key)
+                .map(|index| {
+                    let mut bytes = [0u8; 32];
+                    bytes[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
+                    PeerId::from_bytes(bytes)
+                })
+                .collect();
+            let mut queues = ReplicationQueues::new();
+            // Saturate every source with this node's own fetches first.
+            let mut blockers = Vec::new();
+            for (index, source) in sources.iter().enumerate() {
+                for offset in 0..CAP {
+                    let key = key_at(u32::MAX - u32::try_from(index * CAP + offset).unwrap());
+                    queues.start_fetch(key, *source, vec![*source]);
+                    blockers.push(key);
+                }
+            }
+            let mut distance = 0u32;
+            while queues.fetch_queue_count() < MAX_FETCH_QUEUE {
+                let key = key_at(distance);
+                assert!(queues.enqueue_fetch(key, key, sources.clone()));
+                distance += 1;
+            }
+
+            let started = Instant::now();
+            let dispatch = queues.dispatch_fetches(8, CAP);
+            let park_pass = started.elapsed();
+            assert_eq!(dispatch.started, Vec::new());
+            assert_eq!(queues.fetch_parked.len(), MAX_FETCH_QUEUE);
+
+            let associations: usize = queues.parked_by_source.values().map(BTreeSet::len).sum();
+
+            let started = Instant::now();
+            let stats = queues.take_fetch_dispatch_stats(CAP);
+            let stats_pass = started.elapsed();
+            assert_eq!(stats.parked, MAX_FETCH_QUEUE);
+
+            let started = Instant::now();
+            queues.complete_fetch(&blockers[0]);
+            let wake = queues.dispatch_fetches(8, CAP);
+            let wake_pass = started.elapsed();
+            assert_eq!(wake.started.len(), 1);
+
+            let started = Instant::now();
+            queues.remove_hint_source(&sources[0]);
+            let departure = started.elapsed();
+
+            let started = Instant::now();
+            drop(queues);
+            let teardown = started.elapsed();
+
+            println!(
+                "FETCH-SCALE sources_per_key={sources_per_key} keys={MAX_FETCH_QUEUE} \
+                 associations={associations} park_pass_ms={} stats_ms={} wake_ms={} \
+                 departure_ms={} teardown_ms={}",
+                park_pass.as_millis(),
+                stats_pass.as_millis(),
+                wake_pass.as_millis(),
+                departure.as_millis(),
+                teardown.as_millis()
+            );
+            assert!(
+                park_pass <= park_limit,
+                "park pass {park_pass:?} over {park_limit:?}"
+            );
+            for (name, took) in [
+                ("stats", stats_pass),
+                ("wake", wake_pass),
+                ("departure", departure),
+            ] {
+                assert!(
+                    took <= other_limit,
+                    "{name} took {took:?}, over {other_limit:?}"
+                );
+            }
+            assert!(
+                teardown <= teardown_limit,
+                "teardown took {teardown:?}, over {teardown_limit:?}"
+            );
+        }
     }
 }
