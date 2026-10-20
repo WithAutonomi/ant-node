@@ -150,8 +150,8 @@ busy-reply allowance and stay silent. In the combined build:
 - When a refused requester receives `Busy` within the responder's neutral allowance, it moves on
   after 5-10 s, or sooner if its own fetch timeout runs out first, instead of 30 s, without
   charging the responder.
-- A holder that just refused is not handed this requester's next keys while another holder that is
-  not cooling exists.
+- A holder that just refused is not chosen for a key while another free holder for that key is
+  not cooling.
 - Old nodes decode exactly the messages they always did: a request carries 5 bytes after the
   message that they never read, and they are never sent `Busy`. Rollback is a release without the
   change.
