@@ -245,19 +245,20 @@ busy-reply allowance and stay silent. In the combined build:
 - Measured on real nodes with the test-only gate, in `tests/e2e/fetch_busy_ab.rs` (opt-in): 20
   requesters each within their two-request share, and the first of five holders with its 12-slot
   pool full for 2 s, the refusal case left after #252, with 28 refusals in every run below:
-  - the combined #252 + #253 build, on main b0e29c32: all 40 chunks in 10.1 s, 10.2 s and
-    10.2 s, no holder charged;
+  - the combined #252 + #253 build, on main b0e29c32: all 40 chunks in 10.2 s, 10.0 s, 10.0 s
+    and 10.0 s, no holder charged;
   - #252 alone (447c000d, with the file's two test-only counters added): 60.4 s, 60.5 s and
     60.8 s, with 14 requesters charging the first holder and 8 the second each time, and 0 to 7
     the others.
 
-  One more run of each stopped before measuring, at the test's check that every key was newly
-  queued (38 of 40).
-- Earlier, without #252, on main a6e3388e: the same pool case took 90.3 s on that main
-  (2026-10-16), with 14, 9, 9, 4 and 3 requesters charging the five holders, and 9.4 s to 10.5 s
-  with no holder charged with this change alone (2026-10-16 and 2026-10-20). A single requester
-  over-asking three holders, the case #252 removes, took 90.2 s on that main and 35 s to 39 s
-  with this change alone; that measurement left the file once #252 made the case impossible.
+  One more run of #252 alone stopped before measuring, at the test's check that every key was
+  newly queued (38 of 40).
+- Earlier, without #252, on main a6e3388e: the same pool case took 90.3 s in one run on that
+  main (2026-10-16), with 14, 9, 9, 4 and 3 requesters charging the five holders, and 9.4 s to
+  10.5 s in four runs, no holder charged, with this change alone (2026-10-16 and 2026-10-20). A
+  single requester over-asking three holders, the case #252 removes, took 90.2 s, 90.2 s and
+  90.3 s on that main, and 35.4 s to 39.2 s in six runs with this change alone; that measurement
+  left the file once #252 made the case impossible.
 - A local, unpublished discrete-event model of the 177-node join wave and 24 more scenarios
   informed the design, including the 5-10 s wait. Its source and raw output are not part of this
   change, so its results are not offered as validation.
