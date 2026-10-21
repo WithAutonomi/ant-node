@@ -2487,11 +2487,14 @@ impl ReplicationEngine {
     ///
     /// Unlike the PUT path, this waits for a pending-offer permit before
     /// returning, and it offers the caller's bytes rather than reading them
-    /// back from storage.
+    /// back from storage. Test-only: production writes enter through the PUT
+    /// handler's fresh-write channel.
+    #[cfg(any(test, feature = "test-utils"))]
     pub async fn replicate_fresh(&self, key: &XorName, data: &[u8], proof_of_payment: &[u8]) {
-        fresh::announce_paid_write(
+        let contested = fresh::announce_paid_write(
             key,
             proof_of_payment,
+            &self.payment_verifier,
             &self.paid_list,
             &self.p2p_node,
             &self.config,
@@ -2509,6 +2512,7 @@ impl ReplicationEngine {
             key,
             data.to_vec(),
             proof_of_payment.to_vec(),
+            contested,
             pending_offer,
         )
         .await;
@@ -2550,6 +2554,7 @@ impl ReplicationEngine {
     ) {
         let p2p = Arc::clone(&self.p2p_node);
         let paid_list = Arc::clone(&self.paid_list);
+        let payment_verifier = Arc::clone(&self.payment_verifier);
         let config = Arc::clone(&self.config);
         let shutdown = self.shutdown.clone();
 
@@ -2565,9 +2570,10 @@ impl ReplicationEngine {
                 // Stage one never waits for chunk back-pressure: the paid-list
                 // entry and PaidNotify are what let peers repair the key later,
                 // so every queued write gets them at arrival rate.
-                fresh::announce_paid_write(
+                let contested = fresh::announce_paid_write(
                     &event.key,
                     &event.payment_proof,
+                    &payment_verifier,
                     &paid_list,
                     &p2p,
                     &config,
@@ -2577,6 +2583,7 @@ impl ReplicationEngine {
                     .send(fresh::FreshOfferEvent {
                         key: event.key,
                         payment_proof: event.payment_proof,
+                        contested,
                         read_attempts: 0,
                     })
                     .is_err()
@@ -2689,6 +2696,7 @@ impl ReplicationEngine {
                     &event.key,
                     data,
                     event.payment_proof,
+                    event.contested,
                     pending_offer,
                 )
                 .await;
@@ -3539,6 +3547,7 @@ impl ReplicationEngine {
     fn start_audit_loop(&mut self) {
         let p2p = Arc::clone(&self.p2p_node);
         let storage = Arc::clone(&self.storage);
+        let paid_list = Arc::clone(&self.paid_list);
         let config = Arc::clone(&self.config);
         let shutdown = self.shutdown.clone();
         let sync_history = Arc::clone(&self.sync_history);
@@ -3573,6 +3582,7 @@ impl ReplicationEngine {
                     audit::audit_tick_with_repair_proofs(
                         &p2p,
                         &storage,
+                        &paid_list,
                         &config,
                         &history,
                         &repair_proofs,
@@ -3598,6 +3608,7 @@ impl ReplicationEngine {
                             audit::audit_tick_with_repair_proofs(
                                 &p2p,
                                 &storage,
+                                &paid_list,
                                 &config,
                                 &history,
                                 &repair_proofs,
@@ -6602,10 +6613,15 @@ async fn handle_fresh_offer(
         }
     }
 
-    // Rule 6: add to PaidForList.
-    if let Err(e) = ctx.paid_list.insert(key).await {
-        warn!("Failed to add key to PaidForList: {e}");
-    }
+    // Rule 6: add to PaidForList, marked if the price floor contested the
+    // payment when this node verified it, before the record is stored and
+    // can be hinted.
+    fresh::record_paid_key(
+        key,
+        ctx.payment_verifier.verified_payment_contested(key),
+        &ctx.paid_list,
+    )
+    .await;
 
     // Store the record.
     match ctx.storage.put(key, data).await {
@@ -6811,9 +6827,15 @@ async fn handle_paid_notify(
         }
     }
 
-    if let Err(e) = paid_list.insert(&notify.key).await {
-        warn!("Failed to add paid notify key to PaidForList: {e}");
-    }
+    // Marked if the price floor contested the payment when this node verified
+    // it, so a record later repaired onto this node is not used to judge its
+    // peers either.
+    fresh::record_paid_key(
+        &notify.key,
+        payment_verifier.verified_payment_contested(&notify.key),
+        paid_list,
+    )
+    .await;
 
     Ok(())
 }
