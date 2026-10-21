@@ -188,11 +188,11 @@ limits are not shared with browser traffic. The defaults are:
 
 | Setting | Default | Scope |
 |---|---:|---|
-| `max_connections` | 32 | listener |
+| `max_connections` | 256 | listener |
 | `max_connections_per_ip` | 4 | IPv4 address or IPv6 /64 |
 | `max_channels_per_connection` | 2 | association |
-| `max_channels` | 32 | listener and channel-handler tasks |
-| `max_concurrent_requests` | 16 | listener work slots |
+| `max_channels` | 512 | listener and channel-handler tasks |
+| `max_concurrent_requests` | 512 | listener work slots |
 | `max_requests_per_second` | 256 | listener work token bucket |
 | `max_requests_per_second_per_ip` | 32 | source-prefix work token bucket |
 | `max_requests_per_second_per_connection` | 16 | association work token bucket |
