@@ -1450,6 +1450,13 @@ impl PointerReplication {
             warn!("A fresh pointer write did not parse; not replicating it");
             return;
         };
+        // Decided from the proof being forwarded, before it moves into the
+        // offer: a state the price floor contests here is not used to judge
+        // this node's peers (ADR-0006).
+        let contested = self
+            .payments
+            .price_contested(&state.address, &write.payment_proof)
+            .await;
         let self_id = *self.p2p.peer_id();
         let targets: Vec<PeerId> = self
             .p2p
@@ -1504,6 +1511,14 @@ impl PointerReplication {
             hex::encode(state.address),
             targets.len()
         );
+        if contested {
+            info!(
+                "Fresh pointer {}: no possession check, the payment is contested under \
+                 the price floor",
+                hex::encode(state.address)
+            );
+            return;
+        }
         self.schedule_possession_check(state, targets);
     }
 

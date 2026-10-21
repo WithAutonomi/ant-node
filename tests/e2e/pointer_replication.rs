@@ -8,6 +8,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use super::harness::parseable_single_node_proof;
 use super::testnet::{TestNetworkConfig, TestNode};
 use super::TestHarness;
 use ant_node::ant_protocol::chunk::{
@@ -32,8 +33,10 @@ use bytes::Bytes;
 use saorsa_core::identity::PeerId;
 use saorsa_pqc::api::sig::{ml_dsa_65, MlDsaPublicKey, MlDsaSecretKey};
 use serial_test::serial;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::RwLock;
 
 /// How long to wait for replication to reach a node.
 const SETTLE: Duration = Duration::from_secs(30);
@@ -470,6 +473,98 @@ async fn the_possession_check_penalises_only_a_member_that_dropped_the_record() 
     assert!(
         checker_p2p.peer_trust(&keeper_peer) >= keeper_before,
         "the member that holds the record was penalised"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// ADR-0006: a fresh pointer write the offering node cannot price is not
+/// used to judge its peers. The checker's price floor is wired (a gossip cache
+/// is attached) but it has no commitment of its own, so it cannot price the
+/// single-node proof it forwards, and no possession check may follow. The
+/// control write that follows forwards a proof the floor never prices, and its
+/// check does penalise the members, so the first result is not vacuous.
+#[tokio::test]
+#[serial]
+async fn a_fresh_pointer_write_the_floor_cannot_price_is_not_used_to_judge_peers() {
+    // Long enough for the scheduled check (at most 500 ms here) and its probes
+    // to have run, short enough that unrelated trust events are unlikely.
+    const CONTESTED_WATCH: Duration = Duration::from_secs(5);
+    let mut config = TestNetworkConfig::minimal();
+    config.replication_config = Some(ReplicationConfig {
+        possession_check_delay_min: Duration::from_millis(200),
+        possession_check_delay_max: Duration::from_millis(500),
+        ..ReplicationConfig::default()
+    });
+    let harness = TestHarness::setup_with_config(config).await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let checker = 3;
+    // The checker only judges peers that understand pointers.
+    let everyone: Vec<usize> = (0..harness.node_count()).collect();
+    exchange_hints(&harness, &everyone, &[checker]).await;
+
+    let checker_node = harness.test_node(checker).expect("node");
+    checker_node
+        .ant_protocol
+        .as_ref()
+        .expect("protocol")
+        .payment_verifier_arc()
+        .attach_commitment_cache(Arc::new(RwLock::new(HashMap::new())));
+    let checker_p2p = checker_node.p2p_node.as_ref().expect("p2p");
+    let members: Vec<PeerId> = others(&harness, &[checker])
+        .into_iter()
+        .map(|i| peer(harness.test_node(i).expect("node")))
+        .collect();
+
+    let (pk, sk) = owner();
+    let contested = signed(&pk, &sk, 0, 1);
+    let control = signed(&pk, &sk, 1, 2);
+    let mut outcomes = Vec::new();
+    for (record, proof, watch) in [
+        (
+            &contested,
+            parseable_single_node_proof(contested.state_id()),
+            CONTESTED_WATCH,
+        ),
+        (&control, DUMMY_PROOF.to_vec(), SETTLE),
+    ] {
+        let before: Vec<f64> = members.iter().map(|p| checker_p2p.peer_trust(p)).collect();
+        store(checker_node)
+            .put_bytes(&record.to_bytes())
+            .await
+            .expect("put");
+        // Nothing is paid anywhere, so every member refuses the offer and is
+        // absent when, and only if, the checker probes it.
+        replication(checker_node)
+            .replicate_fresh(PointerFreshWrite {
+                record: record.to_bytes(),
+                payment_proof: proof,
+            })
+            .await;
+
+        // A pointer possession failure is a weight-1 trust event, so any fall
+        // counts.
+        let deadline = tokio::time::Instant::now() + watch;
+        let mut penalised = false;
+        while tokio::time::Instant::now() < deadline {
+            penalised = members
+                .iter()
+                .zip(before.iter())
+                .any(|(p, &b)| checker_p2p.peer_trust(p) < b - f64::EPSILON);
+            if penalised {
+                break;
+            }
+            tokio::time::sleep(POLL).await;
+        }
+        outcomes.push(penalised);
+    }
+
+    assert_eq!(
+        outcomes,
+        vec![false, true],
+        "a write the floor cannot price must not be used to penalise members, while the \
+         control write must"
     );
 
     harness.teardown().await.expect("teardown");

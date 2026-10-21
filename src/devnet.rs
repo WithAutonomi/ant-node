@@ -7,7 +7,7 @@ use crate::ant_protocol::CHUNK_PROTOCOL_ID;
 use crate::config::{default_root_dir, NODES_SUBDIR, NODE_IDENTITY_FILENAME};
 use crate::logging::{debug, info, warn};
 use crate::payment::{
-    EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, PriceFloorConfig, QuoteGenerator,
+    EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator,
     QuotingMetricsTracker,
 };
 use crate::replication::config::ReplicationConfig;
@@ -960,7 +960,6 @@ impl Devnet {
             cache_capacity: DEVNET_PAYMENT_CACHE_CAPACITY,
             close_group_size: replication_config.close_group_size,
             local_rewards_address: rewards_address,
-            price_floor: PriceFloorConfig::default(),
         };
         let payment_verifier = PaymentVerifier::new(payment_config);
         let metrics_tracker = QuotingMetricsTracker::new(DEVNET_INITIAL_RECORDS);

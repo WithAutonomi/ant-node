@@ -13,6 +13,7 @@ use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
 
 use crate::ant_protocol::XorName;
+use crate::error::Result;
 use crate::replication::config::{ReplicationConfig, REPLICATION_PROTOCOL_ID};
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
@@ -61,27 +62,50 @@ pub(crate) struct PeerSyncHints {
 /// This intentionally scans all locally stored records, not only records for
 /// which this node is still responsible. Out-of-range records retained by
 /// prune hysteresis therefore continue to repair their new close group before
-/// this node is allowed to delete them.
+/// this node is allowed to delete them. Price-contested records are left out
+/// (ADR-0006).
 pub async fn build_replica_hints_for_peer(
     peer: &PeerId,
     storage: &Arc<ChunkStore>,
+    paid_list: &PaidList,
     p2p_node: &Arc<P2PNode>,
     close_group_size: usize,
 ) -> Vec<XorName> {
-    build_replica_hints_for_peer_with_close_groups(peer, storage, p2p_node, close_group_size)
-        .await
-        .into_iter()
-        .map(|hint| hint.key)
-        .collect()
+    build_replica_hints_for_peer_with_close_groups(
+        peer,
+        storage,
+        paid_list,
+        p2p_node,
+        close_group_size,
+    )
+    .await
+    .into_iter()
+    .map(|hint| hint.key)
+    .collect()
+}
+
+/// Stored keys this node may hint as replicas: every stored key except those
+/// marked price-contested in the paid list (see `fresh::record_paid_key`),
+/// which go out as paid hints only. A replica hint records a repair proof the
+/// responsible audit later judges the peer on, and makes this node the sole
+/// hinter a peer penalises when its quorum check fails; a paid hint does
+/// neither. The marks are read from memory, so this scans nothing on disk; if
+/// they could not be read when the paid list opened, no key is hinted as a
+/// replica.
+async fn replica_hint_keys(storage: &ChunkStore, paid_list: &PaidList) -> Result<Vec<XorName>> {
+    let mut keys = storage.all_keys().await?;
+    paid_list.retain_unmarked(&mut keys);
+    Ok(keys)
 }
 
 pub(crate) async fn build_replica_hints_for_peer_with_close_groups(
     peer: &PeerId,
     storage: &Arc<ChunkStore>,
+    paid_list: &PaidList,
     p2p_node: &Arc<P2PNode>,
     close_group_size: usize,
 ) -> Vec<SentReplicaHint> {
-    let all_keys = match storage.all_keys().await {
+    let all_keys = match replica_hint_keys(storage, paid_list).await {
         Ok(keys) => keys,
         Err(e) => {
             warn!("Failed to read stored keys for hint construction: {e}");
@@ -125,7 +149,7 @@ pub(crate) async fn build_sync_hints_for_peers(
         return hints_by_peer;
     }
 
-    let all_keys = match storage.all_keys().await {
+    let all_keys = match replica_hint_keys(storage, paid_list).await {
         Ok(keys) => keys,
         Err(e) => {
             warn!("Failed to read stored keys for batch hint construction: {e}");
@@ -521,6 +545,7 @@ pub(crate) async fn handle_sync_request_with_proofs(
     let sent_replica_hints = build_replica_hints_for_peer_with_close_groups(
         sender,
         storage,
+        paid_list,
         p2p_node,
         config.close_group_size,
     )
@@ -558,6 +583,7 @@ pub(crate) async fn handle_sync_request_with_proofs(
 mod tests {
     use super::*;
     use crate::replication::types::PeerSyncRecord;
+    use crate::storage::ChunkStoreConfig;
     use std::collections::HashMap;
 
     /// Build a `PeerId` from a single byte (zero-padded to 32 bytes).
@@ -565,6 +591,44 @@ mod tests {
         let mut bytes = [0u8; 32];
         bytes[0] = b;
         PeerId::from_bytes(bytes)
+    }
+
+    // -- replica_hint_keys ---------------------------------------------------
+
+    /// ADR-0006: a stored key marked price-contested is never hinted as a
+    /// replica; every other stored key still is. The filter reads no paid-list
+    /// database, so it works while this thread cannot read one.
+    #[tokio::test]
+    async fn price_contested_keys_are_not_hinted_as_replicas() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = ChunkStore::new(ChunkStoreConfig {
+            root_dir: dir.path().join("chunks"),
+            ..ChunkStoreConfig::test_default()
+        })
+        .await
+        .expect("chunk store");
+        let paid_list = PaidList::new(dir.path()).await.expect("paid list");
+        let contents: [&[u8]; 3] = [b"plain record", b"contested record", b"unpaid record"];
+        let [plain, contested, unpaid] = contents.map(ChunkStore::compute_address);
+        for (key, content) in [plain, contested, unpaid].iter().zip(contents) {
+            storage.put(key, content).await.expect("put");
+        }
+        paid_list.insert(&plain).await.expect("insert");
+        paid_list
+            .insert_price_contested(&contested)
+            .await
+            .expect("mark");
+
+        let _reader = paid_list.hold_reader_for_tests().expect("hold reader");
+        assert!(paid_list.is_price_contested(&contested).is_err());
+        let mut hinted = replica_hint_keys(&storage, &paid_list)
+            .await
+            .expect("read keys");
+        hinted.sort_unstable();
+        let mut expected = vec![plain, unpaid];
+        expected.sort_unstable();
+
+        assert_eq!(hinted, expected);
     }
 
     // -- select_sync_batch ---------------------------------------------------
