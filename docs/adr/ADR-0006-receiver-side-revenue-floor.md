@@ -381,8 +381,9 @@ replication), arriving in 48 upload bursts. Of those, 1,801 admissions over
      accepted the key. The node also keeps its marked keys in memory, so
      leaving them out of the hints it builds for a peer reads nothing on
      disk. Each paid-list write updates that copy in commit order, a new
-     mark just before its commit, so the copy never lacks a committed mark.
-     If the marks cannot be read when the node starts, it still starts, as
+     mark just before its commit, so the copy never lacks a committed mark,
+     and a write that commits the key unmarked, a plain insert that adds it
+     or a removal, drops any mark the copy holds for it. If the marks cannot be read when the node starts, it still starts, as
      before, and hints no key as a replica until a restart can read them;
    - the responsible audit never samples a marked key, which also covers one
      hinted in the moment before its mark was written;
@@ -589,7 +590,9 @@ out of 1,801:
     the paid list, so unmarked. When a marked insert's commit is what
     failed, the in-memory copy keeps the mark, since the commit may still
     have reached the disk, so this node does not hint the key as a replica
-    while the mark stays; a restart rebuilds the copy from the database.
+    while the mark stays. A later plain insert that adds the key, or a
+    removal of it, drops the mark once that write commits, and a restart
+    rebuilds the copy from the database.
   - Paid-list pruning checks for the record before and after its network
     round, but a record admitted between that check and the delete would
     lose its mark. Both store paths require this node inside the same width
@@ -667,7 +670,9 @@ out of 1,801:
     held;
   - the in-memory copy of the marks is filled on opening and follows every
     write and removal, and a marked insert and a batch removal change it
-    only in the order writes take; building
+    only in the order writes take; a mark held in memory alone, as a failed
+    commit can leave it, goes with a later plain insert of the key and with
+    its removal, single or batched; building
     replica hints works while the paid list cannot be read at all, and a
     paid list whose marks cannot be read on opening still opens and hints no
     replica;
