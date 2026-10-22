@@ -34,6 +34,7 @@ use heed::{Database, Env, EnvOpenOptions, RoTxn};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::slice;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -75,6 +76,20 @@ fn read_price_contested_keys(db: &Database<Bytes, Bytes>, txn: &RoTxn) -> Result
     Ok(keys)
 }
 
+/// Drop `keys` from the in-memory marks, after a commit that left none of
+/// them marked in the database. The set is copied only if one of them is in
+/// it.
+fn unmark_in_memory(marks: &RwLock<Option<Arc<HashSet<XorName>>>>, keys: &[XorName]) {
+    if let Some(marked) = marks.write().as_mut() {
+        if keys.iter().any(|key| marked.contains(key)) {
+            let marked = Arc::make_mut(marked);
+            for key in keys {
+                marked.remove(key);
+            }
+        }
+    }
+}
+
 /// Persistent paid-for-list backed by LMDB.
 ///
 /// Tracks which keys this node believes are paid-authorized.
@@ -97,7 +112,8 @@ pub struct PaidList {
     /// A new mark goes in just before its commit and a removed one just after,
     /// so the copy never lacks a committed mark. A mark whose commit fails
     /// stays, since that commit may still have reached the disk: when in
-    /// doubt, judge no one.
+    /// doubt, judge no one. Any later write that commits the key unmarked, a
+    /// plain insert that adds it or a removal, drops that mark.
     write_order: Arc<Mutex<()>>,
     /// Mark reads that have failed since the last one that succeeded, so a
     /// run of failures is logged once (see `counts_as_price_contested`).
@@ -273,6 +289,9 @@ impl PaidList {
                 wtxn.commit().map_err(|e| {
                     Error::Storage(format!("Failed to commit paid-list insert: {e}"))
                 })?;
+                if value.is_empty() {
+                    unmark_in_memory(&price_contested, slice::from_ref(&key_owned));
+                }
                 drop(ordered);
 
                 Ok(true)
@@ -391,11 +410,7 @@ impl PaidList {
                 wtxn.commit().map_err(|e| {
                     Error::Storage(format!("Failed to commit paid-list delete: {e}"))
                 })?;
-                if let Some(keys) = price_contested.write().as_mut() {
-                    if keys.contains(&key_owned) {
-                        Arc::make_mut(keys).remove(&key_owned);
-                    }
-                }
+                unmark_in_memory(&price_contested, slice::from_ref(&key_owned));
                 drop(ordered);
                 Ok(deleted)
             })
@@ -624,14 +639,9 @@ impl PaidList {
 
                 wtxn.commit()
                     .map_err(|e| Error::Storage(format!("Failed to commit batch remove: {e}")))?;
-                if let Some(keys) = price_contested.write().as_mut() {
-                    if removed.iter().any(|key| keys.contains(key)) {
-                        let keys = Arc::make_mut(keys);
-                        for key in &removed {
-                            keys.remove(key);
-                        }
-                    }
-                }
+                // Every key of the batch, not only those the database held: a
+                // mark whose commit failed can be in memory alone.
+                unmark_in_memory(&price_contested, &keys_owned);
                 drop(ordered);
 
                 Ok(removed)
@@ -896,6 +906,59 @@ mod tests {
         holder.await.expect("holder task");
         assert_eq!(removal.await.expect("remove batch"), 1);
         assert!(marked_in_memory(&pl).is_empty());
+    }
+
+    /// Mark `key` in memory only, with no entry in the database: what a marked
+    /// insert whose commit failed before reaching the disk leaves.
+    fn mark_in_memory_only(pl: &PaidList, key: XorName) {
+        let mut marks = pl.price_contested.write();
+        let marks = marks.as_mut().expect("marks read on open");
+        Arc::make_mut(marks).insert(key);
+    }
+
+    /// ADR-0006: a mark left in memory alone by a failed commit goes with a
+    /// later plain insert that adds the key, so the copy agrees with the
+    /// database again and the key is hinted as a replica. A plain insert of a
+    /// key whose entry carries the mark leaves both as they are.
+    #[tokio::test]
+    async fn a_plain_insert_drops_a_mark_held_in_memory_only() {
+        let (pl, _temp) = create_test_paid_list().await;
+        let stale: XorName = [0x71; 32];
+        let marked: XorName = [0x72; 32];
+        pl.insert_price_contested(&marked).await.expect("mark");
+        mark_in_memory_only(&pl, stale);
+        let mut keys = vec![stale];
+        pl.retain_unmarked(&mut keys);
+        assert_eq!(keys, Vec::<XorName>::new());
+
+        assert!(pl.insert(&stale).await.expect("insert"));
+        assert!(!pl.insert(&marked).await.expect("insert"));
+        assert!(!pl.is_price_contested(&stale).expect("read mark"));
+        assert!(pl.is_price_contested(&marked).expect("read mark"));
+        assert_eq!(marked_in_memory(&pl), HashSet::from([marked]));
+        let mut keys = vec![stale, marked];
+        pl.retain_unmarked(&mut keys);
+        assert_eq!(keys, vec![stale]);
+    }
+
+    /// ADR-0006: a mark left in memory alone by a failed commit goes with a
+    /// later removal of the key, single or batched, although the database
+    /// holds no entry to delete. A mark the removal does not name stays.
+    #[tokio::test]
+    async fn a_removal_drops_a_mark_held_in_memory_only() {
+        let (pl, _temp) = create_test_paid_list().await;
+        let batched: XorName = [0x73; 32];
+        let single: XorName = [0x74; 32];
+        let marked: XorName = [0x75; 32];
+        pl.insert_price_contested(&marked).await.expect("mark");
+        mark_in_memory_only(&pl, batched);
+        mark_in_memory_only(&pl, single);
+
+        assert_eq!(pl.remove_batch(&[batched]).await.expect("remove batch"), 0);
+        assert_eq!(marked_in_memory(&pl), HashSet::from([single, marked]));
+        assert!(!pl.remove(&single).await.expect("remove"));
+        assert_eq!(marked_in_memory(&pl), HashSet::from([marked]));
+        assert!(pl.is_price_contested(&marked).expect("read mark"));
     }
 
     /// Byte offsets in an LMDB meta page on a 64-bit target: the magic number
