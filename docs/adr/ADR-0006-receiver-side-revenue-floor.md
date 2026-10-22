@@ -700,9 +700,9 @@ out of 1,801:
     cache with a forged proof the floor would contest, mark the key exactly
     when the recording node's own verified decision was contested, and never
     from that proof.
-- 48 mutations of the floor, the contest decision, the verifier's memory,
+- 54 mutations of the floor, the contest decision, the verifier's memory,
   the mark, its in-memory copy and every check that reads the mark were run
-  against these unit and e2e tests on this amendment's code, and 47 fail at
+  against these unit and e2e tests on this amendment's code, and 53 fail at
   least one of them. The one that survives makes prune-audit scoring count
   a mark that cannot be read as unset. Only the e2e prune test reaches that
   check, and it cannot make a node's paid-list read fail; the same read
