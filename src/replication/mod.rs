@@ -22,6 +22,7 @@ pub mod bootstrap;
 pub mod commitment;
 pub mod commitment_state;
 pub mod config;
+pub mod fetch_busy;
 pub mod fresh;
 pub mod neighbor_sync;
 pub mod paid_list;
@@ -42,6 +43,8 @@ use std::fmt;
 use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
+#[cfg(any(test, feature = "test-utils"))]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -56,12 +59,13 @@ use parking_lot::Mutex;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use tokio::sync::broadcast::error::RecvError;
-use tokio::sync::{mpsc, Notify, RwLock, Semaphore};
+use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::ant_protocol::XorName;
+use crate::client::xor_distance;
 use crate::error::{Error, Result};
 use crate::payment::{
     PaymentVerifier, VerificationContext, MAX_PAYMENT_PROOF_SIZE_BYTES,
@@ -72,7 +76,7 @@ use crate::pointer::{FinalStateWitness, PointerService};
 use crate::replication::audit::AuditTickResult;
 use crate::replication::audit_coordinator::AuditChallengeCoordinator;
 use crate::replication::audit_metrics::{
-    AuditResponderClass, AuditResponderDropReason, AuditResponderMetrics,
+    AuditResponderClass, AuditResponderDropReason, AuditResponderMetrics, FetchBusyReplyOutcome,
     ReplicationResponderClass, ResponderAdmissionCeiling,
 };
 use crate::replication::commitment::{commitment_hash, StorageCommitment};
@@ -88,6 +92,10 @@ use crate::replication::config::{
     SUBTREE_AUDIT_PROTOCOL_ID, SUBTREE_ROUND1_WORK_BURST_BYTES,
     SUBTREE_ROUND1_WORK_REFILL_BYTES_PER_SEC, SUBTREE_SESSION_TTL,
 };
+use crate::replication::fetch_busy::{
+    busy_wait, busy_wake, BusyReplyDenied, BusyReplyGrant, FetchBusyReplyLimiter,
+    SourceBusyTracker, FETCH_BUSY_REPLY_SEND_TIMEOUT, FETCH_BUSY_WAIT_SPREAD,
+};
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
     FreshReplicationResponse, NeighborSyncResponse, ReplicationMessage, ReplicationMessageBody,
@@ -95,7 +103,12 @@ use crate::replication::protocol::{
 };
 use crate::replication::quorum::KeyVerificationOutcome;
 use crate::replication::recent_provers::RecentProvers;
-use crate::replication::scheduling::{CapacityDisplacement, DeferralOutcome, ReplicationQueues};
+#[cfg(any(test, feature = "test-utils"))]
+pub use crate::replication::scheduling::FetchPipelineSnapshot;
+use crate::replication::scheduling::{
+    fetch_source_limit, CapacityDisplacement, Contact, DeferralOutcome, FetchDispatchStats,
+    FetchRetry, ReplicationQueues,
+};
 use crate::replication::storage_commitment_audit::PointerBindings;
 use crate::replication::types::{
     AuditFailureReason, BootstrapClaimObservation, BootstrapState, FailureEvidence,
@@ -115,6 +128,16 @@ use saorsa_pqc::api::sig::{MlDsaSecretKey, MlDsaVariant};
 /// payment covered) but worth watching. `Closed` (engine shut down) is not
 /// counted: it is not a saturation signal.
 static FIRST_AUDIT_INGRESS_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// One sequence over every fetch request this process sends and every answer
+/// it receives, so the fetch scheduler can order a request against an answer
+/// even when both read the same clock value. See [`Contact`].
+static FETCH_CONTACT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// The next place in [`FETCH_CONTACT_SEQUENCE`].
+fn next_fetch_contact() -> u64 {
+    FETCH_CONTACT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Record one ingress-full drop. Called by the payment verifier's `try_send`
 /// sites; read by the drainer's periodic summary.
@@ -1129,6 +1152,31 @@ const FETCH_RESPONDER_MAX_OUTSTANDING: usize = FETCH_RESPONDER_WORKER_LIMIT * 4;
 /// of the three workers available to other peers under a single-source flood.
 const FETCH_RESPONDER_MAX_OUTSTANDING_PER_PEER: u32 = 2;
 
+/// Maximum busy replies being sent at once.
+///
+/// [`FetchBusyReplyLimiter`] bounds how often busy replies are sent; this
+/// bounds how many sends are open at once, so peers that are slow to take a
+/// reply cannot pile up send tasks. Past it, a refusal falls back to the
+/// silence every refusal got before busy replies existed.
+const FETCH_BUSY_REPLY_MAX_OUTSTANDING: usize = FETCH_RESPONDER_MAX_OUTSTANDING * 4;
+/// Maximum fetches this node keeps in flight to any one source peer that is
+/// answering.
+///
+/// The share every responder grants one requester
+/// ([`FETCH_RESPONDER_MAX_OUTSTANDING_PER_PEER`], unchanged since it was
+/// introduced). A request past that share is dropped without an answer, so
+/// sending it costs the full fetch timeout and a timeout trust event against a
+/// holder that did nothing wrong. Staying within it removes those bursts; it
+/// cannot rule out every refusal, because a request this node has already
+/// timed out on may still be holding its share at the responder until a worker
+/// sheds it.
+///
+/// A source whose request got no answer, and which has not answered since that
+/// request was sent, has no share to stay within. It is fetched from without
+/// this cap, as before the cap existed, until it answers again or two fetch
+/// timeouts pass, so a holder that went silent does not hold its keys back.
+const FETCH_MAX_IN_FLIGHT_PER_SOURCE: usize = FETCH_RESPONDER_MAX_OUTSTANDING_PER_PEER as usize;
+
 /// Maximum verification batches served concurrently.
 ///
 /// Point lookups are fast, but a batch can contain 8,192 of them. Two
@@ -1222,7 +1270,9 @@ fn paid_notify_payment_context() -> VerificationContext {
 }
 
 /// Boxed future type for in-flight fetch tasks.
-type FetchFuture = Pin<Box<dyn Future<Output = (XorName, Option<FetchOutcome>)> + Send>>;
+/// A fetch task's key, its outcome (`None` when the task panicked), and when
+/// the task finished.
+type FetchFuture = Pin<Box<dyn Future<Output = (XorName, Option<FetchOutcome>, Instant)> + Send>>;
 
 /// Fresh-offer keys currently being handled, each with the proofs still to try.
 ///
@@ -1667,6 +1717,8 @@ pub struct ReplicationEngine {
     payment_verifier: Arc<PaymentVerifier>,
     /// Replication pipeline queues.
     queues: Arc<RwLock<ReplicationQueues>>,
+    /// Fetches the worker runs at once: one per hardware thread.
+    fetch_concurrency: usize,
     /// Neighbor sync cycle state.
     sync_state: Arc<RwLock<NeighborSyncState>>,
     /// Per-peer sync history (for `RepairOpportunity`).
@@ -1787,6 +1839,24 @@ pub struct ReplicationEngine {
     fetch_responder_admission_semaphore: Arc<Semaphore>,
     /// Per-source fetch responder counts for flood-fair admission.
     fetch_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    /// Test-only hold on serving admitted fetch requests.
+    #[cfg(any(test, feature = "test-utils"))]
+    fetch_serve_gate: Arc<FetchServeGate>,
+    /// Test-only count of this engine's fetch refusals because its admission
+    /// pool was full.
+    #[cfg(any(test, feature = "test-utils"))]
+    fetch_pool_full_refusals: Arc<AtomicU64>,
+    /// Test-only: refuse every fetch past admission silently, without a busy
+    /// reply, as a holder that has stopped answering would.
+    #[cfg(any(test, feature = "test-utils"))]
+    fetch_busy_replies_off: Arc<AtomicBool>,
+    /// Permits for busy replies being sent to fetch requests refused at
+    /// admission.
+    fetch_busy_reply_semaphore: Arc<Semaphore>,
+    /// Per-peer and global rate bound on those busy replies.
+    fetch_busy_reply_limiter: Arc<FetchBusyReplyLimiter>,
+    /// Sources that recently answered this node's own fetches busy.
+    fetch_busy_sources: Arc<SourceBusyTracker>,
     /// Worker permits for lookup-heavy verification batches.
     verification_responder_worker_semaphore: Arc<Semaphore>,
     /// Admission permits bounding verification workers and queued waiters.
@@ -1872,7 +1942,7 @@ impl ReplicationEngine {
     ///
     /// Returns an error if the `PaidList` LMDB environment cannot be opened
     /// or if the configuration fails validation.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub async fn new(
         config: ReplicationConfig,
         p2p_node: Arc<P2PNode>,
@@ -1902,13 +1972,25 @@ impl ReplicationEngine {
         let (monetized_pin_tx, monetized_pin_rx) =
             mpsc::channel(config::FIRST_AUDIT_INGRESS_CAPACITY);
 
+        let source_limit =
+            fetch_source_limit(config.close_group_size, config.paid_list_close_group_size);
+        // Fetches record busy answers here; the scheduler reads it to put a
+        // holder that just answered busy last.
+        let fetch_busy_sources = Arc::new(SourceBusyTracker::new());
+
         let engine = Self {
             config: Arc::clone(&config),
             p2p_node,
             storage,
             paid_list,
             payment_verifier,
-            queues: Arc::new(RwLock::new(ReplicationQueues::new())),
+            queues: Arc::new(RwLock::new(
+                ReplicationQueues::new()
+                    .with_fetch_source_limit(source_limit)
+                    .with_fetch_request_timeout(config.fetch_request_timeout)
+                    .with_busy_sources(Arc::clone(&fetch_busy_sources)),
+            )),
+            fetch_concurrency: max_parallel_fetch(),
             sync_state: Arc::new(RwLock::new(initial_neighbors)),
             sync_history: Arc::new(RwLock::new(HashMap::new())),
             audit_on_gossip_cooldown: Arc::new(RwLock::new(HashMap::new())),
@@ -1940,6 +2022,15 @@ impl ReplicationEngine {
                 FETCH_RESPONDER_MAX_OUTSTANDING,
             )),
             fetch_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(any(test, feature = "test-utils"))]
+            fetch_serve_gate: Arc::new(FetchServeGate::default()),
+            #[cfg(any(test, feature = "test-utils"))]
+            fetch_pool_full_refusals: Arc::new(AtomicU64::new(0)),
+            #[cfg(any(test, feature = "test-utils"))]
+            fetch_busy_replies_off: Arc::new(AtomicBool::new(false)),
+            fetch_busy_reply_semaphore: Arc::new(Semaphore::new(FETCH_BUSY_REPLY_MAX_OUTSTANDING)),
+            fetch_busy_reply_limiter: Arc::new(FetchBusyReplyLimiter::new()),
+            fetch_busy_sources,
             verification_responder_worker_semaphore: Arc::new(Semaphore::new(
                 VERIFICATION_RESPONDER_WORKER_LIMIT,
             )),
@@ -2172,6 +2263,54 @@ impl ReplicationEngine {
         queues.enqueue_fetch(key, distance, sources)
     }
 
+    /// Test-only: whether this engine puts `source` last when choosing where
+    /// to start or retry a fetch, because it recently answered busy.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn fetch_source_cooling_for_test(&self, source: &PeerId) -> bool {
+        self.fetch_busy_sources.is_cooling(source, Instant::now())
+    }
+
+    /// Test-only: when `source` last answered this engine's fetches busy, if
+    /// it is still remembered.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn fetch_source_last_busy_for_test(&self, source: &PeerId) -> Option<Instant> {
+        self.fetch_busy_sources.last_busy(source)
+    }
+
+    /// Test-only: busy answers `source` has given this engine's fetches since
+    /// it last served one, which spend its neutral allowance.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn fetch_source_unserved_busy_for_test(&self, source: &PeerId) -> u32 {
+        self.fetch_busy_sources.unserved_busy(source)
+    }
+
+    /// Test-only: fetch requests this engine has admitted and not yet finished
+    /// serving.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn fetch_admitted_for_test(&self) -> usize {
+        FETCH_RESPONDER_MAX_OUTSTANDING
+            .saturating_sub(self.fetch_responder_admission_semaphore.available_permits())
+    }
+
+    /// Test-only: fetch requests this engine has refused because its
+    /// admission pool was full.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn fetch_pool_full_refusals_for_test(&self) -> u64 {
+        self.fetch_pool_full_refusals.load(Ordering::Relaxed)
+    }
+
+    /// Test-only: from now on, refuse fetches past admission silently, with no
+    /// busy reply, as a holder that has stopped answering would.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn turn_off_fetch_busy_replies_for_test(&self) {
+        self.fetch_busy_replies_off.store(true, Ordering::Relaxed);
+    }
+
     /// Test-only: whether `key` is still tracked in any fetch-pipeline stage
     /// (pending verification, fetch queue, or in-flight fetch).
     #[cfg(any(test, feature = "test-utils"))]
@@ -2192,6 +2331,35 @@ impl ReplicationEngine {
     #[cfg(any(test, feature = "test-utils"))]
     pub async fn fetch_queued_or_in_flight_for_test(&self, key: &XorName) -> bool {
         self.queues.read().await.fetch_queued_or_in_flight(key)
+    }
+
+    /// Test-only: run `concurrency` fetches at once instead of one per hardware
+    /// thread. Call before [`Self::start`], which reads it. Per engine, so it
+    /// affects no other node or test.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_fetch_concurrency_for_test(&mut self, concurrency: usize) {
+        self.fetch_concurrency = concurrency;
+    }
+
+    /// Test-only: hold this engine's admitted fetch requests before they are
+    /// served, until [`Self::open_fetch_serve_gate_for_test`].
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn close_fetch_serve_gate_for_test(&self) {
+        self.fetch_serve_gate.close();
+    }
+
+    /// Test-only: release this engine's held fetch requests and stop holding
+    /// new ones.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn open_fetch_serve_gate_for_test(&self) {
+        self.fetch_serve_gate.open();
+    }
+
+    /// Test-only: every key queued for fetch and every in-flight fetch with
+    /// the source it was sent to, read under one lock.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn fetch_pipeline_snapshot_for_test(&self) -> FetchPipelineSnapshot {
+        self.queues.read().await.fetch_pipeline_snapshot()
     }
 
     /// Test-only: place `key` into pending verification as though `hinter` had
@@ -2433,6 +2601,12 @@ impl ReplicationEngine {
                 }
             }
         }
+
+        // A test may shut down with the fetch serve gate still closed. The
+        // requests it holds wait on the gate before they reach a worker pool,
+        // so release them, or the drain below never finishes.
+        #[cfg(any(test, feature = "test-utils"))]
+        self.fetch_serve_gate.open();
 
         // Close the responder worker pools. Detached tasks still queued for a
         // worker take the `Err` arm of `acquire_owned()` and exit immediately
@@ -3063,6 +3237,14 @@ impl ReplicationEngine {
         let fetch_responder_admission_semaphore =
             Arc::clone(&self.fetch_responder_admission_semaphore);
         let fetch_responder_inflight = Arc::clone(&self.fetch_responder_inflight);
+        #[cfg(any(test, feature = "test-utils"))]
+        let fetch_serve_gate = Arc::clone(&self.fetch_serve_gate);
+        #[cfg(any(test, feature = "test-utils"))]
+        let fetch_pool_full_refusals = Arc::clone(&self.fetch_pool_full_refusals);
+        #[cfg(any(test, feature = "test-utils"))]
+        let fetch_busy_replies_off = Arc::clone(&self.fetch_busy_replies_off);
+        let fetch_busy_reply_semaphore = Arc::clone(&self.fetch_busy_reply_semaphore);
+        let fetch_busy_reply_limiter = Arc::clone(&self.fetch_busy_reply_limiter);
         let verification_responder_worker_semaphore =
             Arc::clone(&self.verification_responder_worker_semaphore);
         let verification_responder_admission_semaphore =
@@ -3119,6 +3301,14 @@ impl ReplicationEngine {
             fetch_responder_worker_semaphore,
             fetch_responder_admission_semaphore,
             fetch_responder_inflight,
+            #[cfg(any(test, feature = "test-utils"))]
+            fetch_serve_gate,
+            #[cfg(any(test, feature = "test-utils"))]
+            fetch_pool_full_refusals,
+            #[cfg(any(test, feature = "test-utils"))]
+            fetch_busy_replies_off,
+            fetch_busy_reply_semaphore,
+            fetch_busy_reply_limiter,
             verification_responder_worker_semaphore,
             verification_responder_admission_semaphore,
             verification_responder_inflight,
@@ -3881,72 +4071,103 @@ impl ReplicationEngine {
         let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
         let bootstrap_complete_notify = Arc::clone(&self.bootstrap_complete_notify);
         let detached_task_tracker = self.detached_task_tracker.clone();
-        let concurrency = max_parallel_fetch();
+        let busy_sources = Arc::clone(&self.fetch_busy_sources);
+        let concurrency = self.fetch_concurrency;
 
         info!("Fetch worker concurrency set to {concurrency} (hardware threads)");
 
         let handle = tokio::spawn(async move {
-            // Each in-flight future yields (key, Option<FetchOutcome>) so we
-            // always recover the key — even if the inner task panics.
+            // Each in-flight future yields (key, Option<FetchOutcome>, when it
+            // finished), so we always recover the key, even if the inner task
+            // panics.
             let mut in_flight = FuturesUnordered::<FetchFuture>::new();
+            let mut dispatch_window = FetchDispatchWindow::new();
+            // Each answer as it arrives, ahead of its fetch's outcome.
+            let (answers, mut early_answers) = mpsc::unbounded_channel();
 
             loop {
-                // Fill up to `concurrency` slots from the queue.
-                {
-                    let mut q = queues.write().await;
-                    while in_flight.len() < concurrency {
-                        let Some(candidate) = q.dequeue_fetch() else {
-                            break;
-                        };
-                        let fetch_key = candidate.key;
-                        let Some(&source) = candidate.sources.first() else {
-                            warn!(
-                                "Fetch candidate {} has no sources; requeueing for verification",
-                                hex::encode(fetch_key)
-                            );
-                            let _ = q.requeue_candidate_for_verification(
-                                candidate,
-                                config.verification_request_timeout,
-                            );
-                            continue;
-                        };
-                        q.start_dequeued_fetch(candidate, source);
-
-                        let p2p = Arc::clone(&p2p);
-                        let storage = Arc::clone(&storage);
-                        let config = Arc::clone(&config);
-                        let token = shutdown.clone();
-                        let tracker = detached_task_tracker.clone();
-                        in_flight.push(Box::pin(async move {
-                            // Tracked so shutdown() still awaits the task if
-                            // this awaiter is dropped (e.g. the worker is
-                            // aborted): it holds Arc<ChunkStore> and must
-                            // not outlive the engine.
-                            let handle = tracker.spawn(async move {
-                                // Cancel-aware: abort when the engine shuts down.
-                                tokio::select! {
-                                    () = token.cancelled() => FetchOutcome {
-                                        key: fetch_key,
-                                        result: FetchResult::SourceFailed,
-                                    },
-                                    outcome = execute_single_fetch(
-                                        p2p, storage, config, fetch_key, source,
-                                    ) => outcome,
-                                }
-                            });
-                            match handle.await {
-                                Ok(outcome) => (outcome.key, Some(outcome)),
-                                Err(e) => {
-                                    error!(
-                                        "Fetch task for {} panicked: {e}",
-                                        hex::encode(fetch_key)
-                                    );
-                                    (fetch_key, None)
-                                }
+                // Fill free slots from the queue, never sending more than
+                // `FETCH_MAX_IN_FLIGHT_PER_SOURCE` of this node's fetches to any
+                // one answering source at once.
+                let lock_requested = Instant::now();
+                let mut q = queues.write().await;
+                let lock_acquired = Instant::now();
+                record_early_answers(&mut q, &mut early_answers);
+                let free_slots = concurrency.saturating_sub(in_flight.len());
+                let dispatch = q.dispatch_fetches(free_slots, FETCH_MAX_IN_FLIGHT_PER_SOURCE);
+                let parked = dispatch.parked;
+                for candidate in dispatch.sourceless {
+                    warn!(
+                        "Fetch candidate {} has no untried sources; requeueing for verification",
+                        hex::encode(candidate.key)
+                    );
+                    let _ = q.requeue_candidate_for_verification(
+                        candidate,
+                        config.verification_request_timeout,
+                    );
+                }
+                for (fetch_key, source) in dispatch.started {
+                    let p2p = Arc::clone(&p2p);
+                    let storage = Arc::clone(&storage);
+                    let config = Arc::clone(&config);
+                    let busy_sources = Arc::clone(&busy_sources);
+                    let answers = answers.clone();
+                    let token = shutdown.clone();
+                    let tracker = detached_task_tracker.clone();
+                    in_flight.push(Box::pin(async move {
+                        // Tracked so shutdown() still awaits the task if
+                        // this awaiter is dropped (e.g. the worker is
+                        // aborted): it holds Arc<ChunkStore> and must
+                        // not outlive the engine.
+                        let handle = tracker.spawn(async move {
+                            // Cancel-aware: abort when the engine shuts down.
+                            // Shutdown is checked first, so a fetch that is
+                            // ready to charge a busy source at the same
+                            // moment is cancelled uncharged instead.
+                            tokio::select! {
+                                biased;
+                                () = token.cancelled() => FetchOutcome {
+                                    key: fetch_key,
+                                    source,
+                                    result: FetchResult::SourceFailed,
+                                    contact: Contact::Unknown,
+                                },
+                                outcome = execute_single_fetch(
+                                    p2p,
+                                    storage,
+                                    config,
+                                    busy_sources,
+                                    fetch_key,
+                                    source,
+                                    answers,
+                                ) => outcome,
                             }
-                        }));
-                    }
-                } // release queues write lock
+                        });
+                        let joined = handle.await;
+                        let completed_at = Instant::now();
+                        match joined {
+                            Ok(outcome) => (outcome.key, Some(outcome), completed_at),
+                            Err(e) => {
+                                error!("Fetch task for {} panicked: {e}", hex::encode(fetch_key));
+                                (fetch_key, None, completed_at)
+                            }
+                        }
+                    }));
+                }
+                drop(q);
+                dispatch_window.parks += parked;
+                dispatch_window.record_fill(
+                    lock_acquired.duration_since(lock_requested),
+                    lock_acquired.elapsed(),
+                );
+                if dispatch_window.age() >= FETCH_DISPATCH_SUMMARY_INTERVAL {
+                    let stats_requested = Instant::now();
+                    let stats = queues
+                        .write()
+                        .await
+                        .take_fetch_dispatch_stats(FETCH_MAX_IN_FLIGHT_PER_SOURCE);
+                    dispatch_window.log_and_reset(&stats, stats_requested.elapsed());
+                }
 
                 if in_flight.is_empty() {
                     // No work — wait for new items or shutdown.
@@ -3961,22 +4182,33 @@ impl ReplicationEngine {
                 // Wait for the next fetch to complete and process the result.
                 tokio::select! {
                     () = shutdown.cancelled() => break,
-                    Some((key, maybe_outcome)) = in_flight.next() => {
+                    Some((key, maybe_outcome, completed_at)) = in_flight.next() => {
                         let mut q = queues.write().await;
+                        record_early_answers(&mut q, &mut early_answers);
+                        let attempt = attempt_latency(q.in_flight_started_at(&key), completed_at);
+                        dispatch_window.record_outcome(maybe_outcome.as_ref(), attempt);
                         let terminal = if let Some(outcome) = maybe_outcome {
+                            q.record_fetch_contact(outcome.source, outcome.contact);
                             match apply_fetch_result(
                                 &mut q,
                                 &key,
                                 &outcome.result,
                                 config.verification_request_timeout,
+                                xor_distance(&key, p2p.peer_id().as_bytes()),
                             ) {
                                 FetchFollowUp::Terminal => true,
                                 FetchFollowUp::RequeuedForVerification => false,
+                                FetchFollowUp::Parked => {
+                                    dispatch_window.retry_parks += 1;
+                                    false
+                                }
                                 FetchFollowUp::RetryFrom(next_peer) => {
                                     // Spawn a new fetch task for the next source.
                                     let p2p = Arc::clone(&p2p);
                                     let storage = Arc::clone(&storage);
                                     let config = Arc::clone(&config);
+                                    let busy_sources = Arc::clone(&busy_sources);
+                                    let answers = answers.clone();
                                     let token = shutdown.clone();
                                     let tracker = detached_task_tracker.clone();
                                     let fetch_key = key;
@@ -3985,23 +4217,36 @@ impl ReplicationEngine {
                                         // initial fetch spawn above.
                                         let handle = tracker.spawn(async move {
                                             tokio::select! {
+                                                biased;
                                                 () = token.cancelled() => FetchOutcome {
                                                     key: fetch_key,
+                                                    source: next_peer,
                                                     result: FetchResult::SourceFailed,
+                                                    contact: Contact::Unknown,
                                                 },
                                                 outcome = execute_single_fetch(
-                                                    p2p, storage, config, fetch_key, next_peer,
+                                                    p2p,
+                                                    storage,
+                                                    config,
+                                                    busy_sources,
+                                                    fetch_key,
+                                                    next_peer,
+                                                    answers,
                                                 ) => outcome,
                                             }
                                         });
-                                        match handle.await {
-                                            Ok(outcome) => (outcome.key, Some(outcome)),
+                                        let joined = handle.await;
+                                        let completed_at = Instant::now();
+                                        match joined {
+                                            Ok(outcome) => {
+                                                (outcome.key, Some(outcome), completed_at)
+                                            }
                                             Err(e) => {
                                                 error!(
                                                     "Fetch task for {} panicked: {e}",
                                                     hex::encode(fetch_key)
                                                 );
-                                                (fetch_key, None)
+                                                (fetch_key, None, completed_at)
                                             }
                                         }
                                     }));
@@ -4043,7 +4288,22 @@ impl ReplicationEngine {
             // Cancel and drain remaining in-flight fetches on shutdown.
             // The CancellationToken is already cancelled by this point, so
             // spawned tasks will see cancellation via their select! branches.
-            while in_flight.next().await.is_some() {}
+            // Their outcomes are counted but not applied, so the final
+            // summary's in-flight count still includes them.
+            let mut drained = Vec::new();
+            while let Some(resolved) = in_flight.next().await {
+                drained.push(resolved);
+            }
+            let stats_requested = Instant::now();
+            let mut q = queues.write().await;
+            for (key, maybe_outcome, completed_at) in &drained {
+                let attempt = attempt_latency(q.in_flight_started_at(key), *completed_at);
+                dispatch_window.record_outcome(maybe_outcome.as_ref(), attempt);
+            }
+            let stats = q.take_fetch_dispatch_stats(FETCH_MAX_IN_FLIGHT_PER_SOURCE);
+            drop(q);
+            dispatch_window.shutdown = true;
+            dispatch_window.log_and_reset(&stats, stats_requested.elapsed());
             debug!("Fetch worker shut down");
         });
         self.task_handles.push(handle);
@@ -4589,6 +4849,18 @@ struct ReplicationMessageHandlerContext {
     fetch_responder_worker_semaphore: Arc<Semaphore>,
     fetch_responder_admission_semaphore: Arc<Semaphore>,
     fetch_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    /// Test-only hold on serving admitted fetch requests.
+    #[cfg(any(test, feature = "test-utils"))]
+    fetch_serve_gate: Arc<FetchServeGate>,
+    /// Test-only count of this engine's fetch refusals because its admission
+    /// pool was full.
+    #[cfg(any(test, feature = "test-utils"))]
+    fetch_pool_full_refusals: Arc<AtomicU64>,
+    /// Test-only: refuse silently, without busy replies.
+    #[cfg(any(test, feature = "test-utils"))]
+    fetch_busy_replies_off: Arc<AtomicBool>,
+    fetch_busy_reply_semaphore: Arc<Semaphore>,
+    fetch_busy_reply_limiter: Arc<FetchBusyReplyLimiter>,
     verification_responder_worker_semaphore: Arc<Semaphore>,
     verification_responder_admission_semaphore: Arc<Semaphore>,
     verification_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
@@ -7112,6 +7384,45 @@ pub fn verification_requests_for_key_from_for_test(requester: &PeerId, key: &Xor
     })
 }
 
+/// Test-only: holds an engine's admitted fetch requests before they are served.
+///
+/// A held request keeps its admission slot and its requester's per-peer share,
+/// exactly as a request waiting for a worker does, so a test can read what a
+/// requester has outstanding without racing the speed at which the host serves
+/// a chunk. One per engine, so closing it affects no other node or test.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Debug, Default)]
+struct FetchServeGate {
+    closed: AtomicBool,
+    opened: Notify,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl FetchServeGate {
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+
+    fn open(&self) {
+        self.closed.store(false, Ordering::Release);
+        self.opened.notify_waiters();
+    }
+
+    /// Wait while the gate is closed. The wakeup is registered before the flag
+    /// is read, so an open that lands between the two is not missed.
+    async fn wait_open(&self) {
+        loop {
+            let opened = self.opened.notified();
+            tokio::pin!(opened);
+            opened.as_mut().enable();
+            if !self.closed.load(Ordering::Acquire) {
+                return;
+            }
+            opened.await;
+        }
+    }
+}
+
 async fn handle_verification_request(
     source: &PeerId,
     request: &protocol::VerificationRequest,
@@ -7351,11 +7662,42 @@ async fn dispatch_fetch_request(
                 ReplicationResponderClass::Fetch,
                 failure.reason.into(),
             );
+            #[cfg(any(test, feature = "test-utils"))]
+            if failure.reason == ResponderRejectReason::GlobalPoolFull {
+                ctx.fetch_pool_full_refusals.fetch_add(1, Ordering::Relaxed);
+            }
+            let busy_reply = fetch_busy_reply_permit(&source, request.busy_reply, ctx);
+            let capability = if request.busy_reply {
+                "asked"
+            } else {
+                "not_asked"
+            };
+            let reply = if busy_reply.is_some() {
+                "scheduled"
+            } else {
+                "none"
+            };
+            // Same line and counter as before busy replies existed, so the
+            // existing refusal counts carry on. `capability` says whether the
+            // requester asked for a busy reply, and `reply` whether one was
+            // scheduled; whether it was delivered is in the busy-reply counters.
             warn!(
                 responder_class = "fetch",
                 source = %source,
+                capability,
+                reply,
                 "Fetch response dropped at admission: {failure}"
             );
+            if let Some((permit, grant)) = busy_reply {
+                send_fetch_busy_reply(
+                    source,
+                    request.key,
+                    ctx,
+                    request_id,
+                    rr_message_id,
+                    (permit, grant),
+                );
+            }
             return Ok(());
         }
     };
@@ -7365,8 +7707,12 @@ async fn dispatch_fetch_request(
     let p2p_node = Arc::clone(&ctx.p2p_node);
     let request_timeout = ctx.config.fetch_request_timeout;
     let rr_message_id = rr_message_id.map(ToOwned::to_owned);
+    #[cfg(any(test, feature = "test-utils"))]
+    let serve_gate = Arc::clone(&ctx.fetch_serve_gate);
     ctx.detached_task_tracker.spawn(async move {
         let _guard = guard;
+        #[cfg(any(test, feature = "test-utils"))]
+        serve_gate.wait_open().await;
         let Ok(_worker_permit) = worker_semaphore.acquire_owned().await else {
             debug!(
                 responder_class = "fetch",
@@ -7400,6 +7746,95 @@ async fn dispatch_fetch_request(
     });
 
     Ok(())
+}
+
+/// Whether a fetch refused at admission may be answered `Busy`: the send
+/// permit and the limiter's grant to do it with.
+///
+/// Only a requester that asked for busy replies gets one, and only while a
+/// send permit is free, within the limiter's per-peer and global allowances,
+/// and while fewer than the limiter's in-flight limit of busy replies to that
+/// peer (two) are still being sent. Every other
+/// refusal stays silent, exactly as all of them were before busy replies
+/// existed.
+fn fetch_busy_reply_permit(
+    source: &PeerId,
+    busy_reply: bool,
+    ctx: &ReplicationMessageHandlerContext,
+) -> Option<(OwnedSemaphorePermit, BusyReplyGrant)> {
+    if !busy_reply {
+        audit_metrics::record_fetch_busy_reply(FetchBusyReplyOutcome::NotAsked);
+        return None;
+    }
+    #[cfg(any(test, feature = "test-utils"))]
+    if ctx.fetch_busy_replies_off.load(Ordering::Relaxed) {
+        return None;
+    }
+    // The send permit first: if none is free, the reply would not be sent, so
+    // the rate allowance is left unspent.
+    let Ok(permit) = Arc::clone(&ctx.fetch_busy_reply_semaphore).try_acquire_owned() else {
+        audit_metrics::record_fetch_busy_reply(FetchBusyReplyOutcome::SendPoolFull);
+        return None;
+    };
+    match ctx
+        .fetch_busy_reply_limiter
+        .try_acquire(source, Instant::now())
+    {
+        Ok(grant) => Some((permit, grant)),
+        Err(denied) => {
+            audit_metrics::record_fetch_busy_reply(match denied {
+                BusyReplyDenied::RateLimited => FetchBusyReplyOutcome::RateLimited,
+                BusyReplyDenied::PeerInFlight => FetchBusyReplyOutcome::PeerInFlight,
+            });
+            None
+        }
+    }
+}
+
+/// Tell a requester its fetch was refused at admission, off the serial message
+/// loop.
+///
+/// The send runs on the detached task tracker, holding the send permit and
+/// one of the peer's in-flight places until it ends, so a slow or stalled peer
+/// can neither block other replication traffic nor hold more permits than its
+/// in-flight limit (two). It
+/// is abandoned after [`FETCH_BUSY_REPLY_SEND_TIMEOUT`], and it races the
+/// engine's shutdown, so `shutdown()` never waits on a peer that is slow to
+/// take the reply.
+fn send_fetch_busy_reply(
+    source: PeerId,
+    key: XorName,
+    ctx: &ReplicationMessageHandlerContext,
+    request_id: u64,
+    rr_message_id: Option<&str>,
+    held: (OwnedSemaphorePermit, BusyReplyGrant),
+) {
+    let p2p_node = Arc::clone(&ctx.p2p_node);
+    let shutdown = ctx.shutdown.clone();
+    let rr_message_id = rr_message_id.map(ToOwned::to_owned);
+    ctx.detached_task_tracker.spawn(async move {
+        let _held = held;
+        let delivery = tokio::time::timeout(
+            FETCH_BUSY_REPLY_SEND_TIMEOUT,
+            send_replication_response_checked(
+                &source,
+                &p2p_node,
+                request_id,
+                ReplicationMessageBody::FetchResponse(protocol::FetchResponse::Busy { key }),
+                rr_message_id.as_deref(),
+                None,
+            ),
+        );
+        let outcome = tokio::select! {
+            () = shutdown.cancelled() => FetchBusyReplyOutcome::Cancelled,
+            sent = delivery => match sent {
+                Ok(true) => FetchBusyReplyOutcome::Sent,
+                Ok(false) => FetchBusyReplyOutcome::SendFailed,
+                Err(_) => FetchBusyReplyOutcome::TimedOut,
+            },
+        };
+        audit_metrics::record_fetch_busy_reply(outcome);
+    });
 }
 
 fn request_is_stale(received_at: Instant, timeout: Duration) -> bool {
@@ -7666,15 +8101,7 @@ async fn send_replication_response_checked(
             return false;
         }
     };
-    // V2-684: per-peer served-bytes attribution for the heavy serve paths.
-    // `FetchResponse` carries ~99% of served bytes; `NeighborSyncResponse` is
-    // included for completeness. Other response variants (verification/audit/
-    // commitment) are intentionally excluded — the round-2 audit reply is now a
-    // few-KB verified slice (V2-685), not a full-chunk transfer, so it is light.
-    if matches!(
-        msg.body,
-        ReplicationMessageBody::FetchResponse(_) | ReplicationMessageBody::NeighborSyncResponse(_)
-    ) {
+    if counts_as_served(&msg.body) {
         protocol::record_served(peer, encoded.len());
     }
     let protocol = protocol.unwrap_or_else(|| response_protocol_for(&msg.body));
@@ -7690,6 +8117,26 @@ async fn send_replication_response_checked(
         return false;
     }
     true
+}
+
+/// Whether a response's bytes count towards the peer it is sent to in the
+/// per-peer served-bytes attribution (V2-684).
+///
+/// That attribution covers the heavy serve paths. `FetchResponse` carries ~99%
+/// of served bytes; `NeighborSyncResponse` is included for completeness. Other
+/// response variants (verification/audit/commitment) are intentionally
+/// excluded — the round-2 audit reply is now a few-KB verified slice (V2-685),
+/// not a full-chunk transfer, so it is light. A busy reply serves nothing, so
+/// it is left out too.
+const fn counts_as_served(body: &ReplicationMessageBody) -> bool {
+    matches!(
+        body,
+        ReplicationMessageBody::FetchResponse(
+            protocol::FetchResponse::Success { .. }
+                | protocol::FetchResponse::NotFound { .. }
+                | protocol::FetchResponse::Error { .. }
+        ) | ReplicationMessageBody::NeighborSyncResponse(_)
+    )
 }
 
 async fn record_sent_replica_hints(
@@ -8931,7 +9378,10 @@ async fn complete_bootstrap(
 /// Result classification for a single fetch attempt.
 enum FetchResult {
     /// Data fetched, integrity-checked, and stored successfully.
-    Stored,
+    Stored {
+        /// Size of the stored chunk, for the per-source scheduler's summary.
+        bytes: usize,
+    },
     /// Content-address integrity check failed — do not retry.
     IntegrityFailed,
     /// Source failed (network error or non-success response) — retryable.
@@ -8979,7 +9429,159 @@ enum FetchResult {
 /// worker loop to update queue state.
 struct FetchOutcome {
     key: XorName,
+    /// The source this attempt was sent to.
+    source: PeerId,
     result: FetchResult,
+    /// Whether `source` answered, for the per-source cap's exemption of
+    /// sources that stopped answering.
+    contact: Contact,
+}
+
+/// How often the fetch worker reports its dispatching.
+const FETCH_DISPATCH_SUMMARY_INTERVAL: Duration = Duration::from_mins(5);
+
+/// How long an attempt that started at `started` took, up to when its task
+/// finished rather than when the worker got to its outcome.
+fn attempt_latency(started: Option<Instant>, completed_at: Instant) -> Option<Duration> {
+    started.map(|started| completed_at.saturating_duration_since(started))
+}
+
+/// What the fetch worker observed about its own dispatching since the last
+/// summary.
+#[derive(Default)]
+struct FetchDispatchWindow {
+    /// When this window began.
+    started: Option<Instant>,
+    /// Longest wait for the queues write lock before a fill pass.
+    fill_lock_wait_max: Duration,
+    /// Longest hold of the queues write lock by a fill pass, spawning included.
+    fill_lock_hold_max: Duration,
+    /// Fill passes in this window.
+    fills: u64,
+    /// Queued keys parked by fill passes in this window.
+    parks: usize,
+    /// Failed fetches parked because every untried source was full.
+    retry_parks: u64,
+    /// Attempts by outcome.
+    stored: u64,
+    already_held: u64,
+    no_longer_responsible: u64,
+    source_failed: u64,
+    integrity_failed: u64,
+    local_write_failed: u64,
+    panicked: u64,
+    /// Attempts cancelled by shutdown before they resolved.
+    cancelled: u64,
+    /// Bytes of chunks stored by attempts in this window.
+    stored_bytes: u64,
+    /// Attempt latency: longest, and total over `timed_attempts`.
+    attempt_max: Duration,
+    attempt_total: Duration,
+    timed_attempts: u64,
+    /// Set for the summary logged at shutdown, whose in-flight count includes
+    /// attempts drained without being applied.
+    shutdown: bool,
+}
+
+impl FetchDispatchWindow {
+    fn new() -> Self {
+        Self {
+            started: Some(Instant::now()),
+            ..Self::default()
+        }
+    }
+
+    /// Time since this window began.
+    fn age(&self) -> Duration {
+        self.started
+            .map_or(Duration::ZERO, |started| started.elapsed())
+    }
+
+    fn record_fill(&mut self, wait: Duration, hold: Duration) {
+        self.fill_lock_wait_max = self.fill_lock_wait_max.max(wait);
+        self.fill_lock_hold_max = self.fill_lock_hold_max.max(hold);
+        self.fills += 1;
+    }
+
+    /// Count one resolved attempt: `None` when its task panicked. A cancelled
+    /// attempt is counted as cancelled whatever result it carries, and its
+    /// cut-short latency is left out.
+    fn record_outcome(&mut self, outcome: Option<&FetchOutcome>, attempt: Option<Duration>) {
+        if outcome.is_some_and(|outcome| outcome.contact == Contact::Unknown) {
+            self.cancelled += 1;
+            return;
+        }
+        match outcome.map(|outcome| &outcome.result) {
+            Some(FetchResult::Stored { bytes }) => {
+                self.stored += 1;
+                self.stored_bytes = self
+                    .stored_bytes
+                    .saturating_add(u64::try_from(*bytes).unwrap_or(u64::MAX));
+            }
+            Some(FetchResult::AlreadyHeld) => self.already_held += 1,
+            Some(FetchResult::NoLongerResponsible) => self.no_longer_responsible += 1,
+            Some(FetchResult::SourceFailed) => self.source_failed += 1,
+            Some(FetchResult::IntegrityFailed) => self.integrity_failed += 1,
+            Some(FetchResult::LocalWriteFailed) => self.local_write_failed += 1,
+            None => self.panicked += 1,
+        }
+        if let Some(attempt) = attempt {
+            self.attempt_max = self.attempt_max.max(attempt);
+            self.attempt_total = self.attempt_total.saturating_add(attempt);
+            self.timed_attempts += 1;
+        }
+    }
+
+    /// Log this window with the queues' state, then start a new window.
+    /// `stats_lock` is how long reading that state took, lock wait included.
+    fn log_and_reset(&mut self, stats: &FetchDispatchStats, stats_lock: Duration) {
+        let attempt_mean_ms = u32::try_from(self.timed_attempts)
+            .ok()
+            .filter(|count| *count > 0)
+            .map_or(0, |count| (self.attempt_total / count).as_millis());
+        info!(
+            per_source_cap = FETCH_MAX_IN_FLIGHT_PER_SOURCE,
+            window_secs = self.age().as_secs(),
+            parked = stats.parked,
+            parked_associations = stats.parked_associations,
+            oldest_parked_secs = stats.oldest_parked.map_or(0, |age| age.as_secs()),
+            queued = stats.queued,
+            in_flight = stats.in_flight,
+            saturated_sources = stats.saturated_sources,
+            fills = self.fills,
+            parks = self.parks,
+            retry_parks = self.retry_parks,
+            stored = self.stored,
+            stored_bytes = self.stored_bytes,
+            already_held = self.already_held,
+            no_longer_responsible = self.no_longer_responsible,
+            source_failed = self.source_failed,
+            integrity_failed = self.integrity_failed,
+            local_write_failed = self.local_write_failed,
+            panicked = self.panicked,
+            cancelled = self.cancelled,
+            shutdown = self.shutdown,
+            attempt_max_ms = self.attempt_max.as_millis(),
+            attempt_mean_ms,
+            fill_lock_wait_max_ms = self.fill_lock_wait_max.as_millis(),
+            fill_lock_hold_max_ms = self.fill_lock_hold_max.as_millis(),
+            parked_maintenance_max_ms = stats.parked_maintenance_max.as_millis(),
+            tracked_sources = stats.tracked_sources,
+            silent_sources = stats.silent_sources,
+            health_overflow_active = stats.overflow_active,
+            silent_peak = stats.health.silent_peak,
+            silent_starts = stats.health.silent_starts,
+            unreachable = stats.health.unreachable,
+            silent_marks = stats.health.marks,
+            silent_clears = stats.health.clears,
+            silent_expired = stats.health.expired_marks,
+            silent_ignored_stale = stats.health.ignored_stale,
+            health_overflows = stats.health.overflows,
+            stats_lock_ms = stats_lock.as_millis(),
+            "replication fetch dispatch summary"
+        );
+        *self = Self::new();
+    }
 }
 
 /// What the fetch worker must do next for a key whose fetch attempt resolved.
@@ -8993,6 +9595,11 @@ enum FetchFollowUp {
     RequeuedForVerification,
     /// Retry immediately from this next untried verified source.
     RetryFrom(PeerId),
+    /// Every untried source already has this node's per-source share in
+    /// flight, so the key went back to the fetch queue, parked, keeping its
+    /// tried sources and retry reservation. Not terminal: the key is still in
+    /// the pipeline, and the next fill pass starts it once a share frees.
+    Parked,
 }
 
 /// Apply a resolved [`FetchResult`] to the queues and report the follow-up.
@@ -9013,19 +9620,26 @@ fn apply_fetch_result(
     key: &XorName,
     result: &FetchResult,
     verification_retry_after: Duration,
+    distance: XorName,
 ) -> FetchFollowUp {
     match result {
-        FetchResult::Stored | FetchResult::NoLongerResponsible | FetchResult::AlreadyHeld => {
+        FetchResult::Stored { .. }
+        | FetchResult::NoLongerResponsible
+        | FetchResult::AlreadyHeld => {
             q.complete_fetch(key);
             FetchFollowUp::Terminal
         }
         FetchResult::IntegrityFailed | FetchResult::SourceFailed => {
-            if let Some(next_peer) = q.retry_fetch(key) {
-                FetchFollowUp::RetryFrom(next_peer)
-            } else if q.requeue_fetch_for_verification(key, verification_retry_after) {
-                FetchFollowUp::RequeuedForVerification
-            } else {
-                FetchFollowUp::Terminal
+            match q.retry_or_park_fetch(key, distance, FETCH_MAX_IN_FLIGHT_PER_SOURCE) {
+                FetchRetry::Next(next_peer) => FetchFollowUp::RetryFrom(next_peer),
+                FetchRetry::Parked => FetchFollowUp::Parked,
+                FetchRetry::Exhausted => {
+                    if q.requeue_fetch_for_verification(key, verification_retry_after) {
+                        FetchFollowUp::RequeuedForVerification
+                    } else {
+                        FetchFollowUp::Terminal
+                    }
+                }
             }
         }
         // No `retry_fetch`: the local write is what failed, so every other
@@ -9072,7 +9686,6 @@ async fn is_storage_admitted(
     .await
 }
 
-#[allow(clippy::too_many_lines)]
 /// Execute a single fetch request against `source` for `key`.
 ///
 /// Handles encoding, network I/O, integrity checking, storage, and trust
@@ -9090,19 +9703,69 @@ async fn execute_single_fetch(
     p2p_node: Arc<P2PNode>,
     storage: Arc<ChunkStore>,
     config: Arc<ReplicationConfig>,
+    busy_sources: Arc<SourceBusyTracker>,
     key: XorName,
     source: PeerId,
+    answers: mpsc::UnboundedSender<(PeerId, Contact)>,
 ) -> FetchOutcome {
+    let mut contact = Contact::NotAttempted;
+    let result = fetch_attempt(
+        p2p_node,
+        storage,
+        config,
+        &busy_sources,
+        key,
+        source,
+        &mut contact,
+        &answers,
+    )
+    .await;
+    FetchOutcome {
+        key,
+        source,
+        result,
+        contact,
+    }
+}
+
+/// Record every answer a fetch has reported since the last call.
+///
+/// A fetch reports its source's answer as soon as it arrives, before checking
+/// and storing the chunk, so the per-source cap never treats an answering
+/// source as silent while that work is still under way. The same answer comes
+/// again with the fetch's outcome, which records it a second time to no
+/// effect. Each is reported while its fetch is in flight, and the worker calls
+/// this before applying any outcome, so it is recorded before its fetch ends.
+fn record_early_answers(
+    queues: &mut ReplicationQueues,
+    early_answers: &mut mpsc::UnboundedReceiver<(PeerId, Contact)>,
+) {
+    while let Ok((source, contact)) = early_answers.try_recv() {
+        queues.record_fetch_contact(source, contact);
+    }
+}
+
+/// The body of [`execute_single_fetch`]: the attempt's result, with `contact`
+/// set to whether the source answered, stamped when the request returned. An
+/// answer is also sent on `answers` at once.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+async fn fetch_attempt(
+    p2p_node: Arc<P2PNode>,
+    storage: Arc<ChunkStore>,
+    config: Arc<ReplicationConfig>,
+    busy_sources: &SourceBusyTracker,
+    key: XorName,
+    source: PeerId,
+    contact: &mut Contact,
+    answers: &mpsc::UnboundedSender<(PeerId, Contact)>,
+) -> FetchResult {
     let self_id = *p2p_node.peer_id();
     if !is_storage_admitted(&self_id, &key, &p2p_node, &config).await {
         debug!(
             "Skipping fetch for {}: no longer in the storage-admission group",
             hex::encode(key)
         );
-        return FetchOutcome {
-            key,
-            result: FetchResult::NoLongerResponsible,
-        };
+        return FetchResult::NoLongerResponsible;
     }
 
     // Possession, then capacity — both before the dial, and in that order.
@@ -9116,10 +9779,7 @@ async fn execute_single_fetch(
             "Skipping fetch for {}: already held locally",
             hex::encode(key)
         );
-        return FetchOutcome {
-            key,
-            result: FetchResult::AlreadyHeld,
-        };
+        return FetchResult::AlreadyHeld;
     }
 
     // Capacity is checked before the dial rather than after the bytes arrive.
@@ -9141,13 +9801,13 @@ async fn execute_single_fetch(
             "Skipping fetch for {}: local storage cannot accept a write: {e}",
             hex::encode(key)
         );
-        return FetchOutcome {
-            key,
-            result: FetchResult::LocalWriteFailed,
-        };
+        return FetchResult::LocalWriteFailed;
     }
 
-    let request = protocol::FetchRequest { key };
+    let request = protocol::FetchRequest {
+        key,
+        busy_reply: true,
+    };
     let msg = ReplicationMessage {
         request_id: rand::thread_rng().gen::<u64>(),
         body: ReplicationMessageBody::FetchRequest(request),
@@ -9157,13 +9817,12 @@ async fn execute_single_fetch(
         Ok(data) => data,
         Err(e) => {
             warn!("Failed to encode fetch request: {e}");
-            return FetchOutcome {
-                key,
-                result: FetchResult::SourceFailed,
-            };
+            return FetchResult::SourceFailed;
         }
     };
 
+    let sent_at = Instant::now();
+    let sent = next_fetch_contact();
     let result = p2p_node
         .send_request(
             &source,
@@ -9172,6 +9831,18 @@ async fn execute_single_fetch(
             config.fetch_request_timeout,
         )
         .await;
+    *contact = if result.is_ok() {
+        Contact::Answered {
+            order: next_fetch_contact(),
+        }
+    } else {
+        Contact::Unreachable { sent }
+    };
+    if matches!(contact, Contact::Answered { .. }) {
+        // Fails only once the fetch worker has stopped, when no scheduling
+        // decision is left to inform.
+        let _ = answers.send((source, *contact));
+    }
 
     match result {
         Ok(response) => {
@@ -9182,10 +9853,7 @@ async fn execute_single_fetch(
                         TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
                     )
                     .await;
-                return FetchOutcome {
-                    key,
-                    result: FetchResult::SourceFailed,
-                };
+                return FetchResult::SourceFailed;
             };
 
             match resp_msg.body {
@@ -9209,10 +9877,7 @@ async fn execute_single_fetch(
                                 TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
                             )
                             .await;
-                        return FetchOutcome {
-                            key,
-                            result: FetchResult::IntegrityFailed,
-                        };
+                        return FetchResult::IntegrityFailed;
                     }
 
                     // Enforce chunk size invariant on fetched data.
@@ -9231,10 +9896,7 @@ async fn execute_single_fetch(
                                 TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
                             )
                             .await;
-                        return FetchOutcome {
-                            key,
-                            result: FetchResult::IntegrityFailed,
-                        };
+                        return FetchResult::IntegrityFailed;
                     }
 
                     // Content-address integrity check.
@@ -9251,11 +9913,12 @@ async fn execute_single_fetch(
                                 TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
                             )
                             .await;
-                        return FetchOutcome {
-                            key,
-                            result: FetchResult::IntegrityFailed,
-                        };
+                        return FetchResult::IntegrityFailed;
                     }
+
+                    // It served a valid chunk, so any earlier busy answers no
+                    // longer count against it when choosing where to start.
+                    busy_sources.record_served(&source);
 
                     // Responsibility can lapse during the network round-trip.
                     // The bandwidth is already spent; declining the write is
@@ -9268,10 +9931,7 @@ async fn execute_single_fetch(
                             "Fetched {} but responsibility lapsed in transit; not storing",
                             hex::encode(key)
                         );
-                        return FetchOutcome {
-                            key,
-                            result: FetchResult::NoLongerResponsible,
-                        };
+                        return FetchResult::NoLongerResponsible;
                     }
 
                     if let Err(e) = storage.put(&resp_key, &data).await {
@@ -9285,16 +9945,10 @@ async fn execute_single_fetch(
                             "Failed to store fetched record {}: {e}",
                             hex::encode(resp_key)
                         );
-                        return FetchOutcome {
-                            key,
-                            result: FetchResult::LocalWriteFailed,
-                        };
+                        return FetchResult::LocalWriteFailed;
                     }
 
-                    FetchOutcome {
-                        key,
-                        result: FetchResult::Stored,
-                    }
+                    FetchResult::Stored { bytes: data.len() }
                 }
                 ReplicationMessageBody::FetchResponse(
                     ref response @ (protocol::FetchResponse::NotFound { .. }
@@ -9320,23 +9974,70 @@ async fn execute_single_fetch(
                             TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
                         )
                         .await;
-                    FetchOutcome {
-                        key,
-                        result: FetchResult::SourceFailed,
+                    FetchResult::SourceFailed
+                }
+                ReplicationMessageBody::FetchResponse(protocol::FetchResponse::Busy {
+                    key: resp_key,
+                }) if resp_key == key => {
+                    // The source refused at admission and said so, where it
+                    // used to stay silent. A prompt answer to passing overload
+                    // carries no trust event. Waiting here, still holding this
+                    // fetch slot, before the key moves on is what keeps a busy
+                    // answer from becoming a fast retry loop: this slot asks at
+                    // most once per wait, where silence made it once per fetch
+                    // timeout. The attempt then ends exactly as that timeout
+                    // did, so nothing downstream changes. The worker races this
+                    // whole task against shutdown, so the wait does not delay it.
+                    audit_metrics::record_fetch_busy_received();
+                    let jitter =
+                        rand::thread_rng().gen_range(Duration::ZERO..=FETCH_BUSY_WAIT_SPREAD);
+                    // The holder is put last for at least the full jittered
+                    // wait, even when this attempt's own deadline cuts the
+                    // sleep short.
+                    let full_wait = busy_wait(Duration::MAX, jitter);
+                    let answer = busy_sources.record_busy(&source, Instant::now(), full_wait);
+                    // Past its neutral allowance, a source that keeps saying
+                    // busy without serving is handled as the silence it
+                    // replaces: the attempt holds its slot until its fetch
+                    // timeout runs out, never longer, however late the answer
+                    // came, and only then is the source charged the unit-weight
+                    // failure saorsa-core records for a timeout. A fetch
+                    // cancelled by shutdown before then is not charged.
+                    let deadline = sent_at
+                        .checked_add(config.fetch_request_timeout)
+                        .unwrap_or(sent_at);
+                    let now = Instant::now();
+                    let wake = busy_wake(answer, full_wait, now, deadline);
+                    let charged = answer.charged;
+                    debug!(
+                        "Fetch: source {source} busy for {}; moving on in {} ms, \
+                         putting it last for {} ms, charged: {charged}",
+                        hex::encode(key),
+                        wake.saturating_duration_since(now).as_millis(),
+                        answer.cooling_for.as_millis()
+                    );
+                    tokio::time::sleep_until(wake.into()).await;
+                    if charged {
+                        audit_metrics::record_fetch_busy_charged();
+                        p2p_node
+                            .report_trust_event(
+                                &source,
+                                TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
+                            )
+                            .await;
                     }
+                    FetchResult::SourceFailed
                 }
                 _ => {
-                    // Unexpected message type — treat as malformed.
+                    // Unexpected message type, or a busy answer for another
+                    // key — treat as malformed.
                     p2p_node
                         .report_trust_event(
                             &source,
                             TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
                         )
                         .await;
-                    FetchOutcome {
-                        key,
-                        result: FetchResult::SourceFailed,
-                    }
+                    FetchResult::SourceFailed
                 }
             }
         }
@@ -9344,10 +10045,7 @@ async fn execute_single_fetch(
             debug!("Fetch request to {source} failed: {e}");
             // No ApplicationFailure here — P2PNode::send_request() already
             // reports ConnectionTimeout / ConnectionFailed to the TrustEngine.
-            FetchOutcome {
-                key,
-                result: FetchResult::SourceFailed,
-            }
+            FetchResult::SourceFailed
         }
     }
 }
@@ -10537,6 +11235,7 @@ mod tests {
     use crate::replication::audit::AuditTickResult;
     use crate::replication::commitment_state::GOSSIP_ANSWERABILITY_TTL;
     use crate::replication::recent_provers::RecentProvers;
+    use crate::replication::scheduling::MAX_FETCH_QUEUE;
     use crate::replication::types::{AuditFailureReason, FailureEvidence};
     use lru::LruCache;
     use saorsa_core::identity::PeerId;
@@ -13287,6 +13986,7 @@ mod tests {
                 request_id: 1,
                 body: ReplicationMessageBody::FetchRequest(protocol::FetchRequest {
                     key: test_key(1),
+                    busy_reply: true,
                 }),
             },
             rr_message_id: None,
@@ -13779,8 +14479,13 @@ mod tests {
         drive_key_in_flight(&mut q, key, vec![test_peer(0x01), test_peer(0x02)]);
         assert_eq!(q.retry_reserved_slot_count(), 1);
 
-        let follow_up =
-            apply_fetch_result(&mut q, &key, &FetchResult::NoLongerResponsible, RETRY_AFTER);
+        let follow_up = apply_fetch_result(
+            &mut q,
+            &key,
+            &FetchResult::NoLongerResponsible,
+            RETRY_AFTER,
+            key,
+        );
 
         assert_eq!(
             follow_up,
@@ -13810,12 +14515,15 @@ mod tests {
         // Both variants must walk the identical terminal gate so the
         // battle-tested Stored accounting (retry-slot release + bootstrap
         // pending-set shrink in the caller) covers lapsed responsibility too.
-        for result in [FetchResult::Stored, FetchResult::NoLongerResponsible] {
+        for result in [
+            FetchResult::Stored { bytes: 0 },
+            FetchResult::NoLongerResponsible,
+        ] {
             let mut q = ReplicationQueues::new();
             let key = test_key(0xCD);
             drive_key_in_flight(&mut q, key, vec![test_peer(0x03)]);
 
-            let follow_up = apply_fetch_result(&mut q, &key, &result, RETRY_AFTER);
+            let follow_up = apply_fetch_result(&mut q, &key, &result, RETRY_AFTER, key);
 
             assert_eq!(follow_up, FetchFollowUp::Terminal);
             assert!(!q.contains_key(&key));
@@ -13833,7 +14541,8 @@ mod tests {
         let second = test_peer(0x05);
         drive_key_in_flight(&mut q, key, vec![first, second]);
 
-        let follow_up = apply_fetch_result(&mut q, &key, &FetchResult::SourceFailed, RETRY_AFTER);
+        let follow_up =
+            apply_fetch_result(&mut q, &key, &FetchResult::SourceFailed, RETRY_AFTER, key);
         assert_eq!(
             follow_up,
             FetchFollowUp::RetryFrom(second),
@@ -13841,7 +14550,8 @@ mod tests {
         );
         assert_eq!(q.in_flight_count(), 1, "retry keeps the key in flight");
 
-        let follow_up = apply_fetch_result(&mut q, &key, &FetchResult::SourceFailed, RETRY_AFTER);
+        let follow_up =
+            apply_fetch_result(&mut q, &key, &FetchResult::SourceFailed, RETRY_AFTER, key);
         assert_eq!(
             follow_up,
             FetchFollowUp::RequeuedForVerification,
@@ -13853,6 +14563,269 @@ mod tests {
             0,
             "the reservation converts back into the pending entry itself"
         );
+    }
+
+    /// A retry passes over an untried source that recently answered busy when
+    /// another untried source is free, and still takes it when it is the only
+    /// one left: busy holders go last, never out.
+    #[test]
+    fn source_failure_retries_on_a_holder_that_is_not_cooling_first() {
+        const RETRY_AFTER: Duration = Duration::from_mins(1);
+
+        let mut q = ReplicationQueues::new();
+        let key = test_key(0xE1);
+        let (first, cooling, free) = (test_peer(0x11), test_peer(0x12), test_peer(0x13));
+        drive_key_in_flight(&mut q, key, vec![first, cooling, free]);
+        q.busy_sources()
+            .record_busy(&cooling, Instant::now(), Duration::from_mins(1));
+
+        let follow_up =
+            apply_fetch_result(&mut q, &key, &FetchResult::SourceFailed, RETRY_AFTER, key);
+        assert_eq!(follow_up, FetchFollowUp::RetryFrom(free));
+
+        let follow_up =
+            apply_fetch_result(&mut q, &key, &FetchResult::SourceFailed, RETRY_AFTER, key);
+        assert_eq!(
+            follow_up,
+            FetchFollowUp::RetryFrom(cooling),
+            "a cooling holder is still tried once it is the last untried one"
+        );
+
+        let follow_up =
+            apply_fetch_result(&mut q, &key, &FetchResult::SourceFailed, RETRY_AFTER, key);
+        assert_eq!(follow_up, FetchFollowUp::RequeuedForVerification);
+    }
+
+    /// A busy reply serves nothing, so it never counts as served bytes; the
+    /// answers that did before still do.
+    #[test]
+    fn a_busy_reply_is_not_counted_as_served() {
+        let key = test_key(0x77);
+        assert!(!counts_as_served(&ReplicationMessageBody::FetchResponse(
+            protocol::FetchResponse::Busy { key }
+        )));
+        for response in [
+            protocol::FetchResponse::Success {
+                key,
+                data: vec![1, 2, 3],
+            },
+            protocol::FetchResponse::NotFound { key },
+            protocol::FetchResponse::Error {
+                key,
+                reason: "io".to_string(),
+            },
+        ] {
+            assert!(counts_as_served(&ReplicationMessageBody::FetchResponse(
+                response
+            )));
+        }
+        assert!(counts_as_served(
+            &ReplicationMessageBody::NeighborSyncResponse(protocol::NeighborSyncResponse {
+                replica_hints: vec![],
+                paid_hints: vec![],
+                bootstrapping: false,
+                rejected_keys: vec![],
+                commitment: None,
+            })
+        ));
+        assert!(!counts_as_served(
+            &ReplicationMessageBody::VerificationResponse(protocol::VerificationResponse {
+                results: vec![],
+            })
+        ));
+    }
+
+    /// Put two unrelated fetches in flight to `source`, filling its share.
+    fn saturate_source(q: &mut ReplicationQueues, source: PeerId, first_key_byte: u8) {
+        for offset in 0..2u8 {
+            let key = test_key(first_key_byte + offset);
+            q.start_fetch(key, source, vec![source]);
+        }
+    }
+
+    #[test]
+    fn source_failure_with_every_untried_source_full_parks_the_key() {
+        const RETRY_AFTER: Duration = Duration::from_mins(1);
+
+        let mut q = ReplicationQueues::new();
+        let key = test_key(0x2A);
+        let (first, second) = (test_peer(0x01), test_peer(0x02));
+        assert_eq!(drive_key_in_flight(&mut q, key, vec![first, second]), first);
+        saturate_source(&mut q, second, 0xE0);
+        let reserved = q.retry_reserved_slot_count();
+
+        let follow_up =
+            apply_fetch_result(&mut q, &key, &FetchResult::SourceFailed, RETRY_AFTER, key);
+
+        assert_eq!(
+            follow_up,
+            FetchFollowUp::Parked,
+            "the only untried source is at its share, so the key must wait rather \
+             than be sent a request it will drop"
+        );
+        assert!(
+            q.contains_key(&key),
+            "a parked key is still in the pipeline"
+        );
+        assert!(q.fetch_queued_or_in_flight(&key));
+        assert_eq!(
+            q.in_flight_count(),
+            2,
+            "only the two saturating fetches remain"
+        );
+        assert_eq!(
+            q.pending_count(),
+            0,
+            "parking is not a verification requeue"
+        );
+        assert_eq!(q.retry_reserved_slot_count(), reserved);
+    }
+
+    #[test]
+    fn an_answer_reported_before_its_fetch_ends_keeps_a_timed_out_source_capped() {
+        const RETRY_AFTER: Duration = Duration::from_mins(1);
+        const SLOTS: usize = 8;
+
+        let source = test_peer(0x0A);
+        let (dropped, answered) = (test_key(0x50), test_key(0x51));
+        let waiting: Vec<XorName> = (0x60..0x64).map(test_key).collect();
+        // Both of `source`'s shares are in flight and four keys only it holds
+        // wait behind them.
+        let setup = || {
+            let mut q = ReplicationQueues::new();
+            q.start_fetch(dropped, source, vec![source]);
+            q.start_fetch(answered, source, vec![source]);
+            for key in &waiting {
+                assert!(q.enqueue_fetch(*key, *key, vec![source]));
+            }
+            q
+        };
+        let in_flight_to_source = |q: &ReplicationQueues| {
+            q.fetch_pipeline_snapshot()
+                .in_flight
+                .iter()
+                .filter(|(_, peer)| *peer == source)
+                .count()
+        };
+        // The first request is dropped and times out. The second, sent after
+        // it, has been answered and is still checking and storing its chunk.
+        let dropped_sent = next_fetch_contact();
+        let _answered_sent = next_fetch_contact();
+        let answer = Contact::Answered {
+            order: next_fetch_contact(),
+        };
+        let timeout = Contact::Unreachable { sent: dropped_sent };
+
+        // Known only from the second fetch's outcome, the answer comes too
+        // late: the timeout marks `source` silent and the next pass sends it
+        // every waiting key, past its share.
+        let mut late = setup();
+        late.record_fetch_contact(source, timeout);
+        apply_fetch_result(
+            &mut late,
+            &dropped,
+            &FetchResult::SourceFailed,
+            RETRY_AFTER,
+            dropped,
+        );
+        late.dispatch_fetches(SLOTS, FETCH_MAX_IN_FLIGHT_PER_SOURCE);
+        assert_eq!(in_flight_to_source(&late), 1 + waiting.len());
+
+        // Reported when it arrives, the answer is recorded before the timeout,
+        // which it outdates, so `source` stays within its share.
+        let (answers, mut early_answers) = mpsc::unbounded_channel();
+        let mut q = setup();
+        assert!(answers.send((source, answer)).is_ok());
+        record_early_answers(&mut q, &mut early_answers);
+        q.record_fetch_contact(source, timeout);
+        apply_fetch_result(
+            &mut q,
+            &dropped,
+            &FetchResult::SourceFailed,
+            RETRY_AFTER,
+            dropped,
+        );
+        record_early_answers(&mut q, &mut early_answers);
+        let dispatch = q.dispatch_fetches(SLOTS, FETCH_MAX_IN_FLIGHT_PER_SOURCE);
+        assert_eq!(dispatch.started.len(), 1, "one share is free");
+        assert_eq!(in_flight_to_source(&q), FETCH_MAX_IN_FLIGHT_PER_SOURCE);
+
+        // The same answer again, with the second fetch's outcome, changes
+        // nothing.
+        q.record_fetch_contact(source, answer);
+        assert_eq!(
+            q.dispatch_fetches(SLOTS, FETCH_MAX_IN_FLIGHT_PER_SOURCE)
+                .started
+                .len(),
+            0
+        );
+        assert_eq!(in_flight_to_source(&q), FETCH_MAX_IN_FLIGHT_PER_SOURCE);
+    }
+
+    #[test]
+    fn the_dispatch_window_times_resolved_attempts_and_counts_cancelled_ones() {
+        let (key, source) = (test_key(0x31), test_peer(0x01));
+        let outcome = |result: FetchResult, contact: Contact| FetchOutcome {
+            key,
+            source,
+            result,
+            contact,
+        };
+        let started = Instant::now();
+        let at = |millis: u64| started + Duration::from_millis(millis);
+        let mut window = FetchDispatchWindow::new();
+
+        // Two attempts resolve at different times; the worker reaches both
+        // later, which must not count.
+        let stored = outcome(
+            FetchResult::Stored { bytes: 10 },
+            Contact::Answered { order: 2 },
+        );
+        window.record_outcome(Some(&stored), attempt_latency(Some(started), at(100)));
+        let failed = outcome(FetchResult::SourceFailed, Contact::Unreachable { sent: 1 });
+        window.record_outcome(Some(&failed), attempt_latency(Some(started), at(300)));
+        // A cancelled attempt is counted as cancelled, not by its placeholder
+        // result, and its cut-short time is left out.
+        let cancelled = outcome(FetchResult::SourceFailed, Contact::Unknown);
+        window.record_outcome(Some(&cancelled), attempt_latency(Some(started), at(5_000)));
+
+        assert_eq!((window.stored, window.source_failed), (1, 1));
+        assert_eq!((window.cancelled, window.timed_attempts), (1, 2));
+        assert_eq!(window.attempt_max, Duration::from_millis(300));
+        assert_eq!(window.attempt_total, Duration::from_millis(400));
+        assert_eq!(window.stored_bytes, 10);
+        assert_eq!(attempt_latency(None, at(100)), None);
+    }
+
+    #[test]
+    fn source_failure_with_a_full_fetch_queue_requeues_for_verification() {
+        const RETRY_AFTER: Duration = Duration::from_mins(1);
+
+        let mut q = ReplicationQueues::new();
+        let key = test_key(0x2B);
+        let (first, second) = (test_peer(0x01), test_peer(0x02));
+        drive_key_in_flight(&mut q, key, vec![first, second]);
+        saturate_source(&mut q, second, 0xE0);
+        let filler_source = test_peer(0x09);
+        let mut filler = 0u32;
+        while q.fetch_queue_count() < MAX_FETCH_QUEUE {
+            let mut filler_key = [0xC0u8; 32];
+            filler_key[..4].copy_from_slice(&filler.to_be_bytes());
+            assert!(q.enqueue_fetch(filler_key, filler_key, vec![filler_source]));
+            filler += 1;
+        }
+
+        let follow_up =
+            apply_fetch_result(&mut q, &key, &FetchResult::SourceFailed, RETRY_AFTER, key);
+
+        assert_eq!(
+            follow_up,
+            FetchFollowUp::RequeuedForVerification,
+            "with no room to park, the key returns to verification on its own \
+             reserved slot instead of overfilling the fetch queue"
+        );
+        assert_eq!(q.fetch_queue_count(), MAX_FETCH_QUEUE);
+        assert_eq!(q.pending_count(), 1);
     }
 
     #[test]
@@ -13868,7 +14841,8 @@ mod tests {
         let candidate = q.dequeue_fetch().expect("enqueued key must dequeue");
         q.start_dequeued_fetch(candidate, source);
 
-        let follow_up = apply_fetch_result(&mut q, &key, &FetchResult::SourceFailed, RETRY_AFTER);
+        let follow_up =
+            apply_fetch_result(&mut q, &key, &FetchResult::SourceFailed, RETRY_AFTER, key);
 
         assert_eq!(follow_up, FetchFollowUp::Terminal);
         assert!(!q.contains_key(&key));
@@ -13883,7 +14857,8 @@ mod tests {
         let source = test_peer(0x0B);
         drive_key_in_flight(&mut q, key, vec![source, test_peer(0x0C)]);
 
-        let follow_up = apply_fetch_result(&mut q, &key, &FetchResult::AlreadyHeld, RETRY_AFTER);
+        let follow_up =
+            apply_fetch_result(&mut q, &key, &FetchResult::AlreadyHeld, RETRY_AFTER, key);
 
         assert_eq!(
             follow_up,
@@ -13912,8 +14887,13 @@ mod tests {
         let third = test_peer(0x09);
         drive_key_in_flight(&mut q, key, vec![first, second, third]);
 
-        let follow_up =
-            apply_fetch_result(&mut q, &key, &FetchResult::LocalWriteFailed, RETRY_AFTER);
+        let follow_up = apply_fetch_result(
+            &mut q,
+            &key,
+            &FetchResult::LocalWriteFailed,
+            RETRY_AFTER,
+            key,
+        );
 
         assert_eq!(
             follow_up,
@@ -13946,8 +14926,13 @@ mod tests {
         let candidate = q.dequeue_fetch().expect("enqueued key must dequeue");
         q.start_dequeued_fetch(candidate, source);
 
-        let follow_up =
-            apply_fetch_result(&mut q, &key, &FetchResult::LocalWriteFailed, RETRY_AFTER);
+        let follow_up = apply_fetch_result(
+            &mut q,
+            &key,
+            &FetchResult::LocalWriteFailed,
+            RETRY_AFTER,
+            key,
+        );
 
         assert_eq!(follow_up, FetchFollowUp::Terminal);
         assert!(!q.contains_key(&key));
