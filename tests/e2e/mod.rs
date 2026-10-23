@@ -79,6 +79,9 @@ mod fetch_responsibility_recheck;
 mod first_audit_ab;
 
 #[cfg(test)]
+mod price_floor_ab;
+
+#[cfg(test)]
 mod fresh_offer_capacity;
 
 #[cfg(test)]

@@ -9,9 +9,7 @@ use crate::event::{create_event_channel, NodeEvent, NodeEventsChannel, NodeEvent
 use crate::logging::{debug, error, info, warn};
 use crate::payment::metrics::QuotingMetricsTracker;
 use crate::payment::wallet::parse_rewards_address;
-use crate::payment::{
-    EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, PriceFloorConfig, QuoteGenerator,
-};
+use crate::payment::{EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator};
 use crate::replication::config::ReplicationConfig;
 use crate::replication::fresh::FreshWriteEvent;
 use crate::replication::ReplicationEngine;
@@ -504,16 +502,7 @@ impl NodeBuilder {
             cache_capacity: config.payment.cache_capacity,
             close_group_size,
             local_rewards_address: rewards_address,
-            // Shadow mode by default; enforcement is a per-node canary opt-in
-            // via ANT_PRICE_FLOOR_ENFORCE (see PriceFloorConfig).
-            price_floor: PriceFloorConfig::from_env(),
         };
-        if payment_config.price_floor.enforce {
-            info!(
-                "Price floor ENFORCEMENT enabled (tolerance {}%)",
-                payment_config.price_floor.tolerance_percent
-            );
-        }
         let payment_verifier = PaymentVerifier::new(payment_config);
         let metrics_tracker = QuotingMetricsTracker::new(0);
         let mut quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);

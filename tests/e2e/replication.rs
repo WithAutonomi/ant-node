@@ -5,6 +5,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use super::harness::{parseable_single_node_proof, POSSESSION_PENALTY_TRUST_RATIO};
 use super::testnet::{TestNetworkConfig, DEFAULT_CHUNK_OPERATION_TIMEOUT_SECS};
 use super::TestHarness;
 use ant_node::ant_protocol::{ChunkMessage, ChunkMessageBody, ChunkPutRequest, ChunkPutResponse};
@@ -16,10 +17,11 @@ use ant_node::replication::config::{
     REPLICATION_PROTOCOL_ID,
 };
 use ant_node::replication::fresh::FreshWriteEvent;
+use ant_node::replication::neighbor_sync;
 use ant_node::replication::protocol::{
     compute_audit_digest, AuditChallenge, AuditResponse, FetchRequest, FetchResponse,
-    FreshReplicationOffer, FreshReplicationResponse, NeighborSyncRequest, ReplicationMessage,
-    ReplicationMessageBody, VerificationRequest, ABSENT_KEY_DIGEST,
+    FreshReplicationOffer, FreshReplicationResponse, NeighborSyncRequest, PaidNotify,
+    ReplicationMessage, ReplicationMessageBody, VerificationRequest, ABSENT_KEY_DIGEST,
 };
 use ant_node::replication::pruning;
 use ant_node::replication::scheduling::ReplicationQueues;
@@ -30,7 +32,7 @@ use bytes::Bytes;
 use saorsa_core::identity::PeerId;
 use saorsa_core::{P2PNode, TrustEvent};
 use serial_test::serial;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
@@ -551,6 +553,330 @@ async fn fresh_write_pipeline_never_offers_a_corrupt_chunk() {
     harness.teardown().await.expect("teardown");
 }
 
+/// ADR-0006: a fresh write this node cannot price is not used to judge its
+/// peers. Node A's price floor is wired (a gossip cache is attached) but A has
+/// no commitment of its own, so it cannot price the single-node proof it
+/// forwards.
+///
+/// - When A's verification of the payment skipped the floor too (stood in for
+///   here, as these tests settle nothing on chain), the scheduled possession
+///   check must not run, and the key is marked in A's paid list, so A hints it
+///   to its peers as paid only, never as a replica they could later be
+///   audited on.
+/// - When A's verification was not contested but the proof A forwards is, the
+///   check must not run either, and the key is recorded plainly.
+/// - When a marked record of the key won before the write recorded its own
+///   plain decision, as a concurrent `PaidNotify` or fresh offer can, the
+///   winning mark keeps the check from running even with a proof the floor
+///   never prices.
+/// - The control write that follows forwards a proof the floor never prices,
+///   on a key with no mark: its check does penalise the same kind of absent
+///   peer and its key is hinted as a replica, so the other results are not
+///   vacuous.
+#[tokio::test]
+#[serial]
+async fn possession_check_skips_a_write_the_floor_cannot_price() {
+    let mut net_config = TestNetworkConfig::small();
+    net_config.replication_config = Some(ReplicationConfig {
+        possession_check_delay_min: Duration::from_millis(200),
+        possession_check_delay_max: Duration::from_millis(500),
+        ..ReplicationConfig::default()
+    });
+    let harness = TestHarness::setup_with_config(net_config)
+        .await
+        .expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let a_idx = 3;
+    let a = harness.test_node(a_idx).expect("node a");
+    let p2p_a = a.p2p_node.as_ref().expect("p2p a");
+    let engine_a = a.replication_engine.as_ref().expect("engine a");
+    let protocol_a = a.ant_protocol.as_ref().expect("proto a");
+    protocol_a
+        .payment_verifier_arc()
+        .attach_commitment_cache(Arc::new(RwLock::new(HashMap::new())));
+    let self_a = *p2p_a.peer_id();
+    let close_group_size = ReplicationConfig::default().close_group_size;
+
+    let paid_list_a = engine_a.paid_list();
+    let mut outcomes = Vec::new();
+    for (content, parseable, admitted_contested, recorded_contested) in [
+        (
+            &b"adr-0006 contested fan-out payload"[..],
+            true,
+            true,
+            false,
+        ),
+        (
+            &b"adr-0006 contested proof fan-out payload"[..],
+            true,
+            false,
+            false,
+        ),
+        (
+            &b"adr-0006 marked record fan-out payload"[..],
+            false,
+            false,
+            true,
+        ),
+        (
+            &b"adr-0006 control fan-out payload"[..],
+            false,
+            false,
+            false,
+        ),
+    ] {
+        let address = compute_address(content);
+        let proof = if parseable {
+            parseable_single_node_proof(address)
+        } else {
+            dummy_payment_proof()
+        };
+        if admitted_contested {
+            protocol_a
+                .payment_verifier_arc()
+                .note_contested_admission_for_tests(&address);
+        }
+        if recorded_contested {
+            paid_list_a
+                .insert_price_contested(&address)
+                .await
+                .expect("record the winning mark");
+        }
+        let close_group: Vec<PeerId> = p2p_a
+            .dht_manager()
+            .find_closest_nodes_local_with_self(&address, close_group_size)
+            .await
+            .iter()
+            .filter(|n| n.peer_id != self_a)
+            .map(|n| n.peer_id)
+            .collect();
+        let close_peer = *close_group
+            .first()
+            .expect("expected a non-empty close group");
+        let trust_before: Vec<f64> = close_group.iter().map(|p| p2p_a.peer_trust(p)).collect();
+
+        // A client PUTs the chunk to A, through A's handler and fresh-write
+        // pipeline. Only A holds the payment in its cache, so the close group
+        // refuses A's offers and is absent when, and only if, A probes it.
+        harness.prepopulate_payment_cache_for_peer(&self_a, &address);
+        put_cached_chunk(&harness, a_idx, content, proof).await;
+
+        let recorded_by = tokio::time::Instant::now() + PROPAGATION_TIMEOUT;
+        while !paid_list_a.contains(&address).unwrap_or(false)
+            && tokio::time::Instant::now() < recorded_by
+        {
+            tokio::time::sleep(PROPAGATION_POLL_INTERVAL).await;
+        }
+        let marked = paid_list_a
+            .is_price_contested(&address)
+            .expect("read the mark");
+        let replica_hinted = neighbor_sync::build_replica_hints_for_peer(
+            &close_peer,
+            &protocol_a.storage(),
+            paid_list_a,
+            p2p_a,
+            close_group_size,
+        )
+        .await
+        .contains(&address);
+        let paid_hinted = neighbor_sync::build_paid_hints_for_peer(
+            &close_peer,
+            paid_list_a,
+            p2p_a,
+            ReplicationConfig::default().paid_list_close_group_size,
+        )
+        .await
+        .contains(&address);
+
+        let deadline = tokio::time::Instant::now() + PROPAGATION_TIMEOUT;
+        let mut penalised = false;
+        while tokio::time::Instant::now() < deadline {
+            penalised = close_group
+                .iter()
+                .zip(trust_before.iter())
+                .any(|(peer, &before)| {
+                    p2p_a.peer_trust(peer) <= before * POSSESSION_PENALTY_TRUST_RATIO
+                });
+            if penalised {
+                break;
+            }
+            tokio::time::sleep(PROPAGATION_POLL_INTERVAL).await;
+        }
+        outcomes.push((penalised, marked, replica_hinted, paid_hinted));
+    }
+
+    assert_eq!(
+        outcomes,
+        vec![
+            (false, true, false, true),
+            (false, false, true, true),
+            (false, true, false, true),
+            (true, false, true, true),
+        ],
+        "a write the floor cannot price, or whose record is marked, must not be used \
+         to judge peers (no penalty; a marked key is hinted as paid only), while the \
+         control write must"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// How a write reaches the node that records its paid key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecordPath {
+    /// A client PUT, recorded by the storer's fresh-write pipeline.
+    Put,
+    /// A fresh offer on its own, with no `PaidNotify` before it.
+    FreshOffer,
+    /// A `PaidNotify` on its own.
+    PaidNotify,
+}
+
+/// ADR-0006: every path that records a paid key marks it exactly when this
+/// node's own verification of the payment was contested, and never from the
+/// proof that came with the message, which a cache hit leaves unchecked.
+///
+/// Each node's floor is wired but cannot price (it has no commitment of its
+/// own), so every proof below would be contested if it were priced. Payments
+/// are admitted from the payment cache, and the verified contested admission
+/// is stood in for on the keys that have one. Each path records one key with
+/// that admission, which must be marked, and one without, which must not be.
+#[tokio::test]
+#[serial]
+async fn every_record_path_marks_a_key_from_its_own_verified_decision() {
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+    for i in 0..harness.node_count() {
+        if let Some(protocol) = harness.test_node(i).and_then(|n| n.ant_protocol.as_ref()) {
+            protocol
+                .payment_verifier_arc()
+                .attach_commitment_cache(Arc::new(RwLock::new(HashMap::new())));
+        }
+    }
+
+    let (source_idx, receiver_idx) = (3, 1);
+    let source_p2p = harness
+        .test_node(source_idx)
+        .and_then(|n| n.p2p_node.as_ref())
+        .expect("source p2p");
+    let receiver_peer = *harness
+        .test_node(receiver_idx)
+        .and_then(|n| n.p2p_node.as_ref())
+        .expect("receiver p2p")
+        .peer_id();
+
+    let mut outcomes = Vec::new();
+    for (path, admitted_contested) in [
+        (RecordPath::Put, true),
+        (RecordPath::Put, false),
+        (RecordPath::FreshOffer, true),
+        (RecordPath::FreshOffer, false),
+        (RecordPath::PaidNotify, true),
+        (RecordPath::PaidNotify, false),
+    ] {
+        let content = format!("adr-0006 record path {path:?} {admitted_contested}").into_bytes();
+        let address = compute_address(&content);
+        let forged_proof = parseable_single_node_proof(address);
+        harness.prepopulate_payment_cache_everywhere(&address);
+        let recorder_idx = if path == RecordPath::Put {
+            source_idx
+        } else {
+            receiver_idx
+        };
+        let recorder = harness.test_node(recorder_idx).expect("recorder");
+        if admitted_contested {
+            recorder
+                .ant_protocol
+                .as_ref()
+                .expect("recorder protocol")
+                .payment_verifier_arc()
+                .note_contested_admission_for_tests(&address);
+        }
+
+        match path {
+            RecordPath::Put => {
+                put_cached_chunk(&harness, source_idx, &content, forged_proof).await;
+            }
+            RecordPath::FreshOffer => {
+                let response = send_replication_request(
+                    source_p2p,
+                    &receiver_peer,
+                    ReplicationMessage {
+                        request_id: rand::random(),
+                        body: ReplicationMessageBody::FreshReplicationOffer(
+                            FreshReplicationOffer {
+                                key: address,
+                                data: content.clone(),
+                                proof_of_payment: forged_proof,
+                            },
+                        ),
+                    },
+                    PROPAGATION_TIMEOUT,
+                )
+                .await;
+                assert!(
+                    matches!(
+                        response.body,
+                        ReplicationMessageBody::FreshReplicationResponse(
+                            FreshReplicationResponse::Accepted { .. }
+                        )
+                    ),
+                    "the receiver must accept a cached fresh offer: {:?}",
+                    response.body
+                );
+            }
+            RecordPath::PaidNotify => {
+                let notify = ReplicationMessage {
+                    request_id: rand::random(),
+                    body: ReplicationMessageBody::PaidNotify(PaidNotify {
+                        key: address,
+                        proof_of_payment: forged_proof,
+                    }),
+                };
+                source_p2p
+                    .send_message(
+                        &receiver_peer,
+                        REPLICATION_PROTOCOL_ID,
+                        Bytes::from(notify.encode().expect("encode PaidNotify")),
+                        &[],
+                    )
+                    .await
+                    .expect("send PaidNotify");
+            }
+        }
+
+        let paid_list = recorder
+            .replication_engine
+            .as_ref()
+            .expect("recorder engine")
+            .paid_list();
+        let deadline = tokio::time::Instant::now() + PROPAGATION_TIMEOUT;
+        while !paid_list.contains(&address).unwrap_or(false)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(PROPAGATION_POLL_INTERVAL).await;
+        }
+        assert!(
+            paid_list.contains(&address).unwrap_or(false),
+            "{path:?} never recorded the key"
+        );
+        let marked = paid_list
+            .is_price_contested(&address)
+            .expect("read the mark");
+        outcomes.push((path, admitted_contested, marked));
+    }
+
+    for (path, admitted_contested, marked) in outcomes {
+        assert_eq!(
+            marked, admitted_contested,
+            "{path:?}: the mark must follow this node's verified decision, never the attached proof"
+        );
+    }
+
+    harness.teardown().await.expect("teardown");
+}
+
 /// Proof bytes for tests that only need to reach the pre-payment gates.
 fn dummy_payment_proof() -> Vec<u8> {
     vec![DUMMY_PAYMENT_PROOF_BYTE; DUMMY_PAYMENT_PROOF_LEN]
@@ -578,14 +904,26 @@ async fn store_paid_chunk(harness: &TestHarness, source_idx: usize, content: &[u
 /// handler stores it and emits the fresh-write event itself, carrying the
 /// dummy proof it was paid with.
 async fn put_paid_chunk(harness: &TestHarness, source_idx: usize, content: &[u8]) -> XorName {
+    harness.prepopulate_payment_cache_everywhere(&compute_address(content));
+    put_cached_chunk(harness, source_idx, content, dummy_payment_proof()).await
+}
+
+/// PUT a chunk through the source node's handler, attaching `proof`. The
+/// caller has put the payment in the source's cache, so the proof itself is
+/// never checked.
+async fn put_cached_chunk(
+    harness: &TestHarness,
+    source_idx: usize,
+    content: &[u8],
+    proof: Vec<u8>,
+) -> XorName {
     let address = compute_address(content);
-    harness.prepopulate_payment_cache_everywhere(&address);
     let request = ChunkMessage {
         request_id: rand::random(),
         body: ChunkMessageBody::PutRequest(ChunkPutRequest::with_payment(
             address,
             Bytes::copy_from_slice(content),
-            dummy_payment_proof(),
+            proof,
         )),
     };
     let protocol = harness
@@ -1511,6 +1849,91 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
     assert!(
         !pruner_storage.exists(&missing_address).expect("exists"),
         "record should prune once every current target peer proves storage"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// ADR-0006: a peer missing a key whose payment the price floor contested on
+/// the pruner may have refused it under its own floor, so the prune audit
+/// keeps the record (its proofs are still missing) but scores no one. The
+/// control pass, the same shape with an unmarked key, does penalise the
+/// absent peers, so the first result is not vacuous.
+#[tokio::test]
+#[serial]
+async fn prune_audit_scores_no_peer_for_a_price_contested_key() {
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let pruner_idx = 3;
+    let close_group_size = 2;
+    let config = prune_test_config(close_group_size);
+    let sync_state = Arc::new(RwLock::new(NeighborSyncState::new_cycle(vec![])));
+    let repair_proofs = Arc::new(RwLock::new(RepairProofs::new()));
+    let audit_challenge_coordinator = Arc::new(AuditChallengeCoordinator::new());
+
+    let pruner = harness.test_node(pruner_idx).expect("pruner");
+    let pruner_p2p = Arc::clone(pruner.p2p_node.as_ref().expect("pruner p2p"));
+    let pruner_storage = pruner.ant_protocol.as_ref().expect("protocol").storage();
+    let pruner_paid_list = Arc::clone(
+        pruner
+            .replication_engine
+            .as_ref()
+            .expect("pruner replication engine")
+            .paid_list(),
+    );
+    let pruner_peer = *pruner_p2p.peer_id();
+
+    let mut outcomes = Vec::new();
+    for (label, contested) in [("price-contested", true), ("unmarked", false)] {
+        let (content, address, targets) =
+            find_remote_prune_candidate(&harness, pruner_idx, close_group_size, label).await;
+        pruner_storage
+            .put(&address, &content)
+            .await
+            .expect("put record on pruner");
+        if contested {
+            pruner_paid_list
+                .insert_price_contested(&address)
+                .await
+                .expect("mark");
+        }
+        let trust_before: Vec<f64> = targets.iter().map(|p| pruner_p2p.peer_trust(p)).collect();
+
+        // No target holds the record: every one is absent when audited.
+        let result = pruning::run_prune_pass_with_context(pruning::PrunePassContext {
+            self_id: &pruner_peer,
+            storage: &pruner_storage,
+            paid_list: &pruner_paid_list,
+            p2p_node: &pruner_p2p,
+            config: &config,
+            sync_state: &sync_state,
+            repair_proofs: &repair_proofs,
+            allow_remote_prune_audits: true,
+            commitment_state: None,
+            audit_challenge_coordinator: &audit_challenge_coordinator,
+        })
+        .await;
+        assert!(
+            pruner_storage.exists(&address).expect("exists"),
+            "a record no target proves must stay local"
+        );
+        assert_eq!(result.records_pruned, 0);
+
+        let penalised = targets
+            .iter()
+            .zip(trust_before.iter())
+            .any(|(peer, &before)| {
+                pruner_p2p.peer_trust(peer) <= before * POSSESSION_PENALTY_TRUST_RATIO
+            });
+        outcomes.push(penalised);
+    }
+
+    assert_eq!(
+        outcomes,
+        vec![false, true],
+        "an absent peer must not be scored for a price-contested key, and must be for an \
+         unmarked one"
     );
 
     harness.teardown().await.expect("teardown");

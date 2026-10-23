@@ -6,11 +6,44 @@
 use super::anvil::TestAnvil;
 use super::testnet::{TestNetwork, TestNetworkConfig, TestNode, TestnetError};
 use ant_node::client::XorName;
-use evmlib::common::TxHash;
+use ant_node::payment::{serialize_single_node_proof, PaymentProof};
+use evmlib::common::{Amount, TxHash};
+use evmlib::{EncodedPeerId, PaymentQuote, ProofOfPayment, RewardsAddress};
 use saorsa_core::P2PNode;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 use tracing::{info, warn};
+
+/// A possession or audit failure is reported at weight 5, which cuts a peer's
+/// trust by `1 - (1 - 0.124)^5`, about 48%; lighter events cut 12% to 33%. A
+/// fall to this fraction of a peer's score or below is read as that penalty.
+pub const POSSESSION_PENALTY_TRUST_RATIO: f64 = 0.6;
+
+/// A single-node payment proof that parses, naming `content`, whose one quote
+/// is never valid: no signature, no settlement. For tests that need a node to
+/// see a proof the price floor could price, without anyone accepting it.
+#[allow(clippy::expect_used)]
+pub fn parseable_single_node_proof(content: XorName) -> Vec<u8> {
+    let quote = PaymentQuote {
+        content: xor_name::XorName(content),
+        timestamp: SystemTime::now(),
+        price: Amount::from(1u64),
+        rewards_address: RewardsAddress::new([0x11; 20]),
+        committed_key_count: 0,
+        commitment_pin: None,
+        pub_key: Vec::new(),
+        signature: Vec::new(),
+    };
+    serialize_single_node_proof(&PaymentProof {
+        proof_of_payment: ProofOfPayment {
+            peer_quotes: vec![(EncodedPeerId::new([0x22; 32]), quote)],
+        },
+        tx_hashes: Vec::new(),
+        commitment_sidecars: Vec::new(),
+    })
+    .expect("serialize a single-node proof")
+}
 
 /// How many port ranges a network is brought up on before its bind failure
 /// is reported.

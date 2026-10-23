@@ -64,8 +64,8 @@ mod tests {
 
     use crate::{TestHarness, TestNetwork};
     use ant_node::payment::{
-        EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, PriceFloorConfig,
-        QuoteGenerator, QuotingMetricsTracker,
+        EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator,
+        QuotingMetricsTracker,
     };
     use ant_node::storage::{AntProtocol, ChunkStore, ChunkStoreConfig};
     use ant_node::ReplicationConfig;
@@ -445,7 +445,6 @@ mod tests {
             cache_capacity: 100,
             close_group_size: ReplicationConfig::default().close_group_size,
             local_rewards_address: rewards_address,
-            price_floor: PriceFloorConfig::default(),
         });
         let metrics_tracker = QuotingMetricsTracker::new(100);
         let quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
