@@ -294,6 +294,79 @@ mod tests {
             .expect("Failed to teardown harness");
     }
 
+    /// ADR-0020: a node answers get-or-closer with the chunk when it holds
+    /// it, and otherwise with closer peers that the requester checks as a
+    /// `FIND_NODE` answer.
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::panic)]
+    async fn test_get_or_closer_returns_chunk_or_closer_peers() {
+        let harness = TestHarness::setup_minimal()
+            .await
+            .expect("Failed to setup test harness");
+        let fixture = ChunkTestFixture::new();
+        let requester = harness.test_node(3).expect("Node 3 should exist");
+        let p2p = requester
+            .p2p_node
+            .as_ref()
+            .expect("Node 3 should be running");
+        let peers = requester.connected_peers().await;
+        let target = peers.first().expect("Node 3 should have a connected peer");
+
+        let address = ChunkTestFixture::compute_address(&fixture.small);
+        harness.prepopulate_payment_cache_for_peer(target, &address);
+        requester
+            .store_chunk_on_peer(target, &fixture.small)
+            .await
+            .expect("Failed to store chunk on remote node");
+
+        let (found, _) = requester
+            .get_or_closer_from_peer(target, &address)
+            .await
+            .expect("get-or-closer should be answered");
+        let ant_node::ant_protocol::ChunkGetOrCloserResponse::Found {
+            address: found_address,
+            content,
+        } = found
+        else {
+            panic!("expected the holder to answer Found, got {found:?}");
+        };
+        assert_eq!(found_address, address);
+        assert_eq!(content.as_ref(), fixture.small.as_slice());
+
+        // No node holds this address, so every node answers with peers.
+        let missing = [0x5a; 32];
+        let (closer, transport_source) = requester
+            .get_or_closer_from_peer(target, &missing)
+            .await
+            .expect("get-or-closer should be answered");
+        let ant_node::ant_protocol::ChunkGetOrCloserResponse::Closer {
+            address: closer_address,
+            peers,
+        } = closer
+        else {
+            panic!("expected a non-holder to answer Closer, got {closer:?}");
+        };
+        assert_eq!(closer_address, missing);
+        let candidates = p2p
+            .dht_manager()
+            .decode_closer_peers(target, &missing, &peers, transport_source.as_ref())
+            .await
+            .expect("closer peers should decode as a FIND_NODE answer");
+        assert!(
+            !candidates.is_empty(),
+            "the responder should know peers closer to the address"
+        );
+        assert!(
+            candidates.iter().all(|node| node.peer_id != *p2p.peer_id()),
+            "the answer should leave out the requester"
+        );
+
+        harness
+            .teardown()
+            .await
+            .expect("Failed to teardown harness");
+    }
+
     /// Test 8: Reject oversized chunk (> 4MB).
     ///
     /// Chunks have a maximum size of 4MB. Attempting to store a larger

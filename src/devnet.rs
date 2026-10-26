@@ -106,11 +106,10 @@ async fn handle_chunk_message(
     let handled = protocol
         .try_handle_request_with_context(
             &data,
-            Some(ChunkRequestContext::new(
-                source.to_string(),
-                received_at.into(),
-                Duration::ZERO,
-            )),
+            Some(
+                ChunkRequestContext::new(source.to_string(), received_at.into(), Duration::ZERO)
+                    .with_requester(source),
+            ),
         )
         .await;
     let telemetry = handled.get_telemetry;

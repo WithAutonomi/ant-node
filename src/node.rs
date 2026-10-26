@@ -1,6 +1,6 @@
 //! Node implementation - thin wrapper around saorsa-core's `P2PNode`.
 
-use crate::ant_protocol::CHUNK_PROTOCOL_ID;
+use crate::ant_protocol::{CHUNK_PROTOCOL_ID, GET_OR_CLOSER_AGENT_TOKEN};
 use crate::config::{
     default_nodes_dir, default_root_dir, NetworkMode, NodeConfig, NODE_IDENTITY_FILENAME,
 };
@@ -53,8 +53,18 @@ const PROTOCOL_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs
 /// that lost the prefix would stop being routed to. The version is this build's rather than
 /// the transport's, because it is the one a peer needs in order to tell which release it is
 /// talking to.
-fn user_agent() -> String {
-    format!("node/{}", env!("CARGO_PKG_VERSION"))
+///
+/// A node that serves chunks also carries the get-or-closer token (ADR-0020). Native peers
+/// exchange no capabilities, and a node built before that request drops it without a reply,
+/// so this token is how a client knows it may send one. A node with storage switched off
+/// never answers chunk requests, so it does not announce it.
+fn user_agent(serves_chunks: bool) -> String {
+    let agent = format!("node/{}", env!("CARGO_PKG_VERSION"));
+    if serves_chunks {
+        format!("{agent} {GET_OR_CLOSER_AGENT_TOKEN}")
+    } else {
+        agent
+    }
 }
 
 /// Builder for constructing an Ant node.
@@ -334,7 +344,7 @@ impl NodeBuilder {
             }
         }
 
-        core_config.custom_user_agent = Some(user_agent());
+        core_config.custom_user_agent = Some(user_agent(config.storage.enabled));
 
         // Persist close group peers + trust scores across restarts.
         // Default to root_dir (alongside node_identity.key) when not explicitly set.
@@ -985,11 +995,10 @@ impl RunningNode {
         let handled = protocol
             .try_handle_request_with_context(
                 data,
-                Some(ChunkRequestContext::new(
-                    source.to_string(),
-                    received_at,
-                    queue_wait,
-                )),
+                Some(
+                    ChunkRequestContext::new(source.to_string(), received_at, queue_wait)
+                        .with_requester(*source),
+                ),
             )
             .await;
         let telemetry = handled.get_telemetry;
@@ -1615,13 +1624,23 @@ mod tests {
     }
 
     /// The prefix is what keeps this node in its peers' routing tables, and the version is
-    /// this build's, with nothing after it.
+    /// this build's, with nothing after it on a node that does not serve chunks.
     #[test]
     fn the_user_agent_is_this_builds_version_under_the_node_prefix() {
         assert_eq!(
-            super::user_agent(),
+            super::user_agent(false),
             format!("node/{}", env!("CARGO_PKG_VERSION"))
         );
-        assert!(super::user_agent().starts_with("node/"));
+        assert!(super::user_agent(true).starts_with("node/"));
+    }
+
+    #[test]
+    fn user_agent_advertises_get_or_closer_only_when_serving_chunks() {
+        assert!(crate::ant_protocol::advertises_get_or_closer(
+            &super::user_agent(true)
+        ));
+        assert!(!crate::ant_protocol::advertises_get_or_closer(
+            &super::user_agent(false)
+        ));
     }
 }
