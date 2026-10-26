@@ -9,7 +9,9 @@
 - **Related:** Linear V2-1358; ant-client investigation
   `docs/investigations/2026-10-06-kademlia-chunk-get/`;
   [ADR-0015](ADR-0015-direct-browser-clients-over-webrtc-direct.md) (browser
-  capabilities); saorsa-core, ant-protocol and ant-client branches
+  capabilities);
+  [ADR-0023](ADR-0023-spread-hot-reads-and-refuse-full-browser-sessions.md)
+  (spread first reads); saorsa-core, ant-protocol and ant-client branches
   `mickvandijke/v2-1358-kad-chunk-get`
 
 ## Context
@@ -142,8 +144,8 @@ FIND_NODE today.
 - **Otherwise it answers `Closer`,** using `encode_closer_peers` with the
   authenticated sender as the requester.
 - **It advertises support** with the user-agent token `get-or-closer/1`
-  (`ant_protocol::GET_OR_CLOSER_AGENT_TOKEN`), after the existing migration
-  token. The `node/` prefix that saorsa-core gates DHT membership on is kept.
+  (`ant_protocol::GET_OR_CLOSER_AGENT_TOKEN`), after `node/<version>`. The
+  `node/` prefix that saorsa-core gates DHT membership on is kept.
 - **It does not advertise support to browsers.** Browsers cannot decode the
   native peer format. The WebRTC Direct listener keeps refusing the request,
   and HELLO does not list it.
@@ -175,6 +177,15 @@ The round's grace window therefore never cancels a chunk transfer that is
 still arriving. Conflicting reports about a peer are resolved with
 `client_routing::compute_winner`, as in both existing lookups.
 
+- **Peers that probably hold the chunk are asked one at a time.** A peer is a
+  likely holder when fewer than a close group of the peers the lookup knows
+  of are nearer the chunk. The next likely holder is asked once the current
+  one answers `Closer`, or after 500 ms if it is still sending.
+- **The first likely holder is chosen uniformly**, among those the lookup
+  round has handed over, as the ordinary read chooses its first GET
+  ([ADR-0023](ADR-0023-spread-hot-reads-and-refuse-full-browser-sessions.md)).
+  Asking the nearest holder first would put every client's read of a popular
+  chunk on one node of its close group.
 - **A peer whose content fails verification only drops out of the lookup.**
   Every queried peer is asked for the chunk, not just the close group. Ending
   the read on one bad answer would therefore let any dishonest node on a
@@ -265,6 +276,8 @@ still arriving. Conflicting reports about a peer are resolved with
     - drop a peer whose content fails verification, and keep reading
     - keep a transfer alive past its lookup round's grace window
     - fall back to today's path when the lookup finds nothing
+    - choose the first likely holder among a whole lookup round, not the
+      first step to arrive
   - In-process test networks:
     - A network whose nodes all announce the token is read with
       get-or-closer requests only, and no plain GET.
