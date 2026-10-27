@@ -14,8 +14,9 @@
 //! - chunk store persistence
 
 use ant_node::ant_protocol::{
-    ChunkGetRequest, ChunkGetResponse, ChunkMessage, ChunkMessageBody, ChunkPutRequest,
-    ChunkPutResponse, CHUNK_PROTOCOL_ID, MAX_WIRE_MESSAGE_SIZE,
+    ChunkGetOrCloserRequest, ChunkGetOrCloserResponse, ChunkGetRequest, ChunkGetResponse,
+    ChunkMessage, ChunkMessageBody, ChunkPutRequest, ChunkPutResponse, CHUNK_PROTOCOL_ID,
+    MAX_WIRE_MESSAGE_SIZE,
 };
 use ant_node::client::{send_and_await_chunk_response, DataChunk, XorName};
 use ant_node::payment::{
@@ -865,6 +866,46 @@ impl TestNode {
         .await
     }
 
+    /// Send a get-or-closer request (ADR-0020) to a peer, returning its
+    /// answer and the transport address that delivered it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the node is not running, the request cannot be
+    /// encoded or sent, or no answer arrives in time.
+    pub async fn get_or_closer_from_peer(
+        &self,
+        target_peer_id: &PeerId,
+        address: &XorName,
+    ) -> Result<(ChunkGetOrCloserResponse, Option<MultiAddr>)> {
+        let p2p = self.p2p_node.as_ref().ok_or(TestnetError::NodeNotRunning)?;
+        let request_id: u64 = rand::thread_rng().gen();
+        let message = ChunkMessage {
+            request_id,
+            body: ChunkMessageBody::GetOrCloserRequest(ChunkGetOrCloserRequest::new(*address)),
+        };
+        let message_bytes = message.encode().map_err(|e| {
+            TestnetError::Serialization(format!("Failed to encode get-or-closer request: {e}"))
+        })?;
+        let timeout = Duration::from_secs(DEFAULT_CHUNK_OPERATION_TIMEOUT_SECS);
+        let response = ant_protocol::send_and_await_chunk_response_with_metadata(
+            p2p,
+            target_peer_id,
+            message_bytes,
+            request_id,
+            timeout,
+            &[],
+            |body| match body {
+                ChunkMessageBody::GetOrCloserResponse(response) => Some(Ok(response)),
+                _ => None,
+            },
+            |e| TestnetError::Retrieval(format!("Failed to send get-or-closer: {e}")),
+            || TestnetError::Retrieval("Timeout waiting for a get-or-closer answer".to_string()),
+        )
+        .await?;
+        Ok((response.result?, response.transport_source))
+    }
+
     /// Compute content address for chunk data (BLAKE3 hash).
     #[must_use]
     pub fn compute_chunk_address(data: &[u8]) -> XorName {
@@ -1325,32 +1366,13 @@ impl TestNetwork {
                             );
                             let protocol = Arc::clone(&protocol_clone);
                             let p2p = Arc::clone(&p2p_clone);
+                            // As a node's own router answers it, so the
+                            // handler knows the authenticated sender.
                             tokio::spawn(async move {
-                                match protocol.try_handle_request(&data).await {
-                                    Ok(Some(response)) => {
-                                        if let Err(e) = p2p
-                                            .send_message(
-                                                &source,
-                                                CHUNK_PROTOCOL_ID,
-                                                response.to_vec(),
-                                                &[],
-                                            )
-                                            .await
-                                        {
-                                            warn!(
-                                                "Node {node_index} failed to send chunk response to {source}: {e}"
-                                            );
-                                        }
-                                    }
-                                    Ok(None) => {
-                                        // Response message — no reply needed
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            "Node {node_index} chunk protocol handler error: {e}"
-                                        );
-                                    }
-                                }
+                                ant_node::RunningNode::answer_chunk_request(
+                                    &protocol, &p2p, &source, &data,
+                                )
+                                .await;
                             });
                         }
                     }

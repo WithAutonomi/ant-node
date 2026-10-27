@@ -29,10 +29,11 @@
 
 use crate::ant_protocol::DATA_TYPE_CHUNK;
 use crate::ant_protocol::{
-    settlement_compatibility, ChunkGetRequest, ChunkGetResponse, ChunkMessage, ChunkMessageBody,
-    ChunkPutRequest, ChunkPutResponse, ChunkQuoteRequest, ChunkQuoteRequestV2, ChunkQuoteResponse,
-    MerkleCandidateQuoteRequest, MerkleCandidateQuoteRequestV2, MerkleCandidateQuoteResponse,
-    ProtocolError, SettlementCompatibility, XorName, CHUNK_PROTOCOL_ID, CURRENT_SETTLEMENT_VERSION,
+    settlement_compatibility, ChunkGetOrCloserRequest, ChunkGetOrCloserResponse, ChunkGetRequest,
+    ChunkGetResponse, ChunkMessage, ChunkMessageBody, ChunkPutRequest, ChunkPutResponse,
+    ChunkQuoteRequest, ChunkQuoteRequestV2, ChunkQuoteResponse, MerkleCandidateQuoteRequest,
+    MerkleCandidateQuoteRequestV2, MerkleCandidateQuoteResponse, ProtocolError,
+    SettlementCompatibility, XorName, CHUNK_PROTOCOL_ID, CURRENT_SETTLEMENT_VERSION,
     MAX_CHUNK_SIZE, MIN_SUPPORTED_SETTLEMENT_VERSION,
 };
 use crate::client::compute_address;
@@ -48,7 +49,7 @@ use crate::storage::ChunkStore;
 use ant_protocol::chunk::{PointerGetResponse, PointerPutResponse};
 use bytes::Bytes;
 use parking_lot::RwLock;
-use saorsa_core::P2PNode;
+use saorsa_core::{P2PNode, PeerId};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -76,6 +77,8 @@ fn duration_ms(duration: Duration) -> u64 {
 /// encoding, and the response hand-off to the transport.
 pub struct ChunkRequestContext {
     source_peer: String,
+    /// The authenticated sender, when the router knows it.
+    requester: Option<PeerId>,
     received_at: Instant,
     queue_wait_ms: u64,
 }
@@ -85,9 +88,18 @@ impl ChunkRequestContext {
     pub(crate) fn new(source_peer: String, received_at: Instant, queue_wait: Duration) -> Self {
         Self {
             source_peer,
+            requester: None,
             received_at,
             queue_wait_ms: duration_ms(queue_wait),
         }
+    }
+
+    /// Record the authenticated sender, so a get-or-closer answer can leave
+    /// it out of the closer peers, as a `FIND_NODE` answer does.
+    #[must_use]
+    pub(crate) fn with_requester(mut self, requester: PeerId) -> Self {
+        self.requester = Some(requester);
+        self
     }
 }
 
@@ -111,6 +123,8 @@ pub struct HandledChunkRequest {
 /// event with `cancelled` outcomes so the request does not disappear silently.
 #[cfg_attr(not(feature = "logging"), allow(dead_code))]
 pub struct GetRequestTelemetry {
+    /// The read request: `get`, or `get_or_closer` (ADR-0020).
+    request: &'static str,
     source_peer: String,
     request_id: u64,
     chunk_address: String,
@@ -131,14 +145,61 @@ impl GetRequestTelemetry {
         storage_read_ms: u64,
         response: &ChunkGetResponse,
     ) -> Self {
-        let (storage_outcome, storage_error_category) = match response {
+        let storage = match response {
             ChunkGetResponse::Success { .. } => ("success", "none"),
             ChunkGetResponse::NotFound { .. } => ("not_found", "none"),
             ChunkGetResponse::Error(ProtocolError::StorageFailed(_)) => ("error", "storage"),
             ChunkGetResponse::Error(_) => ("error", "protocol"),
             _ => ("unknown", "unknown"),
         };
+        Self::new(
+            "get",
+            context,
+            request_id,
+            chunk_address,
+            storage_read_ms,
+            storage,
+        )
+    }
+
+    /// A get-or-closer read (ADR-0020). Answering with closer peers means the
+    /// chunk was not in storage, so its storage outcome is `not_found`.
+    fn from_get_or_closer_response(
+        context: ChunkRequestContext,
+        request_id: u64,
+        chunk_address: String,
+        storage_read_ms: u64,
+        response: &ChunkGetOrCloserResponse,
+    ) -> Self {
+        let storage = match response {
+            ChunkGetOrCloserResponse::Found { .. } => ("success", "none"),
+            ChunkGetOrCloserResponse::Closer { .. } => ("not_found", "none"),
+            ChunkGetOrCloserResponse::Error(ProtocolError::StorageFailed(_)) => {
+                ("error", "storage")
+            }
+            ChunkGetOrCloserResponse::Error(_) => ("error", "protocol"),
+            _ => ("unknown", "unknown"),
+        };
+        Self::new(
+            "get_or_closer",
+            context,
+            request_id,
+            chunk_address,
+            storage_read_ms,
+            storage,
+        )
+    }
+
+    fn new(
+        request: &'static str,
+        context: ChunkRequestContext,
+        request_id: u64,
+        chunk_address: String,
+        storage_read_ms: u64,
+        (storage_outcome, storage_error_category): (&'static str, &'static str),
+    ) -> Self {
         Self {
+            request,
             source_peer: context.source_peer,
             request_id,
             chunk_address,
@@ -189,6 +250,7 @@ impl GetRequestTelemetry {
         let duration_ms = duration_ms(self.received_at.elapsed());
         info!(
             target: "ant_node::storage::rpc_latency",
+            request = self.request,
             source_peer = %self.source_peer,
             request_id = self.request_id,
             chunk_address = %self.chunk_address,
@@ -659,6 +721,13 @@ impl AntProtocol {
                 let key = ChunkResponseKey::of_pointer_put(&response);
                 (ChunkMessageBody::PointerPutResponse(response), key)
             }
+            ChunkMessageBody::GetOrCloserRequest(req) => {
+                let (response, telemetry) =
+                    self.handle_get_or_closer(req, request_id, context).await;
+                get_telemetry = telemetry;
+                let key = ChunkResponseKey::of_get_or_closer(&response);
+                (ChunkMessageBody::GetOrCloserResponse(response), key)
+            }
             ChunkMessageBody::PointerGetRequest(req) => {
                 let started = Instant::now();
                 let address = req.address;
@@ -918,6 +987,83 @@ impl AntProtocol {
             Err(e) => {
                 warn!("Failed to retrieve chunk {addr_hex}: {e}");
                 ChunkGetResponse::Error(ProtocolError::StorageFailed(e.to_string()))
+            }
+        }
+    }
+
+    /// Answer a get-or-closer request (ADR-0020): the chunk when this node
+    /// holds it, otherwise the `FIND_NODE` answer it would give the requester
+    /// for the address. With a request context, also returns the read's
+    /// telemetry, as a GET's.
+    async fn handle_get_or_closer(
+        &self,
+        request: ChunkGetOrCloserRequest,
+        request_id: u64,
+        context: Option<ChunkRequestContext>,
+    ) -> (ChunkGetOrCloserResponse, Option<GetRequestTelemetry>) {
+        let address = request.address;
+        let requester = context.as_ref().and_then(|context| context.requester);
+        let storage_started = Instant::now();
+        let stored = self.storage.get(&address).await;
+        let storage_read_ms = duration_ms(storage_started.elapsed());
+        let response = match stored {
+            Ok(Some(chunk)) => ChunkGetOrCloserResponse::Found {
+                address,
+                content: Bytes::from(chunk),
+            },
+            Ok(None) => self.closer_peers(address, requester).await,
+            Err(e) => {
+                warn!(
+                    "Failed to read chunk {} for get-or-closer: {e}",
+                    hex::encode(address)
+                );
+                ChunkGetOrCloserResponse::Error(ProtocolError::StorageFailed(e.to_string()))
+            }
+        };
+        let telemetry = context.map(|context| {
+            GetRequestTelemetry::from_get_or_closer_response(
+                context,
+                request_id,
+                hex::encode(address),
+                storage_read_ms,
+                &response,
+            )
+        });
+        (response, telemetry)
+    }
+
+    /// This node's closest known peers to `address`, encoded by saorsa-core
+    /// exactly as its `FIND_NODE` answer to `requester` would hold them.
+    async fn closer_peers(
+        &self,
+        address: XorName,
+        requester: Option<PeerId>,
+    ) -> ChunkGetOrCloserResponse {
+        // Bind the handle out of the lock so no guard is held across `.await`.
+        let attached = self.p2p_node.read().as_ref().map(Arc::clone);
+        let Some(p2p) = attached else {
+            return ChunkGetOrCloserResponse::Error(ProtocolError::Internal(
+                "this node has no routing table to answer from".to_string(),
+            ));
+        };
+        // Without a known requester there is no one to leave out; the local
+        // node never appears in its own answer.
+        let requester = requester.unwrap_or_else(|| *p2p.peer_id());
+        match p2p
+            .dht_manager()
+            .encode_closer_peers(&address, &requester)
+            .await
+        {
+            Ok(peers) => ChunkGetOrCloserResponse::Closer {
+                address,
+                peers: Bytes::from(peers),
+            },
+            Err(e) => {
+                warn!(
+                    "Failed to encode closer peers for {}: {e}",
+                    hex::encode(address)
+                );
+                ChunkGetOrCloserResponse::Error(ProtocolError::Internal(e.to_string()))
             }
         }
     }
@@ -1452,6 +1598,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_or_closer_returns_a_held_chunk() {
+        let (protocol, _temp) = create_test_protocol().await;
+        let content = b"get-or-closer content";
+        let address = compute_address(content);
+        protocol
+            .put_local(&address, content)
+            .await
+            .expect("store chunk");
+        let request = ChunkMessage {
+            request_id: 30,
+            body: ChunkMessageBody::GetOrCloserRequest(ChunkGetOrCloserRequest::new(address)),
+        };
+
+        let response_bytes = protocol
+            .try_handle_request(&request.encode().expect("encode"))
+            .await
+            .expect("handle get-or-closer")
+            .expect("expected response");
+        let response = ChunkMessage::decode(&response_bytes).expect("decode response");
+
+        assert_eq!(response.request_id, 30);
+        let ChunkMessageBody::GetOrCloserResponse(ChunkGetOrCloserResponse::Found {
+            address: found,
+            content: found_content,
+        }) = response.body
+        else {
+            panic!("expected GetOrCloserResponse::Found");
+        };
+        assert_eq!(found, address);
+        assert_eq!(found_content.as_ref(), content);
+    }
+
+    #[tokio::test]
+    async fn test_get_or_closer_without_a_routing_table_is_an_error() {
+        // A node always has a routing table; a protocol without an attached
+        // P2P node must refuse rather than claim it knows no closer peers.
+        let (protocol, _temp) = create_test_protocol().await;
+        let request = ChunkMessage {
+            request_id: 31,
+            body: ChunkMessageBody::GetOrCloserRequest(ChunkGetOrCloserRequest::new([0xCD; 32])),
+        };
+
+        let response_bytes = protocol
+            .try_handle_request(&request.encode().expect("encode"))
+            .await
+            .expect("handle get-or-closer")
+            .expect("expected response");
+        let response = ChunkMessage::decode(&response_bytes).expect("decode response");
+
+        assert!(matches!(
+            response.body,
+            ChunkMessageBody::GetOrCloserResponse(ChunkGetOrCloserResponse::Error(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn test_get_telemetry_preserves_join_fields_and_response() {
         let (protocol, _temp) = create_test_protocol().await;
 
@@ -1475,6 +1677,7 @@ mod tests {
             .await;
 
         let telemetry = handled.get_telemetry.expect("GET telemetry");
+        assert_eq!(telemetry.request, "get");
         assert_eq!(telemetry.source_peer, "peer-v2-995");
         assert_eq!(telemetry.request_id, request_id);
         assert_eq!(telemetry.chunk_address, hex::encode(address));
@@ -1494,6 +1697,45 @@ mod tests {
                 if found == address
         ));
 
+        telemetry.finish_send(Duration::from_millis(3), true);
+    }
+
+    /// A get-or-closer is a read, so it carries the same telemetry as a GET.
+    #[tokio::test]
+    async fn test_get_or_closer_found_carries_read_telemetry() {
+        let (protocol, _temp) = create_test_protocol().await;
+        let content = b"get-or-closer telemetry";
+        let address = compute_address(content);
+        protocol
+            .put_local(&address, content)
+            .await
+            .expect("store chunk");
+        let request_id = 996;
+        let request = ChunkMessage {
+            request_id,
+            body: ChunkMessageBody::GetOrCloserRequest(ChunkGetOrCloserRequest::new(address)),
+        };
+
+        let handled = protocol
+            .try_handle_request_with_context(
+                &request.encode().expect("encode get-or-closer"),
+                Some(ChunkRequestContext::new(
+                    "peer-v2-996".to_string(),
+                    Instant::now(),
+                    Duration::ZERO,
+                )),
+            )
+            .await;
+
+        let telemetry = handled.get_telemetry.expect("get-or-closer telemetry");
+        assert_eq!(telemetry.request, "get_or_closer");
+        assert_eq!(telemetry.request_id, request_id);
+        assert_eq!(telemetry.chunk_address, hex::encode(address));
+        assert_eq!(telemetry.storage_outcome, "success");
+        assert_eq!(
+            handled.traffic_key,
+            Some(ChunkResponseKey::GetOrCloserFound)
+        );
         telemetry.finish_send(Duration::from_millis(3), true);
     }
 
