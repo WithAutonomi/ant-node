@@ -294,6 +294,25 @@ mod tests {
             .expect("Failed to teardown harness");
     }
 
+    /// The peers a get-or-closer answer from `responder` names for `key`,
+    /// decoded on `decoder` as a `FIND_NODE` answer.
+    async fn decode_closer_peers(
+        decoder: &saorsa_core::P2PNode,
+        responder: &saorsa_core::identity::PeerId,
+        key: &[u8; 32],
+        peers: &[u8],
+        transport_source: Option<&saorsa_core::MultiAddr>,
+    ) -> Vec<saorsa_core::identity::PeerId> {
+        decoder
+            .dht_manager()
+            .decode_closer_peers(responder, key, peers, transport_source)
+            .await
+            .expect("closer peers should decode as a FIND_NODE answer")
+            .into_iter()
+            .map(|node| node.peer_id)
+            .collect()
+    }
+
     /// ADR-0020: a node answers get-or-closer with the chunk when it holds
     /// it, and otherwise with closer peers that the requester checks as a
     /// `FIND_NODE` answer.
@@ -333,8 +352,10 @@ mod tests {
         assert_eq!(found_address, address);
         assert_eq!(content.as_ref(), fixture.small.as_slice());
 
-        // No node holds this address, so every node answers with peers.
-        let missing = [0x5a; 32];
+        // No node holds this address, so every node answers with peers. It is
+        // the requester's own ID, so the requester is the nearest peer the
+        // responder could name.
+        let missing = *p2p.peer_id().as_bytes();
         let (closer, transport_source) = requester
             .get_or_closer_from_peer(target, &missing)
             .await
@@ -347,18 +368,53 @@ mod tests {
             panic!("expected a non-holder to answer Closer, got {closer:?}");
         };
         assert_eq!(closer_address, missing);
-        let candidates = p2p
-            .dht_manager()
-            .decode_closer_peers(target, &missing, &peers, transport_source.as_ref())
-            .await
-            .expect("closer peers should decode as a FIND_NODE answer");
+
+        // A third node decodes the answers, since a node leaves itself out of
+        // any answer it decodes. Another node asking the same shows that the
+        // responder does name the requester to anyone else.
+        let others = (0..harness.node_count())
+            .filter_map(|index| harness.test_node(index))
+            .filter(|node| {
+                node.p2p_node.as_ref().is_some_and(|other| {
+                    other.peer_id() != p2p.peer_id() && other.peer_id() != target
+                })
+            })
+            .collect::<Vec<_>>();
+        // The request goes out without dial addresses, so the bystander must
+        // already be connected to the responder.
+        let mut bystander = None;
+        for node in &others {
+            if node.connected_peers().await.contains(target) {
+                bystander = Some(*node);
+                break;
+            }
+        }
+        let bystander = bystander.expect("another node should be connected to the responder");
+        let decoder = others
+            .iter()
+            .filter(|node| !std::ptr::eq(**node, bystander))
+            .find_map(|node| node.p2p_node.as_ref())
+            .expect("a fourth node should exist");
+        let named =
+            decode_closer_peers(decoder, target, &missing, &peers, transport_source.as_ref()).await;
+        assert!(!named.is_empty(), "the responder should know other peers");
         assert!(
-            !candidates.is_empty(),
-            "the responder should know peers closer to the address"
-        );
-        assert!(
-            candidates.iter().all(|node| node.peer_id != *p2p.peer_id()),
+            !named.contains(p2p.peer_id()),
             "the answer should leave out the requester"
+        );
+
+        let (control, control_source) = bystander
+            .get_or_closer_from_peer(target, &missing)
+            .await
+            .expect("get-or-closer should be answered");
+        let ant_node::ant_protocol::ChunkGetOrCloserResponse::Closer { peers, .. } = control else {
+            panic!("expected a non-holder to answer Closer, got {control:?}");
+        };
+        assert!(
+            decode_closer_peers(decoder, target, &missing, &peers, control_source.as_ref())
+                .await
+                .contains(p2p.peer_id()),
+            "another node's answer should name the requester"
         );
 
         harness

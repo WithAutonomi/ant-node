@@ -978,6 +978,28 @@ impl RunningNode {
         Ok(())
     }
 
+    /// Answer one inbound chunk-protocol message from `source` as a running
+    /// node's router does, and send the reply. For test networks that route
+    /// messages themselves.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn answer_chunk_request(
+        protocol: &Arc<AntProtocol>,
+        p2p: &Arc<P2PNode>,
+        source: &saorsa_core::identity::PeerId,
+        data: &[u8],
+    ) {
+        Self::answer_one_request(
+            protocol,
+            p2p,
+            source,
+            data,
+            "chunk",
+            CHUNK_PROTOCOL_ID,
+            Instant::now(),
+        )
+        .await;
+    }
+
     /// Handle one inbound protocol message and send whatever it produced.
     async fn answer_one_request(
         protocol: &Arc<AntProtocol>,

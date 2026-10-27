@@ -1366,32 +1366,13 @@ impl TestNetwork {
                             );
                             let protocol = Arc::clone(&protocol_clone);
                             let p2p = Arc::clone(&p2p_clone);
+                            // As a node's own router answers it, so the
+                            // handler knows the authenticated sender.
                             tokio::spawn(async move {
-                                match protocol.try_handle_request(&data).await {
-                                    Ok(Some(response)) => {
-                                        if let Err(e) = p2p
-                                            .send_message(
-                                                &source,
-                                                CHUNK_PROTOCOL_ID,
-                                                response.to_vec(),
-                                                &[],
-                                            )
-                                            .await
-                                        {
-                                            warn!(
-                                                "Node {node_index} failed to send chunk response to {source}: {e}"
-                                            );
-                                        }
-                                    }
-                                    Ok(None) => {
-                                        // Response message — no reply needed
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            "Node {node_index} chunk protocol handler error: {e}"
-                                        );
-                                    }
-                                }
+                                ant_node::RunningNode::answer_chunk_request(
+                                    &protocol, &p2p, &source, &data,
+                                )
+                                .await;
                             });
                         }
                     }
