@@ -156,20 +156,34 @@ A chunk read runs a client-driven iterative lookup on saorsa-core's public
 lookup engine (`IterativeLookup`). The parameters match today's native lookup:
 alpha 3, K, a 5 s grace period per round, and a 120 s deadline.
 
+Every peer the lookup queries answers it at once, but only peers that
+probably hold the chunk are asked for it. A peer is a **likely holder** when
+fewer than a close group of the peers the read knows of are nearer the chunk.
+Until the read knows two close groups of peers, as in its first round, it
+cannot tell, and every peer counts as one.
+
 For each peer the lookup queries, the client:
 
 1. **Connects to it.** It uses `DhtNetworkManager::connect_lookup_peer`, which
    the lookup's own request would need anyway. It then reads the peer's user
    agent.
-2. **If the peer advertises `get-or-closer/1`,** sends `GetOrCloserRequest`:
-   - `Found`: verify the address and the content hash, then stop the read.
-   - `Closer`: `decode_closer_peers` supplies the lookup candidates. It
-     rejects a payload over the 64 KiB FIND_NODE limit before parsing it,
-     although the chunk message carrying it may be up to 5 MiB.
-3. **Otherwise,** sends FIND_NODE (`DhtNetworkManager::find_node_on_peer`) and
-   a GET at the same time. FIND_NODE supplies the candidates, and a `Success`
-   from the GET stops the read.
-4. **If the connection fails,** marks the peer failed in the lookup, as a
+2. **If the peer is the likely holder chosen to go next,** asks it for the
+   chunk and for closer peers in one step:
+   - If it advertises `get-or-closer/1`, sends `GetOrCloserRequest`:
+     - `Found`: verify the address and the content hash, then stop the read.
+     - `Closer`: `decode_closer_peers` supplies the lookup candidates. It
+       rejects a payload over the 64 KiB FIND_NODE limit before parsing it,
+       although the chunk message carrying it may be up to 5 MiB.
+   - Otherwise, sends FIND_NODE (`DhtNetworkManager::find_node_on_peer`) and
+     a GET at the same time. FIND_NODE supplies the candidates, and a
+     `Success` from the GET stops the read.
+3. **If it is a likely holder that must wait its turn,** sends FIND_NODE now,
+   so the lookup never waits for the holder gate, and a GET when its turn
+   comes. A waiting peer that the lookup has since learnt is not among the
+   nearest is skipped.
+4. **If it is far from the chunk,** sends FIND_NODE only, as today's lookup
+   does.
+5. **If the connection fails,** marks the peer failed in the lookup, as a
    failed FIND_NODE is marked today.
 
 The read driver owns every request, not the lookup round that triggered it.
@@ -177,22 +191,25 @@ The round's grace window therefore never cancels a chunk transfer that is
 still arriving. Conflicting reports about a peer are resolved with
 `client_routing::compute_winner`, as in both existing lookups.
 
-- **Peers that probably hold the chunk are asked one at a time.** A peer is a
-  likely holder when fewer than a close group of the peers the lookup knows
-  of are nearer the chunk. The next likely holder is asked once the current
-  one answers `Closer`, or after 500 ms if it is still sending.
+- **Likely holders are asked one at a time.** The next is asked once the
+  current one answers without the chunk, or after 500 ms if it is still
+  sending. At most two are asked at once, as today's read never runs more
+  than two GETs: on a link too slow to receive a chunk in 500 ms, further
+  copies would only slow each other.
 - **The first likely holder is chosen uniformly**, among those the lookup
   round has handed over, as the ordinary read chooses its first GET
   ([ADR-0023](ADR-0023-spread-hot-reads-and-refuse-full-browser-sessions.md)).
   Asking the nearest holder first would put every client's read of a popular
   chunk on one node of its close group.
-- **A peer whose content fails verification only drops out of the lookup.**
-  Every queried peer is asked for the chunk, not just the close group. Ending
-  the read on one bad answer would therefore let any dishonest node on a
-  lookup path fail reads.
+- **A peer whose content fails verification only drops out of the read.**
+  Likely holders are judged from what the lookup has learnt, and in its first
+  round any peer is one. Ending the read on one bad answer would therefore let
+  a dishonest node on a lookup path fail reads.
 - **When the lookup ends without a chunk,** or fails, the client runs today's
-  read path (`retrieve_progressive`) unchanged. Its absence rule, retry round
-  and rule that bad content ends the read are unchanged.
+  read path (`retrieve_progressive`). Its absence rule, retry round and rule
+  that bad content ends the read are unchanged. Its first round starts from
+  the peers the lookup ended on instead of looking them up again, so reading
+  a chunk that is not stored still costs one lookup.
 - **Browser clients keep today's read path.** A browser variant was built and
   measured on a 60-node testnet (2026-10-12). Nodes took the request inside
   `chunk_protocol` and listed it in HELLO, and answered a missing chunk with
@@ -216,8 +233,13 @@ still arriving. Conflicting reports about a peer are resolved with
   announce the token yet, so every lookup step took the FIND_NODE-plus-GET
   route, and all 150 chunks were found without falling back to the old
   read path.
-- **Upgraded nodes answer each lookup step with one request** instead of
-  FIND_NODE plus GET. The chunk travels in that same reply.
+- **An upgraded likely holder answers its lookup step and the read in one
+  request,** instead of FIND_NODE plus GET. The chunk travels in that same
+  reply.
+- **Node load stays as today's.** Peers that only route get FIND_NODE, which
+  the DHT layer answers, and only likely holders get a chunk request. Nodes
+  answer get-or-closer within the same 64-request limit as GETs and PUTs, so
+  under heavy uploads it waits as a GET does, but routing never waits there.
 - **Compatible in both directions.** Old clients never send the new variant.
   New clients send it only to nodes that advertise it, and treat every other
   peer as before.
@@ -227,10 +249,11 @@ still arriving. Conflicting reports about a peer are resolved with
 
 ### Negative / Trade-offs
 
-- **Duplicate downloads.** Up to alpha holders can return the chunk in the
-  same round: measured at 2.5–3.3 copies per chunk natively. That costs bytes
-  for the client and egress for the nodes. A "have it" or inline-flag variant
-  can bound this later without changing the request defined here.
+- **Duplicate downloads.** Asking every queried peer for the chunk, as first
+  measured, downloaded 2.5–3.3 copies per chunk natively. The holder gate
+  bounds this to at most two copies in flight, the second only after 500 ms,
+  but a hedged copy can still arrive unused. A "have it" or inline-flag
+  variant can bound this further without changing the request defined here.
 - **The native client runs its own lookup**, beside the one in saorsa-core.
   Lookup parameters and peer policy must be kept in step.
 - **Capability is a user-agent token**, and is known only once a peer is
@@ -239,10 +262,13 @@ still arriving. Conflicting reports about a peer are resolved with
   connection anyway.
 - **A second chunk response shape** to maintain, with its own traffic
   accounting.
-- **Every queried peer can send content,** not only peers near the chunk.
-  Each answer is bounded by the 5 MiB chunk message limit, as a GET answer is
-  today, and is verified before use. A peer whose answer fails verification
-  costs the client that transfer and nothing more.
+- **A likely holder can send content even when it is far from the chunk,**
+  because the first round cannot tell. Each answer is bounded by the 5 MiB
+  chunk message limit, as a GET answer is today, and is verified before use. A
+  peer whose answer fails verification costs the client that transfer and
+  nothing more.
+- **A waiting likely holder costs two requests,** FIND_NODE now and a GET
+  later, where a get-or-closer would have been one.
 
 ### Neutral / Operational
 
@@ -266,7 +292,10 @@ still arriving. Conflicting reports about a peer are resolved with
     before parsing it, and reads one of exactly that size.
 - **ant-node**
   - The handler answers `Found` for a held chunk and `Closer`, with decodable
-    peers, otherwise.
+    peers, otherwise. `Closer` leaves out the requester, which the same
+    node's answer to another peer names.
+  - A get-or-closer carries the same read telemetry as a GET.
+  - Devnet nodes announce the token, as production nodes do.
   - The user agent carries the token and keeps the `node/` prefix.
 - **ant-client**
   - The read driver is tested on a scripted network. It must:
@@ -275,12 +304,18 @@ still arriving. Conflicting reports about a peer are resolved with
     - handle a mixed network
     - drop a peer whose content fails verification, and keep reading
     - keep a transfer alive past its lookup round's grace window
-    - fall back to today's path when the lookup finds nothing
+    - fall back to today's path when the lookup finds nothing, handing it the
+      peers the lookup ended on
     - choose the first likely holder among a whole lookup round, not the
       first step to arrive
+    - ask at most two likely holders at once
+    - answer the lookup at once for a likely holder that waits its turn, and
+      skip it if the lookup has since passed it
+    - ask peers far from the chunk only for closer peers
   - In-process test networks:
     - A network whose nodes all announce the token is read with
-      get-or-closer requests only, and no plain GET.
+      get-or-closer requests. One whose nodes do not is read with FIND_NODE
+      and GET, and is sent no get-or-closer request.
     - The full end-to-end suite reads through the new path.
   - Live: a new client against today's nodes takes the legacy route for every
     peer and stays within the measured latency of option 3.
