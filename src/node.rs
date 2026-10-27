@@ -58,7 +58,7 @@ const PROTOCOL_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs
 /// exchange no capabilities, and a node built before that request drops it without a reply,
 /// so this token is how a client knows it may send one. A node with storage switched off
 /// never answers chunk requests, so it does not announce it.
-fn user_agent(serves_chunks: bool) -> String {
+pub(crate) fn user_agent(serves_chunks: bool) -> String {
     let agent = format!("node/{}", env!("CARGO_PKG_VERSION"));
     if serves_chunks {
         format!("{agent} {GET_OR_CLOSER_AGENT_TOKEN}")

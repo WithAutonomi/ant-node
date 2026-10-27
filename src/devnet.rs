@@ -1011,6 +1011,9 @@ impl Devnet {
             .bootstrap_peers
             .clone_from(&node.bootstrap_addrs);
         core_config.diversity_config = Some(IPDiversityConfig::permissive());
+        // Devnet nodes serve chunks, so they announce get-or-closer
+        // (ADR-0020) as a production node does.
+        core_config.custom_user_agent = Some(crate::node::user_agent(true));
 
         let index = node.index;
         let p2p_node = P2PNode::new(core_config)
