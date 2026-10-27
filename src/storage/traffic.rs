@@ -82,7 +82,9 @@ pub enum ChunkResponseKey {
     /// A response variant this table does not itemise (e.g. an `Other`
     /// outcome on a `#[non_exhaustive]` enum).
     Other,
+    /// A get-or-closer answer (ADR-0020) carrying the chunk.
     GetOrCloserFound,
+    /// A get-or-closer answer carrying closer peers.
     GetOrCloserCloser,
     GetOrCloserError,
 }
@@ -138,7 +140,7 @@ impl ChunkRequestKind {
 }
 
 impl ChunkResponseKey {
-    /// Classify a GET response by outcome.
+    /// Classify a get-or-closer response by outcome.
     pub fn of_get_or_closer(response: &ChunkGetOrCloserResponse) -> Self {
         match response {
             ChunkGetOrCloserResponse::Found { .. } => Self::GetOrCloserFound,
@@ -148,6 +150,7 @@ impl ChunkResponseKey {
         }
     }
 
+    /// Classify a GET response by outcome.
     pub fn of_get(response: &ChunkGetResponse) -> Self {
         match response {
             ChunkGetResponse::Success { .. } => Self::GetSuccess,
