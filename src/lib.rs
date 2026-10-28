@@ -58,6 +58,7 @@ pub mod payment;
 pub mod pointer;
 pub mod replication;
 pub mod storage;
+pub mod swarm;
 pub mod upgrade;
 #[cfg(feature = "webrtc-direct")]
 mod web_rtc;

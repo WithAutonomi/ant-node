@@ -27,6 +27,11 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
+
+use crate::node::NativeSwarmRouter;
+#[cfg(feature = "webrtc-direct")]
+use crate::swarm::SwarmService;
 
 #[cfg(all(feature = "webrtc-direct", feature = "test-utils"))]
 use crate::ant_protocol::{ChunkMessage, ChunkMessageBody, ChunkPutRequest, ChunkPutResponse};
@@ -1059,11 +1064,17 @@ impl Devnet {
                     node.index
                 ))
             })?;
+            let swarm = node
+                .ant_protocol
+                .as_ref()
+                .map_or_else(SwarmService::new, |protocol| Arc::clone(protocol.swarm()));
+            swarm.set_node_id(*p2p.peer_id().to_bytes());
             let server = crate::web_rtc::spawn(
                 &webrtc_direct_config,
                 &node.data_dir,
                 p2p,
                 node.ant_protocol.clone(),
+                swarm,
                 self.config
                     .evm_network
                     .as_ref()
@@ -1091,8 +1102,18 @@ impl Devnet {
             let p2p_clone = Arc::clone(p2p);
             let protocol_clone = Arc::clone(protocol);
             let node_index = node.index;
+            // Native clients' swarm requests, as a node routes them.
+            let swarm = NativeSwarmRouter::start(
+                Arc::clone(protocol.swarm()),
+                Arc::clone(p2p),
+                TaskTracker::new(),
+                self.shutdown.clone(),
+            );
             node.protocol_task = Some(tokio::spawn(async move {
                 while let Ok(event) = events.recv().await {
+                    if swarm.route(&event) {
+                        continue;
+                    }
                     if let P2PEvent::Message {
                         topic,
                         source: Some(source),

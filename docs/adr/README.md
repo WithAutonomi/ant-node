@@ -41,3 +41,4 @@ See [`TOOLING.md`](./TOOLING.md) for `adrs`, `adr-kit`, and AI harness setup.
 - [ADR-0019: Pointer audits serve the record round 1 bound](./ADR-0019-pointer-audits-serve-the-record-round-one-bound.md)
 - [ADR-0022: Remove the LMDB Chunk Store](./ADR-0022-remove-the-lmdb-chunk-store.md)
 - [ADR-0023: Spread hot-record reads across the close group, and refuse full browser sessions explicitly](./ADR-0023-spread-hot-reads-and-refuse-full-browser-sessions.md)
+- [ADR-0026: Clients reading the same file share its records; nodes introduce them and stay the last seed](./ADR-0026-clients-share-records-nodes-introduce-them.md)
