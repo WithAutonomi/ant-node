@@ -4014,33 +4014,18 @@ impl ReplicationEngine {
                     let answers = answers.clone();
                     let token = shutdown.clone();
                     let tracker = detached_task_tracker.clone();
-                    in_flight.push(Box::pin(async move {
-                        // Tracked so shutdown() still awaits the task if
-                        // this awaiter is dropped (e.g. the worker is
-                        // aborted): it holds Arc<ChunkStore> and must
-                        // not outlive the engine.
-                        let handle = tracker.spawn(async move {
-                            // Cancel-aware: abort when the engine shuts down.
-                            tokio::select! {
-                                () = token.cancelled() => FetchOutcome {
-                                    key: fetch_key,
-                                    source,
-                                    result: FetchResult::SourceFailed,
-                                    contact: Contact::Unknown,
-                                },
-                                outcome = execute_single_fetch(
-                                    p2p, storage, config, fetch_key, source, answers,
-                                ) => outcome,
-                            }
-                        });
-                        let joined = handle.await;
-                        let completed_at = Instant::now();
-                        match joined {
-                            Ok(outcome) => (outcome.key, Some(outcome), completed_at),
-                            Err(e) => {
-                                error!("Fetch task for {} panicked: {e}", hex::encode(fetch_key));
-                                (fetch_key, None, completed_at)
-                            }
+                    in_flight.push(timed_fetch_task(tracker, fetch_key, async move {
+                        // Cancel-aware: abort when the engine shuts down.
+                        tokio::select! {
+                            () = token.cancelled() => FetchOutcome {
+                                key: fetch_key,
+                                source,
+                                result: FetchResult::SourceFailed,
+                                contact: Contact::Unknown,
+                            },
+                            outcome = execute_single_fetch(
+                                p2p, storage, config, fetch_key, source, answers,
+                            ) => outcome,
                         }
                     }));
                 }
@@ -4101,40 +4086,22 @@ impl ReplicationEngine {
                                     let token = shutdown.clone();
                                     let tracker = detached_task_tracker.clone();
                                     let fetch_key = key;
-                                    in_flight.push(Box::pin(async move {
-                                        // Tracked for the same reason as the
-                                        // initial fetch spawn above.
-                                        let handle = tracker.spawn(async move {
-                                            tokio::select! {
-                                                () = token.cancelled() => FetchOutcome {
-                                                    key: fetch_key,
-                                                    source: next_peer,
-                                                    result: FetchResult::SourceFailed,
-                                                    contact: Contact::Unknown,
-                                                },
-                                                outcome = execute_single_fetch(
-                                                    p2p,
-                                                    storage,
-                                                    config,
-                                                    fetch_key,
-                                                    next_peer,
-                                                    answers,
-                                                ) => outcome,
-                                            }
-                                        });
-                                        let joined = handle.await;
-                                        let completed_at = Instant::now();
-                                        match joined {
-                                            Ok(outcome) => {
-                                                (outcome.key, Some(outcome), completed_at)
-                                            }
-                                            Err(e) => {
-                                                error!(
-                                                    "Fetch task for {} panicked: {e}",
-                                                    hex::encode(fetch_key)
-                                                );
-                                                (fetch_key, None, completed_at)
-                                            }
+                                    in_flight.push(timed_fetch_task(tracker, fetch_key, async move {
+                                        tokio::select! {
+                                            () = token.cancelled() => FetchOutcome {
+                                                key: fetch_key,
+                                                source: next_peer,
+                                                result: FetchResult::SourceFailed,
+                                                contact: Contact::Unknown,
+                                            },
+                                            outcome = execute_single_fetch(
+                                                p2p,
+                                                storage,
+                                                config,
+                                                fetch_key,
+                                                next_peer,
+                                                answers,
+                                            ) => outcome,
                                         }
                                     }));
                                     false
@@ -9192,6 +9159,32 @@ fn attempt_latency(started: Option<Instant>, completed_at: Instant) -> Option<Du
     started.map(|started| completed_at.saturating_duration_since(started))
 }
 
+/// One fetch attempt for the fetch worker's in-flight set. `attempt` runs as a
+/// task on `tracker` once the worker first polls the returned future, and is
+/// timed inside that task as it finishes: the worker may be busy applying
+/// other outcomes for a while before it gets to this one.
+fn timed_fetch_task<F>(tracker: TaskTracker, key: XorName, attempt: F) -> FetchFuture
+where
+    F: Future<Output = FetchOutcome> + Send + 'static,
+{
+    Box::pin(async move {
+        // Tracked so shutdown() still awaits the task if this awaiter is
+        // dropped (e.g. the worker is aborted): it holds Arc<ChunkStore> and
+        // must not outlive the engine.
+        let handle = tracker.spawn(async move {
+            let outcome = attempt.await;
+            (outcome, Instant::now())
+        });
+        match handle.await {
+            Ok((outcome, completed_at)) => (outcome.key, Some(outcome), completed_at),
+            Err(e) => {
+                error!("Fetch task for {} panicked: {e}", hex::encode(key));
+                (key, None, Instant::now())
+            }
+        }
+    })
+}
+
 /// What the fetch worker observed about its own dispatching since the last
 /// summary.
 #[derive(Default)]
@@ -10919,6 +10912,7 @@ mod tests {
     use crate::replication::recent_provers::RecentProvers;
     use crate::replication::scheduling::MAX_FETCH_QUEUE;
     use crate::replication::types::{AuditFailureReason, FailureEvidence};
+    use futures::FutureExt;
     use lru::LruCache;
     use saorsa_core::identity::PeerId;
     use std::collections::HashMap;
@@ -14406,6 +14400,47 @@ mod tests {
         assert_eq!(window.attempt_total, Duration::from_millis(400));
         assert_eq!(window.stored_bytes, 10);
         assert_eq!(attempt_latency(None, at(100)), None);
+    }
+
+    #[tokio::test]
+    async fn an_attempt_is_timed_when_its_task_finishes_not_when_the_worker_gets_to_it() {
+        const WORKER_BUSY: Duration = Duration::from_millis(50);
+        let (key, source) = (test_key(0x32), test_peer(0x01));
+        let tracker = TaskTracker::new();
+        let finished = Arc::new(Mutex::new(None));
+        let finished_in_task = Arc::clone(&finished);
+        let mut attempt = timed_fetch_task(tracker.clone(), key, async move {
+            *finished_in_task.lock() = Some(Instant::now());
+            FetchOutcome {
+                key,
+                source,
+                result: FetchResult::SourceFailed,
+                contact: Contact::Unknown,
+            }
+        });
+
+        // The worker's first poll starts the task. The tracker then sees the
+        // task end without the attempt being polled, and the worker is busy
+        // elsewhere for a while before it gets to the outcome.
+        assert!((&mut attempt).now_or_never().is_none());
+        tracker.close();
+        tracker.wait().await;
+        let task_ended = Instant::now();
+        tokio::time::sleep(WORKER_BUSY).await;
+
+        let (resolved, outcome, completed_at) = attempt.await;
+        assert_eq!(resolved, key);
+        assert!(outcome.is_some());
+        let finished_at = *finished.lock();
+        assert!(
+            finished_at.is_some_and(|at| at <= completed_at),
+            "timed before the attempt finished"
+        );
+        let late = completed_at.saturating_duration_since(task_ended);
+        assert!(
+            completed_at <= task_ended,
+            "timed {late:?} after its task ended, when the worker got to it"
+        );
     }
 
     #[test]
