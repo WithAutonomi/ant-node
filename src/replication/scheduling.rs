@@ -6,14 +6,17 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::logging::debug;
 
 use crate::ant_protocol::{XorName, CLOSE_GROUP_SIZE};
+use crate::replication::audit_metrics;
 use crate::replication::config::{
     FETCH_REQUEST_TIMEOUT, PAID_LIST_CLOSE_GROUP_SIZE, VERIFICATION_RETRY_BACKOFF_MAX,
 };
+use crate::replication::fetch_busy::SourceBusyTracker;
 use crate::replication::types::{
     FetchCandidate, FetchOrder, FetchPayload, VerificationEntry, VerificationState,
 };
@@ -681,6 +684,10 @@ pub struct ReplicationQueues {
     /// Which fetch sources stopped answering, so the per-source cap can leave
     /// them out.
     source_health: SourceHealthTable,
+    /// Which fetch sources recently answered busy, so a key starts or retries
+    /// on another free source first. Shared with the fetches that record the
+    /// busy answers.
+    busy_sources: Arc<SourceBusyTracker>,
     /// Reverse index for removing a departed peer from every pending hint
     /// without scanning the entire pending table.
     pending_keys_by_source: HashMap<PeerId, HashSet<XorName>>,
@@ -737,6 +744,7 @@ impl ReplicationQueues {
             max_fetch_sources: MAX_FETCH_SOURCES_PER_KEY,
             parked_maintenance_max: Duration::ZERO,
             source_health: SourceHealthTable::new(FETCH_REQUEST_TIMEOUT),
+            busy_sources: Arc::new(SourceBusyTracker::new()),
             pending_keys_by_source: HashMap::new(),
             capacity_owner_by_key: HashMap::new(),
             pending_keys_by_owner: HashMap::new(),
@@ -772,6 +780,20 @@ impl ReplicationQueues {
     pub(crate) fn with_fetch_request_timeout(mut self, timeout: Duration) -> Self {
         self.source_health = SourceHealthTable::new(timeout);
         self
+    }
+
+    /// Read which sources recently answered busy from `busy_sources`, the
+    /// tracker this node's fetches record those answers in.
+    #[must_use]
+    pub(crate) fn with_busy_sources(mut self, busy_sources: Arc<SourceBusyTracker>) -> Self {
+        self.busy_sources = busy_sources;
+        self
+    }
+
+    /// The tracker of sources that recently answered busy.
+    #[cfg(test)]
+    pub(crate) fn busy_sources(&self) -> &SourceBusyTracker {
+        &self.busy_sources
     }
 
     /// Apply whether a fetch attempt's `source` answered. Called for every
@@ -2003,7 +2025,8 @@ impl ReplicationQueues {
     /// Each slot goes to the nearest queued key that can start now: one with
     /// an untried source below the cap, or an untried silent source. It starts
     /// on the first untried source below the cap that is not silent, in its
-    /// source-preference order, or else on its first untried silent source,
+    /// source-preference order, one that recently answered busy only when no
+    /// other is below the cap, or else on its first untried silent source,
     /// past the cap. A heap key that cannot start is parked under each of its
     /// untried sources, so it leaves the heap once and a startable key behind
     /// it is reached in the same pass; a parked key becomes a candidate again
@@ -2103,8 +2126,9 @@ impl ReplicationQueues {
     /// of this node's fetches in flight.
     ///
     /// The next untried source with a free share that is not silent is
-    /// returned to retry from now, as [`Self::retry_fetch`] would, or else the
-    /// first untried silent source, past the cap. If every untried source is
+    /// returned to retry from now, as [`Self::retry_fetch`] would, one that
+    /// recently answered busy only when no other is free, or else the first
+    /// untried silent source, past the cap. If every untried source is
     /// answering and at its share, the key goes back to the fetch queue
     /// parked, with only its untried sources and with its tried set kept, so
     /// no source is asked twice this cycle; its retry reservation travels with
@@ -2135,13 +2159,27 @@ impl ReplicationQueues {
             return FetchRetry::Exhausted;
         }
         let health = &self.source_health;
-        let free = untried
+        let busy = &self.busy_sources;
+        let is_free = |peer: &PeerId| {
+            !health.is_silent(peer, now)
+                && in_flight.get(peer).copied().unwrap_or(0) < per_source_cap
+        };
+        // A free source that recently answered busy goes after every other
+        // free one, and still before a silent one.
+        let rested = untried
             .iter()
-            .find(|peer| {
-                !health.is_silent(peer, now)
-                    && in_flight.get(peer).copied().unwrap_or(0) < per_source_cap
-            })
+            .find(|peer| is_free(peer) && !busy.is_cooling(peer, now))
             .copied();
+        if let Some(rested) = rested {
+            if untried
+                .iter()
+                .take_while(|peer| **peer != rested)
+                .any(&is_free)
+            {
+                audit_metrics::record_fetch_busy_cooling_skip();
+            }
+        }
+        let free = rested.or_else(|| untried.iter().find(|peer| is_free(peer)).copied());
         let silent = || {
             untried
                 .iter()
@@ -2190,7 +2228,9 @@ impl ReplicationQueues {
 
     /// The first untried source of `candidate`, in its source-preference
     /// order, that is not silent and is below the cap, or else its first
-    /// untried silent source.
+    /// untried silent source. A source below the cap that recently answered
+    /// busy is passed over while another one below the cap is not cooling,
+    /// and still comes before a silent one: it answers, if only to say busy.
     fn first_startable_source(
         &self,
         candidate: &FetchCandidate,
@@ -2199,6 +2239,7 @@ impl ReplicationQueues {
         let tried = self.fetch_tried.get(&candidate.key);
         let mut any_untried = false;
         let mut first_silent = None;
+        let mut first_cooling = None;
         for source in &candidate.sources {
             if tried.is_some_and(|t| t.contains(source)) {
                 continue;
@@ -2209,10 +2250,16 @@ impl ReplicationQueues {
             } else if startable.in_flight.get(source).copied().unwrap_or(0)
                 < startable.per_source_cap
             {
-                return SourceChoice::Start(*source);
+                if !self.busy_sources.is_cooling(source, startable.now) {
+                    if first_cooling.is_some() {
+                        audit_metrics::record_fetch_busy_cooling_skip();
+                    }
+                    return SourceChoice::Start(*source);
+                }
+                first_cooling = first_cooling.or(Some(*source));
             }
         }
-        match (first_silent, any_untried) {
+        match (first_cooling.or(first_silent), any_untried) {
             (Some(source), _) => SourceChoice::Start(source),
             (None, true) => SourceChoice::AllBusy,
             (None, false) => SourceChoice::NoSource,
@@ -5246,6 +5293,62 @@ mod tests {
             );
             assert_queue_invariants(&queues);
         }
+    }
+
+    /// Record that `source` just answered this node busy.
+    fn cool(queues: &ReplicationQueues, source: PeerId) {
+        queues
+            .busy_sources
+            .record_busy(&source, Instant::now(), Duration::from_mins(1));
+    }
+
+    #[test]
+    fn dispatch_puts_a_source_that_answered_busy_after_the_other_free_ones() {
+        let mut queues = ReplicationQueues::new();
+        let (a, b, s) = (peer(1), peer(2), peer(3));
+        silence(&mut queues, s, 1);
+        cool(&queues, a);
+        let keys: Vec<XorName> = (0..5).map(|d| queue(&mut queues, d, &[a, b, s])).collect();
+
+        let dispatch = queues.dispatch_fetches(8, CAP);
+
+        let expected: Vec<(XorName, PeerId)> = keys.iter().copied().zip([b, b, a, a, s]).collect();
+        assert_eq!(
+            dispatch.started, expected,
+            "b until its share is full, then the busy a, never withheld, before the silent s"
+        );
+        assert!(queues.fetch_parked.is_empty());
+        assert_queue_invariants(&queues);
+    }
+
+    #[test]
+    fn retry_puts_a_source_that_answered_busy_after_the_other_free_ones() {
+        let mut queues = ReplicationQueues::new();
+        let (a, b, c, s) = (peer(1), peer(2), peer(3), peer(4));
+        let key = queue(&mut queues, 0, &[a, b, c, s]);
+        assert_eq!(queues.dispatch_fetches(1, CAP).started, vec![(key, a)]);
+        silence(&mut queues, s, 1);
+        cool(&queues, b);
+
+        assert_eq!(
+            queues.retry_or_park_fetch(&key, key, CAP),
+            FetchRetry::Next(c),
+            "the free c before the busy b"
+        );
+        assert_eq!(
+            queues.retry_or_park_fetch(&key, key, CAP),
+            FetchRetry::Next(b),
+            "the busy b, never withheld, before the silent s"
+        );
+        assert_eq!(
+            queues.retry_or_park_fetch(&key, key, CAP),
+            FetchRetry::Next(s)
+        );
+        assert_eq!(
+            queues.retry_or_park_fetch(&key, key, CAP),
+            FetchRetry::Exhausted
+        );
+        assert_queue_invariants(&queues);
     }
 
     #[test]
