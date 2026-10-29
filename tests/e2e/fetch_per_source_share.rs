@@ -40,6 +40,7 @@ use saorsa_core::identity::PeerId;
 use serial_test::serial;
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
+use tokio::time::Instant as TokioInstant;
 
 /// Above `storage_admission_width` (9), so the network has a real close group.
 const NODE_COUNT: usize = 12;
@@ -277,11 +278,11 @@ async fn teardown_with_the_gate_closed(harness: TestHarness) {
 /// Wait until `engine` has nothing queued or in flight for fetch, continuously
 /// for [`QUIET_FOR`].
 async fn wait_until_fetch_pipeline_is_quiet(engine: &ReplicationEngine) {
-    let deadline = tokio::time::Instant::now() + QUIET_DEADLINE;
-    let mut quiet_since = tokio::time::Instant::now();
+    let deadline = TokioInstant::now() + QUIET_DEADLINE;
+    let mut quiet_since = TokioInstant::now();
     loop {
         let snapshot = engine.fetch_pipeline_snapshot_for_test().await;
-        let now = tokio::time::Instant::now();
+        let now = TokioInstant::now();
         if !snapshot.queued.is_empty() || !snapshot.in_flight.is_empty() {
             quiet_since = now;
         } else if now.duration_since(quiet_since) >= QUIET_FOR {
@@ -302,9 +303,9 @@ async fn observe_max_in_flight_to(
     keys: &HashSet<XorName>,
     holder: &PeerId,
 ) -> usize {
-    let deadline = tokio::time::Instant::now() + OBSERVATION_WINDOW;
+    let deadline = TokioInstant::now() + OBSERVATION_WINDOW;
     let mut max_in_flight = 0;
-    while tokio::time::Instant::now() < deadline {
+    while TokioInstant::now() < deadline {
         let snapshot = engine.fetch_pipeline_snapshot_for_test().await;
         let unrelated: Vec<&XorName> = snapshot
             .queued
