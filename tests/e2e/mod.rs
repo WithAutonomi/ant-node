@@ -70,6 +70,12 @@ mod security_attacks;
 mod subtree_audit_testnet;
 
 #[cfg(test)]
+mod fetch_busy_ab;
+
+#[cfg(test)]
+mod fetch_busy_reply;
+
+#[cfg(test)]
 mod fetch_local_write_guard;
 
 #[cfg(test)]
