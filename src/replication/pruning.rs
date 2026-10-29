@@ -342,6 +342,7 @@ struct PruneAuditReportState {
 #[derive(Clone, Copy)]
 struct PruneAuditContext<'a> {
     storage: &'a Arc<ChunkStore>,
+    paid_list: &'a PaidList,
     p2p_node: &'a Arc<P2PNode>,
     config: &'a ReplicationConfig,
     sync_state: &'a Arc<RwLock<NeighborSyncState>>,
@@ -360,6 +361,7 @@ pub async fn run_prune_pass_with_context(ctx: PrunePassContext<'_>) -> PruneResu
     let (paid_count, paid_stats) = prune_paid_entries(
         ctx.self_id,
         ctx.paid_list,
+        ctx.storage,
         ctx.p2p_node,
         ctx.config,
         now,
@@ -508,16 +510,8 @@ async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPrune
     )
     .await;
 
-    let present_by_key = collect_record_prune_proofs(
-        &audit_selection.candidates,
-        stored_keys.len(),
-        ctx.storage,
-        ctx.p2p_node,
-        ctx.config,
-        ctx.sync_state,
-        ctx.audit_challenge_coordinator,
-    )
-    .await;
+    let present_by_key =
+        collect_record_prune_proofs(&audit_selection.candidates, stored_keys.len(), ctx).await;
     let (keys_to_delete, revalidated_cleared, audit_below_threshold) =
         revalidated_record_prune_keys(&audit_selection.candidates, &present_by_key, ctx).await;
     stats.cleared += revalidated_cleared;
@@ -801,6 +795,7 @@ fn select_record_prune_audits(
 async fn prune_paid_entries(
     self_id: &PeerId,
     paid_list: &Arc<PaidList>,
+    storage: &ChunkStore,
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
     now: Instant,
@@ -849,7 +844,9 @@ async fn prune_paid_entries(
                 let elapsed = now
                     .checked_duration_since(first_seen)
                     .unwrap_or(Duration::ZERO);
-                if elapsed >= config.prune_hysteresis_duration {
+                if elapsed >= config.prune_hysteresis_duration
+                    && !keeps_price_contested_mark(key, paid_list, storage)
+                {
                     match select_paid_prune_candidate(
                         key,
                         &closest,
@@ -886,7 +883,7 @@ async fn prune_paid_entries(
 
     let confirmed_by_key =
         collect_paid_prune_confirmations(&expired_candidates, p2p_node, config).await;
-    let (paid_keys_to_delete, revalidated_cleared) = revalidated_paid_prune_keys(
+    let (mut paid_keys_to_delete, revalidated_cleared) = revalidated_paid_prune_keys(
         &expired_candidates,
         &confirmed_by_key,
         self_id,
@@ -895,10 +892,22 @@ async fn prune_paid_entries(
         config,
     )
     .await;
+    // Checked again after the network round, in case the record arrived
+    // meanwhile.
+    paid_keys_to_delete.retain(|key| !keeps_price_contested_mark(key, paid_list, storage));
     stats.cleared += revalidated_cleared;
     stats.pruned = delete_paid_entries(&paid_keys_to_delete, paid_list).await;
 
     (paid_keys.len(), stats)
+}
+
+/// Whether the paid entry for `key` must outlive the paid-prune rules: it
+/// carries the price-contested mark (see `fresh::record_paid_key`) and this
+/// node still holds the record the mark protects. State that cannot be read
+/// counts as both (see `PaidList::counts_as_price_contested`). Such an entry
+/// is not even put to the paid group, so it costs no verification budget.
+fn keeps_price_contested_mark(key: &XorName, paid_list: &PaidList, storage: &ChunkStore) -> bool {
+    paid_list.counts_as_price_contested(key) && storage.exists(key).unwrap_or(true)
 }
 
 fn select_paid_prune_candidate(
@@ -1202,14 +1211,13 @@ async fn delete_stored_records(
 /// local, and the retained record continues to participate in normal
 /// neighbor-sync repair because replica hint construction walks all locally
 /// stored keys, including out-of-range keys retained by hysteresis.
+///
+/// A price-contested key still needs its proofs before it is deleted, but no
+/// absent peer is scored for it (see `fresh::record_paid_key`).
 async fn collect_record_prune_proofs(
     candidates: &[RecordPruneCandidate],
     local_stored_key_count: usize,
-    storage: &Arc<ChunkStore>,
-    p2p_node: &Arc<P2PNode>,
-    config: &ReplicationConfig,
-    sync_state: &Arc<RwLock<NeighborSyncState>>,
-    audit_challenge_coordinator: &Arc<AuditChallengeCoordinator>,
+    ctx: &PrunePassContext<'_>,
 ) -> HashMap<XorName, HashSet<PeerId>> {
     if candidates.is_empty() {
         return HashMap::new();
@@ -1220,11 +1228,12 @@ async fn collect_record_prune_proofs(
     let challenges = build_peer_audit_challenges(candidates, max_keys_per_challenge);
     let report_state = PruneAuditReportState::default();
     let audit_context = PruneAuditContext {
-        storage,
-        p2p_node,
-        config,
-        sync_state,
-        audit_challenge_coordinator,
+        storage: ctx.storage,
+        paid_list: ctx.paid_list,
+        p2p_node: ctx.p2p_node,
+        config: ctx.config,
+        sync_state: ctx.sync_state,
+        audit_challenge_coordinator: ctx.audit_challenge_coordinator,
         report_state: &report_state,
     };
     let mut requests = stream::iter(challenges)
@@ -1618,15 +1627,7 @@ async fn peer_proves_records(
                     "failed"
                 };
                 if !audit_failure_reported
-                    && report_prune_audit_failure_once(
-                        &peer,
-                        &key,
-                        context.p2p_node,
-                        context.config,
-                        context.report_state,
-                        failure_class,
-                    )
-                    .await
+                    && report_prune_audit_failure_once(&peer, &key, context, failure_class).await
                 {
                     audit_failure_reported = true;
                 }
@@ -1671,16 +1672,7 @@ async fn receive_prune_audit_response(
     };
 
     for key in challenge_keys {
-        if report_prune_audit_failure_once(
-            peer,
-            key,
-            context.p2p_node,
-            context.config,
-            context.report_state,
-            failure_class,
-        )
-        .await
-        {
+        if report_prune_audit_failure_once(peer, key, context, failure_class).await {
             break;
         }
     }
@@ -1964,11 +1956,25 @@ fn audit_digest_proves_key(
 async fn report_prune_audit_failure_once(
     peer: &PeerId,
     key: &XorName,
-    p2p_node: &Arc<P2PNode>,
-    config: &ReplicationConfig,
-    report_state: &PruneAuditReportState,
+    context: PruneAuditContext<'_>,
     audit_failure_class: &'static str,
 ) -> bool {
+    let PruneAuditContext {
+        paid_list,
+        p2p_node,
+        config,
+        report_state,
+        ..
+    } = context;
+    // No peer is scored for a price-contested key (see
+    // `fresh::record_paid_key`); a mark that cannot be read counts as set.
+    if paid_list.counts_as_price_contested(key) {
+        debug!(
+            "Prune audit: not scoring {peer} for {}, a price-contested key",
+            hex::encode(key)
+        );
+        return false;
+    }
     let should_report = peer_is_currently_responsible(peer, key, p2p_node, config).await
         && reserve_prune_audit_failure_report(report_state, peer).await;
     if !should_report {
@@ -2116,6 +2122,53 @@ mod tests {
 
     fn candidate(key: XorName, target_peers: Vec<PeerId>) -> RecordPruneCandidate {
         RecordPruneCandidate { key, target_peers }
+    }
+
+    /// ADR-0006: a price-contested paid entry is kept while its record is
+    /// held, and prunes like any other once the record is gone. Unmarked
+    /// entries are unaffected.
+    #[tokio::test]
+    async fn a_price_contested_paid_entry_outlives_paid_pruning_while_its_record_is_held() {
+        let dir = TempDir::new().expect("temp dir");
+        let storage = ChunkStore::new(ChunkStoreConfig {
+            root_dir: dir.path().join("chunks"),
+            ..ChunkStoreConfig::test_default()
+        })
+        .await
+        .expect("chunk store");
+        let paid_list = PaidList::new(dir.path()).await.expect("paid list");
+        let held_bytes = b"held price-contested record".to_vec();
+        let held = ChunkStore::compute_address(&held_bytes);
+        storage.put(&held, &held_bytes).await.expect("put");
+        let gone: XorName = [0x81; 32];
+        let plain: XorName = [0x82; 32];
+        paid_list.insert_price_contested(&held).await.expect("mark");
+        paid_list.insert_price_contested(&gone).await.expect("mark");
+        paid_list.insert(&plain).await.expect("insert");
+
+        assert!(keeps_price_contested_mark(&held, &paid_list, &storage));
+        assert!(!keeps_price_contested_mark(&gone, &paid_list, &storage));
+        assert!(!keeps_price_contested_mark(&plain, &paid_list, &storage));
+
+        // A held record whose mark cannot be read is kept as if marked.
+        let plain_held_bytes = b"held plain record".to_vec();
+        let plain_held = ChunkStore::compute_address(&plain_held_bytes);
+        storage
+            .put(&plain_held, &plain_held_bytes)
+            .await
+            .expect("put");
+        paid_list.insert(&plain_held).await.expect("insert");
+        assert!(!keeps_price_contested_mark(
+            &plain_held,
+            &paid_list,
+            &storage
+        ));
+        let _reader = paid_list.hold_reader_for_tests().expect("hold reader");
+        assert!(keeps_price_contested_mark(
+            &plain_held,
+            &paid_list,
+            &storage
+        ));
     }
 
     /// A prune audit judges holders against this node's own copy. A copy that

@@ -14,6 +14,7 @@ use crate::ant_protocol::XorName;
 use crate::replication::audit_coordinator::AuditChallengeCoordinator;
 use crate::replication::audit_metrics::{self, AuditFailureClass, AuditType};
 use crate::replication::config::{ReplicationConfig, REPLICATION_PROTOCOL_ID};
+use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
     compute_audit_digest, AuditChallenge, AuditResponse, ReplicationMessage,
     ReplicationMessageBody, ABSENT_KEY_DIGEST,
@@ -99,6 +100,18 @@ pub(crate) fn responsible_audit_response_timeout(
     config.audit_response_timeout(key_count)
 }
 
+/// `sampled` without the keys marked price-contested (see
+/// `fresh::record_paid_key`). Those are never hinted, so they normally hold no
+/// repair proof; this also covers one hinted just before its mark was
+/// written. A mark that cannot be read counts as set (see
+/// `PaidList::counts_as_price_contested`).
+fn keys_open_to_audit(sampled: Vec<XorName>, paid_list: &PaidList) -> Vec<XorName> {
+    sampled
+        .into_iter()
+        .filter(|key| !paid_list.counts_as_price_contested(key))
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Main audit tick
 // ---------------------------------------------------------------------------
@@ -107,7 +120,7 @@ pub(crate) fn responsible_audit_response_timeout(
 ///
 /// This is the production path used by the replication engine. Direct
 /// callers that have not adopted repair proofs remain conservative and do not
-/// audit peers for unproven keys.
+/// audit peers for unproven keys, nor for price-contested ones (ADR-0006).
 #[allow(
     clippy::implicit_hasher,
     clippy::too_many_arguments,
@@ -116,6 +129,7 @@ pub(crate) fn responsible_audit_response_timeout(
 pub async fn audit_tick_with_repair_proofs(
     p2p_node: &Arc<P2PNode>,
     storage: &Arc<ChunkStore>,
+    paid_list: &PaidList,
     config: &ReplicationConfig,
     sync_history: &HashMap<PeerId, PeerSyncRecord>,
     repair_proofs: &Arc<RwLock<RepairProofs>>,
@@ -172,6 +186,7 @@ pub async fn audit_tick_with_repair_proofs(
             .copied()
             .collect()
     };
+    let sampled_keys = keys_open_to_audit(sampled_keys, paid_list);
 
     // Step 4: Filter to keys where the chosen peer is in the close group and
     // this node has proof that it already sent the peer a repair hint for the
@@ -900,6 +915,44 @@ mod tests {
     /// Simulated stored chunk count for tests. Large enough that the dynamic
     /// incoming audit limit (`2 * sqrt(N)`) never rejects small test challenges.
     const TEST_STORED_CHUNKS: usize = 1_000_000;
+
+    /// ADR-0006: the responsible audit never samples a key marked
+    /// price-contested, and samples every other key as before.
+    #[tokio::test]
+    async fn price_contested_keys_are_not_audited() {
+        let dir = TempDir::new().expect("temp dir");
+        let paid_list = PaidList::new(dir.path()).await.expect("paid list");
+        let plain: XorName = [0x71; 32];
+        let contested: XorName = [0x72; 32];
+        let unpaid: XorName = [0x73; 32];
+        paid_list.insert(&plain).await.expect("insert");
+        paid_list
+            .insert_price_contested(&contested)
+            .await
+            .expect("mark");
+
+        assert_eq!(
+            keys_open_to_audit(vec![plain, contested, unpaid], &paid_list),
+            vec![plain, unpaid]
+        );
+    }
+
+    /// ADR-0006: while the paid list cannot be read, the responsible audit
+    /// samples no key, since any of them may be marked.
+    #[tokio::test]
+    async fn an_unreadable_mark_keeps_a_key_out_of_the_audit() {
+        let dir = TempDir::new().expect("temp dir");
+        let paid_list = PaidList::new(dir.path()).await.expect("paid list");
+        let plain: XorName = [0x74; 32];
+        let unpaid: XorName = [0x75; 32];
+        paid_list.insert(&plain).await.expect("insert");
+
+        let _reader = paid_list.hold_reader_for_tests().expect("hold reader");
+        assert_eq!(
+            keys_open_to_audit(vec![plain, unpaid], &paid_list),
+            Vec::<XorName>::new()
+        );
+    }
 
     #[test]
     fn first_challenged_key_label_truncates_to_16_hex_chars() {

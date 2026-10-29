@@ -864,9 +864,9 @@ impl AntProtocol {
                 self.quote_generator.record_store();
 
                 // 7. Notify replication engine for fresh fan-out.
-                //    Only emit when a real proof is present — cached-as-verified
-                //    PUTs have no proof to forward, and the chunk would have
-                //    already replicated on the original write that carried one.
+                //    Only emit when a real proof is present. A cached-as-verified
+                //    PUT normally carries none; one that does forwards it
+                //    unverified, and the fan-out prices it as it stands (ADR-0006).
                 if let (Some(ref tx), Some(proof)) = (&self.fresh_write_tx, request.payment_proof) {
                     // ADR-0004: strip any commitment sidecars before forwarding
                     // to replication — the ADR specifies persisted/replicated
@@ -1249,7 +1249,6 @@ mod tests {
             cache_capacity: 100_000,
             close_group_size: crate::ant_protocol::CLOSE_GROUP_SIZE,
             local_rewards_address: rewards_address,
-            price_floor: crate::payment::PriceFloorConfig::default(),
         };
         let payment_verifier = Arc::new(PaymentVerifier::new(payment_config));
         let metrics_tracker = QuotingMetricsTracker::new(100);
