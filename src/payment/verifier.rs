@@ -5044,7 +5044,7 @@ mod tests {
         let verifier = create_test_verifier();
         assert!(!verifier.price_contested(&xorname, &proof_bytes).await);
 
-        verifier.attach_commitment_cache(Arc::new(tokio::sync::RwLock::new(HashMap::new())));
+        verifier.attach_commitment_cache(CommitmentCache::default());
         assert!(!verifier.price_contested(&xorname, &proof_bytes).await);
     }
 

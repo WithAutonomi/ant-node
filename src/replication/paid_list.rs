@@ -709,6 +709,8 @@ mod tests {
     use std::fs::OpenOptions;
     #[cfg(target_pointer_width = "64")]
     use std::io::{Read, Seek, SeekFrom, Write};
+    use tokio::sync::oneshot;
+    use tokio::task::JoinHandle;
     #[cfg(feature = "logging")]
     use tracing::subscriber::with_default;
     #[cfg(feature = "logging")]
@@ -1309,21 +1311,16 @@ mod tests {
     ///
     /// Returns once the order is held. Dropping the returned sender releases
     /// it.
-    async fn hold_write_order(
-        pl: &PaidList,
-    ) -> (
-        tokio::sync::oneshot::Sender<()>,
-        tokio::task::JoinHandle<()>,
-    ) {
+    async fn hold_write_order(pl: &PaidList) -> (oneshot::Sender<()>, JoinHandle<()>) {
         let write_order = Arc::clone(&pl.write_order);
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-        let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
-        let holder = tokio::task::spawn_blocking(move || {
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let (held_tx, held_rx) = oneshot::channel::<()>();
+        let holder = spawn_blocking(move || {
             let _ordered = write_order.lock();
             let _ = held_tx.send(());
             let _ = release_rx.blocking_recv();
         });
-        held_rx.await.expect("write order held");
+        assert!(held_rx.await.is_ok(), "write order held");
         (release_tx, holder)
     }
 
