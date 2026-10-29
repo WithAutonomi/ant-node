@@ -22,8 +22,9 @@ one requester can occupy:
 The requesting side never matched that share:
 
 - the fetch worker ran one fetch per hardware thread;
-- it sent each one to the first verified holder of its key, in source-preference order (the
-  closest holder that answered Present);
+- it sent each one to the first source of its key in source-preference order, normally the
+  closest holder that answered Present (peers that only advertised the key in a replica hint
+  come after those holders, so a key no holder confirmed goes to one of them first);
 - the fetch queue is nearest-first, so the keys at its head usually share the same few holders.
 
 When more than two fetch slots were available and several queued keys shared a holder, the worker
