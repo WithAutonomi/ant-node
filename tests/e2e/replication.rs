@@ -1203,7 +1203,10 @@ async fn test_fetch_request_returns_record() {
         .expect("put");
 
     // Send fetch request from B to A
-    let request = FetchRequest { key: address };
+    let request = FetchRequest {
+        key: address,
+        busy_reply: false,
+    };
     let msg = ReplicationMessage {
         request_id: 99,
         body: ReplicationMessageBody::FetchRequest(request),
@@ -2030,7 +2033,10 @@ async fn test_fetch_not_found() {
     let peer_a = *p2p_a.peer_id();
 
     let missing_key = [0xEE; 32];
-    let request = FetchRequest { key: missing_key };
+    let request = FetchRequest {
+        key: missing_key,
+        busy_reply: false,
+    };
     let msg = ReplicationMessage {
         request_id: 77,
         body: ReplicationMessageBody::FetchRequest(request),
@@ -2366,7 +2372,10 @@ async fn test_fetch_returns_error_for_corrupt_key() {
     let peer_a = *p2p_a.peer_id();
 
     let fake_key = [0x00; 32];
-    let request = FetchRequest { key: fake_key };
+    let request = FetchRequest {
+        key: fake_key,
+        busy_reply: false,
+    };
     let msg = ReplicationMessage {
         request_id: 4000,
         body: ReplicationMessageBody::FetchRequest(request),
