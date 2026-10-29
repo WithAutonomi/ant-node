@@ -656,7 +656,9 @@ out of 1,801:
   - a write below the contest threshold, or one the node cannot price, is
     contested, and one at the median is not. The threshold is 60% of the
     uncapped median to the atto, it stays on the median when the cap binds,
-    and it follows the view when the write is recorded;
+    and a fan-out judges the proof it forwards against the view when it fans
+    out, while a chunk's paid-list mark keeps the decision its verification
+    made;
   - the tolerance is 30%: exactly `3 x 30%` of the group median clears it
     and one atto less does not;
   - a node with no floor wired contests nothing;

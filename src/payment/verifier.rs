@@ -5048,10 +5048,10 @@ mod tests {
         assert!(!verifier.price_contested(&xorname, &proof_bytes).await);
     }
 
-    /// The decision is taken from the proof against the current view when the
-    /// write is recorded (or, for a pointer, fanned out), so a write stored
-    /// after the group's prices rose is judged against the view peers will
-    /// price it against now.
+    /// A fan-out, chunk or pointer, judges the proof it forwards against the
+    /// view when it fans out, so a write fanned out after the group's prices
+    /// rose is judged against the view peers will price it against now. (A
+    /// chunk's paid-list mark keeps the decision its verification made.)
     #[tokio::test]
     async fn the_contest_follows_the_current_view() {
         let verifier = floor_test_verifier();
