@@ -230,6 +230,10 @@ pub struct TestNetworkConfig {
     /// use this to shorten timers — e.g. the ADR-0003 possession-check delay.
     pub replication_config: Option<ReplicationConfig>,
 
+    /// Fetches each node's worker runs at once. `None` uses one per hardware
+    /// thread.
+    pub fetch_concurrency: Option<usize>,
+
     /// Optional per-node storage disk-reserve overrides.
     ///
     /// Tests can set a node's reserve above available disk space to make its
@@ -283,6 +287,7 @@ impl Default for TestNetworkConfig {
             payment_enforcement: false,
             evm_network: None,
             replication_config: None,
+            fetch_concurrency: None,
             storage_disk_reserve_overrides: HashMap::new(),
         }
     }
@@ -1388,6 +1393,9 @@ impl TestNetwork {
             .await
             {
                 Ok(mut engine) => {
+                    if let Some(concurrency) = self.config.fetch_concurrency {
+                        engine.set_fetch_concurrency_for_test(concurrency);
+                    }
                     // Pointers replicate through the same engine (ADR-0016),
                     // which the service also asks before a final state
                     // (ADR-0018).
