@@ -1,6 +1,6 @@
 //! Node implementation - thin wrapper around saorsa-core's `P2PNode`.
 
-use crate::ant_protocol::CHUNK_PROTOCOL_ID;
+use crate::ant_protocol::{ChunkMessage, CHUNK_PROTOCOL_ID};
 use crate::config::{
     default_nodes_dir, default_root_dir, NetworkMode, NodeConfig, NODE_IDENTITY_FILENAME,
 };
@@ -19,19 +19,22 @@ use crate::storage::legacy_artifacts;
 use crate::storage::traffic as storage_traffic;
 use crate::storage::MIB;
 use crate::storage::{AntProtocol, ChunkRequestContext, ChunkStore, ChunkStoreConfig};
+use crate::swarm::{self, SwarmService, SwarmSession};
 use crate::upgrade::{
     upgrade_cache_dir, AutoApplyUpgrader, BinaryCache, ReleaseCache, UpgradeMonitor, UpgradeResult,
 };
 use rand::Rng;
-use saorsa_core::identity::NodeIdentity;
+use saorsa_core::identity::{NodeIdentity, PeerId};
 use saorsa_core::{
     IPDiversityConfig as CoreDiversityConfig, MultiAddr, NodeConfig as CoreNodeConfig, P2PEvent,
     P2PNode,
 };
+use saorsa_transport::shared::normalize_socket_addr;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
@@ -56,6 +59,204 @@ const PROTOCOL_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs
 fn user_agent() -> String {
     format!("node/{}", env!("CARGO_PKG_VERSION"))
 }
+
+/// Routes native clients' swarm requests to the rendezvous, apart from chunk
+/// requests, and sweeps it: the same for nodes and devnet nodes.
+pub(crate) struct NativeSwarmRouter {
+    swarm: Arc<SwarmService>,
+    /// Swarm requests have their own budget: an announce may wait for a
+    /// signal, and must never hold a permit chunk requests use.
+    slots: Arc<Semaphore>,
+    p2p: Arc<P2PNode>,
+    children: TaskTracker,
+    stopping: CancellationToken,
+}
+
+impl NativeSwarmRouter {
+    /// Starts sweeping `swarm` every [`SWARM_SWEEP_INTERVAL`] until `stopping`.
+    pub(crate) fn start(
+        swarm: Arc<SwarmService>,
+        p2p: Arc<P2PNode>,
+        children: TaskTracker,
+        stopping: CancellationToken,
+    ) -> Self {
+        let sweeping = Arc::clone(&swarm);
+        let stop = stopping.clone();
+        children.spawn(async move {
+            let mut every = tokio::time::interval(SWARM_SWEEP_INTERVAL);
+            loop {
+                tokio::select! {
+                    () = stop.cancelled() => break,
+                    _ = every.tick() => sweeping.sweep(Instant::now()),
+                }
+            }
+        });
+        Self {
+            swarm,
+            slots: Arc::new(Semaphore::new(swarm::MAX_SWARM_TASKS)),
+            p2p,
+            children,
+            stopping,
+        }
+    }
+
+    /// Handles `event` if it is the swarm's: a connection that closed, or a
+    /// swarm request, handed to its own task. Returns whether it was.
+    /// Saturated, a request is dropped: the client times out and fetches
+    /// from nodes alone.
+    pub(crate) fn route(&self, event: &P2PEvent) -> bool {
+        if let P2PEvent::PeerDisconnected(peer) = event {
+            self.swarm
+                .session_closed(SwarmSession::Native(*peer.to_bytes()));
+            return true;
+        }
+        let P2PEvent::Message {
+            topic,
+            source: Some(source),
+            transport_source,
+            timestamp,
+            data,
+        } = event
+        else {
+            return false;
+        };
+        if topic != CHUNK_PROTOCOL_ID || !swarm::is_swarm_request_bytes(data) {
+            return false;
+        }
+        // No legal swarm request is this long; refuse it before decoding.
+        if data.len() > ant_protocol::MAX_SWARM_REQUEST_BYTES {
+            debug!(
+                "Swarm request from {source} dropped: {} bytes is too long",
+                data.len()
+            );
+            return true;
+        }
+        // The reply goes back on the connection the request came on, named
+        // as the transport names it.
+        let Some(channel) = transport_source
+            .as_ref()
+            .and_then(MultiAddr::socket_addr)
+            .map(|address| normalize_socket_addr(address).to_string())
+        else {
+            debug!("Swarm request from {source} dropped: no connection to answer on");
+            return true;
+        };
+        let Ok(permit) = Arc::clone(&self.slots).try_acquire_owned() else {
+            debug!("Swarm request from {source} dropped: swarm slots full");
+            return true;
+        };
+        let swarm = Arc::clone(&self.swarm);
+        let p2p = Arc::clone(&self.p2p);
+        let stopping = self.stopping.clone();
+        let request = SwarmRequest {
+            source: *source,
+            channel,
+            source_ip: transport_source.as_ref().and_then(MultiAddr::ip),
+            signed_at: *timestamp,
+            received: Instant::now(),
+            data: data.clone(),
+        };
+        self.children.spawn(async move {
+            let _permit = permit;
+            Self::answer(&swarm, &p2p, request, &stopping).await;
+        });
+        true
+    }
+
+    /// Answers one swarm request and sends the reply.
+    async fn answer(
+        swarm: &SwarmService,
+        p2p: &Arc<P2PNode>,
+        request: SwarmRequest,
+        stopping: &CancellationToken,
+    ) {
+        let SwarmRequest {
+            source,
+            channel,
+            source_ip,
+            signed_at,
+            received,
+            data,
+        } = request;
+        let source = &source;
+        let message = match ChunkMessage::decode(&data) {
+            Ok(message) => message,
+            Err(e) => {
+                debug!("Undecodable swarm request from {source}: {e}");
+                return;
+            }
+        };
+        // The encoded request is not kept while an announce waits.
+        drop(data);
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        let peer = *source.to_bytes();
+        let starts = swarm::starts_history(&message.body);
+        // One for another node gets its error reply without touching the
+        // client's history here.
+        if swarm.names_this_node(&message.body)
+            && !swarm.first_sight(
+                peer,
+                source_ip,
+                message.request_id,
+                signed_at,
+                now_unix,
+                starts,
+            )
+        {
+            debug!("Swarm request from {source} dropped: stale or seen before");
+            return;
+        }
+        let session = SwarmSession::Native(peer);
+        let Some(body) = swarm
+            .handle(session, source_ip, message.body, stopping, received)
+            .await
+        else {
+            return;
+        };
+        // A client that left (or a node stopping) is not dialled to be told.
+        if stopping.is_cancelled() || swarm.reply_unwanted(session, received) {
+            return;
+        }
+        let reply = ChunkMessage {
+            request_id: message.request_id,
+            body,
+        };
+        match reply.encode() {
+            // Only on the connection the request came on. A signed message
+            // is not bound to its connection, so a node that saw one of this
+            // client's could send it here and have the transport take its
+            // own connection for the client's too: the reply never goes on
+            // another of the client's connections, nor dials a client that
+            // left between the check above and the send.
+            Ok(bytes) => {
+                if let Err(e) = p2p
+                    .send_message_on_channel(source, &channel, CHUNK_PROTOCOL_ID, bytes)
+                    .await
+                {
+                    debug!("Failed to send swarm reply to {source}: {e}");
+                }
+            }
+            Err(e) => warn!("Failed to encode swarm reply: {e}"),
+        }
+    }
+}
+
+/// A swarm request from a native client, as it reached the routing loop.
+struct SwarmRequest {
+    source: PeerId,
+    /// The connection it came on.
+    channel: String,
+    source_ip: Option<IpAddr>,
+    /// The client's signed send time, in Unix seconds.
+    signed_at: u64,
+    received: Instant,
+    data: Vec<u8>,
+}
+
+/// How often silent swarm members and expired swarm signals are swept.
+const SWARM_SWEEP_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Builder for constructing an Ant node.
 pub struct NodeBuilder {
@@ -214,6 +415,11 @@ impl NodeBuilder {
             _ => None,
         };
 
+        // Every node hosts the swarm rendezvous, storing chunks or not.
+        let swarm = ant_protocol
+            .as_ref()
+            .map_or_else(SwarmService::new, |protocol| Arc::clone(protocol.swarm()));
+        swarm.set_node_id(*p2p_arc.peer_id().to_bytes());
         let node = RunningNode {
             config: self.config,
             p2p_node: p2p_arc,
@@ -222,6 +428,7 @@ impl NodeBuilder {
             events_rx: Some(events_rx),
             upgrade_monitor,
             ant_protocol,
+            swarm,
             replication_engine,
             protocol_task: None,
             protocol_children: TaskTracker::new(),
@@ -559,6 +766,9 @@ pub struct RunningNode {
     upgrade_monitor: Option<UpgradeMonitor>,
     /// ANT protocol handler for chunk storage.
     ant_protocol: Option<Arc<AntProtocol>>,
+    /// The swarm rendezvous: the storage handler's, or this node's own when
+    /// it stores nothing.
+    swarm: Arc<SwarmService>,
     /// Replication engine (manages neighbor sync, verification, audits).
     replication_engine: Option<ReplicationEngine>,
     /// Protocol message routing background task.
@@ -669,6 +879,7 @@ impl RunningNode {
                 &self.config.root_dir,
                 Arc::clone(&self.p2p_node),
                 self.ant_protocol.clone(),
+                Arc::clone(&self.swarm),
                 &evm_network,
                 self.shutdown.clone(),
                 None,
@@ -1041,19 +1252,29 @@ impl RunningNode {
     /// Subscribes to P2P events and routes incoming chunk protocol messages
     /// to the `AntProtocol` handler, sending responses back to the sender.
     fn start_protocol_routing(&mut self) {
-        let protocol = match self.ant_protocol {
-            Some(ref p) => Arc::clone(p),
-            None => return,
-        };
+        let protocol = self.ant_protocol.clone();
 
         let mut events = self.p2p_node.subscribe_events();
         let p2p = Arc::clone(&self.p2p_node);
         let semaphore = Arc::new(Semaphore::new(64));
         let children = self.protocol_children.clone();
         let stopping = self.shutdown.clone();
+        let swarm = NativeSwarmRouter::start(
+            Arc::clone(&self.swarm),
+            Arc::clone(&p2p),
+            children.clone(),
+            stopping.clone(),
+        );
 
         self.protocol_task = Some(tokio::spawn(async move {
             while let Ok(event) = events.recv().await {
+                if swarm.route(&event) {
+                    continue;
+                }
+                // Chunk requests only where chunks are stored.
+                let Some(protocol) = protocol.as_ref() else {
+                    continue;
+                };
                 if let P2PEvent::Message {
                     topic,
                     source: Some(source),
@@ -1070,7 +1291,7 @@ impl RunningNode {
                     if let Some((data_type, response_topic)) = handler_info {
                         debug!("Received {data_type} protocol message from {source}");
                         let received_at = Instant::now();
-                        let protocol = Arc::clone(&protocol);
+                        let protocol = Arc::clone(protocol);
                         let p2p = Arc::clone(&p2p);
                         let sem = semaphore.clone();
                         let stopping = stopping.clone();

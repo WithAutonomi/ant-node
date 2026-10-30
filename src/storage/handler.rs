@@ -45,6 +45,7 @@ use crate::replication::config::K_BUCKET_SIZE;
 use crate::replication::fresh::FreshWriteEvent;
 use crate::storage::traffic::{self, ChunkRequestKind, ChunkResponseKey};
 use crate::storage::ChunkStore;
+use crate::swarm::{SwarmService, SwarmSession};
 use ant_protocol::chunk::{PointerGetResponse, PointerPutResponse};
 use bytes::Bytes;
 use parking_lot::RwLock;
@@ -349,6 +350,8 @@ pub struct AntProtocol {
     /// message to a node that does not keep pointers gets a clean refusal
     /// rather than a silent drop.
     pointers: Option<PointerService>,
+    /// Introduces clients downloading the same file to each other.
+    swarm: Arc<SwarmService>,
 }
 
 impl AntProtocol {
@@ -387,6 +390,7 @@ impl AntProtocol {
             fresh_write_tx: None,
             p2p_node: RwLock::new(None),
             pointers: None,
+            swarm: SwarmService::new(),
         }
     }
 
@@ -406,6 +410,39 @@ impl AntProtocol {
         self.pointers.as_ref()
     }
 
+    /// The swarm rendezvous. Every node runs one: it is how clients
+    /// downloading the same file find each other.
+    #[must_use]
+    pub fn swarm(&self) -> &Arc<SwarmService> {
+        &self.swarm
+    }
+
+    /// Answers an encoded swarm request from `session`, which arrived from
+    /// `source_ip`, and returns the encoded reply; `None` if `data` is not a
+    /// swarm request. An announce may wait for a signal until `shutdown`.
+    /// Callers route swarm requests here apart from chunk requests, which
+    /// must not wait behind them (see [`crate::swarm::is_swarm_request_bytes`]).
+    pub async fn handle_swarm_request(
+        &self,
+        session: SwarmSession,
+        source_ip: Option<std::net::IpAddr>,
+        data: &[u8],
+        shutdown: &tokio_util::sync::CancellationToken,
+    ) -> Option<Bytes> {
+        let message = ChunkMessage::decode(data).ok()?;
+        let body = self
+            .swarm
+            .handle(session, source_ip, message.body, shutdown, Instant::now())
+            .await?;
+        ChunkMessage {
+            request_id: message.request_id,
+            body,
+        }
+        .encode()
+        .ok()
+        .map(Bytes::from)
+    }
+
     /// Attach the node's P2P handle for payment live-DHT checks.
     ///
     /// Wires the handle into the payment verifier so payment-proof closeness
@@ -413,6 +450,8 @@ impl AntProtocol {
     /// replaces the verifier handle.
     pub fn attach_p2p_node(&self, node: Arc<P2PNode>) {
         *self.p2p_node.write() = Some(Arc::clone(&node));
+        // Swarm requests must name this node.
+        self.swarm.set_node_id(*node.peer_id().to_bytes());
         if let Some(pointers) = &self.pointers {
             // Pointers take the same self-closeness gate as chunks, judged at
             // the pointer address because that is what the network routes on.

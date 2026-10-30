@@ -38,6 +38,7 @@ import tarfile
 import time
 import tomllib
 import urllib.error
+import urllib.parse
 import urllib.request
 
 LICENCE_FILE = re.compile(
@@ -152,7 +153,11 @@ def resolve_package(name, version, annotation, by_name_version):
     elif annotation.startswith("registry "):
         raise Gap(f"{name} {version} comes from {annotation}; only crates.io is supported")
     elif "://" in annotation:
-        matches = [p for p in candidates if (p["source"] or "").startswith("git+" + annotation)]
+        # cargo tree percent-encodes a git branch's slashes, cargo metadata
+        # does not: compare both decoded.
+        wanted = "git+" + urllib.parse.unquote(annotation)
+        matches = [p for p in candidates
+                   if urllib.parse.unquote(p["source"] or "").startswith(wanted)]
     else:
         wanted = os.path.realpath(annotation)
         matches = [p for p in candidates if p["source"] is None

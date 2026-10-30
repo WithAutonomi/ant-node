@@ -242,3 +242,10 @@ cognitive_complexity = "allow"
 # Allow non-const functions during initial development (may need runtime features later)
 missing_const_for_fn = "allow"
 
+# The swarm's wire types (ant-protocol #50), the send on one named channel
+# (saorsa-core #183) and the plain STUN answers (saorsa-transport #231) are on
+# these branches until they merge.
+[patch.crates-io]
+ant-protocol = { git = "https://github.com/grumbach/ant-protocol", branch = "feat/peer-swarm" }
+saorsa-core = { git = "https://github.com/grumbach/saorsa-core", branch = "feat/peer-swarm" }
+saorsa-transport = { git = "https://github.com/grumbach/saorsa-transport", branch = "feat/peer-swarm" }

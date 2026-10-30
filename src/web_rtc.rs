@@ -19,6 +19,7 @@ use crate::error::{Error, Result};
 use crate::logging::{debug, info, warn};
 use crate::payment::{serialize_single_node_proof, PaymentProof};
 use crate::storage::AntProtocol;
+use crate::swarm::{is_swarm_request, is_swarm_request_bytes, SwarmService, SwarmSession};
 use certificate::load_or_generate_certificate;
 use errors::{error_response, public_error, sanitize_response};
 use evmlib::common::{Amount, TxHash};
@@ -60,6 +61,11 @@ const MAX_FIND_NODE_RESULTS: usize = 20;
 const MAX_CHANNEL_REQUESTS: usize = 4;
 const RPC_MULTIPLEX_CAPABILITY: &str = "rpc-multiplex-4";
 
+/// Advertised when `chunk_protocol` admits the swarm messages: a browser
+/// sends them only to a node that names this, since a node that predates
+/// them closes the channel on an unknown chunk protocol request.
+pub const SWARM_CAPABILITY: &str = "swarm_rendezvous";
+
 /// Advertised when `chunk_protocol` admits pointer reads and paid pointer
 /// writes (ADR-0016), so a browser client can tell a node that would refuse
 /// them from one that failed.
@@ -78,6 +84,16 @@ const FIRST_DATA_CHANNEL_TIMEOUT_ERROR: &str = "DataChannel opening timed out";
 const CHANNEL_CAPACITY_ERROR: &str = "global DataChannel capacity exhausted";
 const REQUEST_CAPACITY_ERROR: &str = "global request capacity exhausted";
 const REQUEST_RATE_ERROR: &str = "request rate limit exceeded";
+const SWARM_RATE_ERROR: &str = "swarm request rate limit exceeded";
+/// Swarm requests a listener takes in a second, in all and from one source,
+/// on budgets of their own: a browser announces about once a second per room
+/// it shares a node with, and those announces must never spend the request
+/// budget its own and every other browser's reads need. A swarm request the
+/// swarm's budget has room for gives the read budget its token back; one past
+/// it keeps that charge and is refused, without closing the channel the
+/// reads share.
+const SWARM_REQUESTS_PER_SECOND: usize = 64;
+const SWARM_REQUESTS_PER_SECOND_PER_SOURCE: usize = 8;
 const GLOBAL_BYTE_CAPACITY_ERROR: &str = "global in-flight byte capacity exhausted";
 const SOURCE_BYTE_CAPACITY_ERROR: &str = "source in-flight byte capacity exhausted";
 
@@ -139,6 +155,13 @@ impl RequestRateBucket {
         }
         self.token_units -= 1_000_000_000;
         true
+    }
+
+    /// Gives back a token taken by [`Self::allow`], up to the bucket's
+    /// capacity.
+    fn refund(&mut self) {
+        let capacity = self.rate_per_second.saturating_mul(1_000_000_000);
+        self.token_units = self.token_units.saturating_add(1_000_000_000).min(capacity);
     }
 }
 
@@ -271,6 +294,8 @@ impl TrackedBytes {
 struct SourceQuota {
     bulk_responses: Arc<Semaphore>,
     request_rate: Mutex<RequestRateBucket>,
+    /// See [`SWARM_REQUESTS_PER_SECOND_PER_SOURCE`].
+    swarm_rate: Mutex<RequestRateBucket>,
     bytes: Arc<ByteBudget>,
 }
 
@@ -288,6 +313,8 @@ struct SourceAdmissionState {
 /// Admission and accounting shared by every association on one listener.
 struct ListenerResources {
     running: AtomicBool,
+    /// Numbers browser connections for the swarm rendezvous.
+    next_connection: AtomicU64,
     connection_rejections: AtomicU64,
     channel_rejections: AtomicU64,
     request_rejections: AtomicU64,
@@ -303,6 +330,8 @@ struct ListenerResources {
     bulk_responses: Arc<Semaphore>,
     request_tasks: Mutex<TaskTracker>,
     global_request_rate: Mutex<RequestRateBucket>,
+    /// See [`SWARM_REQUESTS_PER_SECOND`].
+    global_swarm_rate: Mutex<RequestRateBucket>,
     global_bytes: Arc<ByteBudget>,
     source_state: Mutex<SourceAdmissionState>,
     max_connections_per_ip: usize,
@@ -317,6 +346,7 @@ impl ListenerResources {
         let byte_rejections = Arc::new(AtomicU64::new(0));
         Arc::new(Self {
             running: AtomicBool::new(false),
+            next_connection: AtomicU64::new(0),
             connection_rejections: AtomicU64::new(0),
             channel_rejections: AtomicU64::new(0),
             request_rejections: AtomicU64::new(0),
@@ -334,6 +364,7 @@ impl ListenerResources {
             ))),
             request_tasks: Mutex::new(TaskTracker::new()),
             global_request_rate: Mutex::new(RequestRateBucket::new(config.max_requests_per_second)),
+            global_swarm_rate: Mutex::new(RequestRateBucket::new(SWARM_REQUESTS_PER_SECOND)),
             global_bytes: Arc::new(ByteBudget::with_rejections(
                 config.max_in_flight_bytes,
                 byte_rejections,
@@ -396,6 +427,9 @@ impl ListenerResources {
                     request_rate: Mutex::new(RequestRateBucket::new(
                         self.max_requests_per_second_per_ip,
                     )),
+                    swarm_rate: Mutex::new(RequestRateBucket::new(
+                        SWARM_REQUESTS_PER_SECOND_PER_SOURCE,
+                    )),
                     bytes: Arc::new(ByteBudget::with_rejections(
                         self.max_in_flight_bytes_per_ip,
                         Arc::clone(&self.byte_rejections),
@@ -415,6 +449,9 @@ impl ListenerResources {
             request_rate: Mutex::new(RequestRateBucket::new(
                 self.max_requests_per_second_per_connection,
             )),
+            swarm: SwarmSession::Browser(self.next_connection.fetch_add(1, Ordering::Relaxed)),
+            remote_ip: remote_addr.ip(),
+            closed: CancellationToken::new(),
         });
         Ok(ConnectionAdmission {
             listener: Arc::clone(self),
@@ -457,10 +494,28 @@ impl ListenerResources {
     }
 }
 
+/// The budget a request frame was admitted on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameCharge {
+    /// The request budget the reads share; a swarm request moves its charge
+    /// onto the swarm's own once it is known for one.
+    Requests,
+    /// The swarm's own, with the reads' spent: a frame then goes on only if
+    /// it is a swarm request, and anything else is refused as over the
+    /// request rate, its swarm charge given back.
+    Swarm,
+}
+
 struct ConnectionResources {
     listener: Arc<ListenerResources>,
     source: Arc<SourceQuota>,
     request_rate: Mutex<RequestRateBucket>,
+    /// This connection, as the swarm rendezvous names it.
+    swarm: SwarmSession,
+    /// The browser's address, for the STUN allowlist.
+    remote_ip: IpAddr,
+    /// Cancelled when the connection ends, which ends its waiting announces.
+    closed: CancellationToken,
 }
 
 impl ConnectionResources {
@@ -484,6 +539,92 @@ impl ConnectionResources {
             return Err(REQUEST_RATE_ERROR.to_string());
         }
         Ok(permit)
+    }
+
+    /// Admits a request frame as [`Self::try_admit_request`] does, or, when
+    /// the request budget the reads share has no token left, on the swarm's
+    /// own budget: only once the frame is opened is it known whether it is a
+    /// swarm request, which that budget is for (see [`FrameCharge`]).
+    fn try_admit_frame(&self) -> ServerResult<(OwnedSemaphorePermit, FrameCharge)> {
+        let permit = Arc::clone(&self.listener.request_limit)
+            .try_acquire_owned()
+            .map_err(|_| {
+                self.listener
+                    .request_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                REQUEST_CAPACITY_ERROR.to_string()
+            })?;
+        let now = Instant::now();
+        let charge = if self.take_request_tokens(now) {
+            FrameCharge::Requests
+        } else if self.take_swarm_tokens(now) {
+            FrameCharge::Swarm
+        } else {
+            drop(permit);
+            self.listener
+                .rate_rejections
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(REQUEST_RATE_ERROR.to_string());
+        };
+        Ok((permit, charge))
+    }
+
+    /// Takes a token from each request budget the reads share (the source's,
+    /// the connection's and the listener's), or from none: a budget with no
+    /// token left gives the ones before it theirs back, so a frame taken on
+    /// the swarm's budget instead has spent nothing of the reads'.
+    fn take_request_tokens(&self, now: Instant) -> bool {
+        if !self.source.request_rate.lock().allow(now) {
+            return false;
+        }
+        if !self.request_rate.lock().allow(now) {
+            self.source.request_rate.lock().refund();
+            return false;
+        }
+        if !self.listener.global_request_rate.lock().allow(now) {
+            self.request_rate.lock().refund();
+            self.source.request_rate.lock().refund();
+            return false;
+        }
+        true
+    }
+
+    /// As [`Self::take_request_tokens`], for the swarm's own budgets (the
+    /// source's and the listener's).
+    fn take_swarm_tokens(&self, now: Instant) -> bool {
+        if !self.source.swarm_rate.lock().allow(now) {
+            return false;
+        }
+        if !self.listener.global_swarm_rate.lock().allow(now) {
+            self.source.swarm_rate.lock().refund();
+            return false;
+        }
+        true
+    }
+
+    /// Gives the swarm's budget back a frame's charge: it was no swarm
+    /// request.
+    fn refund_swarm(&self) {
+        self.source.swarm_rate.lock().refund();
+        self.listener.global_swarm_rate.lock().refund();
+    }
+
+    /// Moves an admitted swarm request's charge from the request budget the
+    /// reads share onto the swarm's own: true if the swarm's budget had room
+    /// (the read budget gets its tokens back), false if not (the request
+    /// keeps its charge, and is refused).
+    fn charge_to_swarm(&self) -> bool {
+        let now = Instant::now();
+        if !self.take_swarm_tokens(now) {
+            self.listener
+                .rate_rejections
+                .fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        self.source.request_rate.lock().refund();
+        self.request_rate.lock().refund();
+        self.listener.global_request_rate.lock().refund();
+        true
     }
 
     fn try_reserve_bytes(&self, amount: usize) -> ServerResult<InFlightByteReservation> {
@@ -626,11 +767,13 @@ pub struct WebRtcDirectServer {
 }
 
 /// Start the feature-gated browser listener and return its endpoint and task.
+#[allow(clippy::too_many_arguments)]
 pub async fn spawn(
     config: &WebRtcDirectConfig,
     root_dir: &Path,
     p2p: Arc<P2PNode>,
     ant_protocol: Option<Arc<AntProtocol>>,
+    swarm: Arc<SwarmService>,
     evm_network: &evmlib::Network,
     shutdown: CancellationToken,
     endpoint_catalog: Option<Arc<BrowserEndpointCatalog>>,
@@ -652,6 +795,12 @@ pub async fn spawn(
     )
     .await
     .map_err(|error| Error::Startup(format!("failed to bind WebRTC Direct listener: {error}")))?;
+    // This socket is also the STUN server for swarm members' WebRTC
+    // connections to each other, answering clients that announced recently.
+    let stun = Arc::clone(&swarm);
+    listener.set_plain_binding_policy(Some(Arc::new(move |ip| {
+        stun.stun_allows(ip, Instant::now())
+    })));
     let local_addr = listener.local_addr();
     let identity = Arc::clone(p2p.transport().node_identity());
     let state = Arc::new(ServerState {
@@ -659,6 +808,7 @@ pub async fn spawn(
         identity,
         p2p,
         ant_protocol,
+        swarm,
         payment,
         endpoint: RwLock::new(None),
         endpoint_catalog,
@@ -754,6 +904,8 @@ async fn refresh_browser_endpoint(
     if let Some(catalog) = state.endpoint_catalog.as_ref() {
         catalog.insert(peer_id, endpoint.clone());
     }
+    // The same UDP socket answers swarm members' STUN requests.
+    state.swarm.set_ice_servers(vec![format!("stun:{address}")]);
     *state.endpoint.write() = Some(endpoint);
     state
         .p2p
@@ -1067,6 +1219,10 @@ async fn handle_connection(
     // listener's request tracker and keep their storage state and admission
     // until processing finishes, independently of this connection.
     channel_shutdown.cancel();
+    // The browser has gone: its waiting announces end now, and it leaves every
+    // swarm room it was in.
+    resources.closed.cancel();
+    state.swarm.session_closed(resources.swarm);
     if let Err(error) = connection.close().await {
         debug!(remote = %remote_addr, %error, "Failed to close WebRTC Direct connection");
     }
@@ -1322,6 +1478,7 @@ async fn establish_pq_session(
 struct AdmittedRequest {
     request: Request,
     content: Vec<u8>,
+    charge: FrameCharge,
     _request_permit: OwnedSemaphorePermit,
     _in_flight_bytes: InFlightByteReservation,
 }
@@ -1362,6 +1519,7 @@ async fn start_request(
         let AdmittedRequest {
             request,
             content,
+            charge,
             _request_permit: request_permit,
             _in_flight_bytes: in_flight_bytes,
         } = admitted;
@@ -1381,7 +1539,8 @@ async fn start_request(
         } else {
             None
         };
-        let (response, content) = process_request(request, content, &state, &resources).await?;
+        let (response, content) =
+            process_request(request, content, charge, &state, &resources).await?;
         Ok(CompletedRequest {
             _bulk_permits: bulk_permits,
             response,
@@ -1415,7 +1574,7 @@ async fn read_webrtc_request(
     }
     // Admission happens as soon as a client starts a frame. Idle persistent
     // channels consume neither request-rate tokens nor request worker slots.
-    let request_permit = resources.try_admit_request()?;
+    let (request_permit, charge) = resources.try_admit_frame()?;
     let max_plaintext_bytes = MAX_BROWSER_FRAME_BYTES;
     let mut encrypted = read_pq_payload_after_first(
         first_message,
@@ -1451,9 +1610,21 @@ async fn read_webrtc_request(
     let content = frame[content_offset..].to_vec();
     drop(frame);
     reservation.resize(accounted_request_bytes)?;
+    // Admitted on the swarm's budget, only a swarm request goes on.
+    if charge == FrameCharge::Swarm
+        && !(matches!(request.body, RequestBody::ChunkProtocol) && is_swarm_request_bytes(&content))
+    {
+        resources.refund_swarm();
+        resources
+            .listener
+            .rate_rejections
+            .fetch_add(1, Ordering::Relaxed);
+        return Err(REQUEST_RATE_ERROR.to_string());
+    }
     Ok(AdmittedRequest {
         request,
         content,
+        charge,
         _request_permit: request_permit,
         _in_flight_bytes: reservation,
     })
@@ -1647,9 +1818,38 @@ async fn write_framed_pq_payload(channel: &WebRtcDataChannel, payload: &[u8]) ->
     Ok(())
 }
 
+/// A swarm request's refusal before it is decoded: no legal one is longer
+/// than `MAX_SWARM_REQUEST_BYTES`, and swarm requests run on a budget of their
+/// own, never the reads' (see [`SWARM_REQUESTS_PER_SECOND`]). `None` lets it
+/// go on, its charge moved off the read budget (or there from the start, for
+/// a frame `charge` says was admitted on the swarm's).
+fn swarm_request_refusal(
+    request_id: u64,
+    content_len: usize,
+    charge: FrameCharge,
+    resources: &ConnectionResources,
+) -> Option<Response> {
+    if content_len > ant_protocol::MAX_SWARM_REQUEST_BYTES {
+        return Some(Response::error(
+            request_id,
+            "invalid_request",
+            "swarm request too long",
+        ));
+    }
+    if charge == FrameCharge::Requests && !resources.charge_to_swarm() {
+        return Some(Response::error(
+            request_id,
+            "rate_limited",
+            SWARM_RATE_ERROR,
+        ));
+    }
+    None
+}
+
 async fn process_request(
     request: Request,
     content: Vec<u8>,
+    charge: FrameCharge,
     state: &ServerState,
     resources: &ConnectionResources,
 ) -> ServerResult<(Response, Option<TrackedBytes>)> {
@@ -1669,16 +1869,29 @@ async fn process_request(
     }
     match request.body {
         RequestBody::ChunkProtocol => {
-            let Some(protocol) = state.ant_protocol.as_ref() else {
-                return Ok((
+            // Every node hosts the swarm rendezvous, storing chunks or not.
+            let swarm_request = is_swarm_request_bytes(&content);
+            let storage_disabled = || {
+                Ok((
                     Response::error(
                         request.request_id,
                         "storage_disabled",
                         "chunk storage is disabled".to_string(),
                     ),
                     None,
-                ));
+                ))
             };
+            let protocol = state.ant_protocol.as_ref();
+            if protocol.is_none() && !swarm_request {
+                return storage_disabled();
+            }
+            if swarm_request {
+                if let Some(refused) =
+                    swarm_request_refusal(request.request_id, content.len(), charge, resources)
+                {
+                    return Ok((refused, None));
+                }
+            }
             // The admitted frame remains charged for the whole request. Charge
             // decoding before it copies the input, then retain that allowance
             // for the PUT handler's disk buffer after dropping the wire buffer.
@@ -1688,7 +1901,13 @@ async fn process_request(
             drop(content);
             let response_limit = binary_response_limit(&message.body)?;
             reservation.resize(reservation.source.amount.max(2 * response_limit))?;
-            let response = handle_ant_message(protocol, message).await?;
+            let response = match protocol {
+                _ if is_swarm_request(&message.body) => {
+                    handle_swarm_message(&state.swarm, message, resources).await?
+                }
+                Some(protocol) => handle_ant_message(protocol, message).await?,
+                None => return storage_disabled(),
+            };
             let bytes = encode_binary_response(&response, response_limit)?;
             drop(response);
             reservation.resize(bytes.len())?;
@@ -1756,9 +1975,42 @@ fn binary_response_limit(body: &ChunkMessageBody) -> ServerResult<usize> {
         | ChunkMessageBody::MerkleCandidateQuoteRequest(_)
         | ChunkMessageBody::MerkleCandidateQuoteRequestV2(_)
         | ChunkMessageBody::PointerGetRequest(_)
-        | ChunkMessageBody::PointerPutRequest(_) => Ok(SMALL_BINARY_RESPONSE_BYTES),
+        | ChunkMessageBody::PointerPutRequest(_)
+        | ChunkMessageBody::SwarmAnnounceRequest(_)
+        | ChunkMessageBody::SwarmAnswerRequest(_)
+        | ChunkMessageBody::SwarmLeaveRequest(_) => Ok(SMALL_BINARY_RESPONSE_BYTES),
         _ => Err("unsupported chunk protocol request".to_string()),
     }
+}
+
+// A swarm reply carries at most MAX_SWARM_REPLY_SDP_BYTES of SDP, plus ids and
+// framing for up to MAX_SWARM_INBOX signals: well inside the small bound.
+const _: () = assert!(
+    ant_protocol::swarm::MAX_SWARM_REPLY_SDP_BYTES + 4096 < SMALL_BINARY_RESPONSE_BYTES,
+    "a swarm reply must fit the small response bound"
+);
+
+/// Answers a swarm request on this browser connection. A waiting announce
+/// ends when the connection does.
+async fn handle_swarm_message(
+    swarm: &SwarmService,
+    message: ChunkMessage,
+    resources: &ConnectionResources,
+) -> ServerResult<ChunkMessage> {
+    let body = swarm
+        .handle(
+            resources.swarm,
+            Some(resources.remote_ip),
+            message.body,
+            &resources.closed,
+            Instant::now(),
+        )
+        .await
+        .ok_or_else(|| "unsupported chunk protocol request".to_string())?;
+    Ok(ChunkMessage {
+        request_id: message.request_id,
+        body,
+    })
 }
 
 fn encode_binary_response(message: &ChunkMessage, limit: usize) -> ServerResult<Vec<u8>> {
@@ -1813,6 +2065,8 @@ fn hello_capabilities(pointers: bool) -> Vec<String> {
     if pointers {
         capabilities.push(POINTER_PROTOCOL_CAPABILITY.into());
     }
+    // Every node hosts the swarm rendezvous.
+    capabilities.push(SWARM_CAPABILITY.into());
     capabilities
 }
 
@@ -2269,6 +2523,8 @@ struct ServerState {
     identity: Arc<NodeIdentity>,
     p2p: Arc<P2PNode>,
     ant_protocol: Option<Arc<AntProtocol>>,
+    /// The swarm rendezvous, hosted whether chunks are stored or not.
+    swarm: Arc<SwarmService>,
     payment: BrowserPaymentNetwork,
     endpoint: RwLock<Option<BrowserEndpoint>>,
     endpoint_catalog: Option<Arc<BrowserEndpointCatalog>>,
@@ -2590,6 +2846,176 @@ mod tests {
             Some(REQUEST_RATE_ERROR)
         );
         assert!(honest.context.try_admit_request().is_ok());
+    }
+
+    #[test]
+    fn swarm_requests_within_their_budget_give_the_reads_their_tokens_back() {
+        let config = WebRtcDirectConfig {
+            max_requests_per_second: 100,
+            max_requests_per_second_per_ip: 1,
+            max_requests_per_second_per_connection: 1,
+            ..WebRtcDirectConfig::default()
+        };
+        let resources = ListenerResources::new(&config);
+        let address = "198.51.100.1:1000"
+            .parse()
+            .unwrap_or_else(|error| panic!("browser address: {error}"));
+        let browser = resources
+            .try_admit_connection(address)
+            .unwrap_or_else(|error| panic!("browser connection: {error}"));
+        // An announce takes the source's only token as it arrives, and gives
+        // it back once it is known for a swarm request.
+        let announce = browser
+            .context
+            .try_admit_request()
+            .unwrap_or_else(|error| panic!("announce admitted: {error}"));
+        assert!(browser.context.charge_to_swarm());
+        drop(announce);
+        // So the browser's next read still has it.
+        assert!(browser.context.try_admit_request().is_ok());
+    }
+
+    #[test]
+    fn a_frame_past_the_read_budget_is_admitted_on_the_swarms_own() {
+        let config = WebRtcDirectConfig {
+            max_requests_per_second: 100,
+            max_requests_per_second_per_ip: 1,
+            max_requests_per_second_per_connection: 1,
+            ..WebRtcDirectConfig::default()
+        };
+        let resources = ListenerResources::new(&config);
+        let address = "198.51.100.1:1000"
+            .parse()
+            .unwrap_or_else(|error| panic!("browser address: {error}"));
+        let browser = resources
+            .try_admit_connection(address)
+            .unwrap_or_else(|error| panic!("browser connection: {error}"));
+        // A read takes the source's only token.
+        let (read, charge) = browser
+            .context
+            .try_admit_frame()
+            .unwrap_or_else(|error| panic!("read admitted: {error}"));
+        assert_eq!(charge, FrameCharge::Requests);
+        drop(read);
+        // An announce right after it is still admitted, on the swarm's
+        // budget, rather than refused with the channel the reads share.
+        let (announce, charge) = browser
+            .context
+            .try_admit_frame()
+            .unwrap_or_else(|error| panic!("announce admitted: {error}"));
+        assert_eq!(charge, FrameCharge::Swarm);
+        drop(announce);
+        // A frame that turns out to be no swarm request gives the swarm its
+        // charge back: the swarm's budget lets as many announces through as
+        // before, and the reads gain nothing from it.
+        for _ in 0..SWARM_REQUESTS_PER_SECOND_PER_SOURCE - 1 {
+            let (frame, charge) = browser
+                .context
+                .try_admit_frame()
+                .unwrap_or_else(|error| panic!("frame admitted: {error}"));
+            assert_eq!(charge, FrameCharge::Swarm);
+            browser.context.refund_swarm();
+            drop(frame);
+        }
+        assert!(browser.context.try_admit_frame().is_ok());
+    }
+
+    #[test]
+    fn a_frame_taken_on_the_swarms_budget_spends_none_of_the_reads() {
+        // The connection's budget runs out before the source's.
+        let config = WebRtcDirectConfig {
+            max_requests_per_second: 100,
+            max_requests_per_second_per_ip: 2,
+            max_requests_per_second_per_connection: 1,
+            ..WebRtcDirectConfig::default()
+        };
+        let resources = ListenerResources::new(&config);
+        let connect = |address: &str| {
+            let address = address
+                .parse()
+                .unwrap_or_else(|error| panic!("address: {error}"));
+            resources
+                .try_admit_connection(address)
+                .unwrap_or_else(|error| panic!("connection: {error}"))
+        };
+        let browser = connect("198.51.100.1:1000");
+        let (_read, charge) = browser
+            .context
+            .try_admit_frame()
+            .unwrap_or_else(|error| panic!("read admitted: {error}"));
+        assert_eq!(charge, FrameCharge::Requests);
+        let (_announce, charge) = browser
+            .context
+            .try_admit_frame()
+            .unwrap_or_else(|error| panic!("announce admitted: {error}"));
+        assert_eq!(charge, FrameCharge::Swarm);
+        // The source's second token is still there for the reads of another
+        // of its connections.
+        let other = connect("198.51.100.1:1001");
+        let (_read, charge) = other
+            .context
+            .try_admit_frame()
+            .unwrap_or_else(|error| panic!("other read admitted: {error}"));
+        assert_eq!(charge, FrameCharge::Requests);
+
+        // The listener's budget runs out first: the source's and the
+        // connection's tokens come back.
+        let config = WebRtcDirectConfig {
+            max_requests_per_second: 1,
+            max_requests_per_second_per_ip: 10,
+            max_requests_per_second_per_connection: 10,
+            ..WebRtcDirectConfig::default()
+        };
+        let resources = ListenerResources::new(&config);
+        let address = "198.51.100.2:1000"
+            .parse()
+            .unwrap_or_else(|error| panic!("address: {error}"));
+        let browser = resources
+            .try_admit_connection(address)
+            .unwrap_or_else(|error| panic!("connection: {error}"));
+        let (_read, charge) = browser
+            .context
+            .try_admit_frame()
+            .unwrap_or_else(|error| panic!("read admitted: {error}"));
+        assert_eq!(charge, FrameCharge::Requests);
+        let (_announce, charge) = browser
+            .context
+            .try_admit_frame()
+            .unwrap_or_else(|error| panic!("announce admitted: {error}"));
+        assert_eq!(charge, FrameCharge::Swarm);
+        let now = Instant::now();
+        let left = |bucket: &Mutex<RequestRateBucket>| {
+            (0..20).take_while(|_| bucket.lock().allow(now)).count()
+        };
+        assert_eq!(left(&browser.context.request_rate), 9);
+        assert_eq!(left(&browser.context.source.request_rate), 9);
+    }
+
+    #[test]
+    fn swarm_requests_past_their_budget_are_refused_and_keep_their_charge() {
+        let config = WebRtcDirectConfig {
+            max_requests_per_second: 1000,
+            max_requests_per_second_per_ip: 1000,
+            max_requests_per_second_per_connection: 1000,
+            ..WebRtcDirectConfig::default()
+        };
+        let resources = ListenerResources::new(&config);
+        let connect = |address: &str| {
+            let address = address
+                .parse()
+                .unwrap_or_else(|error| panic!("address: {error}"));
+            resources
+                .try_admit_connection(address)
+                .unwrap_or_else(|error| panic!("connection: {error}"))
+        };
+        let busy = connect("198.51.100.1:1000");
+        for _ in 0..SWARM_REQUESTS_PER_SECOND_PER_SOURCE {
+            assert!(busy.context.charge_to_swarm());
+        }
+        assert!(!busy.context.charge_to_swarm());
+        // Another source has a budget of its own.
+        let other = connect("203.0.113.2:2000");
+        assert!(other.context.charge_to_swarm());
     }
 
     #[test]
