@@ -1964,10 +1964,7 @@ mod tests {
             answer_reply(&service, C, answer(1, a.member, 9)).await,
             SwarmAnswerResponse::Unmatched
         );
-        assert!(call(&service, A, announce(1, &[], 0))
-            .await
-            .inbox
-            .is_empty());
+        assert_eq!(call(&service, A, announce(1, &[], 0)).await.inbox, []);
     }
 
     #[tokio::test]
@@ -2195,7 +2192,7 @@ mod tests {
         assert_eq!(call(&service, B, announce(1, &[], 0)).await.inbox.len(), 1);
         let started = Instant::now();
         let reply = call(&service, B, announce(1, &[], 300)).await;
-        assert!(reply.inbox.is_empty());
+        assert_eq!(reply.inbox, []);
         assert!(started.elapsed() >= Duration::from_millis(250));
     }
 
@@ -2867,9 +2864,6 @@ mod tests {
         }
         assert_eq!(service.stats().pending_offers, 0);
         assert_eq!(service.stats().stored_sdp_bytes, 0);
-        assert!(call(&service, B, announce(1, &[], 0))
-            .await
-            .inbox
-            .is_empty());
+        assert_eq!(call(&service, B, announce(1, &[], 0)).await.inbox, []);
     }
 }
