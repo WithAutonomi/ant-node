@@ -531,8 +531,9 @@ saorsa-transport's WebRTC Direct already uses).
   room was joined are offered too. Records a client already holds when it
   joins a room are told to the room's links as the room learns its file's
   records, so a link that opened first still hears of them. A client sends at
-  most 4 records at once, and starts no send past 1 while reads of its own
-  are running (sends already running when a read starts finish; the count
+  most 4 records at once, and starts no send past 1 while fetches of its own
+  are running, whatever they are for (a file's records or its map, a raw
+  read or an existence check; sends already running when one starts finish; the count
   is taken in one step, so two links never both take the last place): a
   record sent costs the sender's CPU and line, which its own download needs
   first
@@ -579,7 +580,7 @@ saorsa-transport's WebRTC Direct already uses).
   at most 2 offers per announce, each a WebRTC connection with up to 3 s of
   ICE gathering and every negotiation step bounded, and at most 8 links;
   per room, at most 8 answers started in 20 s; per client: 4 rooms, 16
-  links, 8 answers being made, 4 records sent (1 while any of its own reads
+  links, 8 answers being made, 4 records sent (1 while any of its own fetches
   runs) and 8
   received at once. In a browser that makes connections take turns to
   gather ICE (every engine but Chromium), the swarm's own connections take
