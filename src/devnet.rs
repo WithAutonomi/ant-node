@@ -20,7 +20,7 @@ use saorsa_core::{
     IPDiversityConfig, MultiAddr, NodeConfig as CoreNodeConfig, P2PEvent, P2PNode, PeerId,
 };
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -579,10 +579,11 @@ impl Devnet {
         futures::future::join_all(shutdown_futures).await;
 
         if self.config.cleanup_data_dir {
-            if contains_data_root(&self.config.data_dir) {
+            if may_remove_data_root(&self.config.data_dir) {
                 warn!(
                     "Not removing devnet data directory {}: it is the ant data root or \
-                     contains it, and other nodes' and clients' data lives there",
+                     contains it (or that could not be ruled out), and other nodes' and \
+                     clients' data lives there",
                     self.config.data_dir.display()
                 );
             } else if let Err(e) = tokio::fs::remove_dir_all(&self.config.data_dir).await {
@@ -1272,11 +1273,53 @@ fn start_cancelled() -> DevnetError {
     DevnetError::Startup("devnet start cancelled".to_string())
 }
 
-/// Whether `dir` is the ant data root or one of its ancestors. A devnet must
-/// never delete those: the root holds real nodes' data and the client's
-/// payment caches and upload history.
-fn contains_data_root(dir: &Path) -> bool {
-    default_root_dir().starts_with(dir)
+/// Whether removing `dir` could delete the ant data root. A devnet must never
+/// delete the root or any directory above it: the root holds real nodes'
+/// data and the client's payment caches and upload history.
+fn may_remove_data_root(dir: &Path) -> bool {
+    covers(dir, &default_root_dir())
+}
+
+/// Whether `dir` is `protected` or one of its ancestors, comparing both as
+/// [`resolve`]d paths so that `..`, a relative path or a symlink can't
+/// disguise it: `remove_dir_all("<root>/..")` deletes the root's parent. Fails
+/// closed: `true` when either path can't be resolved.
+fn covers(dir: &Path, protected: &Path) -> bool {
+    match (resolve(dir), resolve(protected)) {
+        (Ok(dir), Ok(protected)) => protected.starts_with(dir),
+        _ => true,
+    }
+}
+
+/// `path` as an absolute path with symlinks and `..` resolved. The part of it
+/// that exists is canonicalized. Components below that, which don't exist
+/// yet, are appended with `.` and `..` applied lexically, which is exact
+/// because a path that doesn't exist can't be a symlink.
+fn resolve(path: &Path) -> std::io::Result<PathBuf> {
+    let absolute = std::path::absolute(path)?;
+    let mut existing = absolute.as_path();
+    let mut resolved = loop {
+        match existing.canonicalize() {
+            Ok(canonical) => break canonical,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                existing = existing.parent().ok_or(e)?;
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    let missing = absolute
+        .strip_prefix(existing)
+        .map_err(std::io::Error::other)?;
+    for component in missing.components() {
+        match component {
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::Normal(name) => resolved.push(name),
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+        }
+    }
+    Ok(resolved)
 }
 
 impl Drop for Devnet {
@@ -1312,7 +1355,7 @@ mod tests {
         ];
         for dir in &dirs {
             assert_eq!(dir.parent(), Some(devnets.as_path()), "{}", dir.display());
-            assert!(!contains_data_root(dir), "{}", dir.display());
+            assert!(!may_remove_data_root(dir), "{}", dir.display());
         }
         for (i, a) in dirs.iter().enumerate() {
             for b in &dirs[i + 1..] {
@@ -1342,12 +1385,96 @@ mod tests {
     #[test]
     fn the_data_root_and_its_ancestors_are_never_removed() {
         let root = default_root_dir();
-        assert!(contains_data_root(&root));
+        assert!(may_remove_data_root(&root));
         let mut ancestor = root.parent();
         while let Some(dir) = ancestor {
-            assert!(contains_data_root(dir), "{}", dir.display());
+            assert!(may_remove_data_root(dir), "{}", dir.display());
             ancestor = dir.parent();
         }
-        assert!(!contains_data_root(&root.join(DEVNETS_SUBDIR).join("1-0")));
+        assert!(may_remove_data_root(&root.join("..")));
+        assert!(may_remove_data_root(&root.join(DEVNETS_SUBDIR).join("..")));
+        assert!(!may_remove_data_root(
+            &root.join(DEVNETS_SUBDIR).join("1-0")
+        ));
+    }
+
+    /// A temp dir standing in for the data root: `{base}/data/ant`, with one
+    /// run directory under it. Returns (guard, base, data, root).
+    fn fake_root() -> std::io::Result<(tempfile::TempDir, PathBuf, PathBuf, PathBuf)> {
+        let temp = tempfile::tempdir()?;
+        let base = temp.path().canonicalize()?;
+        let data = base.join("data");
+        let root = data.join("ant");
+        std::fs::create_dir_all(root.join(DEVNETS_SUBDIR).join("run"))?;
+        Ok((temp, base, data, root))
+    }
+
+    #[test]
+    fn dotdot_never_disguises_the_root_or_an_ancestor() -> std::io::Result<()> {
+        let (_temp, base, data, root) = fake_root()?;
+        let run = root.join(DEVNETS_SUBDIR).join("run");
+
+        assert!(covers(&root, &root));
+        assert!(covers(&data, &root));
+        assert!(covers(&base, &root));
+        assert!(covers(&root.join(".."), &root));
+        assert!(covers(&root.join(DEVNETS_SUBDIR).join(".."), &root));
+        assert!(covers(&run.join("..").join("..").join(".."), &root));
+        // `..` below a directory that doesn't exist yet.
+        assert!(covers(&root.join("new").join("..").join(".."), &root));
+
+        assert!(!covers(&run, &root));
+        assert!(!covers(&root.join(DEVNETS_SUBDIR).join("not-yet"), &root));
+        assert!(!covers(&run.join("..").join("other"), &root));
+        assert!(!covers(&base.join("elsewhere"), &root));
+        Ok(())
+    }
+
+    #[test]
+    fn a_root_that_does_not_exist_yet_is_still_protected() -> std::io::Result<()> {
+        let (_temp, base, _data, _root) = fake_root()?;
+        let missing = base.join("missing");
+        let root = missing.join("ant");
+
+        assert!(covers(&root, &root));
+        assert!(covers(&missing, &root));
+        assert!(covers(&base, &root));
+        assert!(!covers(&root.join(DEVNETS_SUBDIR).join("run"), &root));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_path_to_an_ancestor_is_caught(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let (_temp, _base, data, root) = fake_root()?;
+        // `../../..` up to `/` from the current directory, then down to `data`.
+        let cwd = std::env::current_dir()?.canonicalize()?;
+        let up: PathBuf = cwd.components().skip(1).map(|_| "..").collect();
+        let relative = up.join(data.strip_prefix("/")?);
+        assert!(relative.is_relative());
+        assert!(covers(&relative, &root));
+        assert!(!covers(
+            &up.join(root.join(DEVNETS_SUBDIR).strip_prefix("/")?),
+            &root
+        ));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_the_root_or_an_ancestor_is_caught() -> std::io::Result<()> {
+        let (_temp, base, data, root) = fake_root()?;
+        let run = root.join(DEVNETS_SUBDIR).join("run");
+        std::os::unix::fs::symlink(&data, base.join("to-data"))?;
+        std::os::unix::fs::symlink(&root, base.join("to-root"))?;
+        std::os::unix::fs::symlink(&run, base.join("to-run"))?;
+
+        assert!(covers(&base.join("to-data"), &root));
+        assert!(covers(&base.join("to-root"), &root));
+        assert!(covers(&base.join("to-data").join("ant"), &root));
+        assert!(covers(&base.join("to-run").join("..").join(".."), &root));
+        assert!(!covers(&base.join("to-run"), &root));
+        Ok(())
     }
 }
