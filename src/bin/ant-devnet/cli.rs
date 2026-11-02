@@ -25,7 +25,9 @@ pub struct Cli {
     #[arg(long)]
     pub base_port: Option<u16>,
 
-    /// Data directory for node state.
+    /// Data directory for node state. Default: a fresh directory per run under
+    /// `devnets/` in the ant data root, removed on shutdown unless
+    /// `--no-cleanup` is set.
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
 

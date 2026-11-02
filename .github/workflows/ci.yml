@@ -102,6 +102,14 @@ jobs:
             || { echo 'scale ran no tests'; exit 1; }
       - name: Run browser RPC privacy regressions
         run: cargo test --test webrtc_direct_devnet
+      - name: ant-devnet stops cleanly on SIGTERM
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --test devnet_lifecycle -- --test-threads=1 2>&1 | tee /tmp/devnet_lifecycle.log
+          grep -qE 'test result: ok\. [1-9]' /tmp/devnet_lifecycle.log \
+            || { echo 'devnet_lifecycle ran no tests'; exit 1; }
       - name: Run e2e tests
         run: cargo test --test e2e --features test-utils -- --test-threads=1
       - name: Run v12 storage-bound audit attack PoCs

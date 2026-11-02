@@ -20,7 +20,7 @@ use saorsa_core::{
     IPDiversityConfig, MultiAddr, NodeConfig as CoreNodeConfig, P2PEvent, P2PNode, PeerId,
 };
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -54,6 +54,10 @@ pub const DEVNET_PORT_RANGE_MAX: u16 = 60_000;
 // =============================================================================
 // Default Timing Constants
 // =============================================================================
+
+/// Directory under the ant data root that holds one data directory per devnet
+/// run (see [`DevnetConfig::data_dir`]).
+pub const DEVNETS_SUBDIR: &str = "devnets";
 
 /// Default delay between spawning nodes (milliseconds).
 const DEFAULT_SPAWN_DELAY_MS: u64 = 200;
@@ -203,6 +207,13 @@ pub struct DevnetConfig {
     pub bootstrap_count: usize,
 
     /// Root directory for devnet data.
+    ///
+    /// The default is a fresh directory per run,
+    /// `{ant data root}/devnets/{pid}-{random}`. The ant data root also holds
+    /// real nodes' data and the client's payment caches and upload history,
+    /// so a devnet keeps to its own directory and removes only that on
+    /// shutdown. A fresh directory also means a run never picks up what an
+    /// interrupted one left behind (ant-node#261).
     pub data_dir: PathBuf,
 
     /// Delay between node spawns (default: 200ms).
@@ -248,7 +259,11 @@ impl Default for DevnetConfig {
             node_count: DEFAULT_NODE_COUNT,
             base_port,
             bootstrap_count: DEFAULT_BOOTSTRAP_COUNT,
-            data_dir: default_root_dir(),
+            data_dir: default_root_dir().join(DEVNETS_SUBDIR).join(format!(
+                "{}-{:08x}",
+                std::process::id(),
+                rng.gen::<u32>()
+            )),
             spawn_delay: Duration::from_millis(DEFAULT_SPAWN_DELAY_MS),
             stabilization_timeout: Duration::from_secs(DEFAULT_STABILIZATION_TIMEOUT_SECS),
             node_startup_timeout: Duration::from_secs(DEFAULT_NODE_STARTUP_TIMEOUT_SECS),
@@ -564,7 +579,13 @@ impl Devnet {
         futures::future::join_all(shutdown_futures).await;
 
         if self.config.cleanup_data_dir {
-            if let Err(e) = tokio::fs::remove_dir_all(&self.config.data_dir).await {
+            if contains_data_root(&self.config.data_dir) {
+                warn!(
+                    "Not removing devnet data directory {}: it is the ant data root or \
+                     contains it, and other nodes' and clients' data lives there",
+                    self.config.data_dir.display()
+                );
+            } else if let Err(e) = tokio::fs::remove_dir_all(&self.config.data_dir).await {
                 warn!("Failed to cleanup devnet data directory: {e}");
             }
         }
@@ -572,6 +593,29 @@ impl Devnet {
         *self.state.write().await = NetworkState::Stopped;
         info!("Devnet shutdown complete");
         Ok(())
+    }
+
+    /// A token that stops this devnet's [`start`](Self::start) when cancelled.
+    ///
+    /// A start in progress returns an error at its next safe point: between
+    /// node spawns, or while it waits for nodes to come up or the network to
+    /// stabilize. Every node it started is registered by then, so a following
+    /// [`shutdown`](Self::shutdown) stops them all before it removes the data
+    /// directory. Dropping a `start` future part-way instead can leave a node
+    /// running unregistered, still writing into that directory. It is the same
+    /// token `shutdown` cancels.
+    #[must_use]
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.shutdown.clone()
+    }
+
+    /// Wait `delay`, or fail at once if the devnet has been cancelled.
+    async fn pause(&self, delay: Duration) -> Result<()> {
+        tokio::select! {
+            biased;
+            () = self.shutdown.cancelled() => Err(start_cancelled()),
+            () = tokio::time::sleep(delay) => Ok(()),
+        }
     }
 
     /// Get devnet configuration.
@@ -838,7 +882,7 @@ impl Devnet {
         for i in 0..self.config.bootstrap_count {
             let node = self.create_node(i, true, vec![]).await?;
             self.start_node(node).await?;
-            tokio::time::sleep(self.config.spawn_delay).await;
+            self.pause(self.config.spawn_delay).await?;
         }
 
         self.wait_for_nodes_ready(0..self.config.bootstrap_count)
@@ -874,7 +918,7 @@ impl Devnet {
         for i in self.config.bootstrap_count..self.config.node_count {
             let node = self.create_node(i, false, bootstrap_addrs.clone()).await?;
             self.start_node(node).await?;
-            tokio::time::sleep(self.config.spawn_delay).await;
+            self.pause(self.config.spawn_delay).await?;
         }
 
         info!("All regular nodes started");
@@ -1144,8 +1188,8 @@ impl Devnet {
                         return Err(DevnetError::Startup(format!("Node {i} failed: {e}")));
                     }
                     _ => {
-                        tokio::time::sleep(Duration::from_millis(NODE_READY_POLL_INTERVAL_MS))
-                            .await;
+                        self.pause(Duration::from_millis(NODE_READY_POLL_INTERVAL_MS))
+                            .await?;
                     }
                 }
             }
@@ -1187,7 +1231,8 @@ impl Devnet {
                 "Waiting for stabilization: {} total connections",
                 total_connections
             );
-            tokio::time::sleep(Duration::from_secs(STABILIZATION_POLL_INTERVAL_SECS)).await;
+            self.pause(Duration::from_secs(STABILIZATION_POLL_INTERVAL_SECS))
+                .await?;
         }
 
         Err(DevnetError::Stabilization(
@@ -1222,6 +1267,18 @@ impl Devnet {
     }
 }
 
+/// The error a cancelled [`Devnet::start`] returns.
+fn start_cancelled() -> DevnetError {
+    DevnetError::Startup("devnet start cancelled".to_string())
+}
+
+/// Whether `dir` is the ant data root or one of its ancestors. A devnet must
+/// never delete those: the root holds real nodes' data and the client's
+/// payment caches and upload history.
+fn contains_data_root(dir: &Path) -> bool {
+    default_root_dir().starts_with(dir)
+}
+
 impl Drop for Devnet {
     fn drop(&mut self) {
         self.shutdown.cancel();
@@ -1242,5 +1299,55 @@ mod tests {
     #[test]
     fn default_config_has_no_advertise_ip() {
         assert!(DevnetConfig::default().advertise_ip.is_none());
+    }
+
+    #[test]
+    fn each_default_config_gets_its_own_data_dir_under_devnets() {
+        let devnets = default_root_dir().join(DEVNETS_SUBDIR);
+        let dirs = [
+            DevnetConfig::default().data_dir,
+            DevnetConfig::default().data_dir,
+            DevnetConfig::minimal().data_dir,
+            DevnetConfig::small().data_dir,
+        ];
+        for dir in &dirs {
+            assert_eq!(dir.parent(), Some(devnets.as_path()), "{}", dir.display());
+            assert!(!contains_data_root(dir), "{}", dir.display());
+        }
+        for (i, a) in dirs.iter().enumerate() {
+            for b in &dirs[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_devnet_stops_pausing_at_once(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let mut config = DevnetConfig::minimal();
+        config.data_dir = temp.path().join("devnet");
+        config.cleanup_data_dir = false;
+        let devnet = Devnet::new(config).await?;
+
+        assert!(devnet.pause(Duration::ZERO).await.is_ok());
+        devnet.cancellation_token().cancel();
+        let started = Instant::now();
+        let paused = devnet.pause(Duration::from_mins(1)).await;
+        assert!(matches!(paused, Err(DevnetError::Startup(_))), "{paused:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        Ok(())
+    }
+
+    #[test]
+    fn the_data_root_and_its_ancestors_are_never_removed() {
+        let root = default_root_dir();
+        assert!(contains_data_root(&root));
+        let mut ancestor = root.parent();
+        while let Some(dir) = ancestor {
+            assert!(contains_data_root(dir), "{}", dir.display());
+            ancestor = dir.parent();
+        }
+        assert!(!contains_data_root(&root.join(DEVNETS_SUBDIR).join("1-0")));
     }
 }
