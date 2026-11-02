@@ -3250,11 +3250,12 @@ mod tests {
         assert!(state.endpoint.read().is_none());
         assert!(!file.exists());
         assert_eq!(catalog.get(&peer_id), None);
-        assert!(p2p
-            .dht_manager()
-            .supplemental_addresses_for_peer(&peer_id)
-            .await
-            .is_empty());
+        assert_eq!(
+            p2p.dht_manager()
+                .supplemental_addresses_for_peer(&peer_id)
+                .await,
+            Vec::<MultiAddr>::new()
+        );
 
         // With nothing published, a later refresh without a mapping is a no-op.
         refresh_browser_endpoint(&state, root.path(), local, CERTIFICATE_SHA256)
