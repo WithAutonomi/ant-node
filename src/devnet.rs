@@ -20,7 +20,7 @@ use saorsa_core::{
     IPDiversityConfig, MultiAddr, NodeConfig as CoreNodeConfig, P2PEvent, P2PNode, PeerId,
 };
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -41,6 +41,11 @@ use bytes::Bytes;
 #[cfg(all(feature = "webrtc-direct", feature = "test-utils"))]
 use std::collections::HashMap;
 
+mod run_dir;
+
+use run_dir::RunDir;
+pub use run_dir::{LOCK_FILE, MARKER_FILE};
+
 // =============================================================================
 // Devnet Constants
 // =============================================================================
@@ -55,8 +60,8 @@ pub const DEVNET_PORT_RANGE_MAX: u16 = 60_000;
 // Default Timing Constants
 // =============================================================================
 
-/// Directory under the ant data root that holds one data directory per devnet
-/// run (see [`DevnetConfig::data_dir`]).
+/// Directory under the ant data root that devnet runs create their own data
+/// directories in by default (see [`DevnetConfig::data_dir`]).
 pub const DEVNETS_SUBDIR: &str = "devnets";
 
 /// Default delay between spawning nodes (milliseconds).
@@ -206,14 +211,17 @@ pub struct DevnetConfig {
     /// Number of bootstrap nodes (first N nodes, default: 3).
     pub bootstrap_count: usize,
 
-    /// Root directory for devnet data.
+    /// Directory each run creates its own data directory in (default:
+    /// `{ant data root}/devnets`).
     ///
-    /// The default is a fresh directory per run,
-    /// `{ant data root}/devnets/{pid}-{random}`. The ant data root also holds
-    /// real nodes' data and the client's payment caches and upload history,
-    /// so a devnet keeps to its own directory and removes only that on
-    /// shutdown. A fresh directory also means a run never picks up what an
-    /// interrupted one left behind (ant-node#261).
+    /// [`Devnet::new`] creates a fresh `{pid}-{random}` directory inside it,
+    /// and from then on [`Devnet::config`]'s `data_dir` is that run
+    /// directory. A devnet deletes only a directory it created and marked as
+    /// its own ([`MARKER_FILE`]), never this one or anything else in it: the
+    /// ant data root also holds real nodes' data and the client's payment
+    /// caches and upload history (ant-node#261). Run directories that earlier
+    /// runs left here, killed before they could remove them, are removed when
+    /// the next run starts, unless they were kept.
     pub data_dir: PathBuf,
 
     /// Delay between node spawns (default: 200ms).
@@ -228,7 +236,8 @@ pub struct DevnetConfig {
     /// Enable verbose logging for devnet nodes.
     pub enable_node_logging: bool,
 
-    /// Whether to remove the data directory on shutdown.
+    /// Whether to remove the run's data directory on shutdown. When `false`,
+    /// its marker also tells later runs to leave it alone.
     pub cleanup_data_dir: bool,
 
     /// Optional EVM network for payment verification.
@@ -259,11 +268,7 @@ impl Default for DevnetConfig {
             node_count: DEFAULT_NODE_COUNT,
             base_port,
             bootstrap_count: DEFAULT_BOOTSTRAP_COUNT,
-            data_dir: default_root_dir().join(DEVNETS_SUBDIR).join(format!(
-                "{}-{:08x}",
-                std::process::id(),
-                rng.gen::<u32>()
-            )),
+            data_dir: default_root_dir().join(DEVNETS_SUBDIR),
             spawn_delay: Duration::from_millis(DEFAULT_SPAWN_DELAY_MS),
             stabilization_timeout: Duration::from_secs(DEFAULT_STABILIZATION_TIMEOUT_SECS),
             node_startup_timeout: Duration::from_secs(DEFAULT_NODE_STARTUP_TIMEOUT_SECS),
@@ -382,12 +387,19 @@ pub struct Devnet {
     shutdown: CancellationToken,
     state: Arc<RwLock<NetworkState>>,
     health_monitor: Option<JoinHandle<()>>,
+    /// This run's data directory, until [`shutdown`](Self::shutdown) removes
+    /// or releases it. Dropping it releases the run's lock.
+    run_dir: Option<RunDir>,
     #[cfg(feature = "webrtc-direct")]
     browser_endpoint_catalog: Arc<crate::web_rtc::BrowserEndpointCatalog>,
 }
 
 impl Devnet {
     /// Create a new devnet with the given configuration.
+    ///
+    /// Creates this run's own data directory inside `config.data_dir`, after
+    /// removing any that earlier runs left there and that are over and not
+    /// kept (see [`DevnetConfig::data_dir`]).
     ///
     /// # Errors
     ///
@@ -491,7 +503,13 @@ impl Devnet {
             }
         }
 
-        tokio::fs::create_dir_all(&config.data_dir).await?;
+        let parent = config.data_dir.clone();
+        let keep = !config.cleanup_data_dir;
+        let run_dir = tokio::task::spawn_blocking(move || RunDir::create(&parent, keep))
+            .await
+            .map_err(std::io::Error::other)??;
+        config.data_dir = run_dir.path().to_path_buf();
+        info!("Devnet data directory: {}", config.data_dir.display());
 
         Ok(Self {
             config,
@@ -499,6 +517,7 @@ impl Devnet {
             shutdown: CancellationToken::new(),
             state: Arc::new(RwLock::new(NetworkState::Uninitialized)),
             health_monitor: None,
+            run_dir: Some(run_dir),
             #[cfg(feature = "webrtc-direct")]
             browser_endpoint_catalog: Arc::new(crate::web_rtc::BrowserEndpointCatalog::default()),
         })
@@ -578,16 +597,16 @@ impl Devnet {
         }
         futures::future::join_all(shutdown_futures).await;
 
-        if self.config.cleanup_data_dir {
-            if may_remove_data_root(&self.config.data_dir) {
-                warn!(
-                    "Not removing devnet data directory {}: it is the ant data root or \
-                     contains it (or that could not be ruled out), and other nodes' and \
-                     clients' data lives there",
+        // Without cleanup, dropping the run directory releases its lock and
+        // leaves it, marked to be kept.
+        if let Some(run_dir) = self.run_dir.take().filter(|_| self.config.cleanup_data_dir) {
+            match tokio::task::spawn_blocking(move || run_dir.remove()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!(
+                    "Failed to remove devnet data directory {}: {e}",
                     self.config.data_dir.display()
-                );
-            } else if let Err(e) = tokio::fs::remove_dir_all(&self.config.data_dir).await {
-                warn!("Failed to cleanup devnet data directory: {e}");
+                ),
+                Err(e) => warn!("Failed to remove devnet data directory: {e}"),
             }
         }
 
@@ -1273,55 +1292,6 @@ fn start_cancelled() -> DevnetError {
     DevnetError::Startup("devnet start cancelled".to_string())
 }
 
-/// Whether removing `dir` could delete the ant data root. A devnet must never
-/// delete the root or any directory above it: the root holds real nodes'
-/// data and the client's payment caches and upload history.
-fn may_remove_data_root(dir: &Path) -> bool {
-    covers(dir, &default_root_dir())
-}
-
-/// Whether `dir` is `protected` or one of its ancestors, comparing both as
-/// [`resolve`]d paths so that `..`, a relative path or a symlink can't
-/// disguise it: `remove_dir_all("<root>/..")` deletes the root's parent. Fails
-/// closed: `true` when either path can't be resolved.
-fn covers(dir: &Path, protected: &Path) -> bool {
-    match (resolve(dir), resolve(protected)) {
-        (Ok(dir), Ok(protected)) => protected.starts_with(dir),
-        _ => true,
-    }
-}
-
-/// `path` as an absolute path with symlinks and `..` resolved. The part of it
-/// that exists is canonicalized. Components below that, which don't exist
-/// yet, are appended with `.` and `..` applied lexically, which is exact
-/// because a path that doesn't exist can't be a symlink.
-fn resolve(path: &Path) -> std::io::Result<PathBuf> {
-    let absolute = std::path::absolute(path)?;
-    let mut existing = absolute.as_path();
-    let mut resolved = loop {
-        match existing.canonicalize() {
-            Ok(canonical) => break canonical,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                existing = existing.parent().ok_or(e)?;
-            }
-            Err(e) => return Err(e),
-        }
-    };
-    let missing = absolute
-        .strip_prefix(existing)
-        .map_err(std::io::Error::other)?;
-    for component in missing.components() {
-        match component {
-            Component::ParentDir => {
-                resolved.pop();
-            }
-            Component::Normal(name) => resolved.push(name),
-            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
-        }
-    }
-    Ok(resolved)
-}
-
 impl Drop for Devnet {
     fn drop(&mut self) {
         self.shutdown.cancel();
@@ -1345,23 +1315,64 @@ mod tests {
     }
 
     #[test]
-    fn each_default_config_gets_its_own_data_dir_under_devnets() {
+    fn runs_go_in_the_devnets_dir_of_the_data_root_by_default() {
         let devnets = default_root_dir().join(DEVNETS_SUBDIR);
-        let dirs = [
-            DevnetConfig::default().data_dir,
-            DevnetConfig::default().data_dir,
-            DevnetConfig::minimal().data_dir,
-            DevnetConfig::small().data_dir,
-        ];
-        for dir in &dirs {
-            assert_eq!(dir.parent(), Some(devnets.as_path()), "{}", dir.display());
-            assert!(!may_remove_data_root(dir), "{}", dir.display());
+        for config in [
+            DevnetConfig::default(),
+            DevnetConfig::minimal(),
+            DevnetConfig::small(),
+        ] {
+            assert_eq!(config.data_dir, devnets);
+            assert!(config.cleanup_data_dir);
         }
-        for (i, a) in dirs.iter().enumerate() {
-            for b in &dirs[i + 1..] {
-                assert_ne!(a, b);
-            }
+    }
+
+    #[tokio::test]
+    async fn each_devnet_gets_and_removes_only_its_own_run_dir(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let parent = temp.path().join("devnets");
+        let mut config = DevnetConfig::minimal();
+        config.data_dir.clone_from(&parent);
+        let mut first = Devnet::new(config.clone()).await?;
+        let mut second = Devnet::new(config).await?;
+        let first_dir = first.config().data_dir.clone();
+        let second_dir = second.config().data_dir.clone();
+
+        assert_ne!(first_dir, second_dir);
+        for dir in [&first_dir, &second_dir] {
+            assert_eq!(dir.parent(), Some(parent.as_path()), "{}", dir.display());
+            assert!(dir.join(MARKER_FILE).is_file(), "{}", dir.display());
         }
+
+        first.shutdown().await?;
+        assert!(!first_dir.exists());
+        assert!(second_dir.join(MARKER_FILE).is_file());
+        second.shutdown().await?;
+        assert!(!second_dir.exists());
+        assert!(parent.is_dir(), "the parent is not the devnet's to delete");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn without_cleanup_the_run_dir_is_kept(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let mut config = DevnetConfig::minimal();
+        config.data_dir = temp.path().to_path_buf();
+        config.cleanup_data_dir = false;
+        let mut devnet = Devnet::new(config.clone()).await?;
+        let kept = devnet.config().data_dir.clone();
+        devnet.shutdown().await?;
+        drop(devnet);
+
+        // A later run's sweep leaves it too.
+        config.cleanup_data_dir = true;
+        let mut later = Devnet::new(config).await?;
+        assert!(kept.join(MARKER_FILE).is_file());
+        later.shutdown().await?;
+        assert!(kept.join(MARKER_FILE).is_file());
+        Ok(())
     }
 
     #[tokio::test]
@@ -1379,102 +1390,6 @@ mod tests {
         let paused = devnet.pause(Duration::from_mins(1)).await;
         assert!(matches!(paused, Err(DevnetError::Startup(_))), "{paused:?}");
         assert!(started.elapsed() < Duration::from_secs(5));
-        Ok(())
-    }
-
-    #[test]
-    fn the_data_root_and_its_ancestors_are_never_removed() {
-        let root = default_root_dir();
-        assert!(may_remove_data_root(&root));
-        let mut ancestor = root.parent();
-        while let Some(dir) = ancestor {
-            assert!(may_remove_data_root(dir), "{}", dir.display());
-            ancestor = dir.parent();
-        }
-        assert!(may_remove_data_root(&root.join("..")));
-        assert!(may_remove_data_root(&root.join(DEVNETS_SUBDIR).join("..")));
-        assert!(!may_remove_data_root(
-            &root.join(DEVNETS_SUBDIR).join("1-0")
-        ));
-    }
-
-    /// A temp dir standing in for the data root: `{base}/data/ant`, with one
-    /// run directory under it. Returns (guard, base, data, root).
-    fn fake_root() -> std::io::Result<(tempfile::TempDir, PathBuf, PathBuf, PathBuf)> {
-        let temp = tempfile::tempdir()?;
-        let base = temp.path().canonicalize()?;
-        let data = base.join("data");
-        let root = data.join("ant");
-        std::fs::create_dir_all(root.join(DEVNETS_SUBDIR).join("run"))?;
-        Ok((temp, base, data, root))
-    }
-
-    #[test]
-    fn dotdot_never_disguises_the_root_or_an_ancestor() -> std::io::Result<()> {
-        let (_temp, base, data, root) = fake_root()?;
-        let run = root.join(DEVNETS_SUBDIR).join("run");
-
-        assert!(covers(&root, &root));
-        assert!(covers(&data, &root));
-        assert!(covers(&base, &root));
-        assert!(covers(&root.join(".."), &root));
-        assert!(covers(&root.join(DEVNETS_SUBDIR).join(".."), &root));
-        assert!(covers(&run.join("..").join("..").join(".."), &root));
-        // `..` below a directory that doesn't exist yet.
-        assert!(covers(&root.join("new").join("..").join(".."), &root));
-
-        assert!(!covers(&run, &root));
-        assert!(!covers(&root.join(DEVNETS_SUBDIR).join("not-yet"), &root));
-        assert!(!covers(&run.join("..").join("other"), &root));
-        assert!(!covers(&base.join("elsewhere"), &root));
-        Ok(())
-    }
-
-    #[test]
-    fn a_root_that_does_not_exist_yet_is_still_protected() -> std::io::Result<()> {
-        let (_temp, base, _data, _root) = fake_root()?;
-        let missing = base.join("missing");
-        let root = missing.join("ant");
-
-        assert!(covers(&root, &root));
-        assert!(covers(&missing, &root));
-        assert!(covers(&base, &root));
-        assert!(!covers(&root.join(DEVNETS_SUBDIR).join("run"), &root));
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_relative_path_to_an_ancestor_is_caught(
-    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let (_temp, _base, data, root) = fake_root()?;
-        // `../../..` up to `/` from the current directory, then down to `data`.
-        let cwd = std::env::current_dir()?.canonicalize()?;
-        let up: PathBuf = cwd.components().skip(1).map(|_| "..").collect();
-        let relative = up.join(data.strip_prefix("/")?);
-        assert!(relative.is_relative());
-        assert!(covers(&relative, &root));
-        assert!(!covers(
-            &up.join(root.join(DEVNETS_SUBDIR).strip_prefix("/")?),
-            &root
-        ));
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_symlink_to_the_root_or_an_ancestor_is_caught() -> std::io::Result<()> {
-        let (_temp, base, data, root) = fake_root()?;
-        let run = root.join(DEVNETS_SUBDIR).join("run");
-        std::os::unix::fs::symlink(&data, base.join("to-data"))?;
-        std::os::unix::fs::symlink(&root, base.join("to-root"))?;
-        std::os::unix::fs::symlink(&run, base.join("to-run"))?;
-
-        assert!(covers(&base.join("to-data"), &root));
-        assert!(covers(&base.join("to-root"), &root));
-        assert!(covers(&base.join("to-data").join("ant"), &root));
-        assert!(covers(&base.join("to-run").join("..").join(".."), &root));
-        assert!(!covers(&base.join("to-run"), &root));
         Ok(())
     }
 }

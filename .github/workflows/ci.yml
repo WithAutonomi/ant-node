@@ -102,7 +102,7 @@ jobs:
             || { echo 'scale ran no tests'; exit 1; }
       - name: Run browser RPC privacy regressions
         run: cargo test --test webrtc_direct_devnet
-      - name: ant-devnet stops cleanly on SIGTERM
+      - name: ant-devnet stop signals and run directories
         if: runner.os != 'Windows'
         shell: bash
         run: |

@@ -4,7 +4,9 @@
 //! ant-devnet outright: the devnet was never shut down, Anvil was orphaned
 //! still holding its port, and the data directory was left behind. These
 //! tests run the real binary and check that a SIGTERM, while running or
-//! part-way through startup, now shuts it down cleanly.
+//! part-way through startup, now shuts it down cleanly, removing only the
+//! run's own directory, and that the directory a run killed by `SIGKILL`
+//! has to leave behind is removed by the next run.
 //!
 //! The binary runs with `HOME` and `XDG_DATA_HOME` pointed at a temporary
 //! directory, so its default data root, and anything it removes, is inside
@@ -13,6 +15,7 @@
 #![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use ant_node::devnet::MARKER_FILE;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -24,15 +27,29 @@ const STARTUP_TIMEOUT: Duration = Duration::from_mins(4);
 /// How long a stopped devnet may take to shut down and exit.
 const EXIT_TIMEOUT: Duration = Duration::from_mins(1);
 
-/// A running ant-devnet, killed if a test fails before stopping it.
+/// A running ant-devnet, stopped if a test fails before stopping it.
 struct Devnet(Child);
 
 impl Drop for Devnet {
+    /// SIGTERM first: ant-devnet then stops Anvil itself. SIGKILL skips the
+    /// destructors that do that, so when it comes to SIGKILL, Anvil, its one
+    /// child process, is killed first rather than orphaned.
     fn drop(&mut self) {
-        if matches!(self.0.try_wait(), Ok(None)) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+        if !matches!(self.0.try_wait(), Ok(None)) {
+            return;
         }
+        let pid = self.0.id().to_string();
+        let _ = Command::new("kill").args(["-TERM", &pid]).status();
+        let deadline = Instant::now() + EXIT_TIMEOUT;
+        while Instant::now() < deadline {
+            if !matches!(self.0.try_wait(), Ok(None)) {
+                return;
+            }
+            sleep(Duration::from_millis(100));
+        }
+        let _ = Command::new("pkill").args(["-KILL", "-P", &pid]).status();
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 
@@ -101,6 +118,18 @@ fn wait_until<T>(devnet: &mut Devnet, what: &str, mut ready: impl FnMut() -> Opt
     }
 }
 
+/// The run directories in `parent`: those with a run marker.
+fn run_dirs(parent: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(parent)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| Some(entry.ok()?.path()))
+                .filter(|dir| dir.join(MARKER_FILE).is_file())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn read_manifest(path: &Path) -> Option<serde_json::Value> {
     let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
@@ -157,7 +186,11 @@ fn sigterm_while_running_removes_the_data_dir_and_stops_anvil() {
         "{}",
         data_dir.display()
     );
-    assert!(data_dir.is_dir(), "{}", data_dir.display());
+    assert!(
+        data_dir.join(MARKER_FILE).is_file(),
+        "{}",
+        data_dir.display()
+    );
     assert!(accepting(&anvil), "Anvil is not listening on {anvil:?}");
 
     devnet.signal("TERM");
@@ -165,6 +198,7 @@ fn sigterm_while_running_removes_the_data_dir_and_stops_anvil() {
 
     assert!(status.success(), "ant-devnet exited with {status}");
     assert!(!data_dir.exists(), "{} was left behind", data_dir.display());
+    assert!(data_dir.parent().is_some_and(Path::is_dir));
     // Anvil is stopped, so nothing listens on its port any more.
     let deadline = Instant::now() + Duration::from_secs(10);
     while accepting(&anvil) {
@@ -177,9 +211,12 @@ fn sigterm_while_running_removes_the_data_dir_and_stops_anvil() {
 }
 
 #[test]
-fn sigterm_during_startup_removes_the_data_dir() {
+fn sigterm_during_startup_removes_the_run_dir_only() {
     let home = tempfile::tempdir().unwrap();
+    // `--data-dir` names the directory the run creates its own in.
     let data_dir = home.path().join("devnet");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::write(data_dir.join("sentinel"), b"not the devnet's").unwrap();
     let manifest_path = home.path().join("manifest.json");
     // Ten nodes a second apart: startup takes at least ten seconds, so the
     // signal lands while nodes are still being spawned.
@@ -197,12 +234,13 @@ fn sigterm_during_startup_removes_the_data_dir() {
         ],
     );
 
-    let nodes = data_dir.join("nodes");
-    wait_until(&mut devnet, "the first node directory", || {
-        std::fs::read_dir(&nodes)
-            .ok()
-            .and_then(|mut entries| entries.next())
-            .map(|_| ())
+    let run = wait_until(&mut devnet, "the first node directory", || {
+        run_dirs(&data_dir).into_iter().find(|run| {
+            std::fs::read_dir(run.join("nodes"))
+                .ok()
+                .and_then(|mut entries| entries.next())
+                .is_some()
+        })
     });
     assert!(
         !manifest_path.exists(),
@@ -213,9 +251,49 @@ fn sigterm_during_startup_removes_the_data_dir() {
     let status = devnet.wait_for_exit();
 
     assert!(status.success(), "ant-devnet exited with {status}");
-    assert!(!data_dir.exists(), "{} was left behind", data_dir.display());
+    assert!(!run.exists(), "{} was left behind", run.display());
+    assert!(data_dir.join("sentinel").is_file());
     assert!(
         !manifest_path.exists(),
         "a devnet stopped during startup must not write a manifest"
     );
+}
+
+#[test]
+fn the_next_run_removes_what_a_sigkilled_run_left() {
+    let home = tempfile::tempdir().unwrap();
+    let data_dir = home.path().join("devnets");
+    let other = data_dir.join("not-a-run");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("sentinel"), b"not the devnet's").unwrap();
+    let args = [
+        "--preset",
+        "minimal",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ];
+
+    let mut killed = Devnet::spawn(home.path(), &args);
+    let left = wait_until(&mut killed, "the run directory", || {
+        run_dirs(&data_dir).pop()
+    });
+    killed.signal("KILL");
+    killed.wait_for_exit();
+    // SIGKILL can't be caught, so the run could not remove its directory.
+    assert!(left.join(MARKER_FILE).is_file(), "{}", left.display());
+
+    let mut next = Devnet::spawn(home.path(), &args);
+    // It removes it before it creates its own.
+    let runs = wait_until(&mut next, "the next run to replace it", || {
+        let runs = run_dirs(&data_dir);
+        (!left.exists() && !runs.is_empty()).then_some(runs)
+    });
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert!(other.join("sentinel").is_file());
+
+    next.signal("TERM");
+    let status = next.wait_for_exit();
+    assert!(status.success(), "ant-devnet exited with {status}");
+    assert!(run_dirs(&data_dir).is_empty());
+    assert!(other.join("sentinel").is_file());
 }
