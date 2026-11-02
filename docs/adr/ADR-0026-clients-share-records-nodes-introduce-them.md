@@ -332,8 +332,9 @@ saorsa-transport's WebRTC Direct already uses).
   file's record keeps the file's room in use for as long as it runs, however
   long the nodes take. Joining past 4 rooms leaves the room unread longest, once no
   read has used it for 30 s; with every room still read, the join waits (at
-  most 2 do) and is made at a later read of one of the file's records once a
-  room has gone unread, the file meanwhile read from the nodes. A client
+  most 2 do) and is made once a room has gone unread, when the file is
+  joined again or a read of one of its records starts or ends, the file
+  meanwhile read from the nodes. A client
   reading more files than that at once so cannot make every read a new
   membership (a key, a lookup, links that never open), and a long download's
   room is never left for a file opened beside it; at most 8 rooms left at a time tell their nodes so (each
