@@ -294,6 +294,6 @@ fn the_next_run_removes_what_a_sigkilled_run_left() {
     next.signal("TERM");
     let status = next.wait_for_exit();
     assert!(status.success(), "ant-devnet exited with {status}");
-    assert!(run_dirs(&data_dir).is_empty());
+    assert_eq!(run_dirs(&data_dir), Vec::<PathBuf>::new());
     assert!(other.join("sentinel").is_file());
 }
