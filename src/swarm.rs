@@ -2050,18 +2050,51 @@ mod tests {
         assert_eq!(service.stats().members, 0);
     }
 
+    /// Marks every member of `room` as having announced at `at`, without the
+    /// announce itself, which would take the member's inbox.
+    fn seen_at(service: &SwarmService, room: u8, at: Instant) {
+        if let Some(room) = service.state.lock().rooms.get_mut(&[room; 32]) {
+            for member in room.members.values_mut() {
+                member.last_seen = at;
+            }
+        }
+    }
+
     #[tokio::test]
-    async fn unanswered_offers_and_silent_members_expire() {
+    async fn unanswered_offers_expire_while_their_members_stay() {
         let service = service();
+        let start = Instant::now();
         let _b = call(&service, B, announce(1, &[], 0)).await;
         let _a = call(&service, A, announce(1, &[50], 0)).await;
         assert_eq!(service.stats().pending_offers, 1);
         assert!(service.stats().stored_sdp_bytes > 0);
-        let later = Instant::now() + SIGNAL_TTL + Duration::from_secs(1);
-        service.sweep(later);
+        // Both members keep announcing, so only the signal's own deadline can
+        // end the offer: it outlives MEMBER_TTL, which would otherwise take
+        // the members and their offers with them.
+        let before = start + SIGNAL_TTL.saturating_sub(Duration::from_secs(1));
+        seen_at(&service, 1, before);
+        service.sweep(before);
+        assert_eq!(service.stats().members, 2);
+        assert_eq!(service.stats().pending_offers, 1);
+        assert!(service.stats().stored_sdp_bytes > 0);
+        let after = start + SIGNAL_TTL + Duration::from_secs(1);
+        seen_at(&service, 1, after);
+        service.sweep(after);
+        assert_eq!(service.stats().members, 2);
         assert_eq!(service.stats().pending_offers, 0);
         assert_eq!(service.stats().stored_sdp_bytes, 0);
-        service.sweep(Instant::now() + MEMBER_TTL + Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn silent_members_expire_with_their_offers() {
+        let service = service();
+        let start = Instant::now();
+        let _b = call(&service, B, announce(1, &[], 0)).await;
+        let _a = call(&service, A, announce(1, &[50], 0)).await;
+        service.sweep(start + MEMBER_TTL.saturating_sub(Duration::from_secs(1)));
+        assert_eq!(service.stats().members, 2);
+        // Silent for MEMBER_TTL, well before the offer's own deadline.
+        service.sweep(start + MEMBER_TTL + Duration::from_secs(1));
         assert_eq!(service.stats(), SwarmStats::default());
     }
 
@@ -2478,12 +2511,19 @@ mod tests {
         let service = service();
         let _b = call(&service, B, announce(1, &[], 0)).await;
         let mut delivered = 0;
+        let mut received = 0;
         for offer in 0..40u8 {
             delivered += call(&service, A, announce(1, &[offer], 0)).await.delivered;
+            // B collects every offer and answers none, so its inbox always has
+            // room: only A's own cap on unanswered offers can stop them.
+            received += call(&service, B, announce(1, &[], 0)).await.inbox.len();
         }
-        // B's inbox holds 32, A may have 32 offers out: both caps meet at 32.
         assert_eq!(delivered, 32);
+        assert_eq!(received, 32);
         assert_eq!(service.stats().pending_offers, 32);
+        // A's next offer is still refused while B's inbox is empty.
+        assert_eq!(call(&service, A, announce(1, &[40], 0)).await.delivered, 0);
+        assert_eq!(call(&service, B, announce(1, &[], 0)).await.inbox, []);
     }
 
     #[tokio::test]
