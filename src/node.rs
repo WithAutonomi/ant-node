@@ -151,6 +151,11 @@ impl NativeSwarmRouter {
             debug!("Swarm request from {source} dropped: no connection to answer on");
             return true;
         };
+        let source_ip = transport_source.as_ref().and_then(MultiAddr::ip);
+        if !self.swarm.admit_native(source_ip, Instant::now()) {
+            debug!("Swarm request from {source} dropped: over the swarm's request budget");
+            return true;
+        }
         let Ok(permit) = Arc::clone(&self.slots).try_acquire_owned() else {
             debug!("Swarm request from {source} dropped: swarm slots full");
             return true;
@@ -161,7 +166,7 @@ impl NativeSwarmRouter {
         let request = SwarmRequest {
             source: *source,
             channel,
-            source_ip: transport_source.as_ref().and_then(MultiAddr::ip),
+            source_ip,
             signed_at: *timestamp,
             received: Instant::now(),
             data: data.clone(),
@@ -1386,6 +1391,10 @@ fn jittered_interval(base: std::time::Duration) -> std::time::Duration {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    use std::net::SocketAddr;
+
+    use ant_protocol::swarm::SwarmAnnounceRequest;
+    use ant_protocol::ChunkMessageBody;
     use tempfile::TempDir;
 
     use crate::storage::legacy_artifacts::LEGACY_ENV_DIR;
@@ -1448,6 +1457,60 @@ mod tests {
             .await
             .expect("a node builds on a clean root");
 
+        node.shutdown.cancel();
+    }
+
+    /// A native host flooding swarm requests, under as many identities as it
+    /// likes, has its budget's worth routed to the rendezvous and no more, and
+    /// an honest host beside it still gets through.
+    #[tokio::test]
+    async fn a_native_hosts_swarm_flood_is_held_to_its_budget() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("node");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let node = NodeBuilder::new(local_node_config(&root))
+            .build()
+            .await
+            .expect("a node builds on a clean root");
+        let swarm = SwarmService::new();
+        let router = NativeSwarmRouter::start(
+            Arc::clone(&swarm),
+            Arc::clone(&node.p2p_node),
+            TaskTracker::new(),
+            node.shutdown.clone(),
+        );
+        let request = ChunkMessage {
+            request_id: 1,
+            body: ChunkMessageBody::SwarmAnnounceRequest(SwarmAnnounceRequest {
+                room: [1; 32],
+                node: [2; 32],
+                membership: 1,
+                offers: Vec::new(),
+                wait_ms: 0,
+            }),
+        }
+        .encode()
+        .expect("encode");
+        let from = |ip: &str, identity: u8| P2PEvent::Message {
+            topic: CHUNK_PROTOCOL_ID.to_string(),
+            source: Some(PeerId::from_bytes([identity; 32])),
+            transport_source: Some(MultiAddr::quic(SocketAddr::new(
+                ip.parse().expect("ip"),
+                5000,
+            ))),
+            timestamp: 0,
+            data: request.clone(),
+        };
+        let over_budget = || swarm.counters().native_over_budget.load(Ordering::Relaxed);
+        let flood: u32 = 100;
+        for identity in 0..flood {
+            let identity = u8::try_from(identity).expect("fits");
+            assert!(router.route(&from("198.51.100.4", identity)));
+        }
+        let dropped = flood - swarm::NATIVE_SWARM_REQUESTS_PER_SECOND_PER_HOST;
+        assert_eq!(over_budget(), u64::from(dropped));
+        assert!(router.route(&from("198.51.100.5", 0)));
+        assert_eq!(over_budget(), u64::from(dropped));
         node.shutdown.cancel();
     }
 

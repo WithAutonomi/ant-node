@@ -245,7 +245,13 @@ may only be appended.
   arrives once the reads' budget is spent is taken on the swarm's instead,
   since only the opened frame says whether it is a swarm request: one that
   is goes on, and anything else gives the swarm its token back and is
-  refused as over the request rate, as before.
+  refused as over the request rate, as before. Native swarm requests have a
+  budget of their own with the same figures (64 a second in all, 8 from one
+  host, an IPv4 address or an IPv6 /64, since a native client's identities
+  cost nothing to make), taken before the request is decoded or given a
+  task: one past it is dropped, and its client reads from nodes alone. The
+  node remembers at most 4096 hosts' budgets, forgetting first those that
+  have refilled, which leaves room for a new host however many came before.
 - **Closing.** A connection that closes leaves all its rooms at once. No
   request of it still being handled can act after the close (announce, answer
   or leave), nor any request older than a minute. A member that goes takes
@@ -702,8 +708,11 @@ saorsa-transport's WebRTC Direct already uses).
   a later wait short, requests from before a close joining nothing,
   replayed or stale native requests, histories started only by announces and
   leaves and capped per host, ended memberships refused however late their
-  announce, kept per connection and host, members capped per host, and a departing member's signals
-  and the offers made to it going with it.
+  announce, kept per connection and host, members capped per host, a departing member's signals
+  and the offers made to it going with it, and the native request budget (a
+  host's identities and IPv6 /64 sharing one, many hosts held to the node's,
+  the hosts remembered staying bounded, and a flood through the router held
+  to it while another host gets through).
 - ant-client unit tests over an in-memory WebRTC stand-in: a record served to
   a second and a third client, nothing asked for a record nobody announced, a
   forged record and out-of-order pieces ending the link, a stalled peer costing

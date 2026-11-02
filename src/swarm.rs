@@ -248,6 +248,8 @@ pub struct SwarmCounters {
     pub refused: AtomicU64,
     /// Members dropped because they stopped announcing.
     pub members_expired: AtomicU64,
+    /// Native requests dropped past the node's or their host's budget.
+    pub native_over_budget: AtomicU64,
 }
 
 /// Counts at one moment.
@@ -373,6 +375,8 @@ pub struct SwarmService {
     /// signed request this node saw cannot be replayed at another, nor one
     /// another node saw here. Until it is known, every request is refused.
     node_id: RwLock<Option<NodeId>>,
+    /// See [`NATIVE_SWARM_REQUESTS_PER_SECOND`].
+    native_budget: Mutex<NativeBudget>,
 }
 
 impl std::fmt::Debug for SwarmService {
@@ -386,6 +390,114 @@ impl std::fmt::Debug for SwarmService {
 /// Swarm requests handled at once on the native path. Above
 /// [`MAX_WAITING`] so announces that cannot wait still get through.
 pub const MAX_SWARM_TASKS: usize = MAX_WAITING + 256;
+/// Native clients' swarm requests a node takes in a second, in all.
+///
+/// With [`NATIVE_SWARM_REQUESTS_PER_SECOND_PER_HOST`], the native path's own
+/// budget, as the browser listener's swarm budget is for browsers. An identity
+/// costs a native client nothing, so its requests are counted by host (an
+/// IPv4 address or an IPv6 /64). Past either, a request is dropped before any
+/// work; its client times out and reads from nodes alone.
+pub const NATIVE_SWARM_REQUESTS_PER_SECOND: u32 = 64;
+/// See [`NATIVE_SWARM_REQUESTS_PER_SECOND`].
+pub const NATIVE_SWARM_REQUESTS_PER_SECOND_PER_HOST: u32 = 8;
+/// Hosts whose native swarm budget is remembered at once. A host whose
+/// budget has refilled is as good as new, so those go first when it is full;
+/// past it, a request from a host not yet counted is dropped.
+pub const MAX_BUDGETED_HOSTS: usize = 4096;
+
+/// A token bucket of `rate` requests a second, holding at most one second's.
+#[derive(Debug)]
+struct RateBucket {
+    rate: u128,
+    /// Tokens, in billionths.
+    units: u128,
+    last: Instant,
+}
+
+const TOKEN: u128 = 1_000_000_000;
+
+impl RateBucket {
+    fn new(rate: u32, now: Instant) -> Self {
+        let rate = u128::from(rate);
+        Self {
+            rate,
+            units: rate.saturating_mul(TOKEN),
+            last: now,
+        }
+    }
+
+    fn refill(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.last);
+        self.last = self.last.max(now);
+        let capacity = self.rate.saturating_mul(TOKEN);
+        self.units = self
+            .units
+            .saturating_add(elapsed.as_nanos().saturating_mul(self.rate))
+            .min(capacity);
+    }
+
+    fn take(&mut self, now: Instant) -> bool {
+        self.refill(now);
+        if self.units < TOKEN {
+            return false;
+        }
+        self.units -= TOKEN;
+        true
+    }
+
+    fn refund(&mut self) {
+        self.units = self
+            .units
+            .saturating_add(TOKEN)
+            .min(self.rate.saturating_mul(TOKEN));
+    }
+
+    fn is_full(&mut self, now: Instant) -> bool {
+        self.refill(now);
+        self.units >= self.rate.saturating_mul(TOKEN)
+    }
+}
+
+/// The native path's swarm request budget: the node's and each host's.
+#[derive(Debug)]
+struct NativeBudget {
+    all: RateBucket,
+    hosts: HashMap<IpAddr, RateBucket>,
+}
+
+impl NativeBudget {
+    /// Takes a place from the node's budget and from `ip`'s host's, both or
+    /// neither. The node's is taken first, so once it is spent a flood costs
+    /// one check a request.
+    fn admit(&mut self, ip: IpAddr, now: Instant) -> bool {
+        if !self.all.take(now) {
+            return false;
+        }
+        let host = host_of(ip);
+        if !self.hosts.contains_key(&host) && self.hosts.len() >= MAX_BUDGETED_HOSTS {
+            self.hosts.retain(|_, bucket| !bucket.is_full(now));
+        }
+        let taken = (self.hosts.contains_key(&host) || self.hosts.len() < MAX_BUDGETED_HOSTS)
+            && self
+                .hosts
+                .entry(host)
+                .or_insert_with(|| RateBucket::new(NATIVE_SWARM_REQUESTS_PER_SECOND_PER_HOST, now))
+                .take(now);
+        if !taken {
+            self.all.refund();
+        }
+        taken
+    }
+}
+
+impl Default for NativeBudget {
+    fn default() -> Self {
+        Self {
+            all: RateBucket::new(NATIVE_SWARM_REQUESTS_PER_SECOND, Instant::now()),
+            hosts: HashMap::new(),
+        }
+    }
+}
 
 // The wire discriminants of the swarm requests in `ChunkMessageBody`, after
 // the get-or-closer pair at 14 and 15 (ant-protocol pins them in a test).
@@ -767,6 +879,20 @@ impl SwarmService {
     /// Counters for metrics.
     pub fn counters(&self) -> &SwarmCounters {
         &self.counters
+    }
+
+    /// Whether a native swarm request from `ip` may be handled now: it takes
+    /// a place from the node's budget and from its host's, both or neither
+    /// (see [`NATIVE_SWARM_REQUESTS_PER_SECOND`]). A request with no source
+    /// address is refused.
+    pub fn admit_native(&self, ip: Option<IpAddr>, now: Instant) -> bool {
+        let admitted = ip.is_some_and(|ip| self.native_budget.lock().admit(ip, now));
+        if !admitted {
+            self.counters
+                .native_over_budget
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        admitted
     }
 
     /// Whether a reply to a request of `session` received at `received`
@@ -1965,6 +2091,90 @@ mod tests {
             SwarmAnswerResponse::Unmatched
         );
         assert_eq!(call(&service, A, announce(1, &[], 0)).await.inbox, []);
+    }
+
+    #[test]
+    fn a_hosts_native_requests_share_one_budget() {
+        let service = service();
+        let now = Instant::now();
+        let host: IpAddr = "198.51.100.4".parse().expect("ip");
+        for _ in 0..NATIVE_SWARM_REQUESTS_PER_SECOND_PER_HOST {
+            assert!(service.admit_native(Some(host), now));
+        }
+        // Whatever identities it uses, the host has spent its second.
+        assert!(!service.admit_native(Some(host), now));
+        assert_eq!(
+            service
+                .counters()
+                .native_over_budget
+                .load(Ordering::Relaxed),
+            1
+        );
+        // Another host is not held back, and the refused request took
+        // nothing of the node's budget.
+        let other: IpAddr = "198.51.100.5".parse().expect("ip");
+        assert!(service.admit_native(Some(other), now));
+        let all = service.native_budget.lock().all.units / TOKEN;
+        assert_eq!(
+            all,
+            u128::from(
+                NATIVE_SWARM_REQUESTS_PER_SECOND - NATIVE_SWARM_REQUESTS_PER_SECOND_PER_HOST - 1
+            )
+        );
+        // A second later the host has its budget back.
+        assert!(service.admit_native(Some(host), now + Duration::from_secs(1)));
+        // A request with no source address is never admitted.
+        assert!(!service.admit_native(None, now));
+    }
+
+    #[test]
+    fn an_ipv6_hosts_addresses_share_its_budget() {
+        let service = service();
+        let now = Instant::now();
+        for n in 0..NATIVE_SWARM_REQUESTS_PER_SECOND_PER_HOST {
+            let ip: IpAddr = format!("2001:db8:1:2::{n:x}").parse().expect("ip");
+            assert!(service.admit_native(Some(ip), now));
+        }
+        let same_64: IpAddr = "2001:db8:1:2:ffff::1".parse().expect("ip");
+        assert!(!service.admit_native(Some(same_64), now));
+        let next_64: IpAddr = "2001:db8:1:3::1".parse().expect("ip");
+        assert!(service.admit_native(Some(next_64), now));
+    }
+
+    #[test]
+    fn many_hosts_together_get_the_nodes_budget_and_no_more() {
+        let service = service();
+        let now = Instant::now();
+        let host = |n: u32| IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000 + n));
+        for n in 0..NATIVE_SWARM_REQUESTS_PER_SECOND {
+            assert!(service.admit_native(Some(host(n)), now));
+        }
+        // A host that has sent nothing is refused too: the node's second is spent.
+        assert!(!service.admit_native(Some(host(10_000)), now));
+        // It refills at its rate.
+        let later = now + Duration::from_secs(1) / NATIVE_SWARM_REQUESTS_PER_SECOND;
+        assert!(service.admit_native(Some(host(10_000)), later));
+        assert!(!service.admit_native(Some(host(10_001)), later));
+    }
+
+    #[test]
+    fn the_hosts_remembered_stay_bounded_and_a_new_host_still_gets_in() {
+        let service = service();
+        let start = Instant::now();
+        // More hosts than are remembered, each once, slower than the node's
+        // budget refills.
+        let spacing = Duration::from_millis(20);
+        let total = u32::try_from(MAX_BUDGETED_HOSTS).expect("fits") + 100;
+        let mut at = start;
+        for n in 0..total {
+            at = start + spacing * n;
+            let ip = IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000 + n));
+            assert!(service.admit_native(Some(ip), at), "host {n}");
+            assert!(service.native_budget.lock().hosts.len() <= MAX_BUDGETED_HOSTS);
+        }
+        // A host it forgot (its budget had refilled) starts afresh.
+        let first = IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000));
+        assert!(service.admit_native(Some(first), at));
     }
 
     #[tokio::test]
