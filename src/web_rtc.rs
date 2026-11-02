@@ -27,6 +27,7 @@ use futures::{stream::FuturesUnordered, StreamExt};
 use parking_lot::{Mutex, RwLock};
 use saorsa_core::identity::NodeIdentity;
 use saorsa_core::{AddressType, DHTNode, MultiAddr, P2PNode, PeerId};
+use saorsa_transport::upnp::{UpnpConfig, UpnpMappingService, UpnpState, UpnpStateRx};
 use saorsa_transport::webrtc::{
     accept_pq_session, decode_pq_frame, encode_response_frame, parse_request_header,
     pq_frame_length, source_ip_bucket, BrowserCommitmentArtifact, BrowserNode,
@@ -653,6 +654,10 @@ pub async fn spawn(
     .await
     .map_err(|error| Error::Startup(format!("failed to bind WebRTC Direct listener: {error}")))?;
     let local_addr = listener.local_addr();
+    // Like the native QUIC endpoint, ask the gateway to forward the listener's
+    // port. Best effort: without a mapping, publication is unchanged (ADR-0027).
+    let upnp = maps_port_with_upnp(config, local_addr)
+        .then(|| UpnpMappingService::start(local_addr.port(), UpnpConfig::default()));
     let identity = Arc::clone(p2p.transport().node_identity());
     let state = Arc::new(ServerState {
         config: config.clone(),
@@ -662,6 +667,7 @@ pub async fn spawn(
         payment,
         endpoint: RwLock::new(None),
         endpoint_catalog,
+        upnp: upnp.as_ref().map(UpnpMappingService::subscribe),
     });
     refresh_browser_endpoint(&state, root_dir, local_addr, certificate_sha256).await?;
     let browser_endpoint = state.endpoint.read().clone();
@@ -720,6 +726,10 @@ pub async fn spawn(
                 }
             },
         );
+        // Remove the gateway mapping rather than leave it to its lease.
+        if let Some(upnp) = upnp {
+            upnp.shutdown().await;
+        }
     });
     Ok(WebRtcDirectServer {
         diagnostics,
@@ -735,7 +745,12 @@ async fn refresh_browser_endpoint(
     certificate_sha256: [u8; 32],
 ) -> Result<()> {
     let native = state.p2p.dht_manager().local_dht_node().await;
-    let Some(address) = advertised_addr(&state.config, local_addr, &native.typed_addresses())
+    let mapped = state.upnp.as_ref().and_then(|upnp| match upnp.current() {
+        UpnpState::Mapped { external, .. } => Some(external),
+        UpnpState::Probing | UpnpState::Unavailable => None,
+    });
+    let Some(address) =
+        advertised_addr(&state.config, local_addr, mapped, &native.typed_addresses())
     else {
         // As with native publication, keep the last nonempty address set.
         return Ok(());
@@ -871,9 +886,20 @@ fn certificate_path(config: &WebRtcDirectConfig, root_dir: &Path) -> PathBuf {
     }
 }
 
+/// Whether the listener chooses its own public address, and so may ask the
+/// gateway to forward its port: a wildcard listener the operator gave no
+/// advertised address. An explicit bind or advertisement is the operator's.
+fn maps_port_with_upnp(config: &WebRtcDirectConfig, local_addr: SocketAddr) -> bool {
+    config.advertised_addr.is_none() && local_addr.ip().is_unspecified()
+}
+
+/// The address browsers dial: the operator's advertisement, an explicit bind,
+/// the gateway's mapping of the listener's port (`mapped`), or else the native
+/// self-address view's IP with the listener's port.
 fn advertised_addr(
     config: &WebRtcDirectConfig,
     local_addr: SocketAddr,
+    mapped: Option<SocketAddr>,
     native_addresses: &[(MultiAddr, AddressType)],
 ) -> Option<SocketAddr> {
     if let Some(addr) = config.advertised_addr {
@@ -881,6 +907,11 @@ fn advertised_addr(
     }
     if !local_addr.ip().is_unspecified() {
         return Some(local_addr);
+    }
+    // Behind NAT the gateway drops unsolicited traffic to the listener's own
+    // port, so the address it forwards is the one browsers can reach.
+    if let Some(mapped) = mapped.filter(|addr| addr.is_ipv4() == local_addr.is_ipv4()) {
+        return Some(mapped);
     }
     // The native self-address view already applies observation, scope and
     // priority policy. Relay sockets belong to the relay, not this listener.
@@ -2272,6 +2303,8 @@ struct ServerState {
     payment: BrowserPaymentNetwork,
     endpoint: RwLock<Option<BrowserEndpoint>>,
     endpoint_catalog: Option<Arc<BrowserEndpointCatalog>>,
+    /// The gateway mapping of the listener's port, when the listener asked for one.
+    upnp: Option<UpnpStateRx>,
 }
 
 #[cfg(test)]
@@ -2287,6 +2320,7 @@ mod tests {
         PointerGetRequest, PointerGetResponse, PointerPutRequest, PointerPutResponse,
     };
     use ant_protocol::pointer::POINTER_WIRE_LEN;
+    use saorsa_transport::webrtc_direct::WebRtcCertificate;
     use std::net::Ipv4Addr;
 
     #[test]
@@ -2914,7 +2948,7 @@ mod tests {
     fn wildcard_publication_waits_for_native_discovery_and_excludes_relays() {
         let config = WebRtcDirectConfig::default();
         let local = "0.0.0.0:43210".parse().expect("bound listener");
-        assert_eq!(advertised_addr(&config, local, &[]), None);
+        assert_eq!(advertised_addr(&config, local, None, &[]), None);
         let addresses = vec![
             (
                 MultiAddr::quic("203.0.113.1:1000".parse().expect("relay")),
@@ -2925,26 +2959,25 @@ mod tests {
                 AddressType::Direct,
             ),
         ];
-        assert_eq!(advertised_addr(&config, local, &addresses), None);
+        assert_eq!(advertised_addr(&config, local, None, &addresses), None);
         let mut addresses = addresses;
         addresses.push((
             MultiAddr::quic("198.51.100.2:1000".parse().expect("observed")),
             AddressType::Unverified,
         ));
         assert_eq!(
-            advertised_addr(&config, local, &addresses),
+            advertised_addr(&config, local, None, &addresses),
             Some("198.51.100.2:43210".parse().expect("WebRTC"))
         );
         addresses[2].0 = MultiAddr::quic("198.51.100.3:2000".parse().expect("new observed"));
         assert_eq!(
-            advertised_addr(&config, local, &addresses),
+            advertised_addr(&config, local, None, &addresses),
             Some("198.51.100.3:43210".parse().expect("updated WebRTC"))
         );
     }
 
     #[tokio::test]
     async fn automatic_port_is_os_assigned_and_explicit_advertisement_is_independent() {
-        use saorsa_transport::webrtc_direct::WebRtcCertificate;
         let certificate = WebRtcCertificate::generate().expect("certificate");
         let listener =
             WebRtcDirectListener::bind("127.0.0.1:0".parse().expect("bind"), certificate)
@@ -2953,15 +2986,73 @@ mod tests {
         let local = listener.local_addr();
         assert_ne!(local.port(), 0);
         assert_eq!(
-            advertised_addr(&WebRtcDirectConfig::default(), local, &[]),
+            advertised_addr(&WebRtcDirectConfig::default(), local, None, &[]),
             Some(local)
         );
         let config = WebRtcDirectConfig {
             advertised_addr: Some("198.51.100.4:11000".parse().expect("advertised")),
             ..WebRtcDirectConfig::default()
         };
-        assert_eq!(advertised_addr(&config, local, &[]), config.advertised_addr);
+        assert_eq!(
+            advertised_addr(&config, local, None, &[]),
+            config.advertised_addr
+        );
         listener.close().await.expect("close listener");
+    }
+
+    #[test]
+    fn only_a_listener_choosing_its_own_address_maps_its_port() {
+        let wildcard = "0.0.0.0:43210".parse().expect("wildcard listener");
+        let explicit = "192.0.2.7:43210".parse().expect("explicit listener");
+        let default = WebRtcDirectConfig::default();
+        assert!(maps_port_with_upnp(&default, wildcard));
+        assert!(!maps_port_with_upnp(&default, explicit));
+        let advertised = WebRtcDirectConfig {
+            advertised_addr: Some("198.51.100.4:11000".parse().expect("advertised")),
+            ..WebRtcDirectConfig::default()
+        };
+        assert!(!maps_port_with_upnp(&advertised, wildcard));
+    }
+
+    #[test]
+    fn a_gateway_mapping_is_advertised_before_the_native_view() {
+        let local = "0.0.0.0:43210".parse().expect("wildcard listener");
+        let native = vec![(
+            MultiAddr::quic("198.51.100.2:1000".parse().expect("observed")),
+            AddressType::Direct,
+        )];
+        let mapped: SocketAddr = "198.51.100.2:51000".parse().expect("mapped");
+        let default = WebRtcDirectConfig::default();
+        // The gateway may forward another external port than the listener's.
+        assert_eq!(
+            advertised_addr(&default, local, Some(mapped), &native),
+            Some(mapped)
+        );
+        // A mapping needs no native discovery to be published.
+        assert_eq!(
+            advertised_addr(&default, local, Some(mapped), &[]),
+            Some(mapped)
+        );
+        // A mapping in the other address family cannot reach this listener.
+        let mapped_v6 = "[2001:db8::2]:51000".parse().expect("IPv6 mapping");
+        assert_eq!(
+            advertised_addr(&default, local, Some(mapped_v6), &native),
+            Some("198.51.100.2:43210".parse().expect("native view"))
+        );
+        // Losing the mapping falls back to the native view.
+        assert_eq!(
+            advertised_addr(&default, local, None, &native),
+            Some("198.51.100.2:43210".parse().expect("native view"))
+        );
+        // An operator's advertisement still wins.
+        let advertised = WebRtcDirectConfig {
+            advertised_addr: Some("198.51.100.4:11000".parse().expect("advertised")),
+            ..WebRtcDirectConfig::default()
+        };
+        assert_eq!(
+            advertised_addr(&advertised, local, Some(mapped), &native),
+            advertised.advertised_addr
+        );
     }
 
     #[test]
@@ -3067,7 +3158,7 @@ mod tests {
     #[test]
     fn derives_ipv6_advertised_address() {
         let config = WebRtcDirectConfig::default();
-        let addr = advertised_addr(&config, "[::1]:23456".parse().expect("socket"), &[])
+        let addr = advertised_addr(&config, "[::1]:23456".parse().expect("socket"), None, &[])
             .expect("advertised address");
         assert_eq!(addr, "[::1]:23456".parse().expect("socket"));
     }
