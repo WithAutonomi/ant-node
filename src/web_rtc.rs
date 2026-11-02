@@ -104,6 +104,10 @@ impl BrowserEndpointCatalog {
         self.endpoints.write().insert(peer_id, endpoint);
     }
 
+    fn remove(&self, peer_id: &PeerId) {
+        self.endpoints.write().remove(peer_id);
+    }
+
     fn get(&self, peer_id: &PeerId) -> Option<BrowserEndpoint> {
         self.endpoints.read().get(peer_id).cloned()
     }
@@ -667,18 +671,16 @@ pub async fn spawn(
         payment,
         endpoint: RwLock::new(None),
         endpoint_catalog,
-        upnp: upnp.as_ref().map(UpnpMappingService::subscribe),
+        port_mapping: upnp
+            .as_ref()
+            .map(|service| Box::new(service.subscribe()) as Box<dyn PortMapping>),
+        endpoint_needs_mapping: AtomicBool::new(false),
     });
     refresh_browser_endpoint(&state, root_dir, local_addr, certificate_sha256).await?;
     let browser_endpoint = state.endpoint.read().clone();
     if browser_endpoint.is_none() {
         // Do not leave a previous run's socket advertised while discovery is pending.
-        let path = root_dir.join(WEBRTC_DIRECT_MULTIADDR_FILENAME);
-        match tokio::fs::remove_file(path).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
+        remove_persisted_browser_endpoint(root_dir).await?;
     }
     let resources = ListenerResources::new(config);
     let diagnostics = WebRtcServerDiagnostics {
@@ -744,21 +746,33 @@ async fn refresh_browser_endpoint(
     local_addr: SocketAddr,
     certificate_sha256: [u8; 32],
 ) -> Result<()> {
-    let native = state.p2p.dht_manager().local_dht_node().await;
-    let mapped = state.upnp.as_ref().and_then(|upnp| match upnp.current() {
-        UpnpState::Mapped { external, .. } => Some(external),
-        UpnpState::Probing | UpnpState::Unavailable => None,
-    });
-    let Some(address) =
-        advertised_addr(&state.config, local_addr, mapped, &native.typed_addresses())
-    else {
-        // As with native publication, keep the last nonempty address set.
+    let native = state
+        .p2p
+        .dht_manager()
+        .local_dht_node()
+        .await
+        .typed_addresses();
+    let mapped = state
+        .port_mapping
+        .as_ref()
+        .and_then(|mapping| mapping.external());
+    let Some(address) = advertised_addr(&state.config, local_addr, mapped, &native) else {
+        // As with native publication, keep the last nonempty address set,
+        // unless only a mapping the gateway no longer holds made it reachable.
+        if state.endpoint_needs_mapping.swap(false, Ordering::AcqRel) {
+            withdraw_browser_endpoint(state, root_dir).await?;
+        }
         return Ok(());
     };
+    let needs_mapping =
+        valid_only_while_mapped(&state.config, local_addr, mapped, &native, address);
     let peer_id = *state.p2p.peer_id();
     let endpoint = BrowserEndpoint::new(address, peer_id.to_bytes(), certificate_sha256)
         .map_err(|error| Error::Config(error.to_string()))?;
     if state.endpoint.read().as_ref() == Some(&endpoint) {
+        state
+            .endpoint_needs_mapping
+            .store(needs_mapping, Ordering::Release);
         return Ok(());
     }
     let supplemental = endpoint
@@ -771,11 +785,43 @@ async fn refresh_browser_endpoint(
     }
     *state.endpoint.write() = Some(endpoint);
     state
+        .endpoint_needs_mapping
+        .store(needs_mapping, Ordering::Release);
+    state
         .p2p
         .dht_manager()
         .set_supplemental_self_addresses(vec![supplemental])
         .await;
     Ok(())
+}
+
+/// Stop advertising the browser endpoint everywhere it was published: HELLO,
+/// the endpoint file, the in-process catalog and the DHT address record.
+async fn withdraw_browser_endpoint(state: &ServerState, root_dir: &Path) -> Result<()> {
+    let withdrawn = state.endpoint.write().take();
+    let Some(withdrawn) = withdrawn else {
+        return Ok(());
+    };
+    info!(endpoint = %withdrawn.multiaddr,
+        "WebRTC Direct endpoint withdrawn: its gateway mapping ended");
+    remove_persisted_browser_endpoint(root_dir).await?;
+    if let Some(catalog) = state.endpoint_catalog.as_ref() {
+        catalog.remove(state.p2p.peer_id());
+    }
+    state
+        .p2p
+        .dht_manager()
+        .set_supplemental_self_addresses(Vec::new())
+        .await;
+    Ok(())
+}
+
+async fn remove_persisted_browser_endpoint(root_dir: &Path) -> Result<()> {
+    match tokio::fs::remove_file(root_dir.join(WEBRTC_DIRECT_MULTIADDR_FILENAME)).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 async fn persist_browser_endpoint(root_dir: &Path, endpoint: &BrowserEndpoint) -> Result<()> {
@@ -891,6 +937,33 @@ fn certificate_path(config: &WebRtcDirectConfig, root_dir: &Path) -> PathBuf {
 /// advertised address. An explicit bind or advertisement is the operator's.
 fn maps_port_with_upnp(config: &WebRtcDirectConfig, local_addr: SocketAddr) -> bool {
     config.advertised_addr.is_none() && local_addr.ip().is_unspecified()
+}
+
+/// The gateway's mapping of the listener's port, while it holds one.
+trait PortMapping: Send + Sync {
+    fn external(&self) -> Option<SocketAddr>;
+}
+
+impl PortMapping for UpnpStateRx {
+    fn external(&self) -> Option<SocketAddr> {
+        match self.current() {
+            UpnpState::Mapped { external, .. } => Some(external),
+            UpnpState::Probing | UpnpState::Unavailable => None,
+        }
+    }
+}
+
+/// Whether `address` reaches the listener only through the gateway's mapping:
+/// it is the mapping, and the native view would not yield it without one.
+fn valid_only_while_mapped(
+    config: &WebRtcDirectConfig,
+    local_addr: SocketAddr,
+    mapped: Option<SocketAddr>,
+    native_addresses: &[(MultiAddr, AddressType)],
+    address: SocketAddr,
+) -> bool {
+    mapped == Some(address)
+        && advertised_addr(config, local_addr, None, native_addresses) != Some(address)
 }
 
 /// The address browsers dial: the operator's advertisement, an explicit bind,
@@ -2304,7 +2377,10 @@ struct ServerState {
     endpoint: RwLock<Option<BrowserEndpoint>>,
     endpoint_catalog: Option<Arc<BrowserEndpointCatalog>>,
     /// The gateway mapping of the listener's port, when the listener asked for one.
-    upnp: Option<UpnpStateRx>,
+    port_mapping: Option<Box<dyn PortMapping>>,
+    /// The published endpoint reaches the listener only through that mapping,
+    /// so it is withdrawn when the mapping ends and nothing replaces it.
+    endpoint_needs_mapping: AtomicBool,
 }
 
 #[cfg(test)]
@@ -2320,8 +2396,14 @@ mod tests {
         PointerGetRequest, PointerGetResponse, PointerPutRequest, PointerPutResponse,
     };
     use ant_protocol::pointer::POINTER_WIRE_LEN;
+    use saorsa_core::NodeConfig as CoreNodeConfig;
     use saorsa_transport::webrtc_direct::WebRtcCertificate;
     use std::net::Ipv4Addr;
+
+    /// Any listener certificate digest, for publication tests.
+    const CERTIFICATE_SHA256: [u8; 32] = [7; 32];
+    /// Arbitrum Sepolia, a payment network that needs no RPC.
+    const ARBITRUM_SEPOLIA_CHAIN_ID: u64 = 421_614;
 
     #[test]
     fn diagnostics_report_capacity_rate_and_byte_pressure_without_leaking_slots() {
@@ -3053,6 +3135,132 @@ mod tests {
             advertised_addr(&advertised, local, Some(mapped), &native),
             advertised.advertised_addr
         );
+    }
+
+    #[test]
+    fn only_an_address_the_native_view_lacks_needs_the_mapping() {
+        let local = "0.0.0.0:43210".parse().expect("wildcard listener");
+        let native = vec![(
+            MultiAddr::quic("198.51.100.2:1000".parse().expect("observed")),
+            AddressType::Direct,
+        )];
+        let default = WebRtcDirectConfig::default();
+        // The gateway forwarded another port than the listener's.
+        let moved: SocketAddr = "198.51.100.2:51000".parse().expect("mapped");
+        assert!(valid_only_while_mapped(
+            &default,
+            local,
+            Some(moved),
+            &native,
+            moved
+        ));
+        // Without a native view the mapping is the only address.
+        assert!(valid_only_while_mapped(
+            &default,
+            local,
+            Some(moved),
+            &[],
+            moved
+        ));
+        // The gateway kept the port and the native view yields the same
+        // address, which stays published without the mapping, as before.
+        let kept: SocketAddr = "198.51.100.2:43210".parse().expect("mapped");
+        assert!(!valid_only_while_mapped(
+            &default,
+            local,
+            Some(kept),
+            &native,
+            kept
+        ));
+        assert!(!valid_only_while_mapped(
+            &default, local, None, &native, kept
+        ));
+    }
+
+    /// A mapping the test can grant and take away.
+    struct TestMapping(Arc<Mutex<Option<SocketAddr>>>);
+
+    impl PortMapping for TestMapping {
+        fn external(&self) -> Option<SocketAddr> {
+            *self.0.lock()
+        }
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_only_its_mapping_reached_is_withdrawn_when_the_mapping_ends() {
+        // A node that has not started has no native self-address, so the
+        // mapping is the only address the listener can publish.
+        let p2p = Arc::new(
+            P2PNode::new(
+                CoreNodeConfig::builder()
+                    .local(true)
+                    .ipv6(false)
+                    .build()
+                    .expect("core config"),
+            )
+            .await
+            .expect("P2P node"),
+        );
+        let peer_id = *p2p.peer_id();
+        let mapping = Arc::new(Mutex::new(Some(
+            "198.51.100.2:51000".parse().expect("mapped"),
+        )));
+        let catalog = Arc::new(BrowserEndpointCatalog::default());
+        let state = ServerState {
+            config: WebRtcDirectConfig::default(),
+            identity: Arc::clone(p2p.transport().node_identity()),
+            p2p: Arc::clone(&p2p),
+            ant_protocol: None,
+            payment: BrowserPaymentNetwork {
+                chain_id: ARBITRUM_SEPOLIA_CHAIN_ID,
+                payment_token_address: String::new(),
+                payment_vault_address: String::new(),
+            },
+            endpoint: RwLock::new(None),
+            endpoint_catalog: Some(Arc::clone(&catalog)),
+            port_mapping: Some(Box::new(TestMapping(Arc::clone(&mapping)))),
+            endpoint_needs_mapping: AtomicBool::new(false),
+        };
+        let root = tempfile::tempdir().expect("root directory");
+        let file = root.path().join(WEBRTC_DIRECT_MULTIADDR_FILENAME);
+        let local = "0.0.0.0:43210".parse().expect("wildcard listener");
+
+        refresh_browser_endpoint(&state, root.path(), local, CERTIFICATE_SHA256)
+            .await
+            .expect("publish the mapping");
+        let published = state.endpoint.read().clone().expect("published endpoint");
+        assert!(published.multiaddr.contains("/198.51.100.2/udp/51000/"));
+        assert!(tokio::fs::read_to_string(&file)
+            .await
+            .expect("endpoint file")
+            .contains(&published.multiaddr));
+        assert_eq!(catalog.get(&peer_id), Some(published));
+        assert_eq!(
+            p2p.dht_manager()
+                .supplemental_addresses_for_peer(&peer_id)
+                .await
+                .len(),
+            1
+        );
+
+        *mapping.lock() = None;
+        refresh_browser_endpoint(&state, root.path(), local, CERTIFICATE_SHA256)
+            .await
+            .expect("withdraw the mapping");
+        assert!(state.endpoint.read().is_none());
+        assert!(!file.exists());
+        assert_eq!(catalog.get(&peer_id), None);
+        assert!(p2p
+            .dht_manager()
+            .supplemental_addresses_for_peer(&peer_id)
+            .await
+            .is_empty());
+
+        // With nothing published, a later refresh without a mapping is a no-op.
+        refresh_browser_endpoint(&state, root.path(), local, CERTIFICATE_SHA256)
+            .await
+            .expect("nothing to withdraw");
+        assert!(state.endpoint.read().is_none());
     }
 
     #[test]

@@ -152,7 +152,9 @@ the local gateway for a UPnP mapping of its port, and advertises the mapped
 public address while the gateway holds it
 ([ADR-0027](adr/ADR-0027-map-the-browser-listener-port-through-upnp.md)).
 Without a gateway, or when it refuses, the endpoint is the native view's as
-above. An explicit bind IP or advertised address is never mapped.
+above. When the mapping ends and the native view yields no address, the mapped
+endpoint is withdrawn rather than left advertised. An explicit bind IP or
+advertised address is never mapped.
 
 Configure an explicit WebRTC port and permit inbound UDP on that port when a
 stable bootstrap endpoint or firewall rule is needed. Retain the node identity

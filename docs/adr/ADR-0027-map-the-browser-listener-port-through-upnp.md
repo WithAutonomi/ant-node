@@ -83,6 +83,12 @@ We will choose option 2.
   reports a non-public external IP (including CGNAT) or loses the lease, the
   endpoint falls back to the native view as before. The existing one-second
   publication refresh picks up each change.
+- An endpoint only the mapping reached, because the native view yields no
+  address or a different one, is advertised only while the gateway holds the
+  mapping. When the mapping ends and the native view yields nothing, the node
+  withdraws it: from HELLO, the endpoint file, the in-process catalog and the
+  DHT address record. An endpoint the native view still yields stays published
+  as before.
 - Graceful shutdown removes the mapping; otherwise its one-hour lease expires.
 
 There is no new configuration. Setting `--webrtc-direct-advertised-addr` or an
@@ -119,7 +125,11 @@ explicit `--webrtc-direct-bind` IP opts a node out.
 - Unit tests: only a wildcard listener without an advertised address maps its
   port; a mapping is advertised before the native view, needs no native
   discovery, is ignored in the other address family, and an operator's
-  advertisement still wins.
+  advertisement still wins; only an address the native view lacks depends on
+  the mapping.
+- Refresh-level test: on a node with no native address, a published mapping
+  is withdrawn from HELLO state, the endpoint file, the catalog and the DHT
+  supplemental record when the mapping ends.
 - Live check behind a consumer gateway (Sagemcom F3896LG, 2026-11-02): a node on
   this change, bootstrapped to a local devnet with default WebRTC settings,
   bound the listener on an OS-chosen port, the gateway granted a UDP mapping
