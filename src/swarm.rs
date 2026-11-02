@@ -1968,6 +1968,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn only_the_member_an_offer_went_to_can_answer_it() {
+        let service = service();
+        let _b = call(&service, B, announce(1, &[], 0)).await;
+        // A's offer 50 goes to B, the only other member then.
+        let a = call(&service, A, announce(1, &[50], 0)).await;
+        assert_eq!(a.delivered, 1);
+        // C joins the same room and answers it with its real id.
+        let _c = call(&service, C, announce(1, &[], 0)).await;
+        assert_eq!(
+            answer_reply(&service, C, answer(1, a.member, 50)).await,
+            SwarmAnswerResponse::Unmatched
+        );
+        // That took nothing: the offer still waits for B, and A has no answer.
+        assert_eq!(service.stats().pending_offers, 1);
+        assert_eq!(call(&service, A, announce(1, &[], 0)).await.inbox, []);
+        assert_eq!(
+            answer_reply(&service, B, answer(1, a.member, 50)).await,
+            SwarmAnswerResponse::Delivered
+        );
+        assert_eq!(service.stats().pending_offers, 0);
+        assert_eq!(call(&service, A, announce(1, &[], 0)).await.inbox.len(), 1);
+    }
+
+    #[tokio::test]
     async fn a_waiting_announce_wakes_on_the_first_signal() {
         let service = service();
         let _b = call(&service, B, announce(1, &[], 0)).await;
