@@ -553,43 +553,38 @@ timeout / unreachable / send-failure are separated in observability while retain
 wire-compatible evidence semantics; responder admission drops and digest dispatch
 latency are recorded with logging-feature-safe metric labels.
 
-### 11. Drain mature prune backlogs with a wide fast path and request-bounded batching
+### 11. Drain mature prune backlogs with request-bounded batching
 
 Prune classification remains attached to `NeighborSyncCycleComplete`: each pass
 scans the local store against a fresh routing-table view and maintains the
 process-local three-day out-of-range hysteresis. Audit execution is not moved to a
 new background worker.
 
-For each stored key, the pass derives three self-inclusive local groups:
+For each stored key, the pass derives two self-inclusive local groups:
 
-- the storage-retention group (`storage_admission_width`, 9);
-- the widest legitimate admission group (`paid_list_close_group_size`, 20); and
+- the storage-retention group (`storage_admission_width`, 9); and
 - the strict replica group (`close_group_size`, 7).
 
 A key inside width 9 remains in range and clears its out-of-range timestamp. A key
 continuously outside width 9 for less than `PRUNE_HYSTERESIS_DURATION` remains
-hysteresis-pending. Once mature:
+hysteresis-pending. Once mature it is an audited candidate, and deletion requires
+all-but-one positive proofs from the current strict close group (6 of 7 at
+reference parameters), however far outside the group self has moved.
 
-- if a **complete** width-20 lookup contains 20 peers and excludes self, the key is
-  a fast-delete candidate and requires no remote possession audit;
-- otherwise it remains an audited candidate and deletion requires all-but-one
-  positive proofs from the current strict close group (6 of 7 at reference
-  parameters).
+**Withdrawn: the width-20 fast path.** This decision originally also let a mature
+key be deleted with no remote possession audit once a complete width-20 lookup
+excluded self, accepting that twenty locally-closer peers do not prove any of them
+holds the bytes. That trade-off is withdrawn. A local routing-table view is a
+distance statement, not a possession proof, and deleting on distance alone can
+remove the last surviving copy. Every deletion now needs the current close group's
+proofs, and backlogs drain only as fast as the request-bounded audits below allow.
+Pointer pruning follows the same rule.
 
-The fast path deliberately accepts the durability risk that twenty locally-closer
-peers do not prove any of them actually hold the bytes. Hysteresis protects against
-short-lived responsibility churn, not under-replication. This trade-off is accepted
-to make the widest admission boundary an eventual hard storage boundary instead of
-retaining far-out copies indefinitely.
-
-Both paths require bootstrap to be drained and preserve the retained-commitment
-veto. Immediately before a fast deletion, the node rechecks the full width-20
-lookup, width-9 exclusion, hysteresis, bootstrap state, and commitment state.
-Immediately before an audited deletion, it rechecks width-9 exclusion, hysteresis,
-bootstrap and commitment state, and that the positive proofs still satisfy the
-current strict group. A key that moves outside width 20 during an audit may take the
-fast path after the fast-path revalidation; a key that moves back inside width 9 is
-retained and clears hysteresis.
+Pruning requires bootstrap to be drained and preserves the retained-commitment
+veto. Immediately before an audited deletion, the node rechecks width-9 exclusion,
+hysteresis, bootstrap and commitment state, and that the positive proofs still
+satisfy the current strict group. A key that moves back inside width 9 is retained
+and clears hysteresis.
 
 Remote work is bounded by **actual batched requests and candidates**, not by
 candidate-to-peer edges. A pass selects a rotating, bounded candidate window,
@@ -821,9 +816,8 @@ hold the key — coalesce per target as above. Do not add a count cap.
 - Sole peers cannot advertise unacknowledged replicas to offload storage for free
   without incurring bounded trust penalties; local audit concurrency no longer
   manufactures false remote-timeout verdicts.
-- Mature records outside a complete width-20 local view are removed in bounded
-  local batches without generating remote audit traffic, while ranks 10-20 gain
-  substantially denser peer-batched audits per request.
+- Mature prune candidates gain substantially denser peer-batched audits per
+  request.
 
 ### Negative / Trade-offs
 
@@ -859,9 +853,10 @@ hold the key — coalesce per target as above. Do not add a count cap.
 - **More moving parts.** Task trackers, RAII in-flight guards, reservation
   bookkeeping, and the split heap add mechanism that must be kept correct; several
   new tunables now exist (see below).
-- **Accepted far-copy durability risk.** A complete local width-20 view is a
-  distance statement, not a possession proof. Fast deletion can remove the last
-  surviving copy after hysteresis if replication failed across all closer peers.
+- **Slower drain of far-out backlogs.** With the width-20 fast path withdrawn
+  (decision 11), every mature record, however far out, waits for the
+  request-bounded 6-of-7 audit. A node that has fallen far outside many keys'
+  groups sheds them more slowly and holds the extra data for longer.
 - **Inbound serial queue bounded by count, not bytes.** At 64 slots holding owned
   decoded messages of up to 10 MiB, the queue's worst-case resident footprint is
   640 MiB — a ceiling that is acknowledged rather than designed for, and one no
@@ -898,7 +893,7 @@ hold the key — coalesce per target as above. Do not add a count cap.
   The two responsibility
   widths (`storage_admission_width` = 9, `paid_list_close_group_size` = 20) are
   unchanged and shared with ADR-0003.
-- Prune passes use bounded candidate, request, and local fast-delete counts. The
+- Prune passes use bounded candidate and request counts. The
   per-request key count remains dynamic (`floor(sqrt(local_stored_keys))`), and
   timeouts continue to scale with the actual number of challenged keys.
 - **Compatibility: wire format unchanged, public Rust API broken.**
@@ -1013,9 +1008,9 @@ How we will know this decision remains correct (coverage added in PR #165):
   candidate orphaning.
 - **Audit:** coordinator per-target serialization, cross-peer parallelism, and
   cancellation cleanup.
-- **Pruning:** width-9 hysteresis classification; complete-width-20 fast deletion
-  and incomplete-width-20 audited fallback; bootstrap and commitment deferrals;
-  fast-path and audited TOCTOU revalidation; dynamic square-root peer batches;
+- **Pruning:** width-9 hysteresis classification; audited deletion however far
+  outside the group, including outside a complete paid-width group; bootstrap and
+  commitment deferrals; audited TOCTOU revalidation; dynamic square-root peer batches;
   request-budget admission of complete candidate proof sets; every `Rejected`
   reason grading to the non-recovering `Rejected` status without parsing its
   wording; and rotating fairness.
@@ -1023,8 +1018,8 @@ How we will know this decision remains correct (coverage added in PR #165):
   are refused under normal load; revisit `CAPACITY_REJECTED_MAX_AGE` if bootstrap
   drains too slowly under real neighbor-sync cadence; revisit the narrowed replica
   repair width if routing skew causes measurable coverage loss the repair path does
-  not heal; disable or narrow the width-20 fast path if data-availability telemetry
-  shows that the accepted far-copy deletion risk is material; reconsider the
+  not heal; revisit the per-pass prune budgets if far-out backlogs drain too slowly
+  now that every deletion needs the 6-of-7 audit; reconsider the
   size-rejection-as-misbehaviour treatment if the `size_reject` audit-failure label
   fires under normal load (the close-group store spread is exceeding the assumed
   ~2x and honest peers are being penalised).

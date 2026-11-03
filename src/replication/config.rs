@@ -886,10 +886,6 @@ pub const MAX_PRUNE_AUDIT_CANDIDATES_PER_PASS: usize = 1024;
 /// limiting a production pass to roughly nine records.
 pub const MAX_PRUNE_AUDIT_REQUESTS_PER_PASS: usize = 256;
 
-/// Maximum mature records deleted through the complete width-20 fast path per
-/// pass.
-pub const MAX_FAST_PRUNE_DELETIONS_PER_PASS: usize = 2048;
-
 /// Seconds to wait for `DhtNetworkEvent::BootstrapComplete` before proceeding
 /// with bootstrap sync. Covers bootstrap nodes with no peers to connect to.
 const BOOTSTRAP_COMPLETE_TIMEOUT_SECS: u64 = 60;

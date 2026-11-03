@@ -142,10 +142,10 @@ over one state.
   counts as unanswered, never as a vote. This is how a node that missed an
   update, joined late, or lost a record across a restart is brought level.
 - **Pruning.** A record the node has been outside the retention width of for the
-  hysteresis period is deleted — at once if the node is outside a complete
-  paid-width group, otherwise only once all but one of the current close group
-  prove they hold that state or a newer one by returning a valid record. A proof
-  is a record, not a claim: signatures are checked.
+  hysteresis period is deleted only once all but one of the current close group
+  prove they hold that state or a newer one by returning a valid record, however
+  far outside the group the node has moved. A proof is a record, not a claim:
+  signatures are checked.
 - **Possession.** Some minutes after offering a fresh state, the offering node
   asks each member for the record. One that is still responsible and cannot
   produce that state or a newer one is penalised, as a chunk holder is.
@@ -352,7 +352,7 @@ receipt is paid again on retry.
   holds is not adopted, though its hints arrived; an unpaid fresh offer is
   refused; the possession check penalises only the member that dropped the
   record; pruning deletes only once the close group proves it holds the record,
-  and a node far outside the group prunes without asking.
+  even for a node outside a complete paid-width group.
 - From a browser: a node admits pointer requests at its WebRTC boundary, bounds
   a full record inside the small response limit, and passes every pointer reply
   through the sanitizer with errors redacted. In real Chromium against a live

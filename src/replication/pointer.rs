@@ -19,9 +19,9 @@
 //!   them. The record verifies itself; the quorum stands in for the payment
 //!   proof, as presence quorum does for a chunk.
 //! - **Pruning.** A record this node has been out of range of for the
-//!   hysteresis period is deleted — at once if the node is far outside the
-//!   group, otherwise only once all but one of the current close group prove
-//!   they hold that state or a newer one by returning a valid record.
+//!   hysteresis period is deleted only once all but one of the current close
+//!   group prove they hold that state or a newer one by returning a valid
+//!   record, however far outside the group the node has moved.
 //! - **Possession.** Some minutes after offering a fresh state, the node asks
 //!   each close-group member for the record. A member that is still responsible
 //!   and cannot produce that state or a newer one is penalised — unless it holds
@@ -1875,23 +1875,12 @@ impl PointerReplication {
             if committed(&state.address) {
                 continue;
             }
-            let wide = self
-                .p2p
-                .dht_manager()
-                .find_closest_nodes_local_with_self(
-                    &state.address,
-                    self.config.paid_list_close_group_size,
-                )
-                .await;
-            let far = wide.len() >= self.config.paid_list_close_group_size
-                && !wide.iter().any(|node| node.peer_id == self_id);
-            let confirmed = if far {
-                true
-            } else if allow_remote && !*self.is_bootstrapping.read().await {
-                self.others_hold(&state).await
-            } else {
-                false
-            };
+            // However far outside the group this node has moved, only the
+            // close group's proof makes the copy safe to drop: distance says
+            // who is closer, not that any of them holds the record.
+            let confirmed = allow_remote
+                && !*self.is_bootstrapping.read().await
+                && self.others_hold(&state).await;
             // Revalidate just before deleting: the group may have moved back.
             if confirmed
                 && !committed(&state.address)

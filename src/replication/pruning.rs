@@ -25,14 +25,17 @@
 //!   the hysteresis clock. The request/candidate budget is a separate, later
 //!   deferral applied after classification (not a disposition variant) so
 //!   whole proof sets are either scheduled or deferred as a unit.
-//! - `FastDelete`: after hysteresis, a complete self-inclusive width-20
-//!   lookup that excludes self permits deletion without a remote audit.
 //! - `AuditFailed`: an audited candidate whose current strict close group
 //!   returned fewer than the required positive possession proofs
 //!   (`prune_proofs_needed`, 6 of 7 at production parameters). The record
 //!   and its first-seen timestamp are retained and retried on later passes.
 //! - `Pruned`: deleted after immediately re-passing the applicable checks
 //!   against the then-current routing table.
+//!
+//! Distance alone never authorises deletion. However far outside the group
+//! self has moved, a candidate is deleted only once the current strict close
+//! group proves possession: a local routing-table view says which peers are
+//! closer, not that any of them holds the bytes.
 //!
 //! Prune-confirmation audits challenge the CURRENT strict closest
 //! `close_group_size` peers to the key, taken directly from the local
@@ -60,8 +63,8 @@ use crate::replication::audit_metrics::{self, AuditFailureClass, AuditType};
 use crate::replication::commitment_state::ResponderCommitmentState;
 use crate::replication::config::{
     storage_admission_width, ReplicationConfig, AUDIT_FAILURE_TRUST_WEIGHT,
-    MAX_FAST_PRUNE_DELETIONS_PER_PASS, MAX_PRUNE_AUDIT_CANDIDATES_PER_PASS,
-    MAX_PRUNE_AUDIT_REQUESTS_PER_PASS, REPLICATION_PROTOCOL_ID,
+    MAX_PRUNE_AUDIT_CANDIDATES_PER_PASS, MAX_PRUNE_AUDIT_REQUESTS_PER_PASS,
+    REPLICATION_PROTOCOL_ID,
 };
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
@@ -149,7 +152,7 @@ pub struct PrunePassContext<'a> {
     /// entries. Prune candidacy and prune-audit target selection never read it.
     pub repair_proofs: &'a Arc<RwLock<RepairProofs>>,
     /// Whether bootstrap has drained enough to permit pruning this pass.
-    /// This gates both remote confirmation audits and the local fast path.
+    /// This gates the remote confirmation audits every deletion requires.
     pub allow_remote_prune_audits: bool,
     /// Responder commitment state, used to veto deleting a chunk still held
     /// under a recently-gossiped commitment (so the storage-commitment audit's
@@ -187,9 +190,6 @@ struct RecordPruneStats {
     held_by_commitment: usize,
     bootstrap_deferred: usize,
     budget_deferred: usize,
-    fast_delete_candidates: usize,
-    fast_delete_budget_deferred: usize,
-    fast_pruned: usize,
     audits_attempted: usize,
     audit_requests: usize,
     audit_below_threshold: usize,
@@ -247,19 +247,8 @@ struct RecordPruneCandidate {
     target_peers: Vec<PeerId>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct FastPruneCandidate {
-    key: XorName,
-}
-
-enum ScheduledPruneCandidate {
-    Fast(FastPruneCandidate),
-    Auditable(RecordPruneCandidate),
-}
-
 struct RecordPruneLookupGroups {
     retention: Vec<PeerId>,
-    widest: Vec<PeerId>,
     strict: Vec<PeerId>,
 }
 
@@ -295,9 +284,6 @@ enum PruneCandidateDisposition {
     /// Remote prune-confirmation audits are not allowed yet (bootstrap has
     /// not drained).
     BootstrapDeferred,
-    /// A complete self-inclusive width-20 lookup excludes self, so no remote
-    /// confirmation is required.
-    FastDelete(FastPruneCandidate),
     /// The current close group has no remote peers to audit; retain
     /// conservatively.
     Unauditable,
@@ -390,8 +376,7 @@ pub async fn run_prune_pass_with_context(ctx: PrunePassContext<'_>) -> PruneResu
         "Prune pass complete: records total={} in_range={} newly_marked={} cleared={} \
          hysteresis_pending={} candidates={} held_by_commitment={} bootstrap_deferred={} \
          budget_deferred={} audits_attempted={} audit_requests={} audit_below_threshold={} \
-         fast_delete_candidates={} fast_delete_budget_deferred={} fast_pruned={} pruned={}; \
-         paid total={} marked={} cleared={} pruned={}",
+         pruned={}; paid total={} marked={} cleared={} pruned={}",
         result.records_total,
         result.records_in_range,
         result.records_marked_out_of_range,
@@ -404,9 +389,6 @@ pub async fn run_prune_pass_with_context(ctx: PrunePassContext<'_>) -> PruneResu
         result.records_audits_attempted,
         record_stats.audit_requests,
         result.records_audit_below_threshold,
-        record_stats.fast_delete_candidates,
-        record_stats.fast_delete_budget_deferred,
-        record_stats.fast_pruned,
         result.records_pruned,
         paid_count,
         result.paid_entries_marked,
@@ -417,7 +399,6 @@ pub async fn run_prune_pass_with_context(ctx: PrunePassContext<'_>) -> PruneResu
     result
 }
 
-#[allow(clippy::too_many_lines)]
 async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPruneStats) {
     let stored_keys = match ctx.storage.all_keys().await {
         Ok(keys) => keys,
@@ -429,7 +410,6 @@ async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPrune
 
     let now = Instant::now();
     let mut stats = RecordPruneStats::default();
-    let mut fast_candidates = Vec::new();
     let mut audit_candidates = Vec::new();
     let deps = RecordPruneKeyDeps {
         self_id: ctx.self_id,
@@ -444,35 +424,11 @@ async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPrune
         let key = &stored_keys[(scan_start + offset) % stored_keys.len()];
         let groups = record_prune_lookup_groups(key, ctx.p2p_node, ctx.config).await;
 
-        let outcome = evaluate_record_prune_key(
-            &deps,
-            key,
-            &groups.retention,
-            &groups.widest,
-            &groups.strict,
-            now,
-        );
-        match tally_record_prune_outcome(&mut stats, outcome, key) {
-            Some(ScheduledPruneCandidate::Fast(candidate)) => {
-                fast_candidates.push((offset, candidate));
-            }
-            Some(ScheduledPruneCandidate::Auditable(candidate)) => {
-                audit_candidates.push((offset, candidate));
-            }
-            None => {}
+        let outcome = evaluate_record_prune_key(&deps, key, &groups.retention, &groups.strict, now);
+        if let Some(candidate) = tally_record_prune_outcome(&mut stats, outcome, key) {
+            audit_candidates.push((offset, candidate));
         }
     }
-
-    let selected_fast_count = fast_candidates.len().min(MAX_FAST_PRUNE_DELETIONS_PER_PASS);
-    stats.fast_delete_budget_deferred = fast_candidates.len() - selected_fast_count;
-    let selected_fast: Vec<FastPruneCandidate> = fast_candidates
-        .iter()
-        .take(selected_fast_count)
-        .map(|(_, candidate)| *candidate)
-        .collect();
-    let last_fast_offset = fast_candidates
-        .get(selected_fast_count.saturating_sub(1))
-        .map(|(offset, _)| *offset);
 
     let max_keys_per_challenge = ReplicationConfig::responsible_audit_key_limit(stored_keys.len());
     let audit_selection = select_record_prune_audits(
@@ -484,27 +440,12 @@ async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPrune
     stats.budget_deferred = audit_selection.deferred;
     stats.audits_attempted = audit_selection.candidates.len();
     stats.audit_requests = audit_selection.request_count;
-    let last_selected_offset = match (last_fast_offset, audit_selection.last_selected_offset) {
-        (Some(fast), Some(audit)) => Some(fast.max(audit)),
-        (fast, audit) => fast.or(audit),
-    };
 
     advance_prune_cursor(
         ctx.sync_state,
         stored_keys.len(),
         scan_start,
-        last_selected_offset,
-    )
-    .await;
-
-    let (fast_keys_to_delete, fast_cleared) =
-        revalidated_fast_prune_keys(&selected_fast, ctx).await;
-    stats.cleared += fast_cleared;
-    stats.fast_pruned = delete_stored_records(
-        &fast_keys_to_delete,
-        ctx.storage,
-        ctx.paid_list,
-        ctx.repair_proofs,
+        audit_selection.last_selected_offset,
     )
     .await;
 
@@ -522,14 +463,13 @@ async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPrune
         revalidated_record_prune_keys(&audit_selection.candidates, &present_by_key, ctx).await;
     stats.cleared += revalidated_cleared;
     stats.audit_below_threshold = audit_below_threshold;
-    let audited_pruned = delete_stored_records(
+    stats.pruned = delete_stored_records(
         &keys_to_delete,
         ctx.storage,
         ctx.paid_list,
         ctx.repair_proofs,
     )
     .await;
-    stats.pruned = stats.fast_pruned + audited_pruned;
 
     (stored_keys.len(), stats)
 }
@@ -540,7 +480,7 @@ fn tally_record_prune_outcome(
     stats: &mut RecordPruneStats,
     outcome: RecordPruneKeyOutcome,
     key: &XorName,
-) -> Option<ScheduledPruneCandidate> {
+) -> Option<RecordPruneCandidate> {
     if outcome.marked {
         stats.marked += 1;
     }
@@ -567,10 +507,6 @@ fn tally_record_prune_outcome(
                     stats.bootstrap_deferred += 1;
                     None
                 }
-                PruneCandidateDisposition::FastDelete(candidate) => {
-                    stats.fast_delete_candidates += 1;
-                    Some(ScheduledPruneCandidate::Fast(candidate))
-                }
                 PruneCandidateDisposition::Unauditable => {
                     debug!(
                         "Cannot prune-audit {}: current close group has no remote peers",
@@ -578,9 +514,7 @@ fn tally_record_prune_outcome(
                     );
                     None
                 }
-                PruneCandidateDisposition::Auditable(candidate) => {
-                    Some(ScheduledPruneCandidate::Auditable(candidate))
-                }
+                PruneCandidateDisposition::Auditable(candidate) => Some(candidate),
             }
         }
     }
@@ -600,15 +534,8 @@ async fn record_prune_lookup_groups(
     let strict_close_group: Vec<DHTNode> = dht
         .find_closest_nodes_local_with_self(key, config.close_group_size)
         .await;
-    let wide_admission_group: Vec<DHTNode> = dht
-        .find_closest_nodes_local_with_self(key, config.paid_list_close_group_size)
-        .await;
     RecordPruneLookupGroups {
         retention: storage_admission_group
-            .iter()
-            .map(|node| node.peer_id)
-            .collect(),
-        widest: wide_admission_group
             .iter()
             .map(|node| node.peer_id)
             .collect(),
@@ -638,7 +565,6 @@ fn evaluate_record_prune_key(
     deps: &RecordPruneKeyDeps<'_>,
     key: &XorName,
     storage_admission_peers: &[PeerId],
-    wide_admission_peers: &[PeerId],
     strict_close_peers: &[PeerId],
     now: Instant,
 ) -> RecordPruneKeyOutcome {
@@ -682,7 +608,6 @@ fn evaluate_record_prune_key(
         state: RecordPruneKeyState::Candidate(schedule_prune_candidate(
             deps,
             key,
-            wide_admission_peers,
             strict_close_peers,
         )),
     }
@@ -699,7 +624,6 @@ fn evaluate_record_prune_key(
 fn schedule_prune_candidate(
     deps: &RecordPruneKeyDeps<'_>,
     key: &XorName,
-    wide_admission_peers: &[PeerId],
     strict_close_peers: &[PeerId],
 ) -> PruneCandidateDisposition {
     if let Some(cs) = deps.commitment_state {
@@ -712,14 +636,6 @@ fn schedule_prune_candidate(
         return PruneCandidateDisposition::BootstrapDeferred;
     }
 
-    if complete_group_excludes_self(
-        wide_admission_peers,
-        deps.self_id,
-        deps.config.paid_list_close_group_size,
-    ) {
-        return PruneCandidateDisposition::FastDelete(FastPruneCandidate { key: *key });
-    }
-
     let target_peers = remote_close_group_peers(strict_close_peers, deps.self_id);
     if target_peers.is_empty() {
         return PruneCandidateDisposition::Unauditable;
@@ -729,10 +645,6 @@ fn schedule_prune_candidate(
         key: *key,
         target_peers,
     })
-}
-
-fn complete_group_excludes_self(peers: &[PeerId], self_id: &PeerId, expected_width: usize) -> bool {
-    peers.len() == expected_width && !peers.contains(self_id)
 }
 
 struct RecordPruneAuditSelection {
@@ -1241,54 +1153,6 @@ async fn collect_record_prune_proofs(
     present_by_key
 }
 
-async fn revalidated_fast_prune_keys(
-    candidates: &[FastPruneCandidate],
-    ctx: &PrunePassContext<'_>,
-) -> (Vec<XorName>, usize) {
-    let mut keys_to_delete = Vec::new();
-    let mut cleared = 0;
-    let now = Instant::now();
-
-    for candidate in candidates {
-        if !ctx.allow_remote_prune_audits
-            || !stored_record_still_exists(&candidate.key, ctx.storage).await
-        {
-            continue;
-        }
-
-        let groups = record_prune_lookup_groups(&candidate.key, ctx.p2p_node, ctx.config).await;
-        if groups.retention.contains(ctx.self_id) {
-            ctx.paid_list.clear_record_out_of_range(&candidate.key);
-            cleared += 1;
-            continue;
-        }
-        if ctx
-            .commitment_state
-            .is_some_and(|cs| cs.is_held(&candidate.key))
-        {
-            continue;
-        }
-        let Some(first_seen) = ctx.paid_list.record_out_of_range_since(&candidate.key) else {
-            continue;
-        };
-        let elapsed = now
-            .checked_duration_since(first_seen)
-            .unwrap_or(Duration::ZERO);
-        if elapsed < ctx.config.prune_hysteresis_duration {
-            continue;
-        }
-        if complete_group_excludes_self(
-            &groups.widest,
-            ctx.self_id,
-            ctx.config.paid_list_close_group_size,
-        ) {
-            keys_to_delete.push(candidate.key);
-        }
-    }
-
-    (keys_to_delete, cleared)
-}
-
 async fn stored_record_still_exists(key: &XorName, storage: &Arc<ChunkStore>) -> bool {
     match storage.get_raw(key).await {
         Ok(Some(_)) => true,
@@ -1337,8 +1201,6 @@ async fn revalidated_record_prune_keys(
             prune_hysteresis_duration: ctx.config.prune_hysteresis_duration,
             held_by_commitment,
             storage_admission_peers: &groups.retention,
-            wide_admission_peers: &groups.widest,
-            wide_admission_width: ctx.config.paid_list_close_group_size,
             strict_close_peers: &groups.strict,
             now,
         };
@@ -1382,9 +1244,6 @@ struct PruneRevalidationInputs<'a> {
     held_by_commitment: bool,
     /// Current self-inclusive storage-retention group for the key.
     storage_admission_peers: &'a [PeerId],
-    /// Current widest self-inclusive admission group for the key.
-    wide_admission_peers: &'a [PeerId],
-    wide_admission_width: usize,
     /// Current strict close group for the key.
     strict_close_peers: &'a [PeerId],
     now: Instant,
@@ -1396,7 +1255,8 @@ struct PruneRevalidationInputs<'a> {
 /// the hysteresis still holds, no retained commitment holds the key, and at
 /// least [`prune_proofs_needed`] of the current strict close group supplied
 /// positive possession proofs. Stale positive reports from peers no longer in
-/// the current close group never count.
+/// the current close group never count, and no topology — however far outside
+/// the group self has moved — substitutes for the proofs.
 fn revalidate_record_prune_candidate(
     candidate: &RecordPruneCandidate,
     present_by_key: &HashMap<XorName, HashSet<PeerId>>,
@@ -1419,14 +1279,6 @@ fn revalidate_record_prune_candidate(
         .unwrap_or(Duration::ZERO);
     if elapsed < inputs.prune_hysteresis_duration {
         return PruneRevalidationOutcome::HysteresisPending;
-    }
-
-    if complete_group_excludes_self(
-        inputs.wide_admission_peers,
-        inputs.self_id,
-        inputs.wide_admission_width,
-    ) {
-        return PruneRevalidationOutcome::Delete;
     }
 
     let current_target_peers = remote_close_group_peers(inputs.strict_close_peers, inputs.self_id);
@@ -2573,8 +2425,6 @@ mod tests {
     const PROD_CLOSE_GROUP: usize = 7;
     /// Production storage-retention width (`close_group_size + margin`).
     const PROD_RETENTION_WIDTH: usize = 9;
-    /// An incomplete width-20 view, which must retain the audited path.
-    const INCOMPLETE_WIDE_WIDTH: usize = 19;
     /// A self id outside every `peer_ids(..)` helper group.
     const SELF_BYTE: u8 = 99;
 
@@ -2636,7 +2486,6 @@ mod tests {
         let key = key_from_byte(0xA0);
         let commitment = held_commitment_state(key, b"held bytes");
         let admission_peers = peer_ids(PROD_RETENTION_WIDTH);
-        let wide_admission_peers = peer_ids(INCOMPLETE_WIDE_WIDTH);
         let strict_close_peers = peer_ids(PROD_CLOSE_GROUP);
         let deps = record_deps(&self_id, &paid_list, &config, true, Some(&commitment));
 
@@ -2644,7 +2493,6 @@ mod tests {
             &deps,
             &key,
             &admission_peers,
-            &wide_admission_peers,
             &strict_close_peers,
             Instant::now(),
         );
@@ -2672,7 +2520,6 @@ mod tests {
         let self_id = peer_id_from_byte(SELF_BYTE);
         let key = key_from_byte(0xA1);
         let admission_peers = peer_ids(PROD_RETENTION_WIDTH);
-        let wide_admission_peers = peer_ids(INCOMPLETE_WIDE_WIDTH);
         let strict_close_peers = peer_ids(PROD_CLOSE_GROUP);
         let deps = record_deps(&self_id, &paid_list, &config, true, None);
 
@@ -2681,7 +2528,6 @@ mod tests {
             &deps,
             &key,
             &admission_peers,
-            &wide_admission_peers,
             &strict_close_peers,
             Instant::now(),
         );
@@ -2703,7 +2549,6 @@ mod tests {
         let self_id = peer_id_from_byte(SELF_BYTE);
         let key = key_from_byte(0xA2);
         let admission_peers = peer_ids(PROD_RETENTION_WIDTH);
-        let wide_admission_peers = peer_ids(INCOMPLETE_WIDE_WIDTH);
         let strict_close_peers = peer_ids(PROD_CLOSE_GROUP);
         let deps = record_deps(&self_id, &paid_list, &config, true, None);
 
@@ -2715,7 +2560,6 @@ mod tests {
             &deps,
             &key,
             &admission_peers,
-            &wide_admission_peers,
             &strict_close_peers,
             instant_after(first_seen, config.prune_hysteresis_duration),
         );
@@ -2733,38 +2577,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn mature_record_outside_complete_width_twenty_uses_fast_path() {
-        let (paid_list, _dir) = test_paid_list().await;
-        let config = ReplicationConfig::default();
-        let self_id = peer_id_from_byte(SELF_BYTE);
-        let key = key_from_byte(0xA8);
-        let admission_peers = peer_ids(PROD_RETENTION_WIDTH);
-        let wide_admission_peers = peer_ids(config.paid_list_close_group_size);
-        let strict_close_peers = peer_ids(PROD_CLOSE_GROUP);
-        let deps = record_deps(&self_id, &paid_list, &config, true, None);
-
-        paid_list.set_record_out_of_range(&key);
-        let first_seen = paid_list
-            .record_out_of_range_since(&key)
-            .expect("first seen");
-        let outcome = evaluate_record_prune_key(
-            &deps,
-            &key,
-            &admission_peers,
-            &wide_admission_peers,
-            &strict_close_peers,
-            instant_after(first_seen, config.prune_hysteresis_duration),
-        );
-
-        assert!(matches!(
-            outcome.state,
-            RecordPruneKeyState::Candidate(PruneCandidateDisposition::FastDelete(
-                FastPruneCandidate { key: candidate_key }
-            )) if candidate_key == key
-        ));
-    }
-
     /// #5: a retained commitment vetoes deletion after candidacy without
     /// touching the first-seen timestamp or the audit budget.
     #[tokio::test]
@@ -2775,7 +2587,6 @@ mod tests {
         let key = key_from_byte(0xA3);
         let commitment = held_commitment_state(key, b"still committed");
         let admission_peers = peer_ids(PROD_RETENTION_WIDTH);
-        let wide_admission_peers = peer_ids(INCOMPLETE_WIDE_WIDTH);
         let strict_close_peers = peer_ids(PROD_CLOSE_GROUP);
         let deps = record_deps(&self_id, &paid_list, &config, true, Some(&commitment));
 
@@ -2787,7 +2598,6 @@ mod tests {
             &deps,
             &key,
             &admission_peers,
-            &wide_admission_peers,
             &strict_close_peers,
             instant_after(first_seen, config.prune_hysteresis_duration),
         );
@@ -2812,7 +2622,6 @@ mod tests {
         let self_id = peer_id_from_byte(SELF_BYTE);
         let key = key_from_byte(0xA4);
         let admission_peers = peer_ids(PROD_RETENTION_WIDTH);
-        let wide_admission_peers = peer_ids(INCOMPLETE_WIDE_WIDTH);
         let strict_close_peers = peer_ids(PROD_CLOSE_GROUP);
         let deps = record_deps(&self_id, &paid_list, &config, false, None);
 
@@ -2824,7 +2633,6 @@ mod tests {
             &deps,
             &key,
             &admission_peers,
-            &wide_admission_peers,
             &strict_close_peers,
             instant_after(first_seen, config.prune_hysteresis_duration),
         );
@@ -2869,7 +2677,6 @@ mod tests {
         let key = key_from_byte(0xA6);
         let mut admission_peers = peer_ids(PROD_RETENTION_WIDTH - 1);
         admission_peers.push(self_id);
-        let wide_admission_peers = peer_ids(INCOMPLETE_WIDE_WIDTH);
         let strict_close_peers = peer_ids(PROD_CLOSE_GROUP);
         let deps = record_deps(&self_id, &paid_list, &config, true, None);
 
@@ -2878,7 +2685,6 @@ mod tests {
             &deps,
             &key,
             &admission_peers,
-            &wide_admission_peers,
             &strict_close_peers,
             Instant::now(),
         );
@@ -2909,8 +2715,6 @@ mod tests {
             prune_hysteresis_duration: ReplicationConfig::default().prune_hysteresis_duration,
             held_by_commitment,
             storage_admission_peers,
-            wide_admission_peers: storage_admission_peers,
-            wide_admission_width: ReplicationConfig::default().paid_list_close_group_size,
             strict_close_peers,
             now,
         }
@@ -2967,29 +2771,31 @@ mod tests {
         }
     }
 
+    /// Distance is not possession: a node outside even a complete paid-width
+    /// group still keeps a mature record its close group has not proven.
     #[test]
-    fn audited_candidate_that_moves_outside_complete_width_twenty_deletes_without_proofs() {
+    fn revalidation_retains_record_far_outside_group_without_proofs() {
         let self_id = peer_id_from_byte(SELF_BYTE);
         let key = key_from_byte(0xB5);
-        let admission_peers = peer_ids(PROD_RETENTION_WIDTH);
-        let wide_admission_peers =
-            peer_ids(ReplicationConfig::default().paid_list_close_group_size);
+        let far_admission_peers = peer_ids(ReplicationConfig::default().paid_list_close_group_size);
         let strict_close_peers = peer_ids(PROD_CLOSE_GROUP);
         let candidate = candidate(key, strict_close_peers.clone());
         let first_seen = Instant::now();
-        let mut inputs = revalidation_inputs(
+        let inputs = revalidation_inputs(
             &self_id,
             Some(first_seen),
             false,
-            &admission_peers,
+            &far_admission_peers,
             &strict_close_peers,
             matured(first_seen),
         );
-        inputs.wide_admission_peers = &wide_admission_peers;
 
         let outcome = revalidate_record_prune_candidate(&candidate, &HashMap::new(), &inputs);
 
-        assert!(matches!(outcome, PruneRevalidationOutcome::Delete));
+        assert!(
+            matches!(outcome, PruneRevalidationOutcome::AuditFailed),
+            "a record no close-group member proved must never be deleted"
+        );
     }
 
     /// #12: self moving back inside the retention width between the audit and

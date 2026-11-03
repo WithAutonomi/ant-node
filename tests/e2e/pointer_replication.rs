@@ -684,13 +684,14 @@ async fn out_of_range_node(harness: &TestHarness, record: &Pointer) -> usize {
 }
 
 /// Pruning deletes a record the node is no longer responsible for once the
-/// current close group prove they hold it, and keeps it while they do not.
+/// current close group prove they hold it, and keeps it while they do not —
+/// even when the node is outside a complete paid-width group.
 #[tokio::test]
 #[serial]
 async fn pruning_deletes_only_once_the_close_group_proves_it_holds_the_record() {
-    // A paid width no five-node network can complete, so deletion needs the
-    // close group's proof rather than taking the far-away fast path.
-    let harness = TestHarness::setup_with_config(prune_network(20))
+    // A paid width five nodes complete, so the pruner is outside a complete
+    // paid-width group: distance alone must still not let it drop the record.
+    let harness = TestHarness::setup_with_config(prune_network(3))
         .await
         .expect("setup");
     harness.warmup_dht().await.expect("warmup");
@@ -734,36 +735,6 @@ async fn pruning_deletes_only_once_the_close_group_proves_it_holds_the_record() 
     harness.teardown().await.expect("teardown");
 }
 
-/// A node outside even a complete paid-width group drops the record without
-/// asking anyone, as a chunk is.
-#[tokio::test]
-#[serial]
-async fn a_node_far_outside_the_group_prunes_without_asking() {
-    let harness = TestHarness::setup_with_config(prune_network(3))
-        .await
-        .expect("setup");
-    harness.warmup_dht().await.expect("warmup");
-
-    let (pk, sk) = owner();
-    let record = signed(&pk, &sk, 1, 1);
-    let pruner = out_of_range_node(&harness, &record).await;
-    store(harness.test_node(pruner).expect("node"))
-        .put_bytes(&record.to_bytes())
-        .await
-        .expect("put");
-
-    let pruner_node = harness.test_node(pruner).expect("node");
-    replication(pruner_node)
-        .prune_pass(false, Some(commitments(pruner_node)))
-        .await;
-    assert!(
-        held(pruner_node, &record).is_none(),
-        "a far-away record was kept"
-    );
-
-    harness.teardown().await.expect("teardown");
-}
-
 /// A pointer a retained storage commitment still holds is never pruned, as a
 /// chunk is not: a peer pinning that commitment may yet audit it, and a node
 /// that had deleted it would fail. Once no retained commitment holds it, it
@@ -785,6 +756,17 @@ async fn pruning_keeps_a_pointer_a_retained_commitment_still_holds() {
         .await
         .expect("put");
 
+    // The close group already holds it and can prove so, so the retained
+    // commitment is the only thing keeping the pruner's copy.
+    for i in others(&harness, &[pruner]) {
+        store(harness.test_node(i).expect("node"))
+            .put_bytes(&record.to_bytes())
+            .await
+            .expect("put");
+    }
+    let everyone: Vec<usize> = (0..harness.node_count()).collect();
+    exchange_hints(&harness, &everyone, &[pruner]).await;
+
     // The commitment the node gossiped while it was still responsible.
     let (node_pk, node_sk) = owner();
     let committed = BuiltCommitment::build(
@@ -797,18 +779,14 @@ async fn pruning_keeps_a_pointer_a_retained_commitment_still_holds() {
     let state = commitments(pruner_node);
     state.rotate(committed);
 
-    replication(pruner_node)
-        .prune_pass(false, Some(state))
-        .await;
+    replication(pruner_node).prune_pass(true, Some(state)).await;
     assert!(
         holds(pruner_node, &record),
         "a pointer a retained commitment holds was pruned"
     );
 
     state.clear_all();
-    replication(pruner_node)
-        .prune_pass(false, Some(state))
-        .await;
+    replication(pruner_node).prune_pass(true, Some(state)).await;
     assert!(
         held(pruner_node, &record).is_none(),
         "the pointer was kept after no commitment held it"
