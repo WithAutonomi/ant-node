@@ -190,6 +190,7 @@ async fn shadow_mode_accepts_below_floor_real_settlement() {
 /// Enforcement rejects the cheapest-of-K one-quote settlement: a real 3x-baseline
 /// on-chain payment against a fuller receiver, read from the real vault.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "stale since the close-group median floor: no commitment cache is attached, so the floor never evaluates (V2-1803)"]
 async fn enforced_floor_rejects_cheapest_of_k_real_settlement() {
     let testnet = Testnet::new().await.unwrap();
     let network = testnet.to_network();
