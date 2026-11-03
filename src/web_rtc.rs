@@ -759,8 +759,11 @@ async fn refresh_browser_endpoint(
     let Some(address) = advertised_addr(&state.config, local_addr, mapped, &native) else {
         // As with native publication, keep the last nonempty address set,
         // unless only a mapping the gateway no longer holds made it reachable.
-        if state.endpoint_needs_mapping.swap(false, Ordering::AcqRel) {
+        // The flag stays set until the withdrawal completes, so the next
+        // refresh retries a step that failed.
+        if state.endpoint_needs_mapping.load(Ordering::Acquire) {
             withdraw_browser_endpoint(state, root_dir).await?;
+            state.endpoint_needs_mapping.store(false, Ordering::Release);
         }
         return Ok(());
     };
@@ -796,31 +799,36 @@ async fn refresh_browser_endpoint(
 }
 
 /// Stop advertising the browser endpoint everywhere it was published: HELLO,
-/// the endpoint file, the in-process catalog and the DHT address record.
+/// the in-process catalog, the DHT address record and the endpoint file.
+///
+/// What peers and browsers see is withdrawn first, once, and cannot fail.
+/// Removing the file can fail; calling this again retries only that step.
 async fn withdraw_browser_endpoint(state: &ServerState, root_dir: &Path) -> Result<()> {
     let withdrawn = state.endpoint.write().take();
-    let Some(withdrawn) = withdrawn else {
-        return Ok(());
-    };
-    info!(endpoint = %withdrawn.multiaddr,
-        "WebRTC Direct endpoint withdrawn: its gateway mapping ended");
-    remove_persisted_browser_endpoint(root_dir).await?;
-    if let Some(catalog) = state.endpoint_catalog.as_ref() {
-        catalog.remove(state.p2p.peer_id());
+    if let Some(withdrawn) = withdrawn {
+        info!(endpoint = %withdrawn.multiaddr,
+            "WebRTC Direct endpoint withdrawn: its gateway mapping ended");
+        if let Some(catalog) = state.endpoint_catalog.as_ref() {
+            catalog.remove(state.p2p.peer_id());
+        }
+        state
+            .p2p
+            .dht_manager()
+            .set_supplemental_self_addresses(Vec::new())
+            .await;
     }
-    state
-        .p2p
-        .dht_manager()
-        .set_supplemental_self_addresses(Vec::new())
-        .await;
-    Ok(())
+    remove_persisted_browser_endpoint(root_dir).await
 }
 
 async fn remove_persisted_browser_endpoint(root_dir: &Path) -> Result<()> {
-    match tokio::fs::remove_file(root_dir.join(WEBRTC_DIRECT_MULTIADDR_FILENAME)).await {
+    let path = root_dir.join(WEBRTC_DIRECT_MULTIADDR_FILENAME);
+    match tokio::fs::remove_file(&path).await {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
+        Err(error) => Err(Error::Startup(format!(
+            "failed to remove WebRTC Direct endpoint {}: {error}",
+            path.display()
+        ))),
     }
 }
 
@@ -3186,82 +3194,155 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn an_endpoint_only_its_mapping_reached_is_withdrawn_when_the_mapping_ends() {
-        // A node that has not started has no native self-address, so the
-        // mapping is the only address the listener can publish.
-        let p2p = Arc::new(
-            P2PNode::new(
-                CoreNodeConfig::builder()
-                    .local(true)
-                    .ipv6(false)
-                    .build()
-                    .expect("core config"),
+    /// A wildcard listener whose only publishable address is a gateway
+    /// mapping the test controls: a node that has not started has no native
+    /// self-address.
+    struct MappedOnlyListener {
+        p2p: Arc<P2PNode>,
+        mapping: Arc<Mutex<Option<SocketAddr>>>,
+        catalog: Arc<BrowserEndpointCatalog>,
+        state: ServerState,
+        root: tempfile::TempDir,
+        local: SocketAddr,
+    }
+
+    impl MappedOnlyListener {
+        async fn new() -> Self {
+            let p2p = Arc::new(
+                P2PNode::new(
+                    CoreNodeConfig::builder()
+                        .local(true)
+                        .ipv6(false)
+                        .build()
+                        .expect("core config"),
+                )
+                .await
+                .expect("P2P node"),
+            );
+            let mapping = Arc::new(Mutex::new(Some(
+                "198.51.100.2:51000".parse().expect("mapped"),
+            )));
+            let catalog = Arc::new(BrowserEndpointCatalog::default());
+            let state = ServerState {
+                config: WebRtcDirectConfig::default(),
+                identity: Arc::clone(p2p.transport().node_identity()),
+                p2p: Arc::clone(&p2p),
+                ant_protocol: None,
+                payment: BrowserPaymentNetwork {
+                    chain_id: ARBITRUM_SEPOLIA_CHAIN_ID,
+                    payment_token_address: String::new(),
+                    payment_vault_address: String::new(),
+                },
+                endpoint: RwLock::new(None),
+                endpoint_catalog: Some(Arc::clone(&catalog)),
+                port_mapping: Some(Box::new(TestMapping(Arc::clone(&mapping)))),
+                endpoint_needs_mapping: AtomicBool::new(false),
+            };
+            Self {
+                p2p,
+                mapping,
+                catalog,
+                state,
+                root: tempfile::tempdir().expect("root directory"),
+                local: "0.0.0.0:43210".parse().expect("wildcard listener"),
+            }
+        }
+
+        async fn refresh(&self) -> Result<()> {
+            refresh_browser_endpoint(
+                &self.state,
+                self.root.path(),
+                self.local,
+                CERTIFICATE_SHA256,
             )
             .await
-            .expect("P2P node"),
-        );
-        let peer_id = *p2p.peer_id();
-        let mapping = Arc::new(Mutex::new(Some(
-            "198.51.100.2:51000".parse().expect("mapped"),
-        )));
-        let catalog = Arc::new(BrowserEndpointCatalog::default());
-        let state = ServerState {
-            config: WebRtcDirectConfig::default(),
-            identity: Arc::clone(p2p.transport().node_identity()),
-            p2p: Arc::clone(&p2p),
-            ant_protocol: None,
-            payment: BrowserPaymentNetwork {
-                chain_id: ARBITRUM_SEPOLIA_CHAIN_ID,
-                payment_token_address: String::new(),
-                payment_vault_address: String::new(),
-            },
-            endpoint: RwLock::new(None),
-            endpoint_catalog: Some(Arc::clone(&catalog)),
-            port_mapping: Some(Box::new(TestMapping(Arc::clone(&mapping)))),
-            endpoint_needs_mapping: AtomicBool::new(false),
-        };
-        let root = tempfile::tempdir().expect("root directory");
-        let file = root.path().join(WEBRTC_DIRECT_MULTIADDR_FILENAME);
-        let local = "0.0.0.0:43210".parse().expect("wildcard listener");
+        }
 
-        refresh_browser_endpoint(&state, root.path(), local, CERTIFICATE_SHA256)
-            .await
-            .expect("publish the mapping");
-        let published = state.endpoint.read().clone().expect("published endpoint");
+        fn file(&self) -> PathBuf {
+            self.root.path().join(WEBRTC_DIRECT_MULTIADDR_FILENAME)
+        }
+
+        fn peer_id(&self) -> PeerId {
+            *self.p2p.peer_id()
+        }
+
+        async fn supplemental(&self) -> Vec<MultiAddr> {
+            self.p2p
+                .dht_manager()
+                .supplemental_addresses_for_peer(&self.peer_id())
+                .await
+        }
+
+        /// Assert that peers and browsers no longer see the endpoint.
+        async fn assert_unpublished(&self) {
+            assert!(self.state.endpoint.read().is_none());
+            assert_eq!(self.catalog.get(&self.peer_id()), None);
+            assert_eq!(self.supplemental().await, Vec::<MultiAddr>::new());
+        }
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_only_its_mapping_reached_is_withdrawn_when_the_mapping_ends() {
+        let listener = MappedOnlyListener::new().await;
+
+        listener.refresh().await.expect("publish the mapping");
+        let published = listener
+            .state
+            .endpoint
+            .read()
+            .clone()
+            .expect("published endpoint");
         assert!(published.multiaddr.contains("/198.51.100.2/udp/51000/"));
-        assert!(tokio::fs::read_to_string(&file)
+        assert!(tokio::fs::read_to_string(listener.file())
             .await
             .expect("endpoint file")
             .contains(&published.multiaddr));
-        assert_eq!(catalog.get(&peer_id), Some(published));
-        assert_eq!(
-            p2p.dht_manager()
-                .supplemental_addresses_for_peer(&peer_id)
-                .await
-                .len(),
-            1
-        );
+        assert_eq!(listener.catalog.get(&listener.peer_id()), Some(published));
+        assert_eq!(listener.supplemental().await.len(), 1);
 
-        *mapping.lock() = None;
-        refresh_browser_endpoint(&state, root.path(), local, CERTIFICATE_SHA256)
-            .await
-            .expect("withdraw the mapping");
-        assert!(state.endpoint.read().is_none());
-        assert!(!file.exists());
-        assert_eq!(catalog.get(&peer_id), None);
-        assert_eq!(
-            p2p.dht_manager()
-                .supplemental_addresses_for_peer(&peer_id)
-                .await,
-            Vec::<MultiAddr>::new()
-        );
+        *listener.mapping.lock() = None;
+        listener.refresh().await.expect("withdraw the mapping");
+        listener.assert_unpublished().await;
+        assert!(!listener.file().exists());
 
         // With nothing published, a later refresh without a mapping is a no-op.
-        refresh_browser_endpoint(&state, root.path(), local, CERTIFICATE_SHA256)
+        listener.refresh().await.expect("nothing to withdraw");
+        assert!(listener.state.endpoint.read().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_withdrawal_the_endpoint_file_blocks_still_unpublishes_and_is_retried() {
+        let listener = MappedOnlyListener::new().await;
+        listener.refresh().await.expect("publish the mapping");
+
+        // A directory in the file's place makes removing it fail.
+        tokio::fs::remove_file(listener.file())
             .await
-            .expect("nothing to withdraw");
-        assert!(state.endpoint.read().is_none());
+            .expect("remove the endpoint file");
+        tokio::fs::create_dir(listener.file())
+            .await
+            .expect("block the endpoint file");
+        *listener.mapping.lock() = None;
+        listener
+            .refresh()
+            .await
+            .expect_err("the endpoint file cannot be removed");
+        listener.assert_unpublished().await;
+
+        // Once the file can be removed, the next refresh finishes the withdrawal.
+        tokio::fs::remove_dir(listener.file())
+            .await
+            .expect("unblock the endpoint file");
+        tokio::fs::write(listener.file(), "stale endpoint\n")
+            .await
+            .expect("stale endpoint file");
+        listener.refresh().await.expect("finish the withdrawal");
+        assert!(!listener.file().exists());
+        listener.assert_unpublished().await;
+        assert!(!listener
+            .state
+            .endpoint_needs_mapping
+            .load(Ordering::Acquire));
     }
 
     #[test]

@@ -153,7 +153,9 @@ public address while the gateway holds it
 ([ADR-0027](adr/ADR-0027-map-the-browser-listener-port-through-upnp.md)).
 Without a gateway, or when it refuses, the endpoint is the native view's as
 above. When the mapping ends and the native view yields no address, the mapped
-endpoint is withdrawn rather than left advertised. An explicit bind IP or
+endpoint is withdrawn rather than left advertised. Peers stop seeing it even
+if the endpoint file cannot be removed; the node retries the file on each
+refresh. An explicit bind IP or
 advertised address is never mapped.
 
 Configure an explicit WebRTC port and permit inbound UDP on that port when a

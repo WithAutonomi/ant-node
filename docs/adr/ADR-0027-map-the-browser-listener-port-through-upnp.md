@@ -86,9 +86,11 @@ We will choose option 2.
 - An endpoint only the mapping reached, because the native view yields no
   address or a different one, is advertised only while the gateway holds the
   mapping. When the mapping ends and the native view yields nothing, the node
-  withdraws it: from HELLO, the endpoint file, the in-process catalog and the
-  DHT address record. An endpoint the native view still yields stays published
-  as before.
+  withdraws it from HELLO, the in-process catalog and the DHT address record,
+  then removes the endpoint file. Those publications cannot fail, so a file
+  error never keeps the endpoint advertised; the node retries the file on each
+  refresh until it is gone. An endpoint the native view still yields stays
+  published as before.
 - Graceful shutdown removes the mapping; otherwise its one-hour lease expires.
 
 There is no new configuration. Setting `--webrtc-direct-advertised-addr` or an
@@ -127,9 +129,11 @@ explicit `--webrtc-direct-bind` IP opts a node out.
   discovery, is ignored in the other address family, and an operator's
   advertisement still wins; only an address the native view lacks depends on
   the mapping.
-- Refresh-level test: on a node with no native address, a published mapping
+- Refresh-level tests: on a node with no native address, a published mapping
   is withdrawn from HELLO state, the endpoint file, the catalog and the DHT
-  supplemental record when the mapping ends.
+  supplemental record when the mapping ends. When the endpoint file cannot be
+  removed, the endpoint still leaves HELLO, the catalog and the DHT record, and
+  the next refresh removes the file once it can.
 - Live check behind a consumer gateway (Sagemcom F3896LG, 2026-11-02): a node on
   this change, bootstrapped to a local devnet with default WebRTC settings,
   bound the listener on an OS-chosen port, the gateway granted a UDP mapping
