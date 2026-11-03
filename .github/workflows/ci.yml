@@ -121,6 +121,8 @@ jobs:
         run: cargo test --test poc_audit_handler_live --features test-utils
       - name: Run bootstrap-stall PoC regression marker
         run: cargo test --test poc_bootstrap_stall --features test-utils
+      - name: Run build-script git-watch regression tests
+        run: cargo test --test build_script_git_watch --features test-utils
 
   filesystems:
     name: Storage on ${{ matrix.fs }}
