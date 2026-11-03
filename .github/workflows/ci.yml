@@ -110,6 +110,17 @@ jobs:
           cargo test --test devnet_lifecycle -- --test-threads=1 2>&1 | tee /tmp/devnet_lifecycle.log
           grep -qE 'test result: ok\. [1-9]' /tmp/devnet_lifecycle.log \
             || { echo 'devnet_lifecycle ran no tests'; exit 1; }
+      # The run-directory tests that mount a tmpfs and bind mounts inside run
+      # directories, or make a directory another user owns. They need root,
+      # which the runner gives through sudo, so `cargo test` alone skips them.
+      - name: ant-devnet run directories against real mounts
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --lib --features test-utils with_sudo_ -- --ignored --test-threads=1 2>&1 | tee /tmp/run_dir_sudo.log
+          grep -qE 'test result: ok\. [1-9]' /tmp/run_dir_sudo.log \
+            || { echo 'the run-directory mount tests ran nothing'; exit 1; }
       - name: Run e2e tests
         run: cargo test --test e2e --features test-utils -- --test-threads=1
       - name: Run v12 storage-bound audit attack PoCs

@@ -2,9 +2,13 @@
 //! devnet deletes only a directory it can show it created (ant-node#261).
 //!
 //! Each run creates a fresh `{pid}-{random}` directory inside the configured
-//! parent, exclusively, and claims it only if it is still empty once opened,
-//! so it never adopts something that was already there or was put in its
-//! place. Before anything else goes in, it takes an exclusive lock on
+//! parent, exclusively, and claims it only if, once opened, it is still empty
+//! and, on Unix, owned by the run's user, so it never adopts something that
+//! was already there or that another user put in its place. (A process of
+//! the run's own user could put an empty directory there, but it could as
+//! well delete whatever the run keeps: no check could hold that line. On
+//! Windows, which has no owner check without unsafe code, the parent's
+//! permissions decide who could.) Before anything else goes in, it takes an exclusive lock on
 //! [`LOCK_FILE`], held for as long as the run lasts, and then writes
 //! [`MARKER_FILE`] naming the run, the directory itself and the lock file,
 //! by their file numbers (inode, or file index on Windows): a copy of the
@@ -15,7 +19,8 @@
 //!   when it created it, and only if the name still refers to that directory
 //!   and the marker there still names the run.
 //! - Anything else, a later run included, may delete a run directory only if
-//!   it is on the parent's filesystem, its marker names that very directory
+//!   it is on the parent's filesystem and mount, its marker names that very
+//!   directory
 //!   and does not ask to keep it (`--no-cleanup`), and the lock file the
 //!   marker names is there and free. The OS releases the lock however the
 //!   process ends, SIGKILL included, and only a run's own process ever takes
@@ -25,7 +30,11 @@
 //!   mounted again.)
 //! - Deletion removes the data first and the marker and lock last, so one
 //!   that stops part-way leaves a directory the next run still recognises as
-//!   a finished run, and finishes. It does not cross into another mount.
+//!   a finished run, and finishes. It does not cross into another mount: on
+//!   Linux mounts are told apart by their mount ids, which tell a bind mount
+//!   from the filesystem it shows, and where the kernel cannot give one (it
+//!   is older than 5.8, or a sandbox refuses `statx`) nothing is deleted.
+//!   macOS has no bind mounts, so there the device tells them apart.
 //!
 //! On Unix every step after the parent is opened goes through a handle on the
 //! parent or the run directory, and deletion walks the tree through handles
@@ -35,7 +44,9 @@
 //! they are, neither they nor any directory above them can be renamed or
 //! removed, so the paths built on them keep naming the same directories, and
 //! [`std::fs::remove_dir_all`] does not follow links inside the tree. Either
-//! way, retargeting a link above the run directory mid-run redirects nothing.
+//! way, retargeting a link above the run directory mid-run redirects nothing:
+//! not the deletion, and not what is written through [`RunDir::path`], which
+//! has the links in the parent's path resolved.
 
 use crate::logging::{debug, info, warn};
 use rand::Rng;
@@ -141,8 +152,13 @@ impl RunDir {
         let run = parent.open_run(&name)?;
         // Between its creation and its opening, something else could have put
         // a directory of its own in place of this one. If what was opened has
-        // anything in it, it is not this run's: leave it as it is.
-        if !run.is_empty()? {
+        // anything in it, or another user owns it, it is not this run's:
+        // leave it as it is.
+        #[cfg(unix)]
+        let replaced = !run.is_empty()? || !run.is_owned_by_this_user()?;
+        #[cfg(windows)]
+        let replaced = !run.is_empty()?;
+        if replaced {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!(
@@ -192,7 +208,8 @@ impl RunDir {
         })
     }
 
-    /// The run directory.
+    /// The run directory, with any link in the parent's path resolved, so
+    /// that retargeting one does not redirect what is written through it.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -379,6 +396,14 @@ fn finished_run(parent: &Parent, name: &str) -> io::Result<Option<(Run, File)>> 
     {
         return Ok(None);
     }
+    // Not a mount wearing a run's name, a bind mount of a finished run's
+    // directory kept elsewhere for one: deleting through it would empty what
+    // it shows. (On Windows a mounted folder is a link, which `open_run`
+    // refuses.)
+    #[cfg(unix)]
+    if run.mount()? != parent.mount()? {
+        return Ok(None);
+    }
     let lock = run.open_file(LOCK_FILE)?;
     // The run's lock stays held under whatever name its file is moved to, so
     // a free lock means something only if it is that file.
@@ -464,6 +489,7 @@ mod unix {
 
     /// The directory run directories are created in, opened once.
     pub struct Parent {
+        /// The path it was opened by, with every link in it resolved.
         pub path: PathBuf,
         fd: OwnedFd,
     }
@@ -476,15 +502,27 @@ mod unix {
     impl Parent {
         pub fn open(path: &Path) -> io::Result<Self> {
             std::fs::create_dir_all(path)?;
+            let real = std::fs::canonicalize(path)?;
             let fd = rustix::fs::open(
-                path,
+                &real,
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
                 Mode::empty(),
             )?;
-            Ok(Self {
-                path: path.to_path_buf(),
-                fd,
-            })
+            // The run directory's path is built on `real`, so it must still
+            // be free of links, and name the directory just opened.
+            if std::fs::canonicalize(&real)? != real
+                || id(&rustix::fs::stat(&real)?) != id(&rustix::fs::fstat(&fd)?)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{} changed while it was being opened", path.display()),
+                ));
+            }
+            Ok(Self { path: real, fd })
+        }
+
+        pub fn mount(&self) -> io::Result<Mount> {
+            mount_of(&self.fd)
         }
 
         pub fn create_run(&self, name: &str) -> io::Result<()> {
@@ -538,6 +576,14 @@ mod unix {
 
         pub fn is_empty(&self) -> io::Result<bool> {
             Ok(read_names(&self.fd)?.is_empty())
+        }
+
+        pub fn is_owned_by_this_user(&self) -> io::Result<bool> {
+            Ok(rustix::fs::fstat(&self.fd)?.st_uid == rustix::process::geteuid().as_raw())
+        }
+
+        pub fn mount(&self) -> io::Result<Mount> {
+            mount_of(&self.fd)
         }
 
         pub fn create_file(&self, name: &str) -> io::Result<File> {
@@ -605,29 +651,52 @@ mod unix {
     /// Where a directory is mounted: its device and, on Linux, the mount
     /// itself, which also tells a bind mount from the filesystem it shows.
     #[derive(Debug, PartialEq, Eq)]
-    pub(super) struct Mount {
+    pub struct Mount {
         device: Dev,
-        id: Option<u64>,
+        #[cfg(target_os = "linux")]
+        id: u64,
     }
 
+    /// Fails where mounts cannot be told apart, so that nothing is deleted
+    /// there.
     pub(super) fn mount_of(dir: &OwnedFd) -> io::Result<Mount> {
         let device = rustix::fs::fstat(dir)?.st_dev;
         #[cfg(target_os = "linux")]
-        let id = {
+        {
             use rustix::fs::StatxFlags;
-            // Mount ids are in Linux 5.8 and later, and some sandboxes refuse
-            // `statx`. Without one, the device is what tells mounts apart.
-            match rustix::fs::statx(dir, c"", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID) {
-                Ok(statx) => {
-                    (statx.stx_mask & StatxFlags::MNT_ID.bits() != 0).then_some(statx.stx_mnt_id)
-                }
-                Err(Errno::NOSYS | Errno::PERM) => None,
+            let unsupported = || {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "cannot tell a bind mount from the directory it is in: that needs \
+                     mount ids, from Linux 5.8, and `statx` allowed",
+                )
+            };
+            let statx = match rustix::fs::statx(dir, c"", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID) {
+                Ok(statx) => statx,
+                Err(Errno::NOSYS | Errno::PERM) => return Err(unsupported()),
                 Err(e) => return Err(e.into()),
+            };
+            if statx.stx_mask & StatxFlags::MNT_ID.bits() == 0 {
+                return Err(unsupported());
             }
-        };
-        #[cfg(not(target_os = "linux"))]
-        let id = None;
-        Ok(Mount { device, id })
+            Ok(Mount {
+                device,
+                id: statx.stx_mnt_id,
+            })
+        }
+        // No bind mounts on macOS: another mount is another device.
+        #[cfg(target_os = "macos")]
+        {
+            Ok(Mount { device })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = device;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "cannot tell mounts apart on this system",
+            ))
+        }
     }
 
     /// Delete the entry `name` in `dir`, descending only through handles
@@ -710,8 +779,9 @@ mod windows {
 
     /// The directory run directories are created in, held open.
     pub struct Parent {
+        /// `real`, without the `\\?\` prefix where it means the same.
         pub path: PathBuf,
-        /// `path` with every link in it resolved.
+        /// The path it was opened by, with every link in it resolved.
         real: PathBuf,
         held: File,
     }
@@ -736,7 +806,7 @@ mod windows {
                 ));
             }
             Ok(Self {
-                path: path.to_path_buf(),
+                path: plain(&real),
                 real,
                 held,
             })
@@ -845,6 +915,17 @@ mod windows {
             }
             Ok(())
         }
+    }
+
+    /// `real` without its `\\?\` prefix, if it names the same without it,
+    /// as a path on a drive does: [`super::RunDir::path`] is shown in logs and
+    /// the manifest, and read by other programs.
+    fn plain(real: &Path) -> PathBuf {
+        real.to_str()
+            .and_then(|text| text.strip_prefix(r"\\?\"))
+            .map(PathBuf::from)
+            .filter(|plain| std::fs::canonicalize(plain).is_ok_and(|again| again == real))
+            .unwrap_or_else(|| real.to_path_buf())
     }
 
     /// Open the directory `path` to hold it, refusing a link.
@@ -958,7 +1039,16 @@ mod tests {
 
         let run = RunDir::create(&parent, false)?;
 
-        assert_eq!(run.path().parent(), Some(parent.as_path()));
+        assert_eq!(
+            run.path().parent().map(std::fs::canonicalize).transpose()?,
+            Some(std::fs::canonicalize(&parent)?)
+        );
+        #[cfg(windows)]
+        assert!(
+            !run.path().to_string_lossy().starts_with(r"\\?\"),
+            "{}",
+            run.path().display()
+        );
         let name = run
             .path()
             .file_name()
@@ -1324,6 +1414,137 @@ mod tests {
         Ok(())
     }
 
+    /// Run `sudo -n`, with `args` and then `path`.
+    #[cfg(target_os = "linux")]
+    fn sudo(args: &[&std::ffi::OsStr], path: &Path) -> io::Result<()> {
+        let status = std::process::Command::new("sudo")
+            .arg("-n")
+            .args(args)
+            .arg(path)
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "sudo {args:?} {} failed",
+                path.display()
+            )))
+        }
+    }
+
+    /// A mount made through `sudo`, undone when dropped.
+    #[cfg(target_os = "linux")]
+    struct Mounted(PathBuf);
+
+    #[cfg(target_os = "linux")]
+    impl Mounted {
+        fn new(at: &Path, how: &[&std::ffi::OsStr]) -> io::Result<Self> {
+            sudo(&[&[std::ffi::OsStr::new("mount")], how].concat(), at)?;
+            Ok(Self(at.to_path_buf()))
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for Mounted {
+        fn drop(&mut self) {
+            if let Err(e) = sudo(&[std::ffi::OsStr::new("umount")], &self.0) {
+                eprintln!("{e}");
+            }
+        }
+    }
+
+    /// Hermes round 5 on #263, with real mounts: neither a tmpfs nor a bind
+    /// mount of a directory on the same filesystem, which only the mount id
+    /// tells apart, is crossed. The `with_sudo_` tests need root, through
+    /// `sudo -n`; CI runs them in a step of their own.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "mounts through sudo; CI runs it"]
+    fn with_sudo_mounts_inside_a_run_directory_are_not_crossed() -> TestResult {
+        use std::ffi::OsStr;
+        for bind in [false, true] {
+            let temp = tempfile::tempdir()?;
+            let source = temp.path().join("source");
+            std::fs::create_dir(&source)?;
+            std::fs::write(source.join("data"), b"not the run's")?;
+            let run = RunDir::create(&temp.path().join("devnets"), false)?;
+            let path = run.path().to_path_buf();
+            let at = path.join("nodes").join("mounted");
+            std::fs::create_dir_all(&at)?;
+            let _mounted = if bind {
+                Mounted::new(&at, &[OsStr::new("--bind"), source.as_os_str()])?
+            } else {
+                let tmpfs = ["-t", "tmpfs", "-o", "mode=1777", "none"].map(OsStr::new);
+                let mounted = Mounted::new(&at, &tmpfs)?;
+                std::fs::write(at.join("data"), b"not the run's")?;
+                mounted
+            };
+
+            assert!(run.remove().is_err(), "bind: {bind}");
+            assert!(at.join("data").is_file(), "bind: {bind}");
+            assert!(source.join("data").is_file(), "bind: {bind}");
+            assert!(path.join(MARKER_FILE).is_file(), "bind: {bind}");
+        }
+        Ok(())
+    }
+
+    /// Hermes round 5 on #263: a bind mount of a finished run's directory,
+    /// kept elsewhere on the same filesystem, put in the parent under the
+    /// run's name. Everything about it matches but its mount, and the sweep
+    /// would delete through it what it shows.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "mounts through sudo; CI runs it"]
+    fn with_sudo_a_mount_wearing_a_finished_runs_name_is_not_swept() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let outside = finished(&temp.path().join("outside"), false)?;
+        let parent = temp.path().join("devnets");
+        let at = parent.join(outside.file_name().ok_or("no name")?);
+        std::fs::create_dir_all(&at)?;
+        let _mounted = Mounted::new(&at, &[std::ffi::OsStr::new("--bind"), outside.as_os_str()])?;
+        assert!(at.join(MARKER_FILE).is_file());
+
+        let _run = RunDir::create(&parent, false)?;
+
+        assert!(
+            outside.join("nodes").join("peer").join("chunk").is_file(),
+            "swept through the mount"
+        );
+        Ok(())
+    }
+
+    /// Hermes round 5 on #263: an empty directory another user owns, put in
+    /// place of a new run directory before the run opens it, is not claimed,
+    /// though the run could write in it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "makes a directory another user owns through sudo; CI runs it"]
+    fn with_sudo_an_empty_directory_of_another_user_is_not_claimed() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let parent = temp.path().join("devnets");
+        let moved = temp.path().join("moved");
+        let replaced = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let record = std::rc::Rc::clone(&replaced);
+        AFTER_CREATE.with(|act| {
+            *act.borrow_mut() = Some(Box::new(move |path: &Path| {
+                std::fs::rename(path, &moved)?;
+                // root's, and open to anyone.
+                sudo(&["mkdir", "-m", "0777"].map(std::ffi::OsStr::new), path)?;
+                *record.borrow_mut() = Some(path.to_path_buf());
+                Ok(())
+            }));
+        });
+
+        let created = RunDir::create(&parent, false);
+        AFTER_CREATE.with(|act| act.borrow_mut().take());
+
+        assert!(created.is_err());
+        let path = replaced.borrow_mut().take().ok_or("never replaced")?;
+        assert!(!path.join(MARKER_FILE).exists());
+        assert!(!path.join(LOCK_FILE).exists());
+        Ok(())
+    }
+
     /// What that rests on: a directory on another mount is told apart from
     /// one on the run's.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1412,6 +1633,10 @@ mod tests {
         std::fs::remove_file(&link)?;
         std::os::unix::fs::symlink(&second, &link)?;
 
+        // Hermes round 5: nor are writes through the path it hands out.
+        std::fs::write(run.path().join("written"), b"the run's")?;
+        assert!(first.join("devnets").join(&name).join("written").is_file());
+        assert!(!decoy.join("written").exists(), "path() followed the link");
         run.remove()?;
 
         assert!(!first.join("devnets").join(&name).exists());
@@ -1423,12 +1648,16 @@ mod tests {
     }
 
     /// `mklink /J`: a directory junction, which needs no privilege to make.
+    /// The paths reach `cmd` through the environment and are expanded inside
+    /// quotes, once, where none of its metacharacters act, and a Windows path
+    /// cannot hold a quote: whatever they contain, they stay two paths.
     #[cfg(windows)]
     fn junction(link: &Path, target: &Path) -> TestResult {
+        use std::os::windows::process::CommandExt;
         let status = std::process::Command::new("cmd")
-            .args(["/C", "mklink", "/J"])
-            .arg(link)
-            .arg(target)
+            .raw_arg(r#"/D /V:OFF /S /C "mklink /J "%ANT_TEST_LINK%" "%ANT_TEST_TARGET%"""#)
+            .env("ANT_TEST_LINK", link)
+            .env("ANT_TEST_TARGET", target)
             .stdout(std::process::Stdio::null())
             .status()?;
         if status.success() {
@@ -1443,11 +1672,12 @@ mod tests {
     #[test]
     fn retargeting_a_junction_above_the_run_does_not_redirect_removal() -> TestResult {
         let temp = tempfile::tempdir()?;
-        let first = temp.path().join("first");
-        let second = temp.path().join("second");
+        // Names that mean something to `cmd`, which `junction` goes through.
+        let first = temp.path().join("first & %USERNAME% ^(1)!");
+        let second = temp.path().join("second ; %PATH% = ^&");
         std::fs::create_dir_all(&first)?;
         std::fs::create_dir_all(&second)?;
-        let link = temp.path().join("link");
+        let link = temp.path().join("link & %TEMP%");
         junction(&link, &first)?;
 
         let run = RunDir::create(&link.join("devnets"), false)?;
@@ -1459,6 +1689,12 @@ mod tests {
         std::fs::remove_dir(&link)?;
         junction(&link, &second)?;
 
+        std::fs::write(run.path().join("written"), b"the run's")?;
+        assert!(first.join("devnets").join(&name).join("written").is_file());
+        assert!(
+            !decoy.join("written").exists(),
+            "path() followed the junction"
+        );
         run.remove()?;
 
         assert!(!first.join("devnets").join(&name).exists());

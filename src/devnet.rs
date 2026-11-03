@@ -1427,7 +1427,12 @@ mod tests {
 
         assert_ne!(first_dir, second_dir);
         for dir in [&first_dir, &second_dir] {
-            assert_eq!(dir.parent(), Some(parent.as_path()), "{}", dir.display());
+            assert_eq!(
+                dir.parent().map(std::fs::canonicalize).transpose()?,
+                Some(std::fs::canonicalize(&parent)?),
+                "{}",
+                dir.display()
+            );
             assert!(dir.join(MARKER_FILE).is_file(), "{}", dir.display());
         }
 

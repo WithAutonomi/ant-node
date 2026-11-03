@@ -28,41 +28,56 @@ const STARTUP_TIMEOUT: Duration = Duration::from_mins(4);
 /// How long a stopped devnet may take to shut down and exit.
 const EXIT_TIMEOUT: Duration = Duration::from_mins(1);
 
-/// A running ant-devnet, in a process group of its own that Anvil, its child,
-/// joins. Whatever is left of the group is killed when a test ends, however
-/// it ends.
-struct Devnet(Child);
+/// A running ant-devnet, in a process group that Anvil, its child, joins.
+/// Whatever is left of the group is killed when a test ends, however it ends.
+struct Devnet {
+    process: Child,
+    /// The group's leader, which does nothing. It is reaped only once the
+    /// group has been killed, so until then the group's id cannot be reused,
+    /// and the kill cannot reach some other group: ant-devnet itself is
+    /// reaped as soon as a test sees it exit.
+    leader: Child,
+}
 
 impl Drop for Devnet {
     /// SIGTERM first, if it is still running: ant-devnet then stops Anvil
     /// itself. Then SIGKILL to the whole group, for an Anvil left running by
     /// a devnet that was killed, or that exited without stopping it.
     fn drop(&mut self) {
-        let pid = self.0.id();
-        if matches!(self.0.try_wait(), Ok(None)) {
+        if matches!(self.process.try_wait(), Ok(None)) {
             let _ = Command::new("kill")
-                .args(["-TERM", &pid.to_string()])
+                .args(["-TERM", &self.process.id().to_string()])
                 .status();
             let deadline = Instant::now() + EXIT_TIMEOUT;
-            while Instant::now() < deadline && matches!(self.0.try_wait(), Ok(None)) {
+            while Instant::now() < deadline && matches!(self.process.try_wait(), Ok(None)) {
                 sleep(Duration::from_millis(100));
             }
         }
-        // The group outlives ant-devnet for as long as Anvil is in it.
         let _ = Command::new("kill")
-            .args(["-s", "KILL", "--", &format!("-{pid}")])
+            .args(["-s", "KILL", "--", &format!("-{}", self.leader.id())])
             .stderr(Stdio::null())
             .status();
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.leader.kill();
+        let _ = self.leader.wait();
+        let _ = self.process.kill();
+        let _ = self.process.wait();
     }
 }
 
 impl Devnet {
     fn spawn(home: &Path, args: &[&str]) -> Self {
-        let child = Command::new(env!("CARGO_BIN_EXE_ant-devnet"))
-            .args(args)
+        let leader = Command::new("sleep")
+            .arg("86400")
             .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the process group's leader");
+        let group = i32::try_from(leader.id()).expect("a pid fits in an i32");
+        let process = Command::new(env!("CARGO_BIN_EXE_ant-devnet"))
+            .args(args)
+            .process_group(group)
             .env("HOME", home)
             .env("XDG_DATA_HOME", home.join("data"))
             .stdin(Stdio::null())
@@ -70,7 +85,7 @@ impl Devnet {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn ant-devnet");
-        Self(child)
+        Self { process, leader }
     }
 
     /// Send `signal` (a name `kill` accepts, e.g. "TERM") to the devnet,
@@ -78,16 +93,20 @@ impl Devnet {
     fn signal(&self, signal: &str) {
         let status = Command::new("kill")
             .arg(format!("-{signal}"))
-            .arg(self.0.id().to_string())
+            .arg(self.process.id().to_string())
             .status()
             .expect("run kill");
-        assert!(status.success(), "kill -{signal} {} failed", self.0.id());
+        assert!(
+            status.success(),
+            "kill -{signal} {} failed",
+            self.process.id()
+        );
     }
 
     fn wait_for_exit(&mut self) -> ExitStatus {
         let deadline = Instant::now() + EXIT_TIMEOUT;
         loop {
-            if let Some(status) = self.0.try_wait().expect("try_wait") {
+            if let Some(status) = self.process.try_wait().expect("try_wait") {
                 return status;
             }
             assert!(
@@ -101,7 +120,7 @@ impl Devnet {
 
     /// Fail if the devnet exited on its own, e.g. a startup error.
     fn assert_running(&mut self) {
-        if let Some(status) = self.0.try_wait().expect("try_wait") {
+        if let Some(status) = self.process.try_wait().expect("try_wait") {
             panic!("ant-devnet exited early with {status}");
         }
     }
@@ -185,7 +204,8 @@ fn sigterm_while_running_removes_the_data_dir_and_stops_anvil() {
 
     // The default data directory is a fresh one for this run, inside the
     // (redirected) ant data root's devnets directory.
-    assert!(data_dir.starts_with(home.path()), "{}", data_dir.display());
+    let home_dir = std::fs::canonicalize(home.path()).unwrap();
+    assert!(data_dir.starts_with(&home_dir), "{}", data_dir.display());
     assert_eq!(
         data_dir.parent().and_then(Path::file_name),
         Some(std::ffi::OsStr::new("devnets")),
