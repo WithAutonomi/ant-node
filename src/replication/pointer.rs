@@ -159,12 +159,26 @@ const UNDECIDED_BACKOFF: Duration = Duration::from_secs(30);
 /// Most prune candidates examined per pass.
 const MAX_PRUNE_CANDIDATES_PER_PASS: usize = 256;
 
-/// Prune candidates proven at once, as many as chunk pruning's audits. Each
-/// asks its whole group at once and is given one fetch timeout in all, so a
+/// Prune candidates proven at once: half of what this node may have
+/// outstanding at any one peer. Candidates come in address order, so those in
+/// flight mostly share one group; at this width pruning never queues behind
+/// its own requests, and repair and possession checks keep the other half of
+/// every peer's [`MAX_REQUESTS_PER_PEER`]. With [`PRUNE_PROOF_BUDGET`] each, a
 /// pass takes at most `MAX_PRUNE_CANDIDATES_PER_PASS / PRUNE_CONCURRENCY`
-/// fetch timeouts however many peers stay silent, while
-/// [`MAX_REQUESTS_PER_PEER`] still bounds what any one peer is asked.
-const PRUNE_CONCURRENCY: usize = 32;
+/// budgets, about five minutes, however many peers stay silent.
+const PRUNE_CONCURRENCY: usize = MAX_REQUESTS_PER_PEER / 2;
+
+const _: () = assert!(
+    PRUNE_CONCURRENCY > 0,
+    "pruning must be able to prove at least one candidate at a time"
+);
+
+/// How long one prune candidate's group has to prove it holds the record,
+/// this node's wait for its own request slots included. A record is 5,303
+/// bytes, so this is what a storage audit allows a peer for one small read
+/// over a cold connection (its round-two floor). A group slower than that
+/// keeps the record until a later pass.
+const PRUNE_PROOF_BUDGET: Duration = Duration::from_secs(5);
 
 /// How long a node spends asking its close group for a conflicting final
 /// state before taking one (ADR-0018).
@@ -1909,8 +1923,8 @@ impl PointerReplication {
     }
 
     /// Delete `state`'s record if its close group proves it holds that state
-    /// or a newer one, within one fetch timeout, and this node is still out
-    /// of range and uncommitted once it has.
+    /// or a newer one within [`PRUNE_PROOF_BUDGET`], and this node is still
+    /// out of range and uncommitted once it has.
     async fn prune_candidate(
         &self,
         state: PointerState,
@@ -1921,10 +1935,9 @@ impl PointerReplication {
         if self.shutdown.is_cancelled() {
             return false;
         }
-        let proven =
-            tokio::time::timeout(self.config.fetch_request_timeout, self.others_hold(&state))
-                .await
-                .unwrap_or(false);
+        let proven = tokio::time::timeout(PRUNE_PROOF_BUDGET, self.others_hold(&state))
+            .await
+            .unwrap_or(false);
         // Revalidate just before deleting: the group may have moved back.
         proven
             && !committed(&state.address)
