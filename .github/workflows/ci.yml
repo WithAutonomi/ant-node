@@ -103,6 +103,12 @@ jobs:
           version: ${{ env.FOUNDRY_VERSION }}
       - name: Unit tests (lib and bins)
         run: cargo test --lib --bins --features test-utils
+      # Build every integration test binary in one cargo invocation, so they compile
+      # and link in parallel. When each target was built in its own step, each spent
+      # 2-5 minutes building its binary for tests that finish in under a second.
+      - name: Build integration test binaries
+        shell: bash
+        run: cargo test --test '*' --features test-utils --no-run
       # Every integration target Cargo knows about, read from `cargo metadata`,
       # so a new tests/*.rs runs without anyone editing this file. Each target
       # runs on its own, serially, and must pass at least one test: a target
