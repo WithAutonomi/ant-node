@@ -128,6 +128,11 @@ rustix = { version = "1", features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]
 self-replace = "1"
+# The volume serial number and file index of a directory handle, which tells
+# a devnet run directory from a copy put in its place. Already in Cargo.lock
+# (through walkdir), and what it needs, windows-sys 0.48, already ships in the
+# Windows build through `directories`.
+winapi-util = "0.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

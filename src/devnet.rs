@@ -381,6 +381,11 @@ impl DevnetNode {
 }
 
 /// A local devnet composed of multiple nodes.
+///
+/// Call [`shutdown`](Self::shutdown) before dropping it. Dropped without one,
+/// the nodes it started are not stopped, and its run directory is left,
+/// locked until the process exits so that no other run deletes it while they
+/// may still be writing there.
 pub struct Devnet {
     config: DevnetConfig,
     nodes: Vec<DevnetNode>,
@@ -388,7 +393,8 @@ pub struct Devnet {
     state: Arc<RwLock<NetworkState>>,
     health_monitor: Option<JoinHandle<()>>,
     /// This run's data directory, until [`shutdown`](Self::shutdown) removes
-    /// or releases it. Dropping it releases the run's lock.
+    /// or releases it. Dropped without a shutdown, the devnet keeps it locked
+    /// until the process exits.
     run_dir: Option<RunDir>,
     #[cfg(feature = "webrtc-direct")]
     browser_endpoint_catalog: Arc<crate::web_rtc::BrowserEndpointCatalog>,
@@ -1298,6 +1304,13 @@ impl Drop for Devnet {
         if let Some(handle) = self.health_monitor.take() {
             handle.abort();
         }
+        // Not shut down, so nodes it started may still be running: their
+        // tasks hold them, and outlive this. Keep the run directory locked
+        // until the process exits, so that no sweep deletes it under them. A
+        // later run removes it then, as it would after a SIGKILL.
+        if let Some(run_dir) = self.run_dir.take() {
+            run_dir.keep_locked_until_exit();
+        }
     }
 }
 
@@ -1372,6 +1385,35 @@ mod tests {
         assert!(kept.join(MARKER_FILE).is_file());
         later.shutdown().await?;
         assert!(kept.join(MARKER_FILE).is_file());
+        Ok(())
+    }
+
+    /// Hermes round 3 on #263: a started devnet dropped without a shutdown
+    /// leaves nodes running, still writing into its run directory, so the
+    /// next devnet's sweep must leave it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_started_devnet_dropped_without_shutdown_is_not_swept(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let mut config = DevnetConfig::minimal();
+        config.node_count = 2;
+        config.bootstrap_count = 1;
+        config.base_port = 0;
+        config.spawn_delay = Duration::from_millis(20);
+        config.data_dir = temp.path().join("devnets");
+        let mut dropped = Devnet::new(config.clone()).await?;
+        dropped.start().await?;
+        let dropped_dir = dropped.config().data_dir.clone();
+        drop(dropped);
+
+        let mut next = Devnet::new(config).await?;
+
+        assert!(
+            dropped_dir.join(MARKER_FILE).is_file(),
+            "the next devnet swept {}",
+            dropped_dir.display()
+        );
+        next.shutdown().await?;
         Ok(())
     }
 

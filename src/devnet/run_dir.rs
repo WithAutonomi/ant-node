@@ -5,23 +5,34 @@
 //! parent, exclusively, so it never adopts something that was already there.
 //! Before anything else goes in, it takes an exclusive lock on [`LOCK_FILE`],
 //! held for as long as the run lasts, and then writes [`MARKER_FILE`] naming
-//! the run. The parent itself is never deleted.
+//! the run and the directory itself, by its file number (inode, or file
+//! index on Windows): a copy of the marker in any other directory does not
+//! match. The parent itself is never deleted.
 //!
-//! - On shutdown a run deletes its directory, and only if the marker there
-//!   still names that run.
+//! - On shutdown a run deletes its directory through the handle it opened
+//!   when it created it, and only if the name still refers to that directory
+//!   and the marker there still names the run.
 //! - Anything else, a later run included, may delete a run directory only if
-//!   it has a marker, the marker does not ask to keep it (`--no-cleanup`), and
-//!   its lock is free. The OS releases the lock however the process ends,
-//!   SIGKILL included, and only a run's own process ever takes it, so a free
-//!   lock means the run is over. A directory without a marker is never
-//!   touched.
+//!   it is on the parent's filesystem, its marker names that very directory
+//!   and does not ask to keep it (`--no-cleanup`), and its lock is free. The
+//!   OS releases the lock however the process ends, SIGKILL included, and
+//!   only a run's own process ever takes it, so a free lock means the run is
+//!   over. A directory without such a marker is never touched. (The marker
+//!   keeps no device number: on some filesystems, btrfs and NFS among them,
+//!   that changes when they are mounted again.)
+//! - Deletion removes the data first and the marker and lock last, so one
+//!   that stops part-way leaves a directory the next run still recognises as
+//!   a finished run, and finishes.
 //!
 //! On Unix every step after the parent is opened goes through a handle on the
-//! parent, and deletion walks the tree through handles opened without
-//! following links. Retargeting a symlink above the run directory mid-run
-//! cannot redirect any of it. Windows has no such calls: there, deletion goes
-//! through [`std::fs::remove_dir_all`], which does not follow links inside
-//! the tree, after the same marker check.
+//! parent or the run directory, and deletion walks the tree through handles
+//! opened without following links. Windows has no such calls in the standard
+//! library. There, links in the parent's path are resolved once, and the
+//! parent and the run directory are held open without delete sharing: while
+//! they are, neither they nor any directory above them can be renamed or
+//! removed, so the paths built on them keep naming the same directories, and
+//! [`std::fs::remove_dir_all`] does not follow links inside the tree. Either
+//! way, retargeting a link above the run directory mid-run redirects nothing.
 
 use crate::logging::{debug, info, warn};
 use rand::Rng;
@@ -52,6 +63,8 @@ const CREATE_ATTEMPTS: usize = 8;
 struct Marker {
     /// Random and unique to the run.
     run_id: String,
+    /// The run directory's file number on its filesystem ([`DirId::file`]).
+    file_id: u64,
     /// The process that ran the devnet.
     pid: u32,
     /// When the run started, in seconds since the Unix epoch.
@@ -60,6 +73,16 @@ struct Marker {
     version: String,
     /// Set by `--no-cleanup`: nothing but the user deletes this directory.
     keep: bool,
+}
+
+/// Which directory a handle or a name refers to.
+#[derive(Debug, PartialEq, Eq)]
+struct DirId {
+    /// Its device (Unix) or volume serial number (Windows). Compared only
+    /// between handles open at the same time, never kept.
+    device: String,
+    /// Its inode (Unix) or file index (Windows).
+    file: u64,
 }
 
 /// This run's directory: created, locked and marked by [`RunDir::create`].
@@ -71,6 +94,8 @@ pub struct RunDir {
     name: String,
     run_id: String,
     parent: Parent,
+    /// The directory as created, held open until it is deleted.
+    run: Run,
     lock: File,
 }
 
@@ -107,21 +132,29 @@ impl RunDir {
         };
 
         let run = parent.open_run(&name)?;
-        let marker = Marker {
-            run_id: hex::encode(rng.gen::<[u8; 16]>()),
-            pid,
-            started_at: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |since| since.as_secs()),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            keep,
-        };
-        let lock = match claim(&run, &marker) {
-            Ok(lock) => lock,
+        let claimed = run.id().and_then(|id| {
+            let marker = Marker {
+                run_id: hex::encode(rng.gen::<[u8; 16]>()),
+                file_id: id.file,
+                pid,
+                started_at: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |since| since.as_secs()),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                keep,
+            };
+            let lock = claim(&run, &marker)?;
+            Ok((marker.run_id, lock))
+        });
+        let (run_id, lock) = match claimed {
+            Ok(claimed) => claimed,
             Err(e) => {
                 // Unmarked, it would be left alone for good. It is ours: we
-                // have just created it.
-                if let Err(cleanup) = parent.remove_run(&name, run) {
+                // have just created it, and still have it open.
+                if let Err(cleanup) = run
+                    .remove_all_but(&[])
+                    .and_then(|()| parent.remove_empty(&name, run))
+                {
                     warn!("Could not remove half-created devnet run directory {name}: {cleanup}");
                 }
                 return Err(e);
@@ -131,8 +164,9 @@ impl RunDir {
         Ok(Self {
             path: parent.path.join(&name),
             name,
-            run_id: marker.run_id,
+            run_id,
             parent,
+            run,
             lock,
         })
     }
@@ -142,27 +176,44 @@ impl RunDir {
         &self.path
     }
 
-    /// Delete the run directory, if its marker still names this run.
+    /// Delete the run directory, if its name still refers to the directory
+    /// this run created and the marker there still names this run.
     ///
     /// # Errors
     ///
-    /// Fails, deleting nothing, if the directory is no longer this run's, and
-    /// otherwise if the deletion fails.
+    /// Fails, deleting nothing, if the directory is no longer this run's:
+    /// moved, replaced, or marked by another run. Otherwise fails if the
+    /// deletion does, leaving the marker and lock for the next run's sweep.
     pub fn remove(self) -> io::Result<()> {
-        let run = self.parent.open_run(&self.name)?;
+        let Self {
+            path,
+            name,
+            run_id,
+            parent,
+            run,
+            lock,
+        } = self;
         let marker = read_marker(&run)?;
-        if marker.run_id != self.run_id {
+        if marker.run_id != run_id || marker.file_id != run.id()?.file {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
                     "{} is no longer this run's directory: its marker names another run",
-                    self.path.display()
+                    path.display()
                 ),
             ));
         }
-        // Windows refuses to delete a directory with a file open in it.
-        drop(self.lock);
-        self.parent.remove_run(&self.name, run)
+        same_dir(&parent, &name, &run)
+            .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
+        delete(&parent, &name, run, lock)
+    }
+
+    /// Leave the directory, and keep it locked until the process exits, when
+    /// the OS releases the lock. For a run that may still have nodes writing
+    /// into it: no sweep deletes it while it is locked.
+    pub fn keep_locked_until_exit(self) {
+        let Self { lock, .. } = self;
+        std::mem::forget(lock);
     }
 }
 
@@ -194,6 +245,35 @@ fn read_marker(run: &Run) -> io::Result<Marker> {
     serde_json::from_slice(&json).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+/// Fail unless `name` in `parent` is still the directory `run` has open.
+fn same_dir(parent: &Parent, name: &str, run: &Run) -> io::Result<()> {
+    if parent.id_of(name)? == run.id()? {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "it has been moved or replaced since its run created it",
+        ))
+    }
+}
+
+/// Delete the run directory `name`, which `run` has open and whose `lock` is
+/// held: the data first, then the marker, then the lock, then the directory,
+/// empty by then. Should it stop before the marker goes, the marker and the
+/// free lock make the rest a finished run that the next sweep removes. After
+/// that, only an empty directory and an empty lock file can be left.
+fn delete(parent: &Parent, name: &str, run: Run, lock: File) -> io::Result<()> {
+    run.remove_all_but(&[MARKER_FILE, LOCK_FILE])?;
+    run.remove_file(MARKER_FILE)?;
+    // Windows removes no directory with a file open in it.
+    drop(lock);
+    run.remove_file(LOCK_FILE)?;
+    // Only an empty directory is removed, so should `name` be swapped between
+    // this check and the removal, nothing with data in it goes.
+    same_dir(parent, name, &run)?;
+    parent.remove_empty(name, run)
+}
+
 /// Whether `name` has the shape of a run directory's: `{pid}-{8 hex digits}`.
 fn is_run_name(name: &str) -> bool {
     name.split_once('-').is_some_and(|(pid, random)| {
@@ -222,7 +302,7 @@ fn sweep(parent: &Parent) {
     let mut removed = 0_usize;
     for name in names.iter().filter(|name| is_run_name(name)) {
         match finished_run(parent, name) {
-            Ok(Some(run)) => match parent.remove_run(name, run) {
+            Ok(Some((run, lock))) => match delete(parent, name, run, lock) {
                 Ok(()) => removed += 1,
                 Err(e) => warn!(
                     "Could not remove the finished devnet run directory {}: {e}",
@@ -241,37 +321,63 @@ fn sweep(parent: &Parent) {
     }
 }
 
-/// `Some` if `name` is a run that is over and not kept, so may be deleted.
-fn finished_run(parent: &Parent, name: &str) -> io::Result<Option<Run>> {
+/// `Some`, with its lock taken, if `name` is a run that is over and not kept,
+/// so may be deleted.
+fn finished_run(parent: &Parent, name: &str) -> io::Result<Option<(Run, File)>> {
     let run = parent.open_run(name)?;
     let marker = read_marker(&run)?;
     let pid_in_name = name.split_once('-').map(|(pid, _)| pid);
-    if marker.keep || pid_in_name != Some(marker.pid.to_string().as_str()) {
+    let id = run.id()?;
+    if marker.keep
+        || pid_in_name != Some(marker.pid.to_string().as_str())
+        || marker.file_id != id.file
+        || id.device != parent.id()?.device
+    {
         return Ok(None);
     }
     let lock = run.open_file(LOCK_FILE)?;
     match lock.try_lock() {
-        // Released again when `lock` drops, before the caller deletes. No run
-        // takes this lock again: a run only ever locks a directory it has
-        // just created.
-        Ok(()) => Ok(Some(run)),
+        // Held while the directory is deleted. No run takes this lock again:
+        // a run only ever locks a directory it has just created.
+        Ok(()) => Ok(Some((run, lock))),
         Err(TryLockError::WouldBlock) => Ok(None),
         Err(TryLockError::Error(e)) => Err(e),
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests set this to make a deletion fail after removing this many
+    /// entries, as one interrupted part-way would.
+    static FAIL_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Called before each entry a deletion removes, to fail where a test asks.
+#[cfg(test)]
+fn injected_failure() -> io::Result<()> {
+    FAIL_AFTER.with(|left| match left.get() {
+        Some(0) => Err(io::Error::other("injected failure")),
+        Some(n) => {
+            left.set(Some(n - 1));
+            Ok(())
+        }
+        None => Ok(()),
+    })
+}
+
 #[cfg(unix)]
 use unix::{Parent, Run};
 
-#[cfg(not(unix))]
-use path_based::{Parent, Run};
+#[cfg(windows)]
+use windows::{Parent, Run};
 
 /// Every operation relative to a directory handle, never following a link.
 #[cfg(unix)]
 mod unix {
-    use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+    use super::DirId;
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat};
     use rustix::io::Errno;
-    use std::ffi::CString;
+    use std::ffi::{CStr, CString};
     use std::fs::File;
     use std::io;
     use std::os::fd::OwnedFd;
@@ -327,17 +433,35 @@ mod unix {
                 .collect())
         }
 
-        /// Empty `run` through its handle, then remove the now-empty entry
-        /// `name`. Should `name` have been swapped for another directory in
-        /// between, `rmdir` removes that only if it is empty.
-        pub fn remove_run(&self, name: &str, run: Run) -> io::Result<()> {
-            remove_contents(&run.fd)?;
+        pub fn id(&self) -> io::Result<DirId> {
+            Ok(id(&rustix::fs::fstat(&self.fd)?))
+        }
+
+        /// The directory `name`, not following a link.
+        pub fn id_of(&self, name: &str) -> io::Result<DirId> {
+            let stat = rustix::fs::statat(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW)?;
+            if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{name} is not a directory"),
+                ));
+            }
+            Ok(id(&stat))
+        }
+
+        /// Close `run`, then remove the entry `name` if it is an empty
+        /// directory.
+        pub fn remove_empty(&self, name: &str, run: Run) -> io::Result<()> {
             drop(run);
             gone_is_fine(rustix::fs::unlinkat(&self.fd, name, AtFlags::REMOVEDIR))
         }
     }
 
     impl Run {
+        pub fn id(&self) -> io::Result<DirId> {
+            Ok(id(&rustix::fs::fstat(&self.fd)?))
+        }
+
         pub fn create_file(&self, name: &str) -> io::Result<File> {
             let fd = rustix::fs::openat(
                 &self.fd,
@@ -369,35 +493,52 @@ mod unix {
         pub fn rename(&self, from: &str, to: &str) -> io::Result<()> {
             Ok(rustix::fs::renameat(&self.fd, from, &self.fd, to)?)
         }
+
+        pub fn remove_file(&self, name: &str) -> io::Result<()> {
+            gone_is_fine(rustix::fs::unlinkat(&self.fd, name, AtFlags::empty()))
+        }
+
+        /// Delete everything in the directory but the entries named in `keep`.
+        pub fn remove_all_but(&self, keep: &[&str]) -> io::Result<()> {
+            for name in read_names(&self.fd)? {
+                if keep.iter().any(|keep| keep.as_bytes() == name.as_bytes()) {
+                    continue;
+                }
+                #[cfg(test)]
+                super::injected_failure()?;
+                remove_entry(&self.fd, &name)?;
+            }
+            Ok(())
+        }
     }
 
-    /// Delete everything in `dir`, descending only through handles opened
-    /// without following a link: a link is removed, never entered.
-    fn remove_contents(dir: &OwnedFd) -> io::Result<()> {
-        for name in read_names(dir)? {
-            let stat = match rustix::fs::statat(dir, name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW) {
-                Ok(stat) => stat,
-                Err(Errno::NOENT) => continue,
-                Err(e) => return Err(e.into()),
-            };
-            if FileType::from_raw_mode(stat.st_mode) == FileType::Directory {
-                let child = match rustix::fs::openat(dir, name.as_c_str(), DIR_FLAGS, Mode::empty())
-                {
-                    Ok(child) => child,
-                    Err(Errno::NOENT) => continue,
-                    Err(e) => return Err(e.into()),
-                };
-                remove_contents(&child)?;
-                gone_is_fine(rustix::fs::unlinkat(
-                    dir,
-                    name.as_c_str(),
-                    AtFlags::REMOVEDIR,
-                ))?;
-            } else {
-                gone_is_fine(rustix::fs::unlinkat(dir, name.as_c_str(), AtFlags::empty()))?;
-            }
+    fn id(stat: &Stat) -> DirId {
+        DirId {
+            device: stat.st_dev.to_string(),
+            file: stat.st_ino,
         }
-        Ok(())
+    }
+
+    /// Delete the entry `name` in `dir`, descending only through handles
+    /// opened without following a link: a link is removed, never entered.
+    fn remove_entry(dir: &OwnedFd, name: &CStr) -> io::Result<()> {
+        let stat = match rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => stat,
+            Err(Errno::NOENT) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+            return gone_is_fine(rustix::fs::unlinkat(dir, name, AtFlags::empty()));
+        }
+        let child = match rustix::fs::openat(dir, name, DIR_FLAGS, Mode::empty()) {
+            Ok(child) => child,
+            Err(Errno::NOENT) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        for entry in read_names(&child)? {
+            remove_entry(&child, &entry)?;
+        }
+        gone_is_fine(rustix::fs::unlinkat(dir, name, AtFlags::REMOVEDIR))
     }
 
     /// Every name in `dir` but `.` and `..`. Collected before anything is
@@ -423,51 +564,72 @@ mod unix {
     }
 }
 
-/// Without `openat`: the same checks, by path.
-#[cfg(not(unix))]
-mod path_based {
+/// Paths built on directories held open without delete sharing, which keeps
+/// them, and every directory above them, from being renamed or removed.
+#[cfg(windows)]
+mod windows {
+    use super::DirId;
     use std::fs::{File, OpenOptions};
     use std::io;
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use std::path::{Path, PathBuf};
 
-    /// The directory run directories are created in.
+    /// Lets `CreateFileW` open a directory.
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    /// Opens a link itself rather than what it points at.
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    /// `FILE_SHARE_READ | FILE_SHARE_WRITE`, without `FILE_SHARE_DELETE`.
+    const SHARE_ALL_BUT_DELETE: u32 = 0x1 | 0x2;
+
+    /// The directory run directories are created in, held open.
     pub struct Parent {
         pub path: PathBuf,
+        /// `path` with every link in it resolved.
+        real: PathBuf,
+        held: File,
     }
 
-    /// A run directory, checked to be a directory and not a link.
+    /// A run directory, held open.
     pub struct Run {
         path: PathBuf,
+        held: File,
     }
 
     impl Parent {
         pub fn open(path: &Path) -> io::Result<Self> {
             std::fs::create_dir_all(path)?;
+            let real = std::fs::canonicalize(path)?;
+            let held = hold_dir(&real)?;
+            // Held, none of its directories can be renamed or removed any
+            // more, so if `real` has no link in it now, it never will.
+            if std::fs::canonicalize(&real)? != real {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{} changed while it was being opened", path.display()),
+                ));
+            }
             Ok(Self {
                 path: path.to_path_buf(),
+                real,
+                held,
             })
         }
 
         pub fn create_run(&self, name: &str) -> io::Result<()> {
-            std::fs::create_dir(self.path.join(name))
+            std::fs::create_dir(self.real.join(name))
         }
 
         pub fn open_run(&self, name: &str) -> io::Result<Run> {
-            let path = self.path.join(name);
-            // `symlink_metadata` reports a symlink or junction as a link, not
-            // as the directory it points at.
-            if !std::fs::symlink_metadata(&path)?.is_dir() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("{} is not a directory", path.display()),
-                ));
-            }
-            Ok(Run { path })
+            let path = self.real.join(name);
+            let held = hold_dir(&path)?;
+            Ok(Run { path, held })
         }
 
         pub fn names(&self) -> io::Result<Vec<String>> {
             let mut names = Vec::new();
-            for entry in std::fs::read_dir(&self.path)? {
+            for entry in std::fs::read_dir(&self.real)? {
                 if let Ok(name) = entry?.file_name().into_string() {
                     names.push(name);
                 }
@@ -475,17 +637,28 @@ mod path_based {
             Ok(names)
         }
 
-        /// `run` is the check that `name` is a directory and not a link.
-        pub fn remove_run(&self, name: &str, run: Run) -> io::Result<()> {
+        pub fn id(&self) -> io::Result<DirId> {
+            id(&self.held)
+        }
+
+        /// The directory `name`, not following a link.
+        pub fn id_of(&self, name: &str) -> io::Result<DirId> {
+            id(&hold_dir(&self.real.join(name))?)
+        }
+
+        /// Close `run`, then remove the entry `name` if it is an empty
+        /// directory or a link.
+        pub fn remove_empty(&self, name: &str, run: Run) -> io::Result<()> {
             drop(run);
-            match std::fs::remove_dir_all(self.path.join(name)) {
-                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-                result => result,
-            }
+            gone_is_fine(std::fs::remove_dir(self.real.join(name)))
         }
     }
 
     impl Run {
+        pub fn id(&self) -> io::Result<DirId> {
+            id(&self.held)
+        }
+
         pub fn create_file(&self, name: &str) -> io::Result<File> {
             OpenOptions::new()
                 .read(true)
@@ -494,19 +667,87 @@ mod path_based {
                 .open(self.path.join(name))
         }
 
+        /// Open an existing regular file for reading and locking, not
+        /// following a link.
         pub fn open_file(&self, name: &str) -> io::Result<File> {
-            let path = self.path.join(name);
-            if !std::fs::symlink_metadata(&path)?.is_file() {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(self.path.join(name))?;
+            let meta = file.metadata()?;
+            if !meta.is_file() || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("{} is not a regular file", path.display()),
+                    format!("{name} is not a regular file"),
                 ));
             }
-            OpenOptions::new().read(true).write(true).open(path)
+            Ok(file)
         }
 
         pub fn rename(&self, from: &str, to: &str) -> io::Result<()> {
             std::fs::rename(self.path.join(from), self.path.join(to))
+        }
+
+        pub fn remove_file(&self, name: &str) -> io::Result<()> {
+            gone_is_fine(std::fs::remove_file(self.path.join(name)))
+        }
+
+        /// Delete everything in the directory but the entries named in `keep`.
+        pub fn remove_all_but(&self, keep: &[&str]) -> io::Result<()> {
+            for entry in std::fs::read_dir(&self.path)? {
+                let entry = entry?;
+                if keep.iter().any(|keep| entry.file_name() == *keep) {
+                    continue;
+                }
+                #[cfg(test)]
+                super::injected_failure()?;
+                // An entry's metadata describes a link, not what it points
+                // at. A link to a directory counts as a directory, and
+                // `remove_dir_all` removes the link itself.
+                let path = entry.path();
+                gone_is_fine(
+                    if entry.metadata()?.file_attributes() & FILE_ATTRIBUTE_DIRECTORY == 0 {
+                        std::fs::remove_file(path)
+                    } else {
+                        std::fs::remove_dir_all(path)
+                    },
+                )?;
+            }
+            Ok(())
+        }
+    }
+
+    /// Open the directory `path` to hold it, refusing a link.
+    fn hold_dir(path: &Path) -> io::Result<File> {
+        let dir = OpenOptions::new()
+            .read(true)
+            .share_mode(SHARE_ALL_BUT_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        let meta = dir.metadata()?;
+        if !meta.is_dir() || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} is not a directory", path.display()),
+            ));
+        }
+        Ok(dir)
+    }
+
+    fn id(file: &File) -> io::Result<DirId> {
+        let info = winapi_util::file::information(file)?;
+        Ok(DirId {
+            device: info.volume_serial_number().to_string(),
+            file: info.file_index(),
+        })
+    }
+
+    /// Something else, another run's sweep for one, may delete first.
+    fn gone_is_fine(result: io::Result<()>) -> io::Result<()> {
+        match result {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            result => result,
         }
     }
 }
@@ -549,6 +790,32 @@ mod tests {
         Ok(path)
     }
 
+    /// A directory `name` in `parent` carrying a free lock and a marker that
+    /// names it, for this process, as a finished run would, then `edit`ed;
+    /// and a sentinel file.
+    fn forged(
+        parent: &Path,
+        name: &str,
+        edit: impl FnOnce(&mut Marker),
+    ) -> std::result::Result<PathBuf, Box<dyn std::error::Error>> {
+        let dir = parent.join(name);
+        std::fs::create_dir_all(&dir)?;
+        let file_id = Parent::open(parent)?.open_run(name)?.id()?.file;
+        let mut marker = Marker {
+            run_id: "forged".to_string(),
+            file_id,
+            pid: std::process::id(),
+            started_at: 0,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            keep: false,
+        };
+        edit(&mut marker);
+        std::fs::write(dir.join(LOCK_FILE), b"")?;
+        std::fs::write(dir.join(MARKER_FILE), serde_json::to_vec(&marker)?)?;
+        std::fs::write(dir.join("sentinel"), b"keep")?;
+        Ok(dir)
+    }
+
     #[test]
     fn create_makes_a_locked_marked_directory_inside_the_parent() -> TestResult {
         let temp = tempfile::tempdir()?;
@@ -566,6 +833,7 @@ mod tests {
         let marker = marker_in(run.path())?;
         assert_eq!(marker.pid, std::process::id());
         assert_eq!(marker.run_id, run.run_id);
+        assert_eq!(marker.file_id, run.run.id()?.file);
         assert!(!marker.keep);
         assert!(!run.path().join(MARKER_TEMP_FILE).exists());
         assert!(
@@ -613,6 +881,48 @@ mod tests {
         Ok(())
     }
 
+    /// Hermes round 3 on #263: once the run directory has been moved away, a
+    /// directory put in its place, with copies of its marker and lock, is not
+    /// the run's, and nothing is deleted.
+    #[cfg(unix)]
+    #[test]
+    fn remove_refuses_a_replacement_carrying_a_copy_of_the_marker() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let run = RunDir::create(temp.path(), false)?;
+        let path = run.path().to_path_buf();
+        std::fs::write(path.join("data"), b"the run's")?;
+        let moved = temp.path().join("moved");
+        std::fs::rename(&path, &moved)?;
+        std::fs::create_dir(&path)?;
+        std::fs::copy(moved.join(MARKER_FILE), path.join(MARKER_FILE))?;
+        std::fs::copy(moved.join(LOCK_FILE), path.join(LOCK_FILE))?;
+        std::fs::write(path.join("sentinel"), b"not the run's")?;
+
+        assert!(run.remove().is_err());
+        assert!(path.join("sentinel").is_file());
+        assert!(path.join(MARKER_FILE).is_file());
+        assert!(moved.join("data").is_file());
+        Ok(())
+    }
+
+    /// On Windows the same replacement cannot even be set up: while a run
+    /// lasts, neither its directory nor the parent can be moved.
+    #[cfg(windows)]
+    #[test]
+    fn a_run_directory_and_its_parent_cannot_be_moved_while_the_run_lasts() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let parent = temp.path().join("devnets");
+        let run = RunDir::create(&parent, false)?;
+        let path = run.path().to_path_buf();
+
+        assert!(std::fs::rename(&path, parent.join("moved")).is_err());
+        assert!(std::fs::rename(&parent, temp.path().join("moved")).is_err());
+
+        run.remove()?;
+        assert!(!path.exists());
+        Ok(())
+    }
+
     #[test]
     fn the_next_run_sweeps_a_finished_run() -> TestResult {
         let temp = tempfile::tempdir()?;
@@ -623,6 +933,31 @@ mod tests {
 
         assert!(!old.exists(), "{} was not swept", old.display());
         assert!(run.path().is_dir());
+        Ok(())
+    }
+
+    /// Hermes round 3 on #263: a deletion that stops part-way leaves the
+    /// marker and the lock, so the next run still knows the rest is a
+    /// finished run's, and removes it.
+    #[test]
+    fn a_removal_that_stops_part_way_is_finished_by_the_next_run() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let run = RunDir::create(temp.path(), false)?;
+        let path = run.path().to_path_buf();
+        for i in 0..4 {
+            std::fs::create_dir_all(path.join(format!("node-{i}")))?;
+            std::fs::write(path.join(format!("node-{i}")).join("chunk"), b"data")?;
+        }
+
+        FAIL_AFTER.with(|left| left.set(Some(2)));
+        let stopped = run.remove();
+        FAIL_AFTER.with(|left| left.set(None));
+
+        assert!(stopped.is_err());
+        assert!(path.join(MARKER_FILE).is_file());
+        assert!(path.join(LOCK_FILE).is_file());
+        let _next = RunDir::create(temp.path(), false)?;
+        assert!(!path.exists(), "{} was not swept", path.display());
         Ok(())
     }
 
@@ -639,6 +974,20 @@ mod tests {
     }
 
     #[test]
+    fn a_run_kept_locked_until_exit_is_never_swept() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let run = RunDir::create(temp.path(), false)?;
+        let path = run.path().to_path_buf();
+        run.keep_locked_until_exit();
+
+        let _next = RunDir::create(temp.path(), false)?;
+
+        assert!(path.join(MARKER_FILE).is_file());
+        assert!(!lock_is_free(&path)?);
+        Ok(())
+    }
+
+    #[test]
     fn a_kept_run_is_never_swept() -> TestResult {
         let temp = tempfile::tempdir()?;
         let kept = finished(temp.path(), true)?;
@@ -650,20 +999,31 @@ mod tests {
         Ok(())
     }
 
+    /// Hermes round 3 on #263: a finished run's directory moved away, and
+    /// another put in its place with copies of its marker and lock. The copy
+    /// names the moved directory, not this one.
+    #[test]
+    fn a_copy_of_a_finished_runs_marker_is_never_swept() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let old = finished(temp.path(), false)?;
+        let moved = temp.path().join("moved");
+        std::fs::rename(&old, &moved)?;
+        std::fs::create_dir(&old)?;
+        std::fs::copy(moved.join(MARKER_FILE), old.join(MARKER_FILE))?;
+        std::fs::copy(moved.join(LOCK_FILE), old.join(LOCK_FILE))?;
+        std::fs::write(old.join("sentinel"), b"keep")?;
+
+        let _run = RunDir::create(temp.path(), false)?;
+
+        assert!(old.join("sentinel").is_file());
+        assert!(moved.join("nodes").join("peer").join("chunk").is_file());
+        Ok(())
+    }
+
     #[test]
     fn directories_without_a_matching_marker_are_never_swept() -> TestResult {
         let temp = tempfile::tempdir()?;
         let parent = temp.path();
-        // A finished run's marker and lock, copied into places a sweep must leave.
-        let donor = finished(&temp.path().join("donor"), false)?;
-        let copy_run = |name: &str| -> std::io::Result<PathBuf> {
-            let dir = parent.join(name);
-            std::fs::create_dir_all(&dir)?;
-            std::fs::copy(donor.join(MARKER_FILE), dir.join(MARKER_FILE))?;
-            std::fs::copy(donor.join(LOCK_FILE), dir.join(LOCK_FILE))?;
-            std::fs::write(dir.join("sentinel"), b"keep")?;
-            Ok(dir)
-        };
         let pid = std::process::id();
         let survivors = [
             // The right shape but no marker.
@@ -674,31 +1034,42 @@ mod tests {
                 dir
             },
             // A marker, but not a run directory's name.
-            copy_run("other")?,
-            copy_run(&format!("{pid}-DEADBEEF"))?,
-            copy_run(&format!("{pid}-deadbeef0"))?,
-            // A marker naming another process.
-            copy_run(&format!("{}-deadbeef", pid.wrapping_add(1)))?,
+            forged(parent, "other", |_| {})?,
+            forged(parent, &format!("{pid}-DEADBEEF"), |_| {})?,
+            forged(parent, &format!("{pid}-deadbeef0"), |_| {})?,
+            // A marker naming another process than the name does.
+            forged(parent, &format!("{}-deadbeef", pid.wrapping_add(1)), |_| {})?,
+            // A marker naming another directory.
+            forged(parent, &format!("{pid}-d1ffe4e7"), |marker| {
+                marker.file_id = marker.file_id.wrapping_add(1);
+            })?,
+            // A marker asking to keep it.
+            forged(parent, &format!("{pid}-cee9cee9"), |marker| {
+                marker.keep = true;
+            })?,
             // A marker that is not one.
             {
-                let dir = copy_run(&format!("{pid}-0badf00d"))?;
+                let dir = forged(parent, &format!("{pid}-0badf00d"), |_| {})?;
                 std::fs::write(dir.join(MARKER_FILE), b"{ not json")?;
                 dir
             },
             {
-                let dir = copy_run(&format!("{pid}-0ddba11a"))?;
+                let dir = forged(parent, &format!("{pid}-0ddba11a"), |_| {})?;
                 let mut big = std::fs::read(dir.join(MARKER_FILE))?;
                 big.resize(MAX_MARKER_LEN + 1, b' ');
                 std::fs::write(dir.join(MARKER_FILE), big)?;
                 dir
             },
-            // A marker but no lock: a run that never got as far as locking.
+            // A marker but no lock: a run never marks before it has locked.
             {
-                let dir = copy_run(&format!("{pid}-ca11ab1e"))?;
+                let dir = forged(parent, &format!("{pid}-ca11ab1e"), |_| {})?;
                 std::fs::remove_file(dir.join(LOCK_FILE))?;
                 dir
             },
         ];
+        // Unedited, the same forgery is swept: each survivor survives for
+        // its one difference alone.
+        let control = forged(parent, &format!("{pid}-c0ffee00"), |_| {})?;
 
         let _run = RunDir::create(parent, false)?;
 
@@ -709,6 +1080,7 @@ mod tests {
                 dir.display()
             );
         }
+        assert!(!control.exists(), "{} was not swept", control.display());
         Ok(())
     }
 
@@ -798,6 +1170,53 @@ mod tests {
         assert!(
             decoy.join("sentinel").is_file(),
             "the removal followed the retargeted link"
+        );
+        Ok(())
+    }
+
+    /// `mklink /J`: a directory junction, which needs no privilege to make.
+    #[cfg(windows)]
+    fn junction(link: &Path, target: &Path) -> TestResult {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("mklink /J {} {} failed", link.display(), target.display()).into())
+        }
+    }
+
+    /// The same on Windows, with a junction.
+    #[cfg(windows)]
+    #[test]
+    fn retargeting_a_junction_above_the_run_does_not_redirect_removal() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        std::fs::create_dir_all(&first)?;
+        std::fs::create_dir_all(&second)?;
+        let link = temp.path().join("link");
+        junction(&link, &first)?;
+
+        let run = RunDir::create(&link.join("devnets"), false)?;
+        let name = run.path().file_name().ok_or("no name")?.to_owned();
+        let decoy = second.join("devnets").join(&name);
+        std::fs::create_dir_all(&decoy)?;
+        std::fs::copy(run.path().join(MARKER_FILE), decoy.join(MARKER_FILE))?;
+        std::fs::write(decoy.join("sentinel"), b"keep")?;
+        std::fs::remove_dir(&link)?;
+        junction(&link, &second)?;
+
+        run.remove()?;
+
+        assert!(!first.join("devnets").join(&name).exists());
+        assert!(
+            decoy.join("sentinel").is_file(),
+            "the removal followed the retargeted junction"
         );
         Ok(())
     }

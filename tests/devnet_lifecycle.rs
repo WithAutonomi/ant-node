@@ -17,6 +17,7 @@
 
 use ant_node::devnet::MARKER_FILE;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread::sleep;
@@ -27,27 +28,31 @@ const STARTUP_TIMEOUT: Duration = Duration::from_mins(4);
 /// How long a stopped devnet may take to shut down and exit.
 const EXIT_TIMEOUT: Duration = Duration::from_mins(1);
 
-/// A running ant-devnet, stopped if a test fails before stopping it.
+/// A running ant-devnet, in a process group of its own that Anvil, its child,
+/// joins. Whatever is left of the group is killed when a test ends, however
+/// it ends.
 struct Devnet(Child);
 
 impl Drop for Devnet {
-    /// SIGTERM first: ant-devnet then stops Anvil itself. SIGKILL skips the
-    /// destructors that do that, so when it comes to SIGKILL, Anvil, its one
-    /// child process, is killed first rather than orphaned.
+    /// SIGTERM first, if it is still running: ant-devnet then stops Anvil
+    /// itself. Then SIGKILL to the whole group, for an Anvil left running by
+    /// a devnet that was killed, or that exited without stopping it.
     fn drop(&mut self) {
-        if !matches!(self.0.try_wait(), Ok(None)) {
-            return;
-        }
-        let pid = self.0.id().to_string();
-        let _ = Command::new("kill").args(["-TERM", &pid]).status();
-        let deadline = Instant::now() + EXIT_TIMEOUT;
-        while Instant::now() < deadline {
-            if !matches!(self.0.try_wait(), Ok(None)) {
-                return;
+        let pid = self.0.id();
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status();
+            let deadline = Instant::now() + EXIT_TIMEOUT;
+            while Instant::now() < deadline && matches!(self.0.try_wait(), Ok(None)) {
+                sleep(Duration::from_millis(100));
             }
-            sleep(Duration::from_millis(100));
         }
-        let _ = Command::new("pkill").args(["-KILL", "-P", &pid]).status();
+        // The group outlives ant-devnet for as long as Anvil is in it.
+        let _ = Command::new("kill")
+            .args(["-s", "KILL", "--", &format!("-{pid}")])
+            .stderr(Stdio::null())
+            .status();
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
@@ -57,6 +62,7 @@ impl Devnet {
     fn spawn(home: &Path, args: &[&str]) -> Self {
         let child = Command::new(env!("CARGO_BIN_EXE_ant-devnet"))
             .args(args)
+            .process_group(0)
             .env("HOME", home)
             .env("XDG_DATA_HOME", home.join("data"))
             .stdin(Stdio::null())
