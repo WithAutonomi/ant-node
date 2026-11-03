@@ -669,15 +669,14 @@ pub async fn spawn(
         p2p,
         ant_protocol,
         payment,
-        endpoint: RwLock::new(None),
+        publication: RwLock::new(Publication::default()),
         endpoint_catalog,
         port_mapping: upnp
             .as_ref()
             .map(|service| Box::new(service.subscribe()) as Box<dyn PortMapping>),
-        endpoint_needs_mapping: AtomicBool::new(false),
     });
     refresh_browser_endpoint(&state, root_dir, local_addr, certificate_sha256).await?;
-    let browser_endpoint = state.endpoint.read().clone();
+    let browser_endpoint = state.publication.read().endpoint().cloned();
     if browser_endpoint.is_none() {
         // Do not leave a previous run's socket advertised while discovery is pending.
         remove_persisted_browser_endpoint(root_dir).await?;
@@ -756,26 +755,16 @@ async fn refresh_browser_endpoint(
         .port_mapping
         .as_ref()
         .and_then(|mapping| mapping.external());
-    let Some(address) = advertised_addr(&state.config, local_addr, mapped, &native) else {
+    let Some((address, source)) = advertised_addr(&state.config, local_addr, mapped, &native)
+    else {
         // As with native publication, keep the last nonempty address set,
-        // unless only a mapping the gateway no longer holds made it reachable.
-        // The flag stays set until the withdrawal completes, so the next
-        // refresh retries a step that failed.
-        if state.endpoint_needs_mapping.load(Ordering::Acquire) {
-            withdraw_browser_endpoint(state, root_dir).await?;
-            state.endpoint_needs_mapping.store(false, Ordering::Release);
-        }
-        return Ok(());
+        // unless it came from a mapping the gateway no longer holds.
+        return withdraw_mapped_endpoint(state, root_dir).await;
     };
-    let needs_mapping =
-        valid_only_while_mapped(&state.config, local_addr, mapped, &native, address);
     let peer_id = *state.p2p.peer_id();
     let endpoint = BrowserEndpoint::new(address, peer_id.to_bytes(), certificate_sha256)
         .map_err(|error| Error::Config(error.to_string()))?;
-    if state.endpoint.read().as_ref() == Some(&endpoint) {
-        state
-            .endpoint_needs_mapping
-            .store(needs_mapping, Ordering::Release);
+    if state.publication.write().reconfirm(&endpoint, source) {
         return Ok(());
     }
     let supplemental = endpoint
@@ -786,10 +775,7 @@ async fn refresh_browser_endpoint(
     if let Some(catalog) = state.endpoint_catalog.as_ref() {
         catalog.insert(peer_id, endpoint.clone());
     }
-    *state.endpoint.write() = Some(endpoint);
-    state
-        .endpoint_needs_mapping
-        .store(needs_mapping, Ordering::Release);
+    *state.publication.write() = Publication::Published { endpoint, source };
     state
         .p2p
         .dht_manager()
@@ -798,13 +784,16 @@ async fn refresh_browser_endpoint(
     Ok(())
 }
 
-/// Stop advertising the browser endpoint everywhere it was published: HELLO,
-/// the in-process catalog, the DHT address record and the endpoint file.
+/// Withdraw an endpoint whose address only a gateway mapping that has ended
+/// provided, everywhere it was published: HELLO, the in-process catalog and
+/// the DHT address record first, once, then the endpoint file. Any other
+/// publication is kept.
 ///
-/// What peers and browsers see is withdrawn first, once, and cannot fail.
-/// Removing the file can fail; calling this again retries only that step.
-async fn withdraw_browser_endpoint(state: &ServerState, root_dir: &Path) -> Result<()> {
-    let withdrawn = state.endpoint.write().take();
+/// The first three cannot fail, so a file error never keeps the endpoint
+/// advertised. It leaves the publication [`Publication::Withdrawing`], and the
+/// next call retries only the file.
+async fn withdraw_mapped_endpoint(state: &ServerState, root_dir: &Path) -> Result<()> {
+    let withdrawn = state.publication.write().begin_withdrawal();
     if let Some(withdrawn) = withdrawn {
         info!(endpoint = %withdrawn.multiaddr,
             "WebRTC Direct endpoint withdrawn: its gateway mapping ended");
@@ -817,7 +806,12 @@ async fn withdraw_browser_endpoint(state: &ServerState, root_dir: &Path) -> Resu
             .set_supplemental_self_addresses(Vec::new())
             .await;
     }
-    remove_persisted_browser_endpoint(root_dir).await
+    if *state.publication.read() != Publication::Withdrawing {
+        return Ok(());
+    }
+    remove_persisted_browser_endpoint(root_dir).await?;
+    *state.publication.write() = Publication::Unpublished;
+    Ok(())
 }
 
 async fn remove_persisted_browser_endpoint(root_dir: &Path) -> Result<()> {
@@ -974,47 +968,108 @@ impl PortMapping for UpnpStateRx {
     }
 }
 
-/// Whether `address` reaches the listener only through the gateway's mapping:
-/// it is the mapping, and the native view would not yield it without one.
-fn valid_only_while_mapped(
-    config: &WebRtcDirectConfig,
-    local_addr: SocketAddr,
-    mapped: Option<SocketAddr>,
-    native_addresses: &[(MultiAddr, AddressType)],
-    address: SocketAddr,
-) -> bool {
-    mapped == Some(address)
-        && advertised_addr(config, local_addr, None, native_addresses) != Some(address)
+/// Where an advertised browser address came from, in order of precedence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddressSource {
+    /// The operator's `advertised_addr`.
+    Operator,
+    /// An explicit bind address.
+    Bind,
+    /// The gateway's mapping of the listener's port, which the native view
+    /// does not yield. It is valid only while the gateway holds the mapping.
+    Mapped,
+    /// The native self-address view's IP with the listener's port.
+    Native,
 }
 
-/// The address browsers dial: the operator's advertisement, an explicit bind,
-/// the gateway's mapping of the listener's port (`mapped`), or else the native
-/// self-address view's IP with the listener's port.
+/// What the listener advertises to browsers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum Publication {
+    /// Nothing: no address is known yet, or a mapped endpoint was withdrawn.
+    #[default]
+    Unpublished,
+    /// The endpoint browsers dial, and where its address came from.
+    Published {
+        endpoint: BrowserEndpoint,
+        source: AddressSource,
+    },
+    /// A mapped endpoint was withdrawn from peers, but its endpoint file is
+    /// not removed yet.
+    Withdrawing,
+}
+
+impl Publication {
+    fn endpoint(&self) -> Option<&BrowserEndpoint> {
+        match self {
+            Self::Published { endpoint, .. } => Some(endpoint),
+            Self::Unpublished | Self::Withdrawing => None,
+        }
+    }
+
+    /// Whether `endpoint` is already published, recording `source` for it if
+    /// so: the same address may come from another source than before.
+    fn reconfirm(&mut self, endpoint: &BrowserEndpoint, source: AddressSource) -> bool {
+        match self {
+            Self::Published {
+                endpoint: published,
+                source: published_source,
+            } if published == endpoint => {
+                *published_source = source;
+                true
+            }
+            Self::Published { .. } | Self::Unpublished | Self::Withdrawing => false,
+        }
+    }
+
+    /// Start withdrawing a mapped endpoint, returning it. Any other
+    /// publication is kept, and `None` returned.
+    fn begin_withdrawal(&mut self) -> Option<BrowserEndpoint> {
+        match std::mem::take(self) {
+            Self::Published {
+                endpoint,
+                source: AddressSource::Mapped,
+            } => {
+                *self = Self::Withdrawing;
+                Some(endpoint)
+            }
+            kept => {
+                *self = kept;
+                None
+            }
+        }
+    }
+}
+
+/// The address browsers dial and its source: the operator's advertisement, an
+/// explicit bind, the gateway's mapping of the listener's port (`mapped`), or
+/// else the native self-address view's IP with the listener's port.
 fn advertised_addr(
     config: &WebRtcDirectConfig,
     local_addr: SocketAddr,
     mapped: Option<SocketAddr>,
     native_addresses: &[(MultiAddr, AddressType)],
-) -> Option<SocketAddr> {
+) -> Option<(SocketAddr, AddressSource)> {
     if let Some(addr) = config.advertised_addr {
-        return Some(addr);
+        return Some((addr, AddressSource::Operator));
     }
     if !local_addr.ip().is_unspecified() {
-        return Some(local_addr);
-    }
-    // Behind NAT the gateway drops unsolicited traffic to the listener's own
-    // port, so the address it forwards is the one browsers can reach.
-    if let Some(mapped) = mapped.filter(|addr| addr.is_ipv4() == local_addr.is_ipv4()) {
-        return Some(mapped);
+        return Some((local_addr, AddressSource::Bind));
     }
     // The native self-address view already applies observation, scope and
     // priority policy. Relay sockets belong to the relay, not this listener.
-    native_addresses
+    let native = native_addresses
         .iter()
         .filter(|(_, kind)| *kind != AddressType::Relay)
         .filter_map(|(address, _)| address.socket_addr())
         .find(|addr| addr.is_ipv4() == local_addr.is_ipv4())
-        .map(|addr| SocketAddr::new(addr.ip(), local_addr.port()))
+        .map(|addr| SocketAddr::new(addr.ip(), local_addr.port()));
+    // Behind NAT the gateway drops unsolicited traffic to the listener's own
+    // port, so the address it forwards is the one browsers can reach. When
+    // the native view yields that same address, it does not need the mapping.
+    match mapped.filter(|addr| addr.is_ipv4() == local_addr.is_ipv4()) {
+        Some(mapped) if native != Some(mapped) => Some((mapped, AddressSource::Mapped)),
+        _ => native.map(|addr| (addr, AddressSource::Native)),
+    }
 }
 
 #[allow(clippy::significant_drop_tightening)]
@@ -1897,7 +1952,7 @@ fn encode_binary_response(message: &ChunkMessage, limit: usize) -> ServerResult<
 }
 
 fn hello_response(request_id: u64, state: &ServerState) -> Response {
-    let Some(endpoint) = state.endpoint.read().clone() else {
+    let Some(endpoint) = state.publication.read().endpoint().cloned() else {
         return Response::error(
             request_id,
             "endpoint_unavailable",
@@ -2395,13 +2450,10 @@ struct ServerState {
     p2p: Arc<P2PNode>,
     ant_protocol: Option<Arc<AntProtocol>>,
     payment: BrowserPaymentNetwork,
-    endpoint: RwLock<Option<BrowserEndpoint>>,
+    publication: RwLock<Publication>,
     endpoint_catalog: Option<Arc<BrowserEndpointCatalog>>,
     /// The gateway mapping of the listener's port, when the listener asked for one.
     port_mapping: Option<Box<dyn PortMapping>>,
-    /// The published endpoint reaches the listener only through that mapping,
-    /// so it is withdrawn when the mapping ends and nothing replaces it.
-    endpoint_needs_mapping: AtomicBool,
 }
 
 #[cfg(test)]
@@ -3070,12 +3122,18 @@ mod tests {
         ));
         assert_eq!(
             advertised_addr(&config, local, None, &addresses),
-            Some("198.51.100.2:43210".parse().expect("WebRTC"))
+            Some((
+                "198.51.100.2:43210".parse().expect("WebRTC"),
+                AddressSource::Native
+            ))
         );
         addresses[2].0 = MultiAddr::quic("198.51.100.3:2000".parse().expect("new observed"));
         assert_eq!(
             advertised_addr(&config, local, None, &addresses),
-            Some("198.51.100.3:43210".parse().expect("updated WebRTC"))
+            Some((
+                "198.51.100.3:43210".parse().expect("updated WebRTC"),
+                AddressSource::Native
+            ))
         );
     }
 
@@ -3090,7 +3148,7 @@ mod tests {
         assert_ne!(local.port(), 0);
         assert_eq!(
             advertised_addr(&WebRtcDirectConfig::default(), local, None, &[]),
-            Some(local)
+            Some((local, AddressSource::Bind))
         );
         let config = WebRtcDirectConfig {
             advertised_addr: Some("198.51.100.4:11000".parse().expect("advertised")),
@@ -3098,7 +3156,9 @@ mod tests {
         };
         assert_eq!(
             advertised_addr(&config, local, None, &[]),
-            config.advertised_addr
+            config
+                .advertised_addr
+                .map(|addr| (addr, AddressSource::Operator))
         );
         listener.close().await.expect("close listener");
     }
@@ -3146,27 +3206,28 @@ mod tests {
             AddressType::Direct,
         )];
         let mapped: SocketAddr = "198.51.100.2:51000".parse().expect("mapped");
+        let native_view: SocketAddr = "198.51.100.2:43210".parse().expect("native view");
         let default = WebRtcDirectConfig::default();
         // The gateway may forward another external port than the listener's.
         assert_eq!(
             advertised_addr(&default, local, Some(mapped), &native),
-            Some(mapped)
+            Some((mapped, AddressSource::Mapped))
         );
         // A mapping needs no native discovery to be published.
         assert_eq!(
             advertised_addr(&default, local, Some(mapped), &[]),
-            Some(mapped)
+            Some((mapped, AddressSource::Mapped))
         );
         // A mapping in the other address family cannot reach this listener.
         let mapped_v6 = "[2001:db8::2]:51000".parse().expect("IPv6 mapping");
         assert_eq!(
             advertised_addr(&default, local, Some(mapped_v6), &native),
-            Some("198.51.100.2:43210".parse().expect("native view"))
+            Some((native_view, AddressSource::Native))
         );
         // Losing the mapping falls back to the native view.
         assert_eq!(
             advertised_addr(&default, local, None, &native),
-            Some("198.51.100.2:43210".parse().expect("native view"))
+            Some((native_view, AddressSource::Native))
         );
         // An operator's advertisement still wins.
         let advertised = WebRtcDirectConfig {
@@ -3175,48 +3236,26 @@ mod tests {
         };
         assert_eq!(
             advertised_addr(&advertised, local, Some(mapped), &native),
-            advertised.advertised_addr
+            advertised
+                .advertised_addr
+                .map(|addr| (addr, AddressSource::Operator))
         );
     }
 
     #[test]
-    fn only_an_address_the_native_view_lacks_needs_the_mapping() {
+    fn a_mapping_the_native_view_also_yields_comes_from_the_native_view() {
         let local = "0.0.0.0:43210".parse().expect("wildcard listener");
         let native = vec![(
             MultiAddr::quic("198.51.100.2:1000".parse().expect("observed")),
             AddressType::Direct,
         )];
-        let default = WebRtcDirectConfig::default();
-        // The gateway forwarded another port than the listener's.
-        let moved: SocketAddr = "198.51.100.2:51000".parse().expect("mapped");
-        assert!(valid_only_while_mapped(
-            &default,
-            local,
-            Some(moved),
-            &native,
-            moved
-        ));
-        // Without a native view the mapping is the only address.
-        assert!(valid_only_while_mapped(
-            &default,
-            local,
-            Some(moved),
-            &[],
-            moved
-        ));
-        // The gateway kept the port and the native view yields the same
-        // address, which stays published without the mapping, as before.
+        // The gateway kept the listener's port, so the native view yields the
+        // same address, which stays published without the mapping, as before.
         let kept: SocketAddr = "198.51.100.2:43210".parse().expect("mapped");
-        assert!(!valid_only_while_mapped(
-            &default,
-            local,
-            Some(kept),
-            &native,
-            kept
-        ));
-        assert!(!valid_only_while_mapped(
-            &default, local, None, &native, kept
-        ));
+        assert_eq!(
+            advertised_addr(&WebRtcDirectConfig::default(), local, Some(kept), &native),
+            Some((kept, AddressSource::Native))
+        );
     }
 
     /// A mapping the test can grant and take away.
@@ -3267,10 +3306,9 @@ mod tests {
                     payment_token_address: String::new(),
                     payment_vault_address: String::new(),
                 },
-                endpoint: RwLock::new(None),
+                publication: RwLock::new(Publication::default()),
                 endpoint_catalog: Some(Arc::clone(&catalog)),
                 port_mapping: Some(Box::new(TestMapping(Arc::clone(&mapping)))),
-                endpoint_needs_mapping: AtomicBool::new(false),
             };
             Self {
                 p2p,
@@ -3300,6 +3338,10 @@ mod tests {
             *self.p2p.peer_id()
         }
 
+        fn publication(&self) -> Publication {
+            self.state.publication.read().clone()
+        }
+
         async fn supplemental(&self) -> Vec<MultiAddr> {
             self.p2p
                 .dht_manager()
@@ -3309,7 +3351,7 @@ mod tests {
 
         /// Assert that peers and browsers no longer see the endpoint.
         async fn assert_unpublished(&self) {
-            assert!(self.state.endpoint.read().is_none());
+            assert_eq!(self.publication().endpoint(), None);
             assert_eq!(self.catalog.get(&self.peer_id()), None);
             assert_eq!(self.supplemental().await, Vec::<MultiAddr>::new());
         }
@@ -3321,11 +3363,17 @@ mod tests {
 
         listener.refresh().await.expect("publish the mapping");
         let published = listener
-            .state
-            .endpoint
-            .read()
-            .clone()
+            .publication()
+            .endpoint()
+            .cloned()
             .expect("published endpoint");
+        assert_eq!(
+            listener.publication(),
+            Publication::Published {
+                endpoint: published.clone(),
+                source: AddressSource::Mapped
+            }
+        );
         assert!(published.multiaddr.contains("/198.51.100.2/udp/51000/"));
         assert!(tokio::fs::read_to_string(listener.file())
             .await
@@ -3341,7 +3389,7 @@ mod tests {
 
         // With nothing published, a later refresh without a mapping is a no-op.
         listener.refresh().await.expect("nothing to withdraw");
-        assert!(listener.state.endpoint.read().is_none());
+        assert_eq!(listener.publication(), Publication::Unpublished);
     }
 
     #[tokio::test]
@@ -3362,6 +3410,7 @@ mod tests {
             .await
             .expect_err("the endpoint file cannot be removed");
         listener.assert_unpublished().await;
+        assert_eq!(listener.publication(), Publication::Withdrawing);
 
         // Once the file can be removed, the next refresh finishes the withdrawal.
         tokio::fs::remove_dir(listener.file())
@@ -3373,10 +3422,39 @@ mod tests {
         listener.refresh().await.expect("finish the withdrawal");
         assert!(!listener.file().exists());
         listener.assert_unpublished().await;
-        assert!(!listener
-            .state
-            .endpoint_needs_mapping
-            .load(Ordering::Acquire));
+        assert_eq!(listener.publication(), Publication::Unpublished);
+    }
+
+    #[test]
+    fn only_a_mapped_publication_is_withdrawn() {
+        let endpoint = BrowserEndpoint::new(
+            "198.51.100.2:43210".parse().expect("socket address"),
+            PeerId::from_bytes([0x42; 32]).to_bytes(),
+            CERTIFICATE_SHA256,
+        )
+        .expect("browser endpoint");
+        for source in [
+            AddressSource::Operator,
+            AddressSource::Bind,
+            AddressSource::Native,
+        ] {
+            let kept = Publication::Published {
+                endpoint: endpoint.clone(),
+                source,
+            };
+            let mut publication = kept.clone();
+            assert_eq!(publication.begin_withdrawal(), None);
+            assert_eq!(publication, kept);
+        }
+        let mut mapped = Publication::Published {
+            endpoint: endpoint.clone(),
+            source: AddressSource::Mapped,
+        };
+        assert_eq!(mapped.begin_withdrawal(), Some(endpoint));
+        assert_eq!(mapped, Publication::Withdrawing);
+        // A withdrawal already under way has nothing left to take.
+        assert_eq!(mapped.begin_withdrawal(), None);
+        assert_eq!(mapped, Publication::Withdrawing);
     }
 
     #[test]
@@ -3482,9 +3560,11 @@ mod tests {
     #[test]
     fn derives_ipv6_advertised_address() {
         let config = WebRtcDirectConfig::default();
-        let addr = advertised_addr(&config, "[::1]:23456".parse().expect("socket"), None, &[])
-            .expect("advertised address");
+        let (addr, source) =
+            advertised_addr(&config, "[::1]:23456".parse().expect("socket"), None, &[])
+                .expect("advertised address");
         assert_eq!(addr, "[::1]:23456".parse().expect("socket"));
+        assert_eq!(source, AddressSource::Bind);
     }
 
     #[tokio::test]
