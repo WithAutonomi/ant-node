@@ -46,6 +46,9 @@ pub struct Cli {
     pub webrtc_direct_port: Option<u16>,
 
     /// Literal public UDP address to advertise instead of the bind address.
+    ///
+    /// Setting it also stops the node asking the local gateway to forward the
+    /// WebRTC Direct port.
     #[arg(long, env = "ANT_WEBRTC_DIRECT_ADVERTISED_ADDR")]
     pub webrtc_direct_advertised_addr: Option<SocketAddr>,
 
