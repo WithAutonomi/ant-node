@@ -2771,13 +2771,14 @@ mod tests {
         }
     }
 
-    /// Distance is not possession: a node outside even a complete paid-width
-    /// group still keeps a mature record its close group has not proven.
+    /// Distance is not possession: a node outside a complete retention group
+    /// still keeps a mature record its close group has not proven. How far
+    /// outside it is cannot matter, since revalidation is given no distance.
     #[test]
-    fn revalidation_retains_record_far_outside_group_without_proofs() {
+    fn revalidation_retains_record_outside_complete_group_without_proofs() {
         let self_id = peer_id_from_byte(SELF_BYTE);
         let key = key_from_byte(0xB5);
-        let far_admission_peers = peer_ids(ReplicationConfig::default().paid_list_close_group_size);
+        let retention_peers = peer_ids(PROD_RETENTION_WIDTH);
         let strict_close_peers = peer_ids(PROD_CLOSE_GROUP);
         let candidate = candidate(key, strict_close_peers.clone());
         let first_seen = Instant::now();
@@ -2785,7 +2786,7 @@ mod tests {
             &self_id,
             Some(first_seen),
             false,
-            &far_admission_peers,
+            &retention_peers,
             &strict_close_peers,
             matured(first_seen),
         );

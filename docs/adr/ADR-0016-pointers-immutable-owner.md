@@ -145,7 +145,9 @@ over one state.
   hysteresis period is deleted only once all but one of the current close group
   prove they hold that state or a newer one by returning a valid record, however
   far outside the group the node has moved. A proof is a record, not a claim:
-  signatures are checked.
+  signatures are checked. Each pass takes a bounded number of candidates,
+  starting past where the last pass stopped, and asks each candidate's group at
+  once, so records nobody can prove yet never keep the rest from a turn.
 - **Possession.** Some minutes after offering a fresh state, the offering node
   asks each member for the record. One that is still responsible and cannot
   produce that state or a newer one is penalised, as a chunk holder is.
@@ -262,6 +264,13 @@ verified when it was committed and every read verifies it again.
   to 2,048 of them, about 11 MB.
 - The subtree audit's protocol id moved to `v2`, so across the upgrade the
   old and new releases do not audit each other.
+- **Far copies wait for capability.** A node learns a peer is capable only
+  from that peer's own pointer messages, which neighbour sync delivers between
+  near peers. A node that has moved far outside a record's group may never hear
+  from that group, so it cannot ask enough of it for proof and keeps the record:
+  storage held, never a copy lost. This lasts until the capability gate is
+  retired, once no peer older than pointers remains, after which every group
+  member is asked.
 
 ## Implementation status
 
@@ -373,7 +382,10 @@ receipt is paid again on retry.
   peer pinned before the upgrade, and a pointer-leaves file from another
   snapshot attaches nothing.
 - Pruning keeps a pointer a retained commitment holds, and drops it once none
-  does.
+  does. Each pass starts past the last candidate the previous one took, so
+  candidates nobody can prove never starve the rest; proofs are taken without
+  waiting on a peer that stalls, and a group that can no longer reach the
+  threshold, or has too few capable members to, is given up at once.
 - Fresh offers, hints, fetches and state queries are covered by the replication
   protocol's per-variant tests: family, size ceiling, round-trip.
 - End to end against a live testnet with real settlement: create, update, read

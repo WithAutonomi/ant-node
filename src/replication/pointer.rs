@@ -21,7 +21,11 @@
 //! - **Pruning.** A record this node has been out of range of for the
 //!   hysteresis period is deleted only once all but one of the current close
 //!   group prove they hold that state or a newer one by returning a valid
-//!   record, however far outside the group the node has moved.
+//!   record, however far outside the group the node has moved. Each pass
+//!   takes the next candidates past where the last one stopped and asks each
+//!   one's group at once, so candidates nobody can prove yet never keep the
+//!   rest from a turn. A record whose group has too few capable members to
+//!   prove it is kept until it has enough.
 //! - **Possession.** Some minutes after offering a fresh state, the node asks
 //!   each close-group member for the record. A member that is still responsible
 //!   and cannot produce that state or a newer one is penalised — unless it holds
@@ -154,6 +158,13 @@ const UNDECIDED_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Most prune candidates examined per pass.
 const MAX_PRUNE_CANDIDATES_PER_PASS: usize = 256;
+
+/// Prune candidates proven at once, as many as chunk pruning's audits. Each
+/// asks its whole group at once and is given one fetch timeout in all, so a
+/// pass takes at most `MAX_PRUNE_CANDIDATES_PER_PASS / PRUNE_CONCURRENCY`
+/// fetch timeouts however many peers stay silent, while
+/// [`MAX_REQUESTS_PER_PEER`] still bounds what any one peer is asked.
+const PRUNE_CONCURRENCY: usize = 32;
 
 /// How long a node spends asking its close group for a conflicting final
 /// state before taking one (ADR-0018).
@@ -480,6 +491,8 @@ pub struct PointerReplication {
     pending: Mutex<HashMap<XorName, Pending>>,
     /// When each held address was first seen continuously out of range.
     out_of_range: Mutex<HashMap<XorName, Instant>>,
+    /// The last prune candidate a pass took: the next pass starts past it.
+    prune_cursor: Mutex<Option<XorName>>,
     /// Hint pushes answering sync requests that may run at once.
     sync_answers: Arc<Semaphore>,
     /// When each peer was last answered with hints.
@@ -705,6 +718,7 @@ impl PointerReplication {
             capable: Mutex::new(HashSet::new()),
             pending: Mutex::new(HashMap::new()),
             out_of_range: Mutex::new(HashMap::new()),
+            prune_cursor: Mutex::new(None),
             sync_answers: Arc::new(Semaphore::new(MAX_CONCURRENT_SYNC_ANSWERS)),
             answered_syncs: Mutex::new(AnsweredSyncs::default()),
             finality: FinalityLooks::new(),
@@ -1856,7 +1870,9 @@ impl PointerReplication {
                 continue;
             }
             let first_seen = *self.out_of_range.lock().entry(state.address).or_insert(now);
-            if now.duration_since(first_seen) >= self.config.prune_hysteresis_duration {
+            if now.duration_since(first_seen) >= self.config.prune_hysteresis_duration
+                && !committed(&state.address)
+            {
                 candidates.push(*state);
             }
         }
@@ -1867,36 +1883,60 @@ impl PointerReplication {
                 .retain(|address, _| held.contains(address));
         }
 
-        let mut deleted = 0usize;
-        for state in candidates.into_iter().take(MAX_PRUNE_CANDIDATES_PER_PASS) {
-            if self.shutdown.is_cancelled() {
-                return;
-            }
-            if committed(&state.address) {
-                continue;
-            }
-            // However far outside the group this node has moved, only the
-            // close group's proof makes the copy safe to drop: distance says
-            // who is closer, not that any of them holds the record.
-            let confirmed = allow_remote
-                && !*self.is_bootstrapping.read().await
-                && self.others_hold(&state).await;
-            // Revalidate just before deleting: the group may have moved back.
-            if confirmed
-                && !committed(&state.address)
-                && !admission::is_responsible(&self_id, &state.address, &self.p2p, retention).await
-                && self.delete(&state.address).await
-            {
-                deleted += 1;
-            }
+        // However far outside the group this node has moved, only the close
+        // group's proof makes a copy safe to drop: distance says who is
+        // closer, not that any of them holds the record.
+        if !allow_remote || *self.is_bootstrapping.read().await {
+            return;
         }
+        let batch = {
+            let mut cursor = self.prune_cursor.lock();
+            let batch = next_prune_batch(&candidates, *cursor, MAX_PRUNE_CANDIDATES_PER_PASS);
+            if let Some(last) = batch.last() {
+                *cursor = Some(last.address);
+            }
+            batch
+        };
+        let deleted = stream::iter(batch)
+            .map(|state| self.prune_candidate(state, &committed, &self_id, retention))
+            .buffer_unordered(PRUNE_CONCURRENCY)
+            .filter(|deleted| std::future::ready(*deleted))
+            .count()
+            .await;
         if deleted > 0 {
             info!("Pruned {deleted} pointer records this node is no longer responsible for");
         }
     }
 
+    /// Delete `state`'s record if its close group proves it holds that state
+    /// or a newer one, within one fetch timeout, and this node is still out
+    /// of range and uncommitted once it has.
+    async fn prune_candidate(
+        &self,
+        state: PointerState,
+        committed: &(impl Fn(&XorName) -> bool + Sync),
+        self_id: &PeerId,
+        retention: usize,
+    ) -> bool {
+        if self.shutdown.is_cancelled() {
+            return false;
+        }
+        let proven =
+            tokio::time::timeout(self.config.fetch_request_timeout, self.others_hold(&state))
+                .await
+                .unwrap_or(false);
+        // Revalidate just before deleting: the group may have moved back.
+        proven
+            && !committed(&state.address)
+            && !admission::is_responsible(self_id, &state.address, &self.p2p, retention).await
+            && self.delete(&state.address).await
+    }
+
     /// Whether all but one of the current close group prove they hold `ours`
     /// or a newer state, by returning a valid record.
+    ///
+    /// Only capable members are asked, so a group with too few of them is
+    /// not asked at all and the record is kept.
     async fn others_hold(&self, ours: &PointerState) -> bool {
         let group: Vec<PeerId> = self
             .p2p
@@ -1907,26 +1947,19 @@ impl PointerReplication {
             .map(|node| node.peer_id)
             .collect();
         let needed = prune_proofs_needed(group.len());
-        if needed == 0 {
-            return false;
-        }
-        let mut proofs = 0usize;
-        for peer in group.iter().filter(|peer| self.is_capable(peer)) {
-            let proves = self
-                .fetch_record(peer, &ours.address)
+        let capable: Vec<PeerId> = group
+            .into_iter()
+            .filter(|peer| self.is_capable(peer))
+            .collect();
+        enough_prove(capable, needed, |peer| async move {
+            self.fetch_record(&peer, &ours.address)
                 .await
                 .is_some_and(|record| {
                     let state = record.state();
                     state.state_id == ours.state_id || state.replaces(ours)
-                });
-            if proves {
-                proofs += 1;
-                if proofs >= needed {
-                    return true;
-                }
-            }
-        }
-        false
+                })
+        })
+        .await
     }
 
     async fn delete(&self, address: &XorName) -> bool {
@@ -2001,6 +2034,55 @@ where
         }
     }
     None
+}
+
+/// Up to `cap` of `candidates`, which are in address order, starting just
+/// past `after` and wrapping round: every candidate gets its turn, however
+/// many ahead of it the group cannot yet prove.
+fn next_prune_batch(
+    candidates: &[PointerState],
+    after: Option<XorName>,
+    cap: usize,
+) -> Vec<PointerState> {
+    let start = after.map_or(0, |after| {
+        candidates.partition_point(|state| state.address <= after)
+    });
+    let (before, rest) = candidates.split_at(start);
+    rest.iter().chain(before).take(cap).copied().collect()
+}
+
+/// Whether at least `needed` of `peers` prove possession with `prove`.
+///
+/// Every peer is asked at once, and the answer is in as soon as `needed`
+/// proofs are, or as soon as too few peers are left to reach it: a peer that
+/// stalls holds up nobody else's proof, and a group too small to reach
+/// `needed` is never asked at all.
+async fn enough_prove<Prove, ProveFut>(peers: Vec<PeerId>, needed: usize, prove: Prove) -> bool
+where
+    Prove: Fn(PeerId) -> ProveFut,
+    ProveFut: Future<Output = bool>,
+{
+    if needed == 0 || peers.len() < needed {
+        return false;
+    }
+    let spare = peers.len() - needed;
+    let width = peers.len();
+    let (mut proofs, mut failures) = (0usize, 0usize);
+    let mut answers = stream::iter(peers).map(prove).buffer_unordered(width);
+    while let Some(proves) = answers.next().await {
+        if proves {
+            proofs += 1;
+            if proofs >= needed {
+                return true;
+            }
+        } else {
+            failures += 1;
+            if failures > spare {
+                return false;
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -2674,5 +2756,104 @@ mod tests {
             FinalityCheck::Conflict(rival.state())
         );
         assert_eq!(asked.load(Ordering::SeqCst), 2);
+    }
+
+    fn held_at(address: u8) -> PointerState {
+        PointerState {
+            address: [address; 32],
+            ..state(1, 0, 1)
+        }
+    }
+
+    fn addresses(batch: &[PointerState]) -> Vec<u8> {
+        batch.iter().map(|state| state.address[0]).collect()
+    }
+
+    #[test]
+    fn a_prune_pass_starts_past_the_last_one_and_wraps_round() {
+        let candidates: Vec<PointerState> = (1..=5).map(held_at).collect();
+        assert_eq!(
+            addresses(&next_prune_batch(&candidates, None, 3)),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            addresses(&next_prune_batch(&candidates, Some([3; 32]), 3)),
+            vec![4, 5, 1]
+        );
+        // A cursor whose candidate has gone since still finds its place.
+        let without_three: Vec<PointerState> = [1, 2, 4, 5].into_iter().map(held_at).collect();
+        assert_eq!(
+            addresses(&next_prune_batch(&without_three, Some([3; 32]), 2)),
+            vec![4, 5]
+        );
+    }
+
+    #[test]
+    fn candidates_the_group_cannot_prove_never_keep_the_rest_from_a_turn() {
+        // Nothing is ever proven, so every candidate stays one; the passes
+        // must still reach them all rather than retry the first ones.
+        let candidates: Vec<PointerState> = (1..=5).map(held_at).collect();
+        let mut cursor = None;
+        let mut examined = HashSet::new();
+        for _ in 0..3 {
+            let batch = next_prune_batch(&candidates, cursor, 2);
+            cursor = batch.last().map(|state| state.address);
+            examined.extend(addresses(&batch));
+        }
+        assert_eq!(examined, (1..=5).collect());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn enough_proofs_are_taken_without_waiting_for_a_peer_that_stalls() {
+        let staller = peer(1);
+        let group: Vec<PeerId> = (1..=7).map(peer).collect();
+        let proven = tokio::time::timeout(
+            Duration::from_secs(1),
+            enough_prove(group, prune_proofs_needed(7), |asked| async move {
+                if asked == staller {
+                    std::future::pending::<()>().await;
+                }
+                true
+            }),
+        )
+        .await;
+        assert_eq!(proven.ok(), Some(true), "six proofs waited on the staller");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_group_that_can_no_longer_reach_the_threshold_is_given_up_at_once() {
+        // Six of seven are needed and two cannot prove it, so the answer is
+        // in without waiting for the peer that stalls.
+        let (staller, missing) = (peer(1), [peer(2), peer(3)]);
+        let group: Vec<PeerId> = (1..=7).map(peer).collect();
+        let proven = tokio::time::timeout(
+            Duration::from_secs(1),
+            enough_prove(group, prune_proofs_needed(7), |asked| async move {
+                if asked == staller {
+                    std::future::pending::<()>().await;
+                }
+                !missing.contains(&asked)
+            }),
+        )
+        .await;
+        assert_eq!(
+            proven.ok(),
+            Some(false),
+            "a lost cause waited on the staller"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_group_too_small_to_reach_the_threshold_is_never_asked() {
+        // Five capable members of a seven-member group cannot give six proofs.
+        let asked = AtomicUsize::new(0);
+        let capable: Vec<PeerId> = (1..=5).map(peer).collect();
+        let proven = enough_prove(capable, prune_proofs_needed(7), |_| {
+            asked.fetch_add(1, Ordering::SeqCst);
+            async { true }
+        })
+        .await;
+        assert!(!proven);
+        assert_eq!(asked.load(Ordering::SeqCst), 0, "a lost cause was asked");
     }
 }
