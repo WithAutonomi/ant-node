@@ -2,27 +2,30 @@
 //! devnet deletes only a directory it can show it created (ant-node#261).
 //!
 //! Each run creates a fresh `{pid}-{random}` directory inside the configured
-//! parent, exclusively, so it never adopts something that was already there.
-//! Before anything else goes in, it takes an exclusive lock on [`LOCK_FILE`],
-//! held for as long as the run lasts, and then writes [`MARKER_FILE`] naming
-//! the run and the directory itself, by its file number (inode, or file
-//! index on Windows): a copy of the marker in any other directory does not
-//! match. The parent itself is never deleted.
+//! parent, exclusively, and claims it only if it is still empty once opened,
+//! so it never adopts something that was already there or was put in its
+//! place. Before anything else goes in, it takes an exclusive lock on
+//! [`LOCK_FILE`], held for as long as the run lasts, and then writes
+//! [`MARKER_FILE`] naming the run, the directory itself and the lock file,
+//! by their file numbers (inode, or file index on Windows): a copy of the
+//! marker in any other directory does not match, nor does a lock file put
+//! in place of the one the run holds. The parent itself is never deleted.
 //!
 //! - On shutdown a run deletes its directory through the handle it opened
 //!   when it created it, and only if the name still refers to that directory
 //!   and the marker there still names the run.
 //! - Anything else, a later run included, may delete a run directory only if
 //!   it is on the parent's filesystem, its marker names that very directory
-//!   and does not ask to keep it (`--no-cleanup`), and its lock is free. The
-//!   OS releases the lock however the process ends, SIGKILL included, and
-//!   only a run's own process ever takes it, so a free lock means the run is
-//!   over. A directory without such a marker is never touched. (The marker
-//!   keeps no device number: on some filesystems, btrfs and NFS among them,
-//!   that changes when they are mounted again.)
+//!   and does not ask to keep it (`--no-cleanup`), and the lock file the
+//!   marker names is there and free. The OS releases the lock however the
+//!   process ends, SIGKILL included, and only a run's own process ever takes
+//!   it, so a free lock means the run is over. A directory without such a
+//!   marker is never touched. (The marker keeps no device number: on some
+//!   filesystems, btrfs and NFS among them, that changes when they are
+//!   mounted again.)
 //! - Deletion removes the data first and the marker and lock last, so one
 //!   that stops part-way leaves a directory the next run still recognises as
-//!   a finished run, and finishes.
+//!   a finished run, and finishes. It does not cross into another mount.
 //!
 //! On Unix every step after the parent is opened goes through a handle on the
 //! parent or the run directory, and deletion walks the tree through handles
@@ -63,8 +66,10 @@ const CREATE_ATTEMPTS: usize = 8;
 struct Marker {
     /// Random and unique to the run.
     run_id: String,
-    /// The run directory's file number on its filesystem ([`DirId::file`]).
+    /// The run directory's file number on its filesystem ([`FileId::file`]).
     file_id: u64,
+    /// The lock file's, so that one put in its place does not pass for it.
+    lock_id: u64,
     /// The process that ran the devnet.
     pid: u32,
     /// When the run started, in seconds since the Unix epoch.
@@ -75,9 +80,9 @@ struct Marker {
     keep: bool,
 }
 
-/// Which directory a handle or a name refers to.
+/// Which directory or file a handle or a name refers to.
 #[derive(Debug, PartialEq, Eq)]
-struct DirId {
+struct FileId {
     /// Its device (Unix) or volume serial number (Windows). Compared only
     /// between handles open at the same time, never kept.
     device: String,
@@ -131,11 +136,27 @@ impl RunDir {
             }
         };
 
+        #[cfg(test)]
+        after_create(&parent.path.join(&name))?;
         let run = parent.open_run(&name)?;
+        // Between its creation and its opening, something else could have put
+        // a directory of its own in place of this one. If what was opened has
+        // anything in it, it is not this run's: leave it as it is.
+        if !run.is_empty()? {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} was replaced before this run could open it",
+                    parent.path.join(&name).display()
+                ),
+            ));
+        }
         let claimed = run.id().and_then(|id| {
-            let marker = Marker {
+            let mut marker = Marker {
                 run_id: hex::encode(rng.gen::<[u8; 16]>()),
                 file_id: id.file,
+                // Set by `claim`, once the lock file exists.
+                lock_id: 0,
                 pid,
                 started_at: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -143,17 +164,17 @@ impl RunDir {
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 keep,
             };
-            let lock = claim(&run, &marker)?;
+            let lock = claim(&run, &mut marker)?;
             Ok((marker.run_id, lock))
         });
         let (run_id, lock) = match claimed {
             Ok(claimed) => claimed,
             Err(e) => {
-                // Unmarked, it would be left alone for good. It is ours: we
-                // have just created it, and still have it open.
-                if let Err(cleanup) = run
-                    .remove_all_but(&[])
-                    .and_then(|()| parent.remove_empty(&name, run))
+                // Unmarked, it would be left alone for good, so remove it, but
+                // only if it is empty: claiming has removed what it created,
+                // and anything else in it is not known to be this run's.
+                if let Err(cleanup) =
+                    same_dir(&parent, &name, &run).and_then(|()| parent.remove_empty(&name, run))
                 {
                     warn!("Could not remove half-created devnet run directory {name}: {cleanup}");
                 }
@@ -217,18 +238,41 @@ impl RunDir {
     }
 }
 
-/// Lock `run`, then mark it. Marking second is what lets a free lock mean the
-/// run is over: a marked run has always taken its lock already.
-fn claim(run: &Run, marker: &Marker) -> io::Result<File> {
+/// Lock `run`, then mark it, recording the lock file in `marker`. Marking
+/// second is what lets a free lock mean the run is over: a marked run has
+/// always taken its lock already. Should it fail, it removes what it created,
+/// and nothing else.
+fn claim(run: &Run, marker: &mut Marker) -> io::Result<File> {
     let lock = run.create_file(LOCK_FILE)?;
-    lock.try_lock().map_err(io::Error::from)?;
+    let outcome = lock.try_lock().map_err(io::Error::from).and_then(|()| {
+        marker.lock_id = file_id(&lock)?.file;
+        write_marker(run, marker)
+    });
+    match outcome {
+        Ok(()) => Ok(lock),
+        Err(e) => {
+            drop(lock);
+            if let Err(cleanup) = run.remove_file(LOCK_FILE) {
+                warn!("Could not remove the lock file of a devnet run that failed to start: {cleanup}");
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Write `marker` under a temporary name, then rename it into place.
+fn write_marker(run: &Run, marker: &Marker) -> io::Result<()> {
     let json = serde_json::to_vec_pretty(marker).map_err(io::Error::other)?;
     let mut temp = run.create_file(MARKER_TEMP_FILE)?;
-    temp.write_all(&json)?;
-    temp.sync_all()?;
+    let written = temp.write_all(&json).and_then(|()| temp.sync_all());
     drop(temp);
-    run.rename(MARKER_TEMP_FILE, MARKER_FILE)?;
-    Ok(lock)
+    let renamed = written.and_then(|()| run.rename(MARKER_TEMP_FILE, MARKER_FILE));
+    if renamed.is_err() {
+        if let Err(cleanup) = run.remove_file(MARKER_TEMP_FILE) {
+            warn!("Could not remove the marker of a devnet run that failed to start: {cleanup}");
+        }
+    }
+    renamed
 }
 
 fn read_marker(run: &Run) -> io::Result<Marker> {
@@ -336,6 +380,13 @@ fn finished_run(parent: &Parent, name: &str) -> io::Result<Option<(Run, File)>> 
         return Ok(None);
     }
     let lock = run.open_file(LOCK_FILE)?;
+    // The run's lock stays held under whatever name its file is moved to, so
+    // a free lock means something only if it is that file.
+    let lock_id = file_id(&lock)?;
+    let the_runs_lock = lock_id.file == marker.lock_id;
+    if !the_runs_lock || lock_id.device != id.device {
+        return Ok(None);
+    }
     match lock.try_lock() {
         // Held while the directory is deleted. No run takes this lock again:
         // a run only ever locks a directory it has just created.
@@ -350,6 +401,29 @@ thread_local! {
     /// Tests set this to make a deletion fail after removing this many
     /// entries, as one interrupted part-way would.
     static FAIL_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Tests set this to act on a new run directory, by its path, between
+    /// its creation and its opening, as something else could.
+    static AFTER_CREATE: std::cell::RefCell<Option<AfterCreate>> =
+        const { std::cell::RefCell::new(None) };
+    /// Tests set this to have a directory of this name inside a run
+    /// directory count as a mount point.
+    #[cfg(unix)]
+    static MOUNT_POINT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+type AfterCreate = Box<dyn FnOnce(&Path) -> io::Result<()>>;
+
+#[cfg(test)]
+fn after_create(path: &Path) -> io::Result<()> {
+    AFTER_CREATE
+        .with(|act| act.borrow_mut().take())
+        .map_or(Ok(()), |act| act(path))
+}
+
+#[cfg(all(test, unix))]
+fn is_test_mount_point(name: &std::ffi::CStr) -> bool {
+    MOUNT_POINT.with(|mount| mount.borrow().as_deref().map(str::as_bytes) == Some(name.to_bytes()))
 }
 
 /// Called before each entry a deletion removes, to fail where a test asks.
@@ -366,16 +440,16 @@ fn injected_failure() -> io::Result<()> {
 }
 
 #[cfg(unix)]
-use unix::{Parent, Run};
+use unix::{file_id, Parent, Run};
 
 #[cfg(windows)]
-use windows::{Parent, Run};
+use windows::{file_id, Parent, Run};
 
 /// Every operation relative to a directory handle, never following a link.
 #[cfg(unix)]
 mod unix {
-    use super::DirId;
-    use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat};
+    use super::FileId;
+    use rustix::fs::{AtFlags, Dev, FileType, Mode, OFlags, Stat};
     use rustix::io::Errno;
     use std::ffi::{CStr, CString};
     use std::fs::File;
@@ -433,12 +507,12 @@ mod unix {
                 .collect())
         }
 
-        pub fn id(&self) -> io::Result<DirId> {
+        pub fn id(&self) -> io::Result<FileId> {
             Ok(id(&rustix::fs::fstat(&self.fd)?))
         }
 
         /// The directory `name`, not following a link.
-        pub fn id_of(&self, name: &str) -> io::Result<DirId> {
+        pub fn id_of(&self, name: &str) -> io::Result<FileId> {
             let stat = rustix::fs::statat(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW)?;
             if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
                 return Err(io::Error::new(
@@ -458,8 +532,12 @@ mod unix {
     }
 
     impl Run {
-        pub fn id(&self) -> io::Result<DirId> {
+        pub fn id(&self) -> io::Result<FileId> {
             Ok(id(&rustix::fs::fstat(&self.fd)?))
+        }
+
+        pub fn is_empty(&self) -> io::Result<bool> {
+            Ok(read_names(&self.fd)?.is_empty())
         }
 
         pub fn create_file(&self, name: &str) -> io::Result<File> {
@@ -500,28 +578,62 @@ mod unix {
 
         /// Delete everything in the directory but the entries named in `keep`.
         pub fn remove_all_but(&self, keep: &[&str]) -> io::Result<()> {
+            let mount = mount_of(&self.fd)?;
             for name in read_names(&self.fd)? {
                 if keep.iter().any(|keep| keep.as_bytes() == name.as_bytes()) {
                     continue;
                 }
                 #[cfg(test)]
                 super::injected_failure()?;
-                remove_entry(&self.fd, &name)?;
+                remove_entry(&self.fd, &name, &mount)?;
             }
             Ok(())
         }
     }
 
-    fn id(stat: &Stat) -> DirId {
-        DirId {
+    pub fn file_id(file: &File) -> io::Result<FileId> {
+        Ok(id(&rustix::fs::fstat(file)?))
+    }
+
+    fn id(stat: &Stat) -> FileId {
+        FileId {
             device: stat.st_dev.to_string(),
             file: stat.st_ino,
         }
     }
 
+    /// Where a directory is mounted: its device and, on Linux, the mount
+    /// itself, which also tells a bind mount from the filesystem it shows.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) struct Mount {
+        device: Dev,
+        id: Option<u64>,
+    }
+
+    pub(super) fn mount_of(dir: &OwnedFd) -> io::Result<Mount> {
+        let device = rustix::fs::fstat(dir)?.st_dev;
+        #[cfg(target_os = "linux")]
+        let id = {
+            use rustix::fs::StatxFlags;
+            // Mount ids are in Linux 5.8 and later, and some sandboxes refuse
+            // `statx`. Without one, the device is what tells mounts apart.
+            match rustix::fs::statx(dir, c"", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID) {
+                Ok(statx) => {
+                    (statx.stx_mask & StatxFlags::MNT_ID.bits() != 0).then_some(statx.stx_mnt_id)
+                }
+                Err(Errno::NOSYS | Errno::PERM) => None,
+                Err(e) => return Err(e.into()),
+            }
+        };
+        #[cfg(not(target_os = "linux"))]
+        let id = None;
+        Ok(Mount { device, id })
+    }
+
     /// Delete the entry `name` in `dir`, descending only through handles
-    /// opened without following a link: a link is removed, never entered.
-    fn remove_entry(dir: &OwnedFd, name: &CStr) -> io::Result<()> {
+    /// opened without following a link, and only on `mount`: a link is
+    /// removed, never entered, and a mount point is left, with all in it.
+    fn remove_entry(dir: &OwnedFd, name: &CStr, mount: &Mount) -> io::Result<()> {
         let stat = match rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(stat) => stat,
             Err(Errno::NOENT) => return Ok(()),
@@ -535,8 +647,21 @@ mod unix {
             Err(Errno::NOENT) => return Ok(()),
             Err(e) => return Err(e.into()),
         };
+        #[cfg(not(test))]
+        let mount_point = mount_of(&child)? != *mount;
+        #[cfg(test)]
+        let mount_point = mount_of(&child)? != *mount || super::is_test_mount_point(name);
+        if mount_point {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} is a mount point, so it and what is in it are left",
+                    name.to_string_lossy()
+                ),
+            ));
+        }
         for entry in read_names(&child)? {
-            remove_entry(&child, &entry)?;
+            remove_entry(&child, &entry, mount)?;
         }
         gone_is_fine(rustix::fs::unlinkat(dir, name, AtFlags::REMOVEDIR))
     }
@@ -568,7 +693,7 @@ mod unix {
 /// them, and every directory above them, from being renamed or removed.
 #[cfg(windows)]
 mod windows {
-    use super::DirId;
+    use super::FileId;
     use std::fs::{File, OpenOptions};
     use std::io;
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
@@ -637,13 +762,13 @@ mod windows {
             Ok(names)
         }
 
-        pub fn id(&self) -> io::Result<DirId> {
-            id(&self.held)
+        pub fn id(&self) -> io::Result<FileId> {
+            file_id(&self.held)
         }
 
         /// The directory `name`, not following a link.
-        pub fn id_of(&self, name: &str) -> io::Result<DirId> {
-            id(&hold_dir(&self.real.join(name))?)
+        pub fn id_of(&self, name: &str) -> io::Result<FileId> {
+            file_id(&hold_dir(&self.real.join(name))?)
         }
 
         /// Close `run`, then remove the entry `name` if it is an empty
@@ -655,8 +780,12 @@ mod windows {
     }
 
     impl Run {
-        pub fn id(&self) -> io::Result<DirId> {
-            id(&self.held)
+        pub fn id(&self) -> io::Result<FileId> {
+            file_id(&self.held)
+        }
+
+        pub fn is_empty(&self) -> io::Result<bool> {
+            Ok(std::fs::read_dir(&self.path)?.next().is_none())
         }
 
         pub fn create_file(&self, name: &str) -> io::Result<File> {
@@ -735,9 +864,9 @@ mod windows {
         Ok(dir)
     }
 
-    fn id(file: &File) -> io::Result<DirId> {
+    pub fn file_id(file: &File) -> io::Result<FileId> {
         let info = winapi_util::file::information(file)?;
-        Ok(DirId {
+        Ok(FileId {
             device: info.volume_serial_number().to_string(),
             file: info.file_index(),
         })
@@ -777,6 +906,10 @@ mod tests {
         }
     }
 
+    fn file_id_of(path: &Path) -> std::result::Result<u64, Box<dyn std::error::Error>> {
+        Ok(file_id(&File::open(path)?)?.file)
+    }
+
     /// A finished run's directory, as a run killed by `SIGKILL` leaves it.
     fn finished(
         parent: &Path,
@@ -801,16 +934,18 @@ mod tests {
         let dir = parent.join(name);
         std::fs::create_dir_all(&dir)?;
         let file_id = Parent::open(parent)?.open_run(name)?.id()?.file;
+        std::fs::write(dir.join(LOCK_FILE), b"")?;
+        let lock_id = file_id_of(&dir.join(LOCK_FILE))?;
         let mut marker = Marker {
             run_id: "forged".to_string(),
             file_id,
+            lock_id,
             pid: std::process::id(),
             started_at: 0,
             version: env!("CARGO_PKG_VERSION").to_string(),
             keep: false,
         };
         edit(&mut marker);
-        std::fs::write(dir.join(LOCK_FILE), b"")?;
         std::fs::write(dir.join(MARKER_FILE), serde_json::to_vec(&marker)?)?;
         std::fs::write(dir.join("sentinel"), b"keep")?;
         Ok(dir)
@@ -834,6 +969,7 @@ mod tests {
         assert_eq!(marker.pid, std::process::id());
         assert_eq!(marker.run_id, run.run_id);
         assert_eq!(marker.file_id, run.run.id()?.file);
+        assert_eq!(marker.lock_id, file_id(&run.lock)?.file);
         assert!(!marker.keep);
         assert!(!run.path().join(MARKER_TEMP_FILE).exists());
         assert!(
@@ -987,6 +1123,63 @@ mod tests {
         Ok(())
     }
 
+    /// Hermes round 4 on #263: a live run's lock file moved aside and
+    /// another put in its place. That one is free, but it is not the lock the
+    /// run holds.
+    #[test]
+    fn a_live_run_whose_lock_file_is_replaced_is_never_swept() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let run = RunDir::create(temp.path(), false)?;
+        let path = run.path().to_path_buf();
+        std::fs::write(path.join("data"), b"the run's")?;
+        std::fs::rename(path.join(LOCK_FILE), path.join("moved.lock"))?;
+        std::fs::write(path.join(LOCK_FILE), b"")?;
+        assert!(lock_is_free(&path)?);
+
+        let _next = RunDir::create(temp.path(), false)?;
+
+        assert!(path.join("data").is_file(), "{} was swept", path.display());
+        drop(run);
+        Ok(())
+    }
+
+    /// Hermes round 4 on #263: a directory put in place of a new run
+    /// directory before the run opens it is not the run's, so the run neither
+    /// claims it nor deletes anything in it, whether or not claiming it would
+    /// have failed.
+    #[test]
+    fn a_directory_put_in_place_of_a_new_run_directory_is_left_alone() -> TestResult {
+        for with_lock in [false, true] {
+            let temp = tempfile::tempdir()?;
+            let parent = temp.path().join("devnets");
+            let moved = temp.path().join("moved");
+            let replaced = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let record = std::rc::Rc::clone(&replaced);
+            AFTER_CREATE.with(|act| {
+                *act.borrow_mut() = Some(Box::new(move |path: &Path| {
+                    std::fs::rename(path, &moved)?;
+                    std::fs::create_dir(path)?;
+                    std::fs::write(path.join("sentinel"), b"not the run's")?;
+                    if with_lock {
+                        std::fs::write(path.join(LOCK_FILE), b"not the run's")?;
+                    }
+                    *record.borrow_mut() = Some(path.to_path_buf());
+                    Ok(())
+                }));
+            });
+
+            let created = RunDir::create(&parent, false);
+            AFTER_CREATE.with(|act| act.borrow_mut().take());
+
+            assert!(created.is_err(), "with_lock: {with_lock}");
+            let path = replaced.borrow_mut().take().ok_or("never replaced")?;
+            assert!(path.join("sentinel").is_file(), "with_lock: {with_lock}");
+            assert!(!path.join(MARKER_FILE).exists(), "with_lock: {with_lock}");
+            assert_eq!(path.join(LOCK_FILE).is_file(), with_lock);
+        }
+        Ok(())
+    }
+
     #[test]
     fn a_kept_run_is_never_swept() -> TestResult {
         let temp = tempfile::tempdir()?;
@@ -1000,8 +1193,8 @@ mod tests {
     }
 
     /// Hermes round 3 on #263: a finished run's directory moved away, and
-    /// another put in its place with copies of its marker and lock. The copy
-    /// names the moved directory, not this one.
+    /// another put in its place with a copy of its marker and its very lock
+    /// file. The copy names the moved directory, not this one.
     #[test]
     fn a_copy_of_a_finished_runs_marker_is_never_swept() -> TestResult {
         let temp = tempfile::tempdir()?;
@@ -1010,7 +1203,7 @@ mod tests {
         std::fs::rename(&old, &moved)?;
         std::fs::create_dir(&old)?;
         std::fs::copy(moved.join(MARKER_FILE), old.join(MARKER_FILE))?;
-        std::fs::copy(moved.join(LOCK_FILE), old.join(LOCK_FILE))?;
+        std::fs::rename(moved.join(LOCK_FILE), old.join(LOCK_FILE))?;
         std::fs::write(old.join("sentinel"), b"keep")?;
 
         let _run = RunDir::create(temp.path(), false)?;
@@ -1042,6 +1235,10 @@ mod tests {
             // A marker naming another directory.
             forged(parent, &format!("{pid}-d1ffe4e7"), |marker| {
                 marker.file_id = marker.file_id.wrapping_add(1);
+            })?,
+            // A marker naming another lock file than the one there.
+            forged(parent, &format!("{pid}-10c4ed00"), |marker| {
+                marker.lock_id = marker.lock_id.wrapping_add(1);
             })?,
             // A marker asking to keep it.
             forged(parent, &format!("{pid}-cee9cee9"), |marker| {
@@ -1102,6 +1299,57 @@ mod tests {
         ] {
             assert!(!is_run_name(name), "{name}");
         }
+    }
+
+    /// Hermes round 4 on #263: a deletion does not cross into another mount
+    /// inside the run directory. It stops, leaving the mount point, what is
+    /// in it, and the marker.
+    #[cfg(unix)]
+    #[test]
+    fn removal_does_not_cross_into_another_mount() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let run = RunDir::create(temp.path(), false)?;
+        let path = run.path().to_path_buf();
+        let mounted = path.join("nodes").join("mounted");
+        std::fs::create_dir_all(&mounted)?;
+        std::fs::write(mounted.join("data"), b"not the run's")?;
+
+        MOUNT_POINT.with(|mount| *mount.borrow_mut() = Some("mounted".to_string()));
+        let removed = run.remove();
+        MOUNT_POINT.with(|mount| mount.borrow_mut().take());
+
+        assert!(removed.is_err());
+        assert!(mounted.join("data").is_file());
+        assert!(path.join(MARKER_FILE).is_file());
+        Ok(())
+    }
+
+    /// What that rests on: a directory on another mount is told apart from
+    /// one on the run's.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_directory_on_another_mount_is_told_apart() -> TestResult {
+        use rustix::fs::{Mode, OFlags};
+        let open = |path: &Path| {
+            rustix::fs::open(
+                path,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+        };
+        let temp = tempfile::tempdir()?;
+        std::fs::create_dir(temp.path().join("sub"))?;
+        // procfs on Linux, devfs on macOS: always mounts of their own.
+        let other = if cfg!(target_os = "linux") {
+            "/proc"
+        } else {
+            "/dev"
+        };
+
+        let here = unix::mount_of(&open(temp.path())?)?;
+        assert_eq!(unix::mount_of(&open(&temp.path().join("sub"))?)?, here);
+        assert_ne!(unix::mount_of(&open(Path::new(other))?)?, here);
+        Ok(())
     }
 
     /// Hermes round 2 on #263: a parent reached through a dangling symlink
