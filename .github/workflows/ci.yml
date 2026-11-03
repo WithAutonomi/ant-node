@@ -119,7 +119,9 @@ jobs:
       - name: Integration tests (every target)
         shell: bash
         run: |
-          set -uo pipefail
+          # GitHub runs `shell: bash` with -e; turn it off so one failing target
+          # doesn't stop the rest from running.
+          set +e -uo pipefail
           targets=$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name == "ant-node") | .targets[] | select(.kind | index("test")) | .name' | tr -d '\r')
           echo "integration targets: $(echo $targets)"
@@ -127,8 +129,16 @@ jobs:
           failed=""
           for t in $targets; do
             extra=""
-            # Prints the measured index memory and inode cost, which is the point of it.
-            [ "$t" = storage_scale ] && extra="--nocapture"
+            if [ "$t" = storage_scale ]; then
+              # Its gates compare the store scan against timed directory walks, and
+              # were measured on Linux; it has only ever run there.
+              if [ "$RUNNER_OS" != Linux ]; then
+                echo "skipping $t on $RUNNER_OS (Linux only)"
+                continue
+              fi
+              # Prints the measured index memory and inode cost, which is the point of it.
+              extra="--nocapture"
+            fi
             echo "::group::$t"
             cargo test --test "$t" --features test-utils -- --test-threads=1 $extra 2>&1 | tee "/tmp/$t.log"
             status=${PIPESTATUS[0]}
