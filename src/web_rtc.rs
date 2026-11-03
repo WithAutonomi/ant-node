@@ -1108,7 +1108,35 @@ async fn log_listener_summaries(diagnostics: WebRtcServerDiagnostics, shutdown: 
     debug!("WebRTC Direct listener summary loop shut down");
 }
 
+/// Refresh the browser endpoint (see [`publish_browser_endpoint`]), then let
+/// the swarm host rooms only under the endpoint left published, naming its
+/// address as their STUN server: none after a refresh that failed, which can
+/// leave an old endpoint published (a gateway mapping that has ended or moved).
+/// A refresh that changes or withdraws the endpoint stops the swarm hosting
+/// before its first await, so it never names the old address meanwhile.
 async fn refresh_browser_endpoint(
+    state: &ServerState,
+    root_dir: &Path,
+    local_addr: SocketAddr,
+    certificate_sha256: [u8; 32],
+) -> Result<()> {
+    let result = publish_browser_endpoint(state, root_dir, local_addr, certificate_sha256).await;
+    let stun = match &result {
+        Ok(()) => state.publication.read().endpoint().and_then(stun_server),
+        Err(_) => None,
+    };
+    state.swarm.set_ice_servers(stun.into_iter().collect());
+    result
+}
+
+/// The STUN server a published endpoint's socket answers as: the same UDP
+/// socket answers swarm members' STUN requests.
+fn stun_server(endpoint: &BrowserEndpoint) -> Option<String> {
+    let address = endpoint.parse().ok()?.socket_addr().ok()?;
+    Some(format!("stun:{address}"))
+}
+
+async fn publish_browser_endpoint(
     state: &ServerState,
     root_dir: &Path,
     local_addr: SocketAddr,
@@ -1140,12 +1168,13 @@ async fn refresh_browser_endpoint(
         .multiaddr
         .parse()
         .map_err(|error| Error::Startup(format!("invalid WebRTC transport address: {error}")))?;
+    // The published endpoint changes, possibly from a mapping that has ended
+    // or moved: no rooms until the refresh ends (see `refresh_browser_endpoint`).
+    state.swarm.set_ice_servers(Vec::new());
     persist_browser_endpoint(root_dir, &endpoint).await?;
     if let Some(catalog) = state.endpoint_catalog.as_ref() {
         catalog.insert(peer_id, endpoint.clone());
     }
-    // The same UDP socket answers swarm members' STUN requests.
-    state.swarm.set_ice_servers(vec![format!("stun:{address}")]);
     *state.publication.write() = Publication::Published { endpoint, source };
     state
         .p2p
@@ -1156,11 +1185,11 @@ async fn refresh_browser_endpoint(
 }
 
 /// Withdraw an endpoint whose address only a gateway mapping that has ended
-/// provided, everywhere it was published: HELLO, the in-process catalog and
-/// the DHT address record first, once, then the endpoint file. Any other
-/// publication is kept.
+/// provided, everywhere it was published: HELLO, the in-process catalog, the
+/// swarm's STUN server and the DHT address record first, once, then the
+/// endpoint file. Any other publication is kept.
 ///
-/// The first three cannot fail, so a file error never keeps the endpoint
+/// The first four cannot fail, so a file error never keeps the endpoint
 /// advertised. It leaves the publication [`Publication::Withdrawing`], and the
 /// next call retries only the file.
 async fn withdraw_mapped_endpoint(state: &ServerState, root_dir: &Path) -> Result<()> {
@@ -1171,6 +1200,8 @@ async fn withdraw_mapped_endpoint(state: &ServerState, root_dir: &Path) -> Resul
         if let Some(catalog) = state.endpoint_catalog.as_ref() {
             catalog.remove(state.p2p.peer_id());
         }
+        // No rooms while the DHT record is withdrawn, which can wait on peers.
+        state.swarm.set_ice_servers(Vec::new());
         state
             .p2p
             .dht_manager()
@@ -4130,11 +4161,13 @@ mod tests {
                 .await
         }
 
-        /// Assert that peers and browsers no longer see the endpoint.
+        /// Assert that peers and browsers no longer see the endpoint, and that
+        /// the swarm hosts no rooms without it.
         async fn assert_unpublished(&self) {
             assert_eq!(self.publication().endpoint(), None);
             assert_eq!(self.catalog.get(&self.peer_id()), None);
             assert_eq!(self.supplemental().await, Vec::<MultiAddr>::new());
+            assert_eq!(self.state.swarm.ice_servers(), Vec::<String>::new());
         }
     }
 
@@ -4162,6 +4195,10 @@ mod tests {
             .contains(&published.multiaddr));
         assert_eq!(listener.catalog.get(&listener.peer_id()), Some(published));
         assert_eq!(listener.supplemental().await.len(), 1);
+        assert_eq!(
+            listener.state.swarm.ice_servers(),
+            vec!["stun:198.51.100.2:51000".to_string()]
+        );
 
         *listener.mapping.lock() = None;
         listener.refresh().await.expect("withdraw the mapping");
@@ -4204,6 +4241,155 @@ mod tests {
         assert!(!listener.file().exists());
         listener.assert_unpublished().await;
         assert_eq!(listener.publication(), Publication::Unpublished);
+    }
+
+    #[tokio::test]
+    async fn the_swarm_hosts_no_rooms_while_a_changed_endpoint_cannot_be_published() {
+        let listener = MappedOnlyListener::new().await;
+        listener.refresh().await.expect("publish the mapping");
+
+        // A directory in the file's place makes writing it fail.
+        tokio::fs::remove_file(listener.file())
+            .await
+            .expect("remove the endpoint file");
+        tokio::fs::create_dir(listener.file())
+            .await
+            .expect("block the endpoint file");
+        *listener.mapping.lock() = Some("198.51.100.3:52000".parse().expect("moved mapping"));
+        listener
+            .refresh()
+            .await
+            .expect_err("the endpoint file cannot be written");
+        assert!(listener
+            .publication()
+            .endpoint()
+            .expect("the old endpoint stays published")
+            .multiaddr
+            .contains("/198.51.100.2/udp/51000/"));
+        assert_eq!(listener.state.swarm.ice_servers(), Vec::<String>::new());
+
+        // Once the file can be written, the moved mapping is published and
+        // the swarm names it.
+        tokio::fs::remove_dir(listener.file())
+            .await
+            .expect("unblock the endpoint file");
+        listener.refresh().await.expect("publish the moved mapping");
+        assert!(listener
+            .publication()
+            .endpoint()
+            .expect("the moved endpoint is published")
+            .multiaddr
+            .contains("/198.51.100.3/udp/52000/"));
+        assert_eq!(
+            listener.state.swarm.ice_servers(),
+            vec!["stun:198.51.100.3:52000".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_swarm_hosts_rooms_again_when_its_published_endpoint_comes_back() {
+        let listener = MappedOnlyListener::new().await;
+        listener.refresh().await.expect("publish the mapping");
+        tokio::fs::remove_file(listener.file())
+            .await
+            .expect("remove the endpoint file");
+        tokio::fs::create_dir(listener.file())
+            .await
+            .expect("block the endpoint file");
+        *listener.mapping.lock() = Some("198.51.100.3:52000".parse().expect("moved mapping"));
+        listener
+            .refresh()
+            .await
+            .expect_err("the endpoint file cannot be written");
+        assert_eq!(listener.state.swarm.ice_servers(), Vec::<String>::new());
+
+        // The mapping returns to the published endpoint before the moved one
+        // could be published: nothing is written, and the swarm names it again.
+        *listener.mapping.lock() = Some("198.51.100.2:51000".parse().expect("mapping"));
+        listener
+            .refresh()
+            .await
+            .expect("reconfirm the published endpoint");
+        assert_eq!(
+            listener.state.swarm.ice_servers(),
+            vec!["stun:198.51.100.2:51000".to_string()]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_swarm_hosts_no_rooms_while_a_changed_endpoint_is_written() {
+        let listener = MappedOnlyListener::new().await;
+        listener.refresh().await.expect("publish the mapping");
+
+        // A FIFO in the file's place holds the write until a reader opens it.
+        tokio::fs::remove_file(listener.file())
+            .await
+            .expect("remove the endpoint file");
+        let path = std::ffi::CString::new(listener.file().as_os_str().as_encoded_bytes())
+            .expect("endpoint file path");
+        #[allow(unsafe_code)]
+        let rc = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+        *listener.mapping.lock() = Some("198.51.100.3:52000".parse().expect("moved mapping"));
+
+        let refresh = listener.refresh();
+        tokio::pin!(refresh);
+        let mut finished = None;
+        for _ in 0..250 {
+            if listener.state.swarm.ice_servers().is_empty() {
+                break;
+            }
+            if let Ok(result) = tokio::time::timeout(Duration::from_millis(20), &mut refresh).await
+            {
+                finished = Some(result);
+                break;
+            }
+        }
+        let while_written = listener.state.swarm.ice_servers();
+        if finished.is_none() {
+            if let Ok(result) = tokio::time::timeout(Duration::from_millis(20), &mut refresh).await
+            {
+                finished = Some(result);
+            }
+        }
+        let finished_unread = finished.is_some();
+
+        // A reader lets a write still waiting finish, so a failed check never
+        // leaves the write blocked.
+        let result = if let Some(result) = finished {
+            result
+        } else {
+            let fifo = listener.file();
+            let reader = tokio::task::spawn_blocking(move || std::fs::read(fifo));
+            let result = refresh.await;
+            reader
+                .await
+                .expect("reader task")
+                .expect("read the endpoint");
+            result
+        };
+        assert!(!finished_unread, "the endpoint write waits for a reader");
+        assert_eq!(while_written, Vec::<String>::new());
+        result.expect("publish the moved mapping");
+        assert_eq!(
+            listener.state.swarm.ice_servers(),
+            vec!["stun:198.51.100.3:52000".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_swarm_hosts_no_rooms_when_the_first_endpoint_cannot_be_published() {
+        let listener = MappedOnlyListener::new().await;
+        tokio::fs::create_dir(listener.file())
+            .await
+            .expect("block the endpoint file");
+        listener
+            .refresh()
+            .await
+            .expect_err("the endpoint file cannot be written");
+        assert_eq!(listener.publication(), Publication::Unpublished);
+        assert_eq!(listener.state.swarm.ice_servers(), Vec::<String>::new());
     }
 
     #[test]

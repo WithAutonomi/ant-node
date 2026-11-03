@@ -94,10 +94,13 @@ announces itself at the `SWARM_RENDEZVOUS_NODES` (2) nodes closest to the key
 that host rooms, so two readers whose views of the close group differ
 slightly still share one, and readers still meet while some of the closest
 nodes predate rooms: it looks up the 8 nodes closest to the key and passes
-over those that host none (see Older nodes). A node hosts rooms only once
-browsers can reach it: until its browser listener has an endpoint, and so a
-STUN server to name, it refuses every announce as `NotHosting`, and a client
-passes it over at once, with no pause. Native readers so pass over the same
+over those that host none (see Older nodes). A node hosts rooms only while
+browsers can reach it, under the endpoint its browser listener has published,
+whose address it names as their STUN server: until one is published, while a
+changed one is being published and after a refresh that failed to (the old one
+may be a gateway mapping that has ended), and from the start of the withdrawal
+of an endpoint only a mapping reached (ADR-0027), it refuses every announce as
+`NotHosting`, and a client passes it over at once, with no pause. Native readers so pass over the same
 nodes browsers never see (a relay-only node, or one
 built without the listener), and meet the browsers at the closest nodes
 both can reach, rather than at nodes no browser comes to and that give them

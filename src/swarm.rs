@@ -907,8 +907,14 @@ impl SwarmService {
         *self.node_id.write() = Some(node_id);
     }
 
+    /// The STUN servers handed to members: none while the node hosts no rooms.
+    #[cfg(test)]
+    pub(crate) fn ice_servers(&self) -> Vec<String> {
+        self.ice_servers.read().clone()
+    }
+
     /// Sets the STUN servers handed to members (this node's own, once its
-    /// public address is known).
+    /// public address is known; none once browsers can no longer reach it).
     pub fn set_ice_servers(&self, servers: Vec<String>) {
         *self.ice_servers.write() = servers
             .into_iter()
