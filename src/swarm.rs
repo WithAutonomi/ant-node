@@ -908,7 +908,8 @@ impl SwarmService {
     }
 
     /// The STUN servers handed to members: none while the node hosts no rooms.
-    #[cfg(test)]
+    /// Only the browser listener's tests read it, so it exists only with them.
+    #[cfg(all(test, feature = "webrtc-direct"))]
     pub(crate) fn ice_servers(&self) -> Vec<String> {
         self.ice_servers.read().clone()
     }
