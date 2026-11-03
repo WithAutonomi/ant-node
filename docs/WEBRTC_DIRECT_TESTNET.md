@@ -147,7 +147,8 @@ usable native address discovery, refresh the published endpoint as it changes,
 and never fabricate a route-probe or loopback fallback. The endpoint file is
 created only once an address is known.
 
-Like native QUIC, a wildcard listener without an advertised address also asks
+Like native QUIC, a wildcard IPv4 listener without an advertised address, on a
+node outside development mode, also asks
 the local gateway for a UPnP mapping of its port, and advertises the mapped
 public address while the gateway holds it
 ([ADR-0027](adr/ADR-0027-map-the-browser-listener-port-through-upnp.md)).

@@ -72,10 +72,13 @@ reports the chunk missing when those are unavailable.
 
 We will choose option 2.
 
-- A listener that chooses its own public address, one bound to a wildcard
+- A listener that chooses its own public address, one bound to a wildcard IPv4
   address with no `advertised_addr`, starts saorsa-transport's
   `UpnpMappingService` for its port with the default configuration. An explicit
-  bind address or advertised address is the operator's, and is not mapped.
+  bind address or advertised address is the operator's, and is not mapped. A
+  development-mode node, whose native endpoint is confined to loopback, is not
+  mapped either: it stays off the Internet and its browsers dial the loopback
+  view. The service maps IPv4 only, so an IPv6 listener is not mapped.
 - The gateway's mapping, when it exists and matches the listener's address
   family, is advertised before the native self-address view. The service asks
   for the listener's own port first, so the advertised port is usually unchanged.
@@ -119,13 +122,14 @@ explicit `--webrtc-direct-bind` IP opts a node out.
 
 - No wire, storage, protocol or payment change. Browsers see only a different
   advertised address.
-- Local devnets set an advertised address for every node, so tests and devnets
-  never contact a gateway.
+- Local devnets set an advertised address for every node, and development-mode
+  nodes are not mapped, so tests, devnets and local development never contact
+  a gateway.
 
 ## Validation
 
-- Unit tests: only a wildcard listener without an advertised address maps its
-  port; a mapping is advertised before the native view, needs no native
+- Unit tests: only a wildcard IPv4 listener without an advertised address, on
+  a node outside development mode, maps its port; a mapping is advertised before the native view, needs no native
   discovery, is ignored in the other address family, and an operator's
   advertisement still wins; only an address the native view lacks depends on
   the mapping.

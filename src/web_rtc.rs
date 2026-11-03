@@ -660,7 +660,7 @@ pub async fn spawn(
     let local_addr = listener.local_addr();
     // Like the native QUIC endpoint, ask the gateway to forward the listener's
     // port. Best effort: without a mapping, publication is unchanged (ADR-0027).
-    let upnp = maps_port_with_upnp(config, local_addr)
+    let upnp = maps_port_with_upnp(config, local_addr, p2p.config().local)
         .then(|| UpnpMappingService::start(local_addr.port(), UpnpConfig::default()));
     let identity = Arc::clone(p2p.transport().node_identity());
     let state = Arc::new(ServerState {
@@ -941,10 +941,23 @@ fn certificate_path(config: &WebRtcDirectConfig, root_dir: &Path) -> PathBuf {
 }
 
 /// Whether the listener chooses its own public address, and so may ask the
-/// gateway to forward its port: a wildcard listener the operator gave no
-/// advertised address. An explicit bind or advertisement is the operator's.
-fn maps_port_with_upnp(config: &WebRtcDirectConfig, local_addr: SocketAddr) -> bool {
-    config.advertised_addr.is_none() && local_addr.ip().is_unspecified()
+/// gateway to forward its port: a wildcard IPv4 listener the operator gave no
+/// advertised address, on a node whose native endpoint is not confined to
+/// loopback.
+///
+/// An explicit bind or advertisement is the operator's. A loopback-only
+/// (development) node stays off the Internet, and its browsers dial the
+/// native loopback view. Gateway mappings are IPv4, which an IPv6 listener
+/// would not advertise.
+fn maps_port_with_upnp(
+    config: &WebRtcDirectConfig,
+    local_addr: SocketAddr,
+    loopback_only: bool,
+) -> bool {
+    !loopback_only
+        && config.advertised_addr.is_none()
+        && local_addr.ip().is_unspecified()
+        && local_addr.is_ipv4()
 }
 
 /// The gateway's mapping of the listener's port, while it holds one.
@@ -3095,13 +3108,34 @@ mod tests {
         let wildcard = "0.0.0.0:43210".parse().expect("wildcard listener");
         let explicit = "192.0.2.7:43210".parse().expect("explicit listener");
         let default = WebRtcDirectConfig::default();
-        assert!(maps_port_with_upnp(&default, wildcard));
-        assert!(!maps_port_with_upnp(&default, explicit));
+        assert!(maps_port_with_upnp(&default, wildcard, false));
+        assert!(!maps_port_with_upnp(&default, explicit, false));
         let advertised = WebRtcDirectConfig {
             advertised_addr: Some("198.51.100.4:11000".parse().expect("advertised")),
             ..WebRtcDirectConfig::default()
         };
-        assert!(!maps_port_with_upnp(&advertised, wildcard));
+        assert!(!maps_port_with_upnp(&advertised, wildcard, false));
+    }
+
+    #[test]
+    fn a_development_node_does_not_map_its_port() {
+        let wildcard = "0.0.0.0:43210".parse().expect("wildcard listener");
+        assert!(!maps_port_with_upnp(
+            &WebRtcDirectConfig::default(),
+            wildcard,
+            true
+        ));
+    }
+
+    #[test]
+    fn an_ipv6_listener_does_not_map_its_port() {
+        // Gateway mappings are IPv4, which an IPv6 listener never advertises.
+        let wildcard = "[::]:43210".parse().expect("IPv6 wildcard listener");
+        assert!(!maps_port_with_upnp(
+            &WebRtcDirectConfig::default(),
+            wildcard,
+            false
+        ));
     }
 
     #[test]
