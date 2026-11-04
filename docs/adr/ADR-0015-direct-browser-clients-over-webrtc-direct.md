@@ -321,6 +321,38 @@ Counters survive shutdown; live connection entries are removed on close or owner
 Unexpected UDP-driver termination wakes accept and ends the accept loop rather
 than repeatedly logging errors while reporting a live listener.
 
+Snapshots are also logged, so a fleet node's browser-listener pressure is
+visible without a diagnostics consumer. The listener task emits
+`webrtc listener summary (cumulative)` at INFO on target
+`ant_node::web_rtc::traffic` every `WEBRTC_SUMMARY_INTERVAL_SECS` (300 s, the
+cadence of the replication and chunk-RPC summaries), in two lines sharing that
+target and message and told apart by `group`. `group = 1` carries the
+application listener: `running`, the live-versus-configured gauges
+(`active_connections`/`max_connections`, `active_channels`/`max_channels`,
+`active_requests`/`max_concurrent_requests`,
+`in_flight_bytes`/`max_in_flight_bytes`,
+`bulk_slots_in_use`/`bulk_slots_max`), the rejection and error counters
+(`connection_rejections`, `channel_rejections`, `request_rejections`,
+`rate_rejections`, `byte_rejections`, `listener_errors`, `connection_errors`,
+`channel_errors`, `task_failures`), and the browser GET latency counters
+(`get_service_count`, `get_service_total_ms`, `get_service_max_ms`,
+`get_service_failures`, `bulk_wait_count`, `bulk_wait_total_ms`,
+`bulk_wait_max_ms`). `group = 2` carries the transport beneath it, each key
+prefixed `transport_`: `active_connections`, `connecting_connections`,
+`connection_attempts`, `successful_connections`, `failed_connections`,
+`closed_connections`, `disconnections`, `rejected_connections`,
+`listener_errors`, `bytes_sent`, `bytes_received`. The capacity and slot fields
+are instantaneous gauges read at emission; every other field is a counter
+accumulated since process start, so a query diffs two lines to get a rate.
+Field names are a query contract and are never renamed.
+
+GET service time is measured from the request worker starting to its response
+being prepared, so it includes the wait for the source and global
+bulk-response slots that `bulk_wait_*` reports on its own — the queueing that
+V2-1795 could not see in production logs. A GET whose processing errors is
+counted in `get_service_failures` only, and is absent from
+`get_service_count` and the service-time totals.
+
 These are internal diagnostics, without a new HTTP endpoint or relay/reachability
 probes. A running listener is not proof of external connectivity. Traffic counts
 exclude UDP/DTLS/SCTP overhead. RTT and packet loss are unavailable (`None`),
