@@ -311,7 +311,6 @@ struct PruneAuditContext<'a> {
 pub async fn run_prune_pass_with_context(ctx: PrunePassContext<'_>) -> PruneResult {
     let (stored_count, record_stats) = prune_stored_records(&ctx).await;
     let (paid_count, paid_evicted) = evict_excess_paid_entries(&ctx).await;
-    ctx.paid_list.persist_record_out_of_range().await;
 
     let result = PruneResult {
         records_total: stored_count,
@@ -392,6 +391,9 @@ async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPrune
     let stored: HashSet<&XorName> = stored_keys.iter().collect();
     ctx.paid_list
         .retain_record_out_of_range(|key| stored.contains(key));
+    // Before any audit or deletion, so a restart during those can't bring back
+    // a clock this pass stopped.
+    ctx.paid_list.persist_record_out_of_range().await;
 
     // A candidate is eligible, not due: with room on the disk it stays, and
     // no audit is sent, since none could lead to a deletion.

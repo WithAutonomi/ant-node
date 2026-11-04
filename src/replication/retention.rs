@@ -166,11 +166,11 @@ impl DiskPressure {
     /// records not demoted, farthest from `self_id` first, then demoted ones,
     /// oldest failure first.
     ///
-    /// Farthest first, so the records closest to this node go last. Oldest
-    /// failure first,
-    /// so a record that failed once for a passing reason gets another turn
-    /// within the spell, however many new candidates arrive. Demotions of
-    /// records that are no longer candidates are forgotten.
+    /// Farthest first, so the records closest to this node go last. Demoted
+    /// records wait while records not yet tried fill the limit: they stay on
+    /// disk meanwhile, and the limit still goes to records that may free space.
+    /// Once a pass has room for them, oldest failure first gives each its turn
+    /// again. Demotions of records that are no longer candidates are forgotten.
     pub fn erasure_order<T>(
         &self,
         kind: RecordKind,
@@ -422,7 +422,7 @@ mod tests {
     }
 
     #[test]
-    fn new_candidates_arriving_do_not_stop_failed_ones_being_retried() {
+    fn a_few_new_candidates_each_pass_do_not_stop_failed_ones_being_retried() {
         // A new candidate arrives every pass and nothing is ever proven. A
         // new one is always untried, so waiting for every candidate to have
         // failed would leave the farthest failed ones holding all other slots.

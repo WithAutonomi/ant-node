@@ -92,8 +92,8 @@ that restarted with the process would leave a node with nothing to erase for 72 
 every upgrade.
 
 - **Wall-clock times:** chunk and pointer clocks are kept as wall-clock times, and saved
-  in `record_out_of_range.bin` and `pointer_out_of_range.bin` after a prune pass that
-  changed them.
+  in `record_out_of_range.bin` and `pointer_out_of_range.bin` during a prune pass that
+  changed them, before it audits or erases anything.
 - **Time offline counts:** a clock keeps its start across a restart, including the time
   the node was down.
 - **Cleared only once bootstrap has drained:** a restarted node knows few peers at first,
@@ -141,8 +141,9 @@ store shares that partition.
 - **Failed proofs go last, oldest failure first:** a record whose proof failed comes after
   every record not yet tried, and failed records are retried in the order they last
   failed. So records the group can't prove yet never keep the rest from a turn, and a
-  record that failed once for a passing reason is tried again within the spell, however
-  many new candidates arrive. Demotions are forgotten when the spell ends.
+  record that failed once for a passing reason is tried again once a pass has room after
+  the records not yet tried. Until then it stays on disk, and the budget still goes to
+  records that may free space. Demotions are forgotten when the spell ends.
 - **Per-deletion checks:** each deletion still needs 6 of 7 proofs from the current
   strict close group, plus the existing re-check before deleting. A pointer candidate is
   also checked for pressure before its group is asked: once earlier deletions have ended
@@ -247,7 +248,8 @@ store shares that partition.
   than a round's writes. Evicting at write time is possible follow-up work.
 - **A long outage can leave records immediately eligible.** Time offline counts towards
   the hysteresis, so a node that returns after days can erase under pressure once
-  bootstrap has drained, still only on the current group's proofs.
+  bootstrap has drained, still only on the current group's proofs. A clock stopped just
+  before a crash, or whose save failed, can come back the same way.
 
 ### Neutral / Operational
 
@@ -271,7 +273,7 @@ store shares that partition.
   - a failed measurement;
   - farthest-first order with demotions last, and a limit taking the first of it;
   - no candidate waiting more than a round for its next turn, over many passes;
-  - new candidates arriving not stopping failed ones being retried;
+  - a few new candidates each pass not stopping failed ones being retried;
   - passes under pressure spaced, and a completed cycle always running one;
   - demotions ending with the spell.
 - **Unit tests** (`out_of_range_clocks.rs`, `paid_list.rs`, `pruning.rs`, `pointer.rs`):
