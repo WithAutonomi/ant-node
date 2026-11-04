@@ -522,6 +522,25 @@ mod tests {
         );
     }
 
+    /// Test: the published key file is the key nodes enforce.
+    ///
+    /// The release notes tell people to verify downloads against
+    /// `sign/release-signing-key.pub`, and the release workflow verifies every
+    /// signature against that file before publishing. Nodes verify upgrades
+    /// against `RELEASE_SIGNING_KEY`. The two drifted once: fda30ed rotated the
+    /// embedded key and not the file, so from 2026-03-24 every signature
+    /// failed to verify against the published key (V2-1802). A rotation has to
+    /// change both.
+    #[test]
+    fn test_published_key_file_matches_embedded_key() {
+        let published: &[u8] = include_bytes!("../../sign/release-signing-key.pub");
+        assert!(
+            published == RELEASE_SIGNING_KEY,
+            "sign/release-signing-key.pub is not RELEASE_SIGNING_KEY; \
+             regenerate the file from the embedded key (or rotate both)"
+        );
+    }
+
     /// Test: Invalid signature rejected with embedded key
     #[test]
     fn test_embedded_key_rejects_invalid_signature() {
