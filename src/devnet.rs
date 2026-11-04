@@ -228,6 +228,10 @@ pub struct DevnetConfig {
     /// caches and upload history (ant-node#261). Run directories that earlier
     /// runs left here, killed before they could remove them, are removed when
     /// the next run starts, unless they were kept.
+    ///
+    /// On Unix it must be a directory only the user and root can change, as
+    /// must every directory above it, or [`Devnet::new`] fails: another user
+    /// who could would be able to redirect what the nodes write.
     pub data_dir: PathBuf,
 
     /// Delay between node spawns (default: 200ms).

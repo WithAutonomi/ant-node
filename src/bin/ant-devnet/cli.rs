@@ -29,7 +29,8 @@ pub struct Cli {
     /// `devnets/` in the ant data root). The run directory is removed on
     /// shutdown unless `--no-cleanup` is set; this directory, and anything else
     /// in it, never is. Run directories left here by runs that were killed
-    /// are removed when the next run starts.
+    /// are removed when the next run starts. On Unix only you and root may be
+    /// able to change it, or any directory above it.
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
 

@@ -19,16 +19,17 @@
 //!   when it created it, and only if the name still refers to that directory
 //!   and the marker there still names the run.
 //! - Anything else, a later run included, may delete a run directory only if
-//!   it is on the parent's filesystem and mount, its marker names that very
-//!   directory
-//!   and does not ask to keep it (`--no-cleanup`), and the lock file the
+//!   it belongs to the user (on Unix), is on the parent's filesystem and
+//!   mount, its marker names that very directory and does not ask to keep it
+//!   (`--no-cleanup`), and the lock file the
 //!   marker names is there and free. The OS releases the lock however the
 //!   process ends, SIGKILL included, and only a run's own process ever takes
 //!   it, so a free lock means the run is over. A directory without such a
 //!   marker is never touched. (The marker keeps no device number: on some
 //!   filesystems, btrfs and NFS among them, that changes when they are
 //!   mounted again.)
-//! - Deletion removes the data first and the marker and lock last, so one
+//! - Deletion first checks that the name still refers to the directory it
+//!   has open, then removes the data, and the marker and lock last, so one
 //!   that stops part-way leaves a directory the next run still recognises as
 //!   a finished run, and finishes. It does not cross into another mount: on
 //!   Linux mounts are told apart by their mount ids, which tell a bind mount
@@ -38,8 +39,19 @@
 //!
 //! On Unix every step after the parent is opened goes through a handle on the
 //! parent or the run directory, and deletion walks the tree through handles
-//! opened without following links. Windows has no such calls in the standard
-//! library. There, links in the parent's path are resolved once, and the
+//! opened without following links. The handles do not keep the paths still,
+//! though. Whoever can write to a directory can rename what is in it: swap a
+//! directory above the run directory for a link to another tree, which
+//! writes through [`RunDir::path`] would then follow, or move the run
+//! directory away while it is being deleted. So the parent must be one no
+//! other user can change: it, and every directory above it, must belong to
+//! the user or root, and be one no one else can write to, or sticky, as
+//! `/tmp` is, which lets no one rename what they do not own. (On Linux, one
+//! its group can write to passes if the group is the user's own, as with
+//! Ubuntu's user private groups, and no ACL lets anyone else in. On macOS,
+//! where every user shares a group, it does not.) A run refuses to start in
+//! any other parent. Windows has no such calls in the standard library.
+//! There, links in the parent's path are resolved once, and the
 //! parent and the run directory are held open without delete sharing: while
 //! they are, neither they nor any directory above them can be renamed or
 //! removed, so the paths built on them keep naming the same directories, and
@@ -124,8 +136,9 @@ impl RunDir {
     ///
     /// # Errors
     ///
-    /// Fails if `parent` cannot be created or opened, or the run directory
-    /// cannot be created, locked or marked.
+    /// Fails if `parent` cannot be created or opened, or, on Unix, another
+    /// user could change it or a directory above it (see the module docs); or
+    /// if the run directory cannot be created, locked or marked.
     pub fn create(parent: &Path, keep: bool) -> io::Result<Self> {
         let parent = Parent::open(parent)?;
         sweep(&parent);
@@ -241,8 +254,6 @@ impl RunDir {
                 ),
             ));
         }
-        same_dir(&parent, &name, &run)
-            .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
         delete(&parent, &name, run, lock)
     }
 
@@ -313,17 +324,23 @@ fn same_dir(parent: &Parent, name: &str, run: &Run) -> io::Result<()> {
     } else {
         Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "it has been moved or replaced since its run created it",
+            "it has been moved or replaced since it was opened",
         ))
     }
 }
 
 /// Delete the run directory `name`, which `run` has open and whose `lock` is
-/// held: the data first, then the marker, then the lock, then the directory,
-/// empty by then. Should it stop before the marker goes, the marker and the
-/// free lock make the rest a finished run that the next sweep removes. After
-/// that, only an empty directory and an empty lock file can be left.
+/// held, if `name` still refers to it: the data first, then the marker, then
+/// the lock, then the directory, empty by then. Should it stop before the
+/// marker goes, the marker and the free lock make the rest a finished run
+/// that the next sweep removes. After that, only an empty directory and an
+/// empty lock file can be left.
 fn delete(parent: &Parent, name: &str, run: Run, lock: File) -> io::Result<()> {
+    // Moved since it was opened, it would be emptied through `run` wherever
+    // it went. Once this has passed, only the user or root can still move it:
+    // no one else can change the parent (see the module docs), and on Windows
+    // the handle keeps it where it is.
+    same_dir(parent, name, &run)?;
     run.remove_all_but(&[MARKER_FILE, LOCK_FILE])?;
     run.remove_file(MARKER_FILE)?;
     // Windows removes no directory with a file open in it.
@@ -363,13 +380,17 @@ fn sweep(parent: &Parent) {
     let mut removed = 0_usize;
     for name in names.iter().filter(|name| is_run_name(name)) {
         match finished_run(parent, name) {
-            Ok(Some((run, lock))) => match delete(parent, name, run, lock) {
-                Ok(()) => removed += 1,
-                Err(e) => warn!(
-                    "Could not remove the finished devnet run directory {}: {e}",
-                    parent.path.join(name).display()
-                ),
-            },
+            Ok(Some((run, lock))) => {
+                #[cfg(test)]
+                after_found(&parent.path.join(name));
+                match delete(parent, name, run, lock) {
+                    Ok(()) => removed += 1,
+                    Err(e) => warn!(
+                        "Could not remove the finished devnet run directory {}: {e}",
+                        parent.path.join(name).display()
+                    ),
+                }
+            }
             Ok(None) => {}
             Err(e) => debug!("Leaving {}: {e}", parent.path.join(name).display()),
         }
@@ -386,6 +407,12 @@ fn sweep(parent: &Parent) {
 /// so may be deleted.
 fn finished_run(parent: &Parent, name: &str) -> io::Result<Option<(Run, File)>> {
     let run = parent.open_run(name)?;
+    // Another user's is theirs, whatever is in it, and in a parent anyone can
+    // make directories in, a sticky one, they could still move it.
+    #[cfg(unix)]
+    if !run.is_owned_by_this_user()? {
+        return Ok(None);
+    }
     let marker = read_marker(&run)?;
     let pid_in_name = name.split_once('-').map(|(pid, _)| pid);
     let id = run.id()?;
@@ -430,6 +457,10 @@ thread_local! {
     /// its creation and its opening, as something else could.
     static AFTER_CREATE: std::cell::RefCell<Option<AfterCreate>> =
         const { std::cell::RefCell::new(None) };
+    /// Tests set this to act on a finished run's directory, by its path,
+    /// once the sweep has found it finished and before it deletes it.
+    static AFTER_FOUND: std::cell::RefCell<Option<AfterFound>> =
+        const { std::cell::RefCell::new(None) };
     /// Tests set this to have a directory of this name inside a run
     /// directory count as a mount point.
     #[cfg(unix)]
@@ -440,10 +471,20 @@ thread_local! {
 type AfterCreate = Box<dyn FnOnce(&Path) -> io::Result<()>>;
 
 #[cfg(test)]
+type AfterFound = Box<dyn FnOnce(&Path)>;
+
+#[cfg(test)]
 fn after_create(path: &Path) -> io::Result<()> {
     AFTER_CREATE
         .with(|act| act.borrow_mut().take())
         .map_or(Ok(()), |act| act(path))
+}
+
+#[cfg(test)]
+fn after_found(path: &Path) {
+    if let Some(act) = AFTER_FOUND.with(|act| act.borrow_mut().take()) {
+        act(path);
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -503,6 +544,7 @@ mod unix {
         pub fn open(path: &Path) -> io::Result<Self> {
             std::fs::create_dir_all(path)?;
             let real = std::fs::canonicalize(path)?;
+            no_one_else_can_change(&real)?;
             let fd = rustix::fs::open(
                 &real,
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
@@ -646,6 +688,70 @@ mod unix {
             device: stat.st_dev.to_string(),
             file: stat.st_ino,
         }
+    }
+
+    /// Fail unless only the user and root can change `real`: neither it nor
+    /// any directory above it may belong to another user, or be one another
+    /// user can write to, unless it is sticky, which lets no one rename what
+    /// they do not own. Whoever could write to one could move what is in it,
+    /// a run directory or a directory above one.
+    fn no_one_else_can_change(real: &Path) -> io::Result<()> {
+        let uid = rustix::process::geteuid().as_raw();
+        for dir in real.ancestors() {
+            let stat = rustix::fs::lstat(dir)?;
+            if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{} changed while it was being opened", real.display()),
+                ));
+            }
+            let mode = Mode::from_raw_mode(stat.st_mode);
+            let who = if stat.st_uid != 0 && stat.st_uid != uid {
+                Some(format!("belongs to user {}", stat.st_uid))
+            } else if mode.contains(Mode::SVTX) {
+                None
+            } else if mode.contains(Mode::WOTH) {
+                Some("can be written to by every user".to_string())
+            } else if mode.contains(Mode::WGRP) {
+                group_writers(dir, &stat)?
+            } else {
+                None
+            };
+            if let Some(who) = who {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "{} {who}, so another user could move or redirect a devnet's \
+                         data under it: use a data directory that only you and root \
+                         can change, with only such directories above it",
+                        dir.display()
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Who but the user can write to `dir`, which its group can write to.
+    fn group_writers(dir: &Path, stat: &Stat) -> io::Result<Option<String>> {
+        // On Linux, the user's own group, which with user private groups,
+        // Ubuntu's default, is the user alone. macOS has none: every user's
+        // group there is `staff`.
+        #[cfg(target_os = "linux")]
+        if stat.st_gid == rustix::process::getegid().as_raw() {
+            // An ACL shows in the group bits only as its mask, the most it
+            // grants anyone it names.
+            return match rustix::fs::lgetxattr(dir, "system.posix_acl_access", &mut [0_u8; 0]) {
+                Ok(_) => Ok(Some(
+                    "has an ACL, which can let other users write to it".to_string(),
+                )),
+                Err(Errno::NODATA | Errno::OPNOTSUPP) => Ok(None),
+                Err(e) => Err(e.into()),
+            };
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = dir;
+        Ok(Some(format!("can be written to by group {}", stat.st_gid)))
     }
 
     /// Where a directory is mounted: its device and, on Linux, the mount
@@ -1133,16 +1239,23 @@ mod tests {
 
     /// On Windows the same replacement cannot even be set up: while a run
     /// lasts, neither its directory nor the parent can be moved.
+    /// Hermes round 6 on #263: nor can any directory above the parent, so
+    /// `RunDir::path` keeps naming the run directory.
     #[cfg(windows)]
     #[test]
-    fn a_run_directory_and_its_parent_cannot_be_moved_while_the_run_lasts() -> TestResult {
+    fn a_run_directory_and_every_directory_above_it_cannot_be_moved_while_the_run_lasts(
+    ) -> TestResult {
         let temp = tempfile::tempdir()?;
-        let parent = temp.path().join("devnets");
+        let above = temp.path().join("above");
+        let parent = above.join("devnets");
         let run = RunDir::create(&parent, false)?;
         let path = run.path().to_path_buf();
 
         assert!(std::fs::rename(&path, parent.join("moved")).is_err());
-        assert!(std::fs::rename(&parent, temp.path().join("moved")).is_err());
+        assert!(std::fs::rename(&parent, above.join("moved")).is_err());
+        assert!(std::fs::rename(&above, temp.path().join("moved")).is_err());
+        let temp_moved = temp.path().with_extension("moved");
+        assert!(std::fs::rename(temp.path(), &temp_moved).is_err());
 
         run.remove()?;
         assert!(!path.exists());
@@ -1303,6 +1416,42 @@ mod tests {
         Ok(())
     }
 
+    /// Hermes round 6 on #263: a finished run's directory moved out of its
+    /// name once the sweep has found it finished is not emptied where it went.
+    /// On Windows the sweep holds it, and it cannot be moved.
+    #[test]
+    fn a_finished_run_moved_once_it_is_found_is_left() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let old = finished(temp.path(), false)?;
+        let moved = temp.path().join("moved");
+        let to = moved.clone();
+        let outcome = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let record = std::rc::Rc::clone(&outcome);
+        AFTER_FOUND.with(|act| {
+            *act.borrow_mut() = Some(Box::new(move |path: &Path| {
+                *record.borrow_mut() = Some(std::fs::rename(path, &to).is_ok());
+            }));
+        });
+
+        let created = RunDir::create(temp.path(), false);
+        AFTER_FOUND.with(|act| act.borrow_mut().take());
+        let _run = created?;
+
+        let was_moved = outcome.borrow_mut().take().ok_or("never found")?;
+        if cfg!(windows) {
+            assert!(!was_moved, "moved while the sweep held it");
+            assert!(!old.exists(), "{} was not swept", old.display());
+        } else {
+            assert!(was_moved);
+            assert!(
+                moved.join("nodes").join("peer").join("chunk").is_file(),
+                "emptied where it was moved to"
+            );
+            assert!(moved.join(MARKER_FILE).is_file());
+        }
+        Ok(())
+    }
+
     #[test]
     fn directories_without_a_matching_marker_are_never_swept() -> TestResult {
         let temp = tempfile::tempdir()?;
@@ -1453,6 +1602,18 @@ mod tests {
         }
     }
 
+    /// Whether `mv from to`, run as `nobody` through `sudo -n`, succeeds.
+    #[cfg(target_os = "linux")]
+    fn nobody_moves(from: &Path, to: &Path) -> io::Result<bool> {
+        Ok(std::process::Command::new("sudo")
+            .args(["-n", "-u", "nobody", "mv"])
+            .arg(from)
+            .arg(to)
+            .stderr(std::process::Stdio::null())
+            .status()?
+            .success())
+    }
+
     /// Hermes round 5 on #263, with real mounts: neither a tmpfs nor a bind
     /// mount of a directory on the same filesystem, which only the mount id
     /// tells apart, is crossed. The `with_sudo_` tests need root, through
@@ -1545,6 +1706,103 @@ mod tests {
         Ok(())
     }
 
+    /// Hermes round 6 on #263, as another user: `nobody` can move what the
+    /// user makes in a directory anyone can write to, and so could swap a
+    /// directory above a run directory for a link; a run refuses to start
+    /// below one. Below a sticky one, which a run does start in, `nobody`
+    /// cannot, and writes through `RunDir::path` land in the run directory.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "acts as another user through sudo; CI runs it"]
+    fn with_sudo_another_user_cannot_redirect_what_a_run_writes() -> TestResult {
+        use std::ffi::OsStr;
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir()?;
+        // Within `nobody`'s reach.
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o755))?;
+
+        // root's, open to anyone, not sticky.
+        let open = temp.path().join("open");
+        sudo(&["mkdir", "-m", "0777"].map(OsStr::new), &open)?;
+        std::fs::create_dir(open.join("mine"))?;
+        assert!(nobody_moves(&open.join("mine"), &open.join("moved"))?);
+        let refused = RunDir::create(&open.join("moved").join("devnets"), false);
+        assert_eq!(
+            refused.err().map(|e| e.kind()),
+            Some(io::ErrorKind::PermissionDenied)
+        );
+
+        // root's, open to anyone, sticky.
+        let sticky = temp.path().join("sticky");
+        sudo(&["mkdir", "-m", "1777"].map(OsStr::new), &sticky)?;
+        let mine = sticky.join("mine");
+        let run = RunDir::create(&mine.join("devnets"), false)?;
+        assert!(!nobody_moves(&mine, &sticky.join("moved"))?);
+        std::fs::write(run.path().join("written"), b"the run's")?;
+        let name = run.path().file_name().ok_or("no name")?;
+        assert!(mine.join("devnets").join(name).join("written").is_file());
+        run.remove()?;
+        Ok(())
+    }
+
+    /// Hermes round 6 on #263: nor below a directory another user owns, or
+    /// one a group other than the user's own can write to.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "makes directories another user owns through sudo; CI runs it"]
+    fn with_sudo_a_parent_below_another_users_or_groups_directory_is_refused() -> TestResult {
+        use std::ffi::OsStr;
+        let temp = tempfile::tempdir()?;
+        let me = rustix::process::geteuid().as_raw().to_string();
+        for (name, how) in [
+            ("theirs", ["-o", "65534", "-m", "0755"]),
+            ("their-group", ["-g", "65534", "-m", "0775"]),
+        ] {
+            let above = temp.path().join(name);
+            let parent = above.join("devnets");
+            let make: Vec<&OsStr> = ["install", "-d"]
+                .into_iter()
+                .chain(how)
+                .map(OsStr::new)
+                .collect();
+            sudo(&make, &above)?;
+            sudo(
+                &["install", "-d", "-o", me.as_str()].map(OsStr::new),
+                &parent,
+            )?;
+
+            let refused = RunDir::create(&parent, false);
+
+            assert_eq!(
+                refused.err().map(|e| e.kind()),
+                Some(io::ErrorKind::PermissionDenied),
+                "{name}"
+            );
+            assert!(std::fs::read_dir(&parent)?.next().is_none(), "{name}");
+        }
+        Ok(())
+    }
+
+    /// Hermes round 6 on #263: a finished run's directory another user owns
+    /// is theirs, whatever is in it, and in a sticky parent they could still
+    /// move it once the sweep has found it. It is not swept, though the user
+    /// could delete what is in it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "hands a directory to another user through sudo; CI runs it"]
+    fn with_sudo_another_users_finished_run_is_not_swept() -> TestResult {
+        use std::ffi::OsStr;
+        let temp = tempfile::tempdir()?;
+        let old = finished(temp.path(), false)?;
+        sudo(&["chown", "-R", "65534"].map(OsStr::new), &old)?;
+        sudo(&["chmod", "-R", "a+rwX"].map(OsStr::new), &old)?;
+
+        let _run = RunDir::create(temp.path(), false)?;
+
+        assert!(old.join("nodes").join("peer").join("chunk").is_file());
+        Ok(())
+    }
+
     /// What that rests on: a directory on another mount is told apart from
     /// one on the run's.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1588,6 +1846,113 @@ mod tests {
 
         assert!(victim.join("sentinel").is_file());
         assert!(!victim.join("not-yet").exists());
+        Ok(())
+    }
+
+    /// `parent` inside `above`, inside a fresh temporary directory, with
+    /// `mode` set on whichever of the two `which` names.
+    #[cfg(unix)]
+    fn parent_with(
+        which: &str,
+        mode: u32,
+    ) -> std::result::Result<(tempfile::TempDir, PathBuf), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir()?;
+        let above = temp.path().join("above");
+        let parent = above.join("devnets");
+        std::fs::create_dir_all(&parent)?;
+        let dir = if which == "above" { &above } else { &parent };
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))?;
+        Ok((temp, parent))
+    }
+
+    /// Hermes round 6 on #263: another user who can write to the parent, or
+    /// to a directory above it, can move what is in it. A run refuses to
+    /// start there, and makes nothing there.
+    #[cfg(unix)]
+    #[test]
+    fn a_parent_another_user_could_change_is_refused() -> TestResult {
+        let mut cases = vec![("above", 0o777), ("parent", 0o777)];
+        // No user private groups on macOS: a group there is shared.
+        if cfg!(not(target_os = "linux")) {
+            cases.push(("above", 0o775));
+        }
+        for (which, mode) in cases {
+            let (_temp, parent) = parent_with(which, mode)?;
+
+            let refused = RunDir::create(&parent, false);
+
+            assert_eq!(
+                refused.err().map(|e| e.kind()),
+                Some(io::ErrorKind::PermissionDenied),
+                "{which} {mode:o}"
+            );
+            assert!(
+                std::fs::read_dir(&parent)?.next().is_none(),
+                "{which} {mode:o}"
+            );
+        }
+        Ok(())
+    }
+
+    /// What a run does start in: a parent in, or below, a sticky directory
+    /// anyone can write to, as `/tmp` is, which lets no one rename what they
+    /// do not own; and on Linux, below one the user's own group can write to.
+    #[cfg(unix)]
+    #[test]
+    fn a_parent_only_this_user_can_change_is_accepted() -> TestResult {
+        let mut cases = vec![("above", 0o1777), ("parent", 0o1777)];
+        if cfg!(target_os = "linux") {
+            cases.push(("above", 0o775));
+        }
+        for (which, mode) in cases {
+            let (_temp, parent) = parent_with(which, mode)?;
+
+            let run =
+                RunDir::create(&parent, false).map_err(|e| format!("{which} {mode:o}: {e}"))?;
+
+            assert!(run.path().join(MARKER_FILE).is_file(), "{which} {mode:o}");
+        }
+        Ok(())
+    }
+
+    /// With an ACL, a directory's group bits are only its mask, the most it
+    /// grants anyone it names, so one the user's own group can write to does
+    /// not pass if it has one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_parent_below_a_directory_with_an_acl_is_refused() -> TestResult {
+        let (_temp, parent) = parent_with("above", 0o755)?;
+        let above = parent.parent().ok_or("no parent")?;
+        // user::rwx, user:65534:rwx, group::r-x, mask::rwx, other::r-x, in the
+        // kernel's `system.posix_acl_access` format.
+        let mut acl = 2_u32.to_le_bytes().to_vec();
+        for (tag, perm, id) in [
+            (0x01_u16, 7_u16, u32::MAX),
+            (0x02, 7, 65534),
+            (0x04, 5, u32::MAX),
+            (0x10, 7, u32::MAX),
+            (0x20, 5, u32::MAX),
+        ] {
+            acl.extend_from_slice(&tag.to_le_bytes());
+            acl.extend_from_slice(&perm.to_le_bytes());
+            acl.extend_from_slice(&id.to_le_bytes());
+        }
+        rustix::fs::lsetxattr(
+            above,
+            "system.posix_acl_access",
+            &acl,
+            rustix::fs::XattrFlags::empty(),
+        )?;
+        let mode = rustix::fs::Mode::from_raw_mode(rustix::fs::lstat(above)?.st_mode);
+        assert!(mode.contains(rustix::fs::Mode::WGRP), "{mode:?}");
+
+        let refused = RunDir::create(&parent, false);
+
+        assert_eq!(
+            refused.err().map(|e| e.kind()),
+            Some(io::ErrorKind::PermissionDenied)
+        );
         Ok(())
     }
 
