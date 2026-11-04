@@ -147,6 +147,18 @@ usable native address discovery, refresh the published endpoint as it changes,
 and never fabricate a route-probe or loopback fallback. The endpoint file is
 created only once an address is known.
 
+Like native QUIC, a wildcard IPv4 listener without an advertised address, on a
+node outside development mode, also asks
+the local gateway for a UPnP mapping of its port, and advertises the mapped
+public address while the gateway holds it
+([ADR-0027](adr/ADR-0027-map-the-browser-listener-port-through-upnp.md)).
+Without a gateway, or when it refuses, the endpoint is the native view's as
+above. When the mapping ends and the native view yields no address, the mapped
+endpoint is withdrawn rather than left advertised. Peers stop seeing it even
+if the endpoint file cannot be removed; the node retries the file on each
+refresh. An explicit bind IP or
+advertised address is never mapped.
+
 Configure an explicit WebRTC port and permit inbound UDP on that port when a
 stable bootstrap endpoint or firewall rule is needed. Retain the node identity
 and certificate and use a fixed public IP. Certificate persistence alone does

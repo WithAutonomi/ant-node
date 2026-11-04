@@ -740,7 +740,9 @@ address, and this implementation has no WebRTC relay transport. An endpoint
 that cannot be reached is simply a failed browser dial and is suppressed by
 the negative-endpoint cache. Supporting NATed WebRTC nodes would require a
 separate signaling and relay design; it is not represented by the current
-reachability field.
+reachability field. [ADR-0027](./ADR-0027-map-the-browser-listener-port-through-upnp.md)
+maps a wildcard listener's port through the local gateway's UPnP where it allows
+one, which makes nodes behind such routers directly reachable.
 
 ### Implemented proof-of-concept slice
 
