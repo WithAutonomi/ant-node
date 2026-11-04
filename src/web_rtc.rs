@@ -71,6 +71,12 @@ const FIRST_DATA_CHANNEL_TIMEOUT: Duration = Duration::from_secs(15);
 const REQUEST_IDLE_TIMEOUT: Duration = Duration::from_mins(1);
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const ADDRESS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+/// Cadence of the `webrtc listener summary (cumulative)` INFO lines (V2-1871).
+/// Matches `TRAFFIC_SUMMARY_INTERVAL_SECS` so browser-listener pressure lines
+/// up with the replication and chunk-RPC summaries in fleet logs. A `const` so
+/// testnets can drop it to 60s; 300s is the production default that keeps log
+/// volume negligible.
+const WEBRTC_SUMMARY_INTERVAL_SECS: u64 = 300;
 const TRACKED_SOURCE_MULTIPLIER: usize = 4;
 const MIN_TRACKED_SOURCES: usize = 64;
 const CONNECTION_CAPACITY_ERROR: &str = "global connection capacity exhausted";
@@ -290,6 +296,13 @@ struct SourceAdmissionState {
     sources: HashMap<IpAddr, SourceEntry>,
 }
 
+/// Saturating millisecond conversion for the listener's latency counters.
+/// Mirrors `replication::audit_metrics::duration_ms`; the crate denies
+/// `unwrap_used`, so the overflow case clamps rather than panicking.
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 /// Admission and accounting shared by every association on one listener.
 struct ListenerResources {
     running: AtomicBool,
@@ -302,6 +315,22 @@ struct ListenerResources {
     connection_errors: AtomicU64,
     channel_errors: AtomicU64,
     task_failures: AtomicU64,
+    /// GETs that reached a response, counted where `get_service_total_ms` is added.
+    get_service_count: AtomicU64,
+    /// Summed GET service time, including the bulk-slot wait.
+    get_service_total_ms: AtomicU64,
+    /// Longest single GET service time, including the bulk-slot wait. A
+    /// lifetime high-water mark: `fetch_max` only, never reset.
+    get_service_max_ms: AtomicU64,
+    /// GETs whose processing returned an error instead of a response.
+    get_service_failures: AtomicU64,
+    /// GETs that acquired both bulk-response permits.
+    bulk_wait_count: AtomicU64,
+    /// Summed time GETs spent waiting for their bulk-response permits.
+    bulk_wait_total_ms: AtomicU64,
+    /// Longest single wait for the bulk-response permits. A lifetime
+    /// high-water mark: `fetch_max` only, never reset.
+    bulk_wait_max_ms: AtomicU64,
     connection_limit: Arc<Semaphore>,
     channel_limit: Arc<Semaphore>,
     request_limit: Arc<Semaphore>,
@@ -330,6 +359,13 @@ impl ListenerResources {
             connection_errors: AtomicU64::new(0),
             channel_errors: AtomicU64::new(0),
             task_failures: AtomicU64::new(0),
+            get_service_count: AtomicU64::new(0),
+            get_service_total_ms: AtomicU64::new(0),
+            get_service_max_ms: AtomicU64::new(0),
+            get_service_failures: AtomicU64::new(0),
+            bulk_wait_count: AtomicU64::new(0),
+            bulk_wait_total_ms: AtomicU64::new(0),
+            bulk_wait_max_ms: AtomicU64::new(0),
             byte_rejections: Arc::clone(&byte_rejections),
             connection_limit: Arc::new(Semaphore::new(config.max_connections)),
             channel_limit: Arc::new(Semaphore::new(config.max_channels)),
@@ -435,6 +471,26 @@ impl ListenerResources {
             entry.active_connections = entry.active_connections.saturating_sub(1);
             entry.last_seen = Instant::now();
         }
+    }
+
+    /// Record how long one GET waited for both bulk-response permits.
+    fn record_bulk_wait(&self, waited: Duration) {
+        let waited = duration_ms(waited);
+        self.bulk_wait_count.fetch_add(1, Ordering::Relaxed);
+        self.bulk_wait_total_ms.fetch_add(waited, Ordering::Relaxed);
+        self.bulk_wait_max_ms.fetch_max(waited, Ordering::Relaxed);
+    }
+
+    /// Record one GET's service time: from the spawned request worker starting
+    /// to its response being prepared. Includes the bulk-slot wait recorded by
+    /// [`Self::record_bulk_wait`], and excludes admission, frame assembly and
+    /// decryption, which all finish before the worker is spawned.
+    fn record_get_service(&self, served: Duration) {
+        let served = duration_ms(served);
+        self.get_service_count.fetch_add(1, Ordering::Relaxed);
+        self.get_service_total_ms
+            .fetch_add(served, Ordering::Relaxed);
+        self.get_service_max_ms.fetch_max(served, Ordering::Relaxed);
     }
 
     fn spawn_request<F>(&self, work: F) -> ServerResult<JoinHandle<F::Output>>
@@ -543,6 +599,10 @@ pub struct WebRtcServerSnapshot {
     pub in_flight_bytes: usize,
     /// Configured frame-memory capacity.
     pub max_in_flight_bytes: usize,
+    /// Global bulk-response preparation slots currently held by GETs.
+    pub bulk_slots_in_use: usize,
+    /// Global bulk-response preparation slots derived from `max_in_flight_bytes`.
+    pub bulk_slots_max: usize,
     /// Application connection admissions denied by capacity policy.
     pub connection_rejections: u64,
     /// `DataChannels` rejected by global or per-connection capacity policy.
@@ -561,6 +621,30 @@ pub struct WebRtcServerSnapshot {
     pub channel_errors: u64,
     /// Connection or `DataChannel` tasks that panicked or were unexpectedly cancelled.
     pub task_failures: u64,
+    /// GETs served to a response, the denominator for `get_service_total_ms`.
+    pub get_service_count: u64,
+    /// Summed GET service time, measured from the spawned request worker
+    /// starting to its response being prepared. Includes the bulk-response
+    /// slot wait; excludes admission, frame assembly and decryption, which
+    /// complete before the worker is spawned.
+    pub get_service_total_ms: u64,
+    /// Longest single GET service time, including the bulk-response slot
+    /// wait. A lifetime high-water mark: never reset, so it only rises. Do
+    /// not diff it — use the mean from `get_service_total_ms` over
+    /// `get_service_count` to see a window's latency.
+    pub get_service_max_ms: u64,
+    /// GETs whose processing returned an error instead of a response. They are
+    /// excluded from `get_service_count` and the service-time totals.
+    pub get_service_failures: u64,
+    /// GETs that acquired both bulk-response permits, the denominator for
+    /// `bulk_wait_total_ms`.
+    pub bulk_wait_count: u64,
+    /// Summed time GETs spent waiting for their source and global
+    /// bulk-response permits.
+    pub bulk_wait_total_ms: u64,
+    /// Longest single wait for the bulk-response permits. A lifetime
+    /// high-water mark like `get_service_max_ms`, with the same caveat.
+    pub bulk_wait_max_ms: u64,
 }
 
 /// Cloneable diagnostics handle for a running or stopped browser listener.
@@ -598,6 +682,9 @@ impl WebRtcServerDiagnostics {
             max_concurrent_requests: self.config.max_concurrent_requests,
             in_flight_bytes: resources.global_bytes.in_use.load(Ordering::Acquire),
             max_in_flight_bytes: self.config.max_in_flight_bytes,
+            bulk_slots_in_use: bulk_response_slots(self.config.max_in_flight_bytes)
+                .saturating_sub(resources.bulk_responses.available_permits()),
+            bulk_slots_max: bulk_response_slots(self.config.max_in_flight_bytes),
             connection_rejections: resources.connection_rejections.load(Ordering::Relaxed),
             channel_rejections: resources.channel_rejections.load(Ordering::Relaxed),
             request_rejections: resources.request_rejections.load(Ordering::Relaxed),
@@ -607,7 +694,104 @@ impl WebRtcServerDiagnostics {
             connection_errors: resources.connection_errors.load(Ordering::Relaxed),
             channel_errors: resources.channel_errors.load(Ordering::Relaxed),
             task_failures: resources.task_failures.load(Ordering::Relaxed),
+            get_service_count: resources.get_service_count.load(Ordering::Relaxed),
+            get_service_total_ms: resources.get_service_total_ms.load(Ordering::Relaxed),
+            get_service_max_ms: resources.get_service_max_ms.load(Ordering::Relaxed),
+            get_service_failures: resources.get_service_failures.load(Ordering::Relaxed),
+            bulk_wait_count: resources.bulk_wait_count.load(Ordering::Relaxed),
+            bulk_wait_total_ms: resources.bulk_wait_total_ms.load(Ordering::Relaxed),
+            bulk_wait_max_ms: resources.bulk_wait_max_ms.load(Ordering::Relaxed),
         }
+    }
+
+    /// Emit the browser listener's state as INFO summary lines, target
+    /// `ant_node::web_rtc::traffic`, message `webrtc listener summary
+    /// (cumulative)`.
+    ///
+    /// Flat snake-case integer keys like the storage and replication
+    /// summaries. Two lines sharing the same target and message, told apart by
+    /// `group`: the application listener (`group = 1`) and the WebRTC
+    /// transport beneath it (`group = 2`, each key prefixed `transport_`), so
+    /// neither line approaches `tracing`'s 32-field cap.
+    ///
+    /// The fields fall into four classes, and only one of them may be
+    /// differenced. Field names are a query contract and are never renamed.
+    ///
+    /// * **Additive counters**, accumulated since process start: the rejection
+    ///   and error counts, `get_service_count`, `get_service_total_ms`,
+    ///   `get_service_failures`, `bulk_wait_count`, `bulk_wait_total_ms`, and
+    ///   every `transport_` field except the two active/connecting gauges.
+    ///   Diff two lines for a rate; mean GET latency over an interval is the
+    ///   `get_service_total_ms` diff over the `get_service_count` diff.
+    /// * **Instantaneous gauges**, sampled at emission and not cumulative:
+    ///   `running`, `active_connections`, `active_channels`,
+    ///   `active_requests`, `in_flight_bytes`, `bulk_slots_in_use`,
+    ///   `transport_active_connections` and
+    ///   `transport_connecting_connections`. Differencing these is
+    ///   meaningless; read the level, or average it over the window.
+    /// * **Lifetime maxima**: `get_service_max_ms` and `bulk_wait_max_ms` are
+    ///   high-water marks that are never reset, so they rise and never fall.
+    ///   A diff of either is 0 whenever the window's worst case did not beat
+    ///   the all-time worst case, which hides sustained high latency — watch
+    ///   the mean from the counters above for that, and read these two as the
+    ///   worst case seen since start.
+    /// * **Configured capacities**, constant for the process:
+    ///   `max_connections`, `max_channels`, `max_concurrent_requests`,
+    ///   `max_in_flight_bytes` and `bulk_slots_max`. They are emitted so a
+    ///   gauge can be read as a fraction of its limit.
+    pub fn log_webrtc_listener_summary(&self) {
+        let snapshot = self.snapshot();
+        let transport = &snapshot.transport;
+
+        crate::logging::info!(
+            target: "ant_node::web_rtc::traffic",
+            group = 1,
+            running = u64::from(snapshot.running),
+            active_connections = snapshot.active_connections as u64,
+            max_connections = snapshot.max_connections as u64,
+            active_channels = snapshot.active_channels as u64,
+            max_channels = snapshot.max_channels as u64,
+            active_requests = snapshot.active_requests as u64,
+            max_concurrent_requests = snapshot.max_concurrent_requests as u64,
+            in_flight_bytes = snapshot.in_flight_bytes as u64,
+            max_in_flight_bytes = snapshot.max_in_flight_bytes as u64,
+            bulk_slots_in_use = snapshot.bulk_slots_in_use as u64,
+            bulk_slots_max = snapshot.bulk_slots_max as u64,
+            connection_rejections = snapshot.connection_rejections,
+            channel_rejections = snapshot.channel_rejections,
+            request_rejections = snapshot.request_rejections,
+            rate_rejections = snapshot.rate_rejections,
+            byte_rejections = snapshot.byte_rejections,
+            listener_errors = snapshot.listener_errors,
+            connection_errors = snapshot.connection_errors,
+            channel_errors = snapshot.channel_errors,
+            task_failures = snapshot.task_failures,
+            get_service_count = snapshot.get_service_count,
+            get_service_total_ms = snapshot.get_service_total_ms,
+            get_service_max_ms = snapshot.get_service_max_ms,
+            get_service_failures = snapshot.get_service_failures,
+            bulk_wait_count = snapshot.bulk_wait_count,
+            bulk_wait_total_ms = snapshot.bulk_wait_total_ms,
+            bulk_wait_max_ms = snapshot.bulk_wait_max_ms,
+            "webrtc listener summary (cumulative)"
+        );
+
+        crate::logging::info!(
+            target: "ant_node::web_rtc::traffic",
+            group = 2,
+            transport_active_connections = transport.active_connections as u64,
+            transport_connecting_connections = transport.connecting_connections as u64,
+            transport_connection_attempts = transport.connection_attempts,
+            transport_successful_connections = transport.successful_connections,
+            transport_failed_connections = transport.failed_connections,
+            transport_closed_connections = transport.closed_connections,
+            transport_disconnections = transport.disconnections,
+            transport_rejected_connections = transport.rejected_connections,
+            transport_listener_errors = transport.listener_errors,
+            transport_bytes_sent = transport.bytes_sent,
+            transport_bytes_received = transport.bytes_received,
+            "webrtc listener summary (cumulative)"
+        );
     }
 }
 
@@ -693,9 +877,11 @@ pub async fn spawn(
     info!(bind = %local_addr, certificate = %certificate_path.display(),
         "ADR-0015 WebRTC Direct listening");
     let root_dir = root_dir.to_path_buf();
+    let summary_diagnostics = diagnostics.clone();
     let task = tokio::spawn(async move {
-        // Both futures are owned by the listener task. Address publication cannot
-        // block accepting sessions, and shutdown cancels a pending publication.
+        // All three futures are owned by the listener task. Neither address
+        // publication nor the diagnostics summary can block accepting sessions,
+        // and shutdown cancels a pending publication.
         tokio::join!(
             serve_webrtc(
                 listener,
@@ -704,28 +890,14 @@ pub async fn spawn(
                 shutdown.clone(),
                 run_guard
             ),
-            async {
-                let refresh = async {
-                    let mut interval = tokio::time::interval(ADDRESS_REFRESH_INTERVAL);
-                    loop {
-                        interval.tick().await;
-                        if let Err(error) = refresh_browser_endpoint(
-                            &state,
-                            &root_dir,
-                            local_addr,
-                            certificate_sha256,
-                        )
-                        .await
-                        {
-                            warn!(%error, "Failed to update WebRTC Direct endpoint");
-                        }
-                    }
-                };
-                tokio::select! {
-                    () = shutdown.cancelled() => {},
-                    () = refresh => {},
-                }
-            },
+            refresh_browser_endpoint_loop(
+                state,
+                root_dir,
+                local_addr,
+                certificate_sha256,
+                shutdown.clone(),
+            ),
+            log_listener_summaries(summary_diagnostics, shutdown.clone()),
         );
         // Remove the gateway mapping rather than leave it to its lease.
         if let Some(upnp) = upnp {
@@ -737,6 +909,53 @@ pub async fn spawn(
         endpoint: browser_endpoint,
         task,
     })
+}
+
+/// Republish the listener's advertised address every
+/// `ADDRESS_REFRESH_INTERVAL` until shutdown.
+///
+/// Owned by the listener task so publication cannot block accepting sessions,
+/// and shutdown cancels a pending publication.
+async fn refresh_browser_endpoint_loop(
+    state: Arc<ServerState>,
+    root_dir: PathBuf,
+    local_addr: SocketAddr,
+    certificate_sha256: [u8; 32],
+    shutdown: CancellationToken,
+) {
+    let refresh = async {
+        let mut interval = tokio::time::interval(ADDRESS_REFRESH_INTERVAL);
+        loop {
+            interval.tick().await;
+            if let Err(error) =
+                refresh_browser_endpoint(&state, &root_dir, local_addr, certificate_sha256).await
+            {
+                warn!(%error, "Failed to update WebRTC Direct endpoint");
+            }
+        }
+    };
+    tokio::select! {
+        () = shutdown.cancelled() => {},
+        () = refresh => {},
+    }
+}
+
+/// Emit the browser listener summary every `WEBRTC_SUMMARY_INTERVAL_SECS`
+/// until shutdown.
+///
+/// Sampling only reads atomics and semaphore permit counts, so this loop never
+/// holds a lock across an await and never blocks the accept loop or a request
+/// worker.
+async fn log_listener_summaries(diagnostics: WebRtcServerDiagnostics, shutdown: CancellationToken) {
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => break,
+            () = tokio::time::sleep(Duration::from_secs(WEBRTC_SUMMARY_INTERVAL_SECS)) => {
+                diagnostics.log_webrtc_listener_summary();
+            }
+        }
+    }
+    debug!("WebRTC Direct listener summary loop shut down");
 }
 
 async fn refresh_browser_endpoint(
@@ -1539,16 +1758,23 @@ async fn start_request(
 ) -> ServerResult<CompletedRequest> {
     let listener = Arc::clone(&resources.listener);
     let worker = listener.spawn_request(async move {
+        // V2-1871: time the worker from the moment it starts, so the GET
+        // service time below covers the bulk-slot wait as well as the work.
+        // This is deliberately not admission: the request permit, frame
+        // assembly and decryption all happen before the worker is spawned, so
+        // this clock excludes them.
+        let worker_started_at = Instant::now();
         let AdmittedRequest {
             request,
             content,
             _request_permit: request_permit,
             _in_flight_bytes: in_flight_bytes,
         } = admitted;
+        let is_get = request_is_get(&request, &content);
         // Reserve enough preparation capacity for one complete response to
         // make progress under the existing byte limits. Acquire source first:
         // queued work from one source cannot occupy every global bulk slot.
-        let bulk_permits = if request_is_get(&request, &content) {
+        let bulk_permits = if is_get {
             let source = Arc::clone(&resources.source.bulk_responses)
                 .acquire_owned()
                 .await
@@ -1557,11 +1783,31 @@ async fn start_request(
                 .acquire_owned()
                 .await
                 .map_err(|_| "bulk response admission closed".to_string())?;
+            resources
+                .listener
+                .record_bulk_wait(worker_started_at.elapsed());
             Some((source, global))
         } else {
             None
         };
-        let (response, content) = process_request(request, content, &state, &resources).await?;
+        let (response, content) = match process_request(request, content, &state, &resources).await
+        {
+            Ok(processed) => processed,
+            Err(error) => {
+                if is_get {
+                    resources
+                        .listener
+                        .get_service_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                return Err(error);
+            }
+        };
+        if is_get {
+            resources
+                .listener
+                .record_get_service(worker_started_at.elapsed());
+        }
         Ok(CompletedRequest {
             _bulk_permits: bulk_permits,
             response,
@@ -2496,6 +2742,17 @@ mod tests {
             resources: Arc::clone(&resources),
             config,
         };
+        let fresh = diagnostics.snapshot();
+        assert_eq!(fresh.get_service_count, 0);
+        assert_eq!(fresh.get_service_total_ms, 0);
+        assert_eq!(fresh.get_service_max_ms, 0);
+        assert_eq!(fresh.get_service_failures, 0);
+        assert_eq!(fresh.bulk_wait_count, 0);
+        assert_eq!(fresh.bulk_wait_total_ms, 0);
+        assert_eq!(fresh.bulk_wait_max_ms, 0);
+        assert_eq!(fresh.bulk_slots_in_use, 0);
+        // This config's 8-byte frame budget floors the bulk queue at one slot.
+        assert_eq!(fresh.bulk_slots_max, 1);
         let first = resources
             .try_admit_connection("192.0.2.1:1000".parse().unwrap())
             .unwrap();
@@ -2529,6 +2786,102 @@ mod tests {
         assert_eq!(idle.in_flight_bytes, 0);
         assert_eq!(idle.active_connections, 0);
         assert_eq!(idle.byte_rejections, 2);
+    }
+
+    #[test]
+    fn latency_counters_accumulate_and_the_summary_logs_the_snapshot() {
+        let config = WebRtcDirectConfig::default();
+        let resources = ListenerResources::new(&config);
+        let diagnostics = WebRtcServerDiagnostics {
+            local_addr: "127.0.0.1:1234".parse().unwrap(),
+            transport: WebRtcDiagnostics::default(),
+            resources: Arc::clone(&resources),
+            config,
+        };
+        resources.record_bulk_wait(Duration::from_millis(5));
+        resources.record_bulk_wait(Duration::from_millis(11));
+        resources.record_get_service(Duration::from_millis(40));
+        resources.record_get_service(Duration::from_millis(17));
+        let snapshot = diagnostics.snapshot();
+        assert_eq!(snapshot.bulk_wait_count, 2);
+        assert_eq!(snapshot.bulk_wait_total_ms, 16);
+        assert_eq!(snapshot.bulk_wait_max_ms, 11);
+        assert_eq!(snapshot.get_service_count, 2);
+        assert_eq!(snapshot.get_service_total_ms, 57);
+        assert_eq!(snapshot.get_service_max_ms, 40);
+        // The four global bulk slots whose queueing V2-1795 could not observe.
+        assert_eq!(snapshot.bulk_slots_max, 4);
+        assert_eq!(snapshot.bulk_slots_in_use, 0);
+        diagnostics.log_webrtc_listener_summary();
+    }
+
+    /// A `ServerState` with storage disabled: enough for the real request
+    /// worker to serve one GET without a node or a chunk store.
+    async fn storage_disabled_state() -> Arc<ServerState> {
+        let p2p = Arc::new(
+            P2PNode::new(
+                CoreNodeConfig::builder()
+                    .local(true)
+                    .ipv6(false)
+                    .build()
+                    .expect("core config"),
+            )
+            .await
+            .expect("P2P node"),
+        );
+        Arc::new(ServerState {
+            config: WebRtcDirectConfig::default(),
+            identity: Arc::clone(p2p.transport().node_identity()),
+            p2p,
+            ant_protocol: None,
+            payment: BrowserPaymentNetwork {
+                chain_id: ARBITRUM_SEPOLIA_CHAIN_ID,
+                payment_token_address: String::new(),
+                payment_vault_address: String::new(),
+            },
+            publication: RwLock::new(Publication::default()),
+            endpoint_catalog: None,
+            port_mapping: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn one_get_records_a_bulk_wait_and_a_service_time() {
+        let config = WebRtcDirectConfig::default();
+        let resources = ListenerResources::new(&config);
+        let state = storage_disabled_state().await;
+        let connection = resources
+            .try_admit_connection("192.0.2.1:1000".parse().expect("source"))
+            .expect("connection");
+        let admitted = AdmittedRequest {
+            request: Request::new(
+                1,
+                RequestBody::GetChunk {
+                    address: hex::encode([7_u8; 32]),
+                },
+                0,
+            ),
+            content: Vec::new(),
+            _request_permit: connection
+                .context
+                .try_admit_request()
+                .expect("request slot"),
+            _in_flight_bytes: connection.context.try_reserve_bytes(1024).expect("bytes"),
+        };
+        let completed = start_request(admitted, state, Arc::clone(&connection.context))
+            .await
+            .expect("GET completed");
+        let slots = bulk_response_slots(config.max_in_flight_bytes);
+        assert_eq!(
+            resources.bulk_responses.available_permits(),
+            slots - 1,
+            "the prepared response still holds its bulk-response slot"
+        );
+        assert_eq!(resources.bulk_wait_count.load(Ordering::Relaxed), 1);
+        assert_eq!(resources.get_service_count.load(Ordering::Relaxed), 1);
+        assert_eq!(resources.get_service_failures.load(Ordering::Relaxed), 0);
+        drop(completed);
+        assert_eq!(resources.bulk_responses.available_permits(), slots);
     }
 
     #[tokio::test]
