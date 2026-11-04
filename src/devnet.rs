@@ -27,6 +27,7 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 #[cfg(all(feature = "webrtc-direct", feature = "test-utils"))]
 use crate::ant_protocol::{ChunkMessage, ChunkMessageBody, ChunkPutRequest, ChunkPutResponse};
@@ -41,6 +42,11 @@ use bytes::Bytes;
 #[cfg(all(feature = "webrtc-direct", feature = "test-utils"))]
 use std::collections::HashMap;
 
+mod run_dir;
+
+use run_dir::RunDir;
+pub use run_dir::{LOCK_FILE, MARKER_FILE};
+
 // =============================================================================
 // Devnet Constants
 // =============================================================================
@@ -54,6 +60,10 @@ pub const DEVNET_PORT_RANGE_MAX: u16 = 60_000;
 // =============================================================================
 // Default Timing Constants
 // =============================================================================
+
+/// Directory under the ant data root that devnet runs create their own data
+/// directories in by default (see [`DevnetConfig::data_dir`]).
+pub const DEVNETS_SUBDIR: &str = "devnets";
 
 /// Default delay between spawning nodes (milliseconds).
 const DEFAULT_SPAWN_DELAY_MS: u64 = 200;
@@ -81,6 +91,11 @@ const STABILIZATION_MIN_CONNECTIONS_CAP: usize = 3;
 
 /// Health monitor check interval (seconds).
 const HEALTH_CHECK_INTERVAL_SECS: u64 = 5;
+
+/// How long shutdown gives a node's request handlers, and then the storage
+/// writes they started, to finish (seconds), as a node does. A node still
+/// writing after that keeps the run directory.
+const DRAIN_GRACE_SECS: u64 = 5;
 
 // =============================================================================
 // AntProtocol Devnet Configuration
@@ -201,7 +216,21 @@ pub struct DevnetConfig {
     /// Number of bootstrap nodes (first N nodes, default: 3).
     pub bootstrap_count: usize,
 
-    /// Root directory for devnet data.
+    /// Directory each run creates its own data directory in (default:
+    /// `{ant data root}/devnets`).
+    ///
+    /// [`Devnet::new`] creates a fresh `{pid}-{random}` directory inside it,
+    /// and from then on [`Devnet::config`]'s `data_dir` is that run
+    /// directory. A devnet deletes only a directory it created and marked as
+    /// its own ([`MARKER_FILE`]), never this one or anything else in it: the
+    /// ant data root also holds real nodes' data and the client's payment
+    /// caches and upload history (ant-node#261). Run directories that earlier
+    /// runs left here, killed before they could remove them, are removed when
+    /// the next run starts, unless they were kept.
+    ///
+    /// On Unix it must be a directory only the user and root can change, as
+    /// must every directory above it, or [`Devnet::new`] fails: another user
+    /// who could would be able to redirect what the nodes write.
     pub data_dir: PathBuf,
 
     /// Delay between node spawns (default: 200ms).
@@ -216,7 +245,8 @@ pub struct DevnetConfig {
     /// Enable verbose logging for devnet nodes.
     pub enable_node_logging: bool,
 
-    /// Whether to remove the data directory on shutdown.
+    /// Whether to remove the run's data directory on shutdown. When `false`,
+    /// its marker also tells later runs to leave it alone.
     pub cleanup_data_dir: bool,
 
     /// Optional EVM network for payment verification.
@@ -247,7 +277,7 @@ impl Default for DevnetConfig {
             node_count: DEFAULT_NODE_COUNT,
             base_port,
             bootstrap_count: DEFAULT_BOOTSTRAP_COUNT,
-            data_dir: default_root_dir(),
+            data_dir: default_root_dir().join(DEVNETS_SUBDIR),
             spawn_delay: Duration::from_millis(DEFAULT_SPAWN_DELAY_MS),
             stabilization_timeout: Duration::from_secs(DEFAULT_STABILIZATION_TIMEOUT_SECS),
             node_startup_timeout: Duration::from_secs(DEFAULT_NODE_STARTUP_TIMEOUT_SECS),
@@ -340,6 +370,9 @@ pub struct DevnetNode {
     state: Arc<RwLock<NodeState>>,
     bootstrap_addrs: Vec<MultiAddr>,
     protocol_task: Option<JoinHandle<()>>,
+    /// The request handlers `protocol_task` has started, which shutdown
+    /// waits for.
+    handlers: TaskTracker,
     #[cfg(feature = "webrtc-direct")]
     webrtc_direct_task: Option<JoinHandle<()>>,
     #[cfg(feature = "webrtc-direct")]
@@ -360,18 +393,33 @@ impl DevnetNode {
 }
 
 /// A local devnet composed of multiple nodes.
+///
+/// Call [`shutdown`](Self::shutdown) before dropping it. Dropped without one,
+/// the nodes it started are not stopped, and its run directory is left,
+/// locked until the process exits so that no other run deletes it while they
+/// may still be writing there.
 pub struct Devnet {
     config: DevnetConfig,
     nodes: Vec<DevnetNode>,
     shutdown: CancellationToken,
     state: Arc<RwLock<NetworkState>>,
     health_monitor: Option<JoinHandle<()>>,
+    /// This run's data directory, until [`shutdown`](Self::shutdown) removes
+    /// or releases it. Dropped without a shutdown, the devnet keeps it locked
+    /// until the process exits.
+    run_dir: Option<RunDir>,
+    /// [`DRAIN_GRACE_SECS`], shorter in tests.
+    drain_grace: Duration,
     #[cfg(feature = "webrtc-direct")]
     browser_endpoint_catalog: Arc<crate::web_rtc::BrowserEndpointCatalog>,
 }
 
 impl Devnet {
     /// Create a new devnet with the given configuration.
+    ///
+    /// Creates this run's own data directory inside `config.data_dir`, after
+    /// removing any that earlier runs left there and that are over and not
+    /// kept (see [`DevnetConfig::data_dir`]).
     ///
     /// # Errors
     ///
@@ -475,7 +523,13 @@ impl Devnet {
             }
         }
 
-        tokio::fs::create_dir_all(&config.data_dir).await?;
+        let parent = config.data_dir.clone();
+        let keep = !config.cleanup_data_dir;
+        let run_dir = tokio::task::spawn_blocking(move || RunDir::create(&parent, keep))
+            .await
+            .map_err(std::io::Error::other)??;
+        config.data_dir = run_dir.path().to_path_buf();
+        info!("Devnet data directory: {}", config.data_dir.display());
 
         Ok(Self {
             config,
@@ -483,6 +537,8 @@ impl Devnet {
             shutdown: CancellationToken::new(),
             state: Arc::new(RwLock::new(NetworkState::Uninitialized)),
             health_monitor: None,
+            run_dir: Some(run_dir),
+            drain_grace: Duration::from_secs(DRAIN_GRACE_SECS),
             #[cfg(feature = "webrtc-direct")]
             browser_endpoint_catalog: Arc::new(crate::web_rtc::BrowserEndpointCatalog::default()),
         })
@@ -518,6 +574,12 @@ impl Devnet {
 
     /// Shutdown the devnet.
     ///
+    /// Stops every node, then removes the run's data directory, but only if
+    /// they have all stopped writing to it. A node that has not, because a
+    /// request is still being handled after a few seconds or its P2P node
+    /// failed to shut down, leaves the directory, locked until the process
+    /// exits; the next run removes it then.
+    ///
     /// # Errors
     ///
     /// Returns `DevnetError::Io` if the data directory cleanup fails.
@@ -531,46 +593,123 @@ impl Devnet {
             handle.abort();
         }
 
-        let mut shutdown_futures = Vec::with_capacity(self.nodes.len());
+        let grace = self.drain_grace;
+        let mut stops = Vec::with_capacity(self.nodes.len());
         for node in self.nodes.iter_mut().rev() {
             debug!("Stopping node {}", node.index);
-            if let Some(handle) = node.protocol_task.take() {
-                handle.abort();
-            }
-            #[cfg(feature = "webrtc-direct")]
-            if let Some(handle) = node.webrtc_direct_task.take() {
-                if let Err(error) = handle.await {
-                    warn!(
-                        "Error stopping node {} WebRtcDirect listener: {error}",
-                        node.index
-                    );
-                }
-            }
-
             let node_index = node.index;
             let node_state = Arc::clone(&node.state);
+            let protocol_task = node.protocol_task.take();
+            #[cfg(feature = "webrtc-direct")]
+            let webrtc_direct_task = node.webrtc_direct_task.take();
+            let handlers = node.handlers.clone();
+            let storage = node
+                .ant_protocol
+                .as_ref()
+                .map(|protocol| protocol.storage());
             let p2p_node = node.p2p_node.take();
 
-            shutdown_futures.push(async move {
+            stops.push(async move {
+                let mut stopped = true;
+                // The token cancelled above closes the browser listener,
+                // which drains its own requests before it returns.
+                #[cfg(feature = "webrtc-direct")]
+                if let Some(handle) = webrtc_direct_task {
+                    if let Err(error) = handle.await {
+                        warn!("Error stopping node {node_index} WebRtcDirect listener: {error}");
+                        stopped = false;
+                    }
+                }
+                // As a node does: the routing loop first, aborted and awaited
+                // so that it starts no more handlers, then the handlers it
+                // started, given a moment to finish.
+                if let Some(handle) = protocol_task {
+                    handle.abort();
+                    let _ = handle.await;
+                }
+                handlers.close();
+                if tokio::time::timeout(grace, handlers.wait()).await.is_err() {
+                    warn!(
+                        "Node {node_index}: {} request handler(s) still running after {grace:?}",
+                        handlers.len()
+                    );
+                    stopped = false;
+                }
+                // A storage write outlives the future that started it.
+                if let Some(storage) = storage {
+                    if tokio::time::timeout(grace, storage.wait_idle())
+                        .await
+                        .is_err()
+                    {
+                        warn!("Node {node_index}: storage writes still running after {grace:?}");
+                        stopped = false;
+                    }
+                }
                 if let Some(p2p) = p2p_node {
                     if let Err(e) = p2p.shutdown().await {
                         warn!("Error shutting down node {node_index}: {e}");
+                        stopped = false;
                     }
                 }
                 *node_state.write().await = NodeState::Stopped;
+                stopped
             });
         }
-        futures::future::join_all(shutdown_futures).await;
+        let all_stopped = futures::future::join_all(stops)
+            .await
+            .into_iter()
+            .all(|stopped| stopped);
 
-        if self.config.cleanup_data_dir {
-            if let Err(e) = tokio::fs::remove_dir_all(&self.config.data_dir).await {
-                warn!("Failed to cleanup devnet data directory: {e}");
+        match self.run_dir.take() {
+            Some(run_dir) if !all_stopped => {
+                warn!(
+                    "Leaving devnet data directory {}: not every node has stopped writing to it. \
+                     It stays locked until this process exits, and the next run removes it.",
+                    self.config.data_dir.display()
+                );
+                run_dir.keep_locked_until_exit();
             }
+            Some(run_dir) if self.config.cleanup_data_dir => {
+                match tokio::task::spawn_blocking(move || run_dir.remove()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => warn!(
+                        "Failed to remove devnet data directory {}: {e}",
+                        self.config.data_dir.display()
+                    ),
+                    Err(e) => warn!("Failed to remove devnet data directory: {e}"),
+                }
+            }
+            // Without cleanup, dropping the run directory releases its lock
+            // and leaves it, marked to be kept.
+            Some(_) | None => {}
         }
 
         *self.state.write().await = NetworkState::Stopped;
         info!("Devnet shutdown complete");
         Ok(())
+    }
+
+    /// A token that stops this devnet's [`start`](Self::start) when cancelled.
+    ///
+    /// A start in progress returns an error at its next safe point: between
+    /// node spawns, or while it waits for nodes to come up or the network to
+    /// stabilize. Every node it started is registered by then, so a following
+    /// [`shutdown`](Self::shutdown) stops them all before it removes the data
+    /// directory. Dropping a `start` future part-way instead can leave a node
+    /// running unregistered, still writing into that directory. It is the same
+    /// token `shutdown` cancels.
+    #[must_use]
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.shutdown.clone()
+    }
+
+    /// Wait `delay`, or fail at once if the devnet has been cancelled.
+    async fn pause(&self, delay: Duration) -> Result<()> {
+        tokio::select! {
+            biased;
+            () = self.shutdown.cancelled() => Err(start_cancelled()),
+            () = tokio::time::sleep(delay) => Ok(()),
+        }
     }
 
     /// Get devnet configuration.
@@ -837,7 +976,7 @@ impl Devnet {
         for i in 0..self.config.bootstrap_count {
             let node = self.create_node(i, true, vec![]).await?;
             self.start_node(node).await?;
-            tokio::time::sleep(self.config.spawn_delay).await;
+            self.pause(self.config.spawn_delay).await?;
         }
 
         self.wait_for_nodes_ready(0..self.config.bootstrap_count)
@@ -873,7 +1012,7 @@ impl Devnet {
         for i in self.config.bootstrap_count..self.config.node_count {
             let node = self.create_node(i, false, bootstrap_addrs.clone()).await?;
             self.start_node(node).await?;
-            tokio::time::sleep(self.config.spawn_delay).await;
+            self.pause(self.config.spawn_delay).await?;
         }
 
         info!("All regular nodes started");
@@ -922,6 +1061,7 @@ impl Devnet {
             state: Arc::new(RwLock::new(NodeState::Pending)),
             bootstrap_addrs,
             protocol_task: None,
+            handlers: TaskTracker::new(),
             #[cfg(feature = "webrtc-direct")]
             webrtc_direct_task: None,
             #[cfg(feature = "webrtc-direct")]
@@ -1027,6 +1167,13 @@ impl Devnet {
 
         node.p2p_node = Some(Arc::new(p2p_node));
         *node.state.write().await = NodeState::Running;
+        // Registered as soon as it runs, so that should the rest of its
+        // startup fail, shutdown still stops it before removing its data.
+        self.nodes.push(node);
+        let node = self
+            .nodes
+            .last_mut()
+            .ok_or_else(|| DevnetError::Startup(format!("Node {index} was not registered")))?;
 
         #[cfg(feature = "webrtc-direct")]
         if self.config.webrtc_direct {
@@ -1092,6 +1239,7 @@ impl Devnet {
             let mut events = p2p.subscribe_events();
             let p2p_clone = Arc::clone(p2p);
             let protocol_clone = Arc::clone(protocol);
+            let handlers = node.handlers.clone();
             let node_index = node.index;
             node.protocol_task = Some(tokio::spawn(async move {
                 while let Ok(event) = events.recv().await {
@@ -1109,7 +1257,7 @@ impl Devnet {
                             let protocol = Arc::clone(&protocol_clone);
                             let p2p = Arc::clone(&p2p_clone);
                             let received_at = Instant::now();
-                            tokio::spawn(handle_chunk_message(
+                            handlers.spawn(handle_chunk_message(
                                 protocol,
                                 p2p,
                                 source,
@@ -1124,7 +1272,6 @@ impl Devnet {
         }
 
         debug!("Node {} started successfully", node.index);
-        self.nodes.push(node);
         Ok(())
     }
 
@@ -1146,8 +1293,8 @@ impl Devnet {
                         return Err(DevnetError::Startup(format!("Node {i} failed: {e}")));
                     }
                     _ => {
-                        tokio::time::sleep(Duration::from_millis(NODE_READY_POLL_INTERVAL_MS))
-                            .await;
+                        self.pause(Duration::from_millis(NODE_READY_POLL_INTERVAL_MS))
+                            .await?;
                     }
                 }
             }
@@ -1189,7 +1336,8 @@ impl Devnet {
                 "Waiting for stabilization: {} total connections",
                 total_connections
             );
-            tokio::time::sleep(Duration::from_secs(STABILIZATION_POLL_INTERVAL_SECS)).await;
+            self.pause(Duration::from_secs(STABILIZATION_POLL_INTERVAL_SECS))
+                .await?;
         }
 
         Err(DevnetError::Stabilization(
@@ -1224,11 +1372,23 @@ impl Devnet {
     }
 }
 
+/// The error a cancelled [`Devnet::start`] returns.
+fn start_cancelled() -> DevnetError {
+    DevnetError::Startup("devnet start cancelled".to_string())
+}
+
 impl Drop for Devnet {
     fn drop(&mut self) {
         self.shutdown.cancel();
         if let Some(handle) = self.health_monitor.take() {
             handle.abort();
+        }
+        // Not shut down, so nodes it started may still be running: their
+        // tasks hold them, and outlive this. Keep the run directory locked
+        // until the process exits, so that no sweep deletes it under them. A
+        // later run removes it then, as it would after a SIGKILL.
+        if let Some(run_dir) = self.run_dir.take() {
+            run_dir.keep_locked_until_exit();
         }
     }
 }
@@ -1244,5 +1404,223 @@ mod tests {
     #[test]
     fn default_config_has_no_advertise_ip() {
         assert!(DevnetConfig::default().advertise_ip.is_none());
+    }
+
+    #[test]
+    fn runs_go_in_the_devnets_dir_of_the_data_root_by_default() {
+        let devnets = default_root_dir().join(DEVNETS_SUBDIR);
+        for config in [
+            DevnetConfig::default(),
+            DevnetConfig::minimal(),
+            DevnetConfig::small(),
+        ] {
+            assert_eq!(config.data_dir, devnets);
+            assert!(config.cleanup_data_dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn each_devnet_gets_and_removes_only_its_own_run_dir(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let parent = temp.path().join("devnets");
+        let mut config = DevnetConfig::minimal();
+        config.data_dir.clone_from(&parent);
+        let mut first = Devnet::new(config.clone()).await?;
+        let mut second = Devnet::new(config).await?;
+        let first_dir = first.config().data_dir.clone();
+        let second_dir = second.config().data_dir.clone();
+
+        assert_ne!(first_dir, second_dir);
+        for dir in [&first_dir, &second_dir] {
+            assert_eq!(
+                dir.parent().map(std::fs::canonicalize).transpose()?,
+                Some(std::fs::canonicalize(&parent)?),
+                "{}",
+                dir.display()
+            );
+            assert!(dir.join(MARKER_FILE).is_file(), "{}", dir.display());
+        }
+
+        first.shutdown().await?;
+        assert!(!first_dir.exists());
+        assert!(second_dir.join(MARKER_FILE).is_file());
+        second.shutdown().await?;
+        assert!(!second_dir.exists());
+        assert!(parent.is_dir(), "the parent is not the devnet's to delete");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn without_cleanup_the_run_dir_is_kept(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let mut config = DevnetConfig::minimal();
+        config.data_dir = temp.path().to_path_buf();
+        config.cleanup_data_dir = false;
+        let mut devnet = Devnet::new(config.clone()).await?;
+        let kept = devnet.config().data_dir.clone();
+        devnet.shutdown().await?;
+        drop(devnet);
+
+        // A later run's sweep leaves it too.
+        config.cleanup_data_dir = true;
+        let mut later = Devnet::new(config).await?;
+        assert!(kept.join(MARKER_FILE).is_file());
+        later.shutdown().await?;
+        assert!(kept.join(MARKER_FILE).is_file());
+        Ok(())
+    }
+
+    /// A devnet of two nodes, quick to start, running in `parent`.
+    fn two_nodes(parent: &std::path::Path) -> DevnetConfig {
+        let mut config = DevnetConfig::minimal();
+        config.node_count = 2;
+        config.bootstrap_count = 1;
+        config.base_port = 0;
+        config.spawn_delay = Duration::from_millis(20);
+        config.data_dir = parent.join("devnets");
+        config
+    }
+
+    /// Hermes round 3 on #263: a started devnet dropped without a shutdown
+    /// leaves nodes running, still writing into its run directory, so the
+    /// next devnet's sweep must leave it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_started_devnet_dropped_without_shutdown_is_not_swept(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let config = two_nodes(temp.path());
+        let mut dropped = Devnet::new(config.clone()).await?;
+        dropped.start().await?;
+        let dropped_dir = dropped.config().data_dir.clone();
+        drop(dropped);
+
+        let mut next = Devnet::new(config).await?;
+
+        assert!(
+            dropped_dir.join(MARKER_FILE).is_file(),
+            "the next devnet swept {}",
+            dropped_dir.display()
+        );
+        next.shutdown().await?;
+        Ok(())
+    }
+
+    /// Hermes round 4 on #263: a PUT still being written when the devnet
+    /// shuts down keeps the run directory, locked, rather than having it
+    /// removed under the write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_put_still_being_written_at_shutdown_keeps_the_run_dir(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use crate::ant_protocol::{ChunkMessage, ChunkMessageBody, ChunkPutRequest};
+
+        let temp = tempfile::tempdir()?;
+        let mut devnet = Devnet::new(two_nodes(temp.path())).await?;
+        devnet.start().await?;
+        devnet.drain_grace = Duration::from_millis(500);
+        let run_dir = devnet.config().data_dir.clone();
+        let sender = devnet
+            .nodes
+            .first()
+            .and_then(|node| node.p2p_node.clone())
+            .ok_or("no sender")?;
+        let receiver = devnet.nodes.get(1).ok_or("no receiver")?;
+        let peer = receiver.peer_id;
+        let protocol = receiver.ant_protocol.clone().ok_or("no protocol")?;
+        let storage = protocol.storage();
+        let content = b"a chunk still being written at shutdown";
+        let address = ChunkStore::compute_address(content);
+        protocol.payment_verifier().cache_insert(address);
+        let request = ChunkMessage {
+            request_id: 1,
+            body: ChunkMessageBody::PutRequest(ChunkPutRequest::new(
+                address,
+                bytes::Bytes::from_static(content),
+            )),
+        }
+        .encode()?;
+
+        // Held, the write waits on its way into the store.
+        let gate = storage.test_put_gate();
+        let held = gate.write();
+        sender
+            .send_message(&peer, CHUNK_PROTOCOL_ID, request, &[])
+            .await?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while storage.tasks_in_flight() == 0 {
+            assert!(Instant::now() < deadline, "the PUT never reached the store");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        devnet.shutdown().await?;
+
+        assert!(
+            run_dir.join(MARKER_FILE).is_file(),
+            "{} was removed under a write",
+            run_dir.display()
+        );
+        drop(held);
+        storage.wait_idle().await;
+        assert!(run_dir.join(MARKER_FILE).is_file());
+        // Kept locked, so the next run leaves it too.
+        let mut next = Devnet::new(two_nodes(temp.path())).await?;
+        assert!(run_dir.join(MARKER_FILE).is_file());
+        next.shutdown().await?;
+        Ok(())
+    }
+
+    /// Hermes round 4 on #263: a node whose startup fails once its P2P node
+    /// is running, here because its WebRTC Direct port is taken, is
+    /// registered all the same, so shutdown stops it.
+    #[cfg(feature = "webrtc-direct")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_node_whose_startup_fails_part_way_is_stopped_by_shutdown(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let mut config = two_nodes(temp.path());
+        config.webrtc_direct = true;
+        let mut devnet = Devnet::new(config).await?;
+        let taken = std::net::UdpSocket::bind((
+            Ipv4Addr::LOCALHOST,
+            devnet.config().webrtc_direct_base_port,
+        ))?;
+
+        let started = devnet.start().await;
+
+        assert!(
+            matches!(started, Err(DevnetError::Startup(_))),
+            "{started:?}"
+        );
+        let p2p = devnet
+            .nodes
+            .first()
+            .and_then(|node| node.p2p_node.clone())
+            .ok_or("the node that failed part-way was not registered")?;
+        assert!(p2p.is_running());
+        devnet.shutdown().await?;
+        assert!(!p2p.is_running(), "shutdown left the node running");
+        assert!(!devnet.config().data_dir.exists());
+        drop(taken);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_devnet_stops_pausing_at_once(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let mut config = DevnetConfig::minimal();
+        config.data_dir = temp.path().join("devnet");
+        config.cleanup_data_dir = false;
+        let devnet = Devnet::new(config).await?;
+
+        assert!(devnet.pause(Duration::ZERO).await.is_ok());
+        devnet.cancellation_token().cancel();
+        let started = Instant::now();
+        let paused = devnet.pause(Duration::from_mins(1)).await;
+        assert!(matches!(paused, Err(DevnetError::Startup(_))), "{paused:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        Ok(())
     }
 }

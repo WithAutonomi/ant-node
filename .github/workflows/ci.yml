@@ -129,6 +129,12 @@ jobs:
           failed=""
           for t in $targets; do
             extra=""
+            if [ "$t" = devnet_lifecycle ] && [ "$RUNNER_OS" = Windows ]; then
+              # It stops ant-devnet with SIGTERM and SIGKILL, so it is Unix
+              # only, and compiles to nothing on Windows.
+              echo "skipping $t on $RUNNER_OS (Unix only)"
+              continue
+            fi
             if [ "$t" = storage_scale ]; then
               # Its gates compare the store scan against timed directory walks, and
               # were measured on Linux; it has only ever run there.
@@ -165,6 +171,18 @@ jobs:
       - name: Unit tests without default features (no logging, no webrtc-direct)
         if: runner.os == 'Linux'
         run: cargo test --lib --no-default-features
+      # The run-directory tests that mount a tmpfs and bind mounts inside run
+      # directories, make directories another user owns, or act as another
+      # user. They need root, which the runner gives through sudo, so
+      # `cargo test` alone skips them.
+      - name: ant-devnet run directories against real mounts and other users
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --lib --features test-utils with_sudo_ -- --ignored --test-threads=1 2>&1 | tee /tmp/run_dir_sudo.log
+          grep -qE 'test result: ok\. [1-9]' /tmp/run_dir_sudo.log \
+            || { echo 'the run-directory sudo tests ran nothing'; exit 1; }
 
   filesystems:
     name: Storage on ${{ matrix.fs }}

@@ -42,6 +42,13 @@ use cli::Cli;
 async fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
 
+    // Listen for stop requests before anything starts. Until a handler is
+    // installed, SIGTERM kills the process outright: the devnet is never shut
+    // down, Anvil is orphaned and the data directory is left behind
+    // (ant-node#261).
+    let stop = stop_requested()?;
+    tokio::pin!(stop);
+
     let cli = Cli::parse();
 
     #[cfg(feature = "logging")]
@@ -118,19 +125,54 @@ async fn main() -> color_eyre::Result<()> {
     if let Some(base_port) = cli.webrtc_direct_base_port {
         config.webrtc_direct_base_port = base_port;
     }
+    // A stop request during EVM setup drops the half-finished setup, and with
+    // it any Anvil it already started.
     let ResolvedEvm {
         manifest: evm_info,
-        local_testnet: _local_evm_testnet,
-    } = resolve_evm_info(
-        cli.evm_network.as_deref(),
-        cli.enable_evm,
-        cli.host,
-        &mut config,
-    )
-    .await?;
+        local_testnet,
+    } = tokio::select! {
+        evm = resolve_evm_info(
+            cli.evm_network.as_deref(),
+            cli.enable_evm,
+            cli.host,
+            &mut config,
+        ) => evm?,
+        signal = &mut stop => {
+            ant_node::logging::info!("{signal} during EVM setup; exiting");
+            return Ok(());
+        }
+    };
 
     let mut devnet = Devnet::new(config).await?;
-    devnet.start().await?;
+    // A stop request during startup cancels the start rather than dropping
+    // it, so the start returns with every node it started registered and
+    // the shutdown below stops them all before removing the data directory.
+    let cancel = devnet.cancellation_token();
+    let started = {
+        let start = devnet.start();
+        tokio::pin!(start);
+        tokio::select! {
+            started = &mut start => started,
+            signal = &mut stop => {
+                ant_node::logging::info!("{signal} during startup; stopping the devnet");
+                cancel.cancel();
+                start.await
+            }
+        }
+    };
+    // Stopped or failed part-way: shut down the nodes that did start and
+    // remove the data directory. Anvil stops when `local_testnet` drops on
+    // return.
+    if cancel.is_cancelled() {
+        devnet.shutdown().await?;
+        return Ok(());
+    }
+    if let Err(e) = started {
+        if let Err(cleanup) = devnet.shutdown().await {
+            ant_node::logging::warn!("Cleanup after a failed start also failed: {cleanup}");
+        }
+        return Err(e.into());
+    }
 
     let created_at = chrono::Utc::now().to_rfc3339();
 
@@ -209,11 +251,50 @@ async fn main() -> color_eyre::Result<()> {
         )?;
     }
 
-    ant_node::logging::info!("Devnet running. Press Ctrl+C to stop.");
-    tokio::signal::ctrl_c().await?;
+    ant_node::logging::info!("Devnet running. Press Ctrl+C or send SIGTERM to stop.");
+    let signal = stop.await;
+    ant_node::logging::info!("{signal} received; stopping the devnet");
 
     devnet.shutdown().await?;
+    // Stop Anvil after the nodes, which verify payments against it.
+    drop(local_testnet);
     Ok(())
+}
+
+/// A future that resolves when the process is asked to stop, naming the
+/// request: SIGINT (Ctrl+C), SIGTERM (`kill`, service managers, `ant dev
+/// stop`) or SIGHUP (the terminal closed) on Unix; Ctrl+C or Ctrl+Break on
+/// Windows.
+///
+/// The handlers are installed by this call, not when the future is first
+/// polled, so call it before starting anything.
+fn stop_requested() -> std::io::Result<impl std::future::Future<Output = &'static str>> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        let mut terminate = signal(SignalKind::terminate())?;
+        let mut hangup = signal(SignalKind::hangup())?;
+        Ok(async move {
+            tokio::select! {
+                _ = interrupt.recv() => "SIGINT",
+                _ = terminate.recv() => "SIGTERM",
+                _ = hangup.recv() => "SIGHUP",
+            }
+        })
+    }
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows::{ctrl_break, ctrl_c};
+        let mut interrupt = ctrl_c()?;
+        let mut brk = ctrl_break()?;
+        Ok(async move {
+            tokio::select! {
+                _ = interrupt.recv() => "Ctrl+C",
+                _ = brk.recv() => "Ctrl+Break",
+            }
+        })
+    }
 }
 
 #[cfg(all(feature = "webrtc-direct", feature = "test-utils"))]
@@ -451,7 +532,7 @@ fn serve_manifest_api(
 /// payloads are tiny and a devnet serves a handful of LAN devices, so a single
 /// thread bounds resource use (no per-connection thread to exhaust). Each
 /// connection gets a read timeout so a slow/idle client can't stall the loop.
-/// The thread is detached and dies when the process exits on Ctrl+C.
+/// The thread is detached and dies when the process exits.
 fn spawn_manifest_server(
     listener: std::net::TcpListener,
     manifest_json: String,
