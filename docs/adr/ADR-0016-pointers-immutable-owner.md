@@ -142,10 +142,15 @@ over one state.
   counts as unanswered, never as a vote. This is how a node that missed an
   update, joined late, or lost a record across a restart is brought level.
 - **Pruning.** A record the node has been outside the retention width of for the
-  hysteresis period is deleted — at once if the node is outside a complete
-  paid-width group, otherwise only once all but one of the current close group
-  prove they hold that state or a newer one by returning a valid record. A proof
-  is a record, not a claim: signatures are checked.
+  hysteresis period is deleted only once all but one of the current close group
+  prove they hold that state or a newer one by returning a valid record, however
+  far outside the group the node has moved. A proof is a record, not a claim:
+  signatures are checked. Under ADR-0028 a candidate is only erased while the
+  disk is under pressure: with room, the node keeps it and asks nobody. Under
+  pressure each pass takes a bounded number of candidates, farthest from the
+  node first and those whose group failed to prove them in the current round
+  last, and asks each candidate's group at once, so records nobody can prove
+  yet never keep the rest from a turn.
 - **Possession.** Some minutes after offering a fresh state, the offering node
   asks each member for the record. One that is still responsible and cannot
   produce that state or a newer one is penalised, as a chunk holder is.
@@ -262,6 +267,13 @@ verified when it was committed and every read verifies it again.
   to 2,048 of them, about 11 MB.
 - The subtree audit's protocol id moved to `v2`, so across the upgrade the
   old and new releases do not audit each other.
+- **Far copies wait for capability.** A node learns a peer is capable only
+  from that peer's own pointer messages, which neighbour sync delivers between
+  near peers. A node that has moved far outside a record's group may never hear
+  from that group, so it cannot ask enough of it for proof and keeps the record:
+  storage held, never a copy lost. This lasts until the capability gate is
+  retired, once no peer older than pointers remains, after which every group
+  member is asked.
 
 ## Implementation status
 
@@ -352,7 +364,7 @@ receipt is paid again on retry.
   holds is not adopted, though its hints arrived; an unpaid fresh offer is
   refused; the possession check penalises only the member that dropped the
   record; pruning deletes only once the close group proves it holds the record,
-  and a node far outside the group prunes without asking.
+  even for a node outside a complete paid-width group.
 - From a browser: a node admits pointer requests at its WebRTC boundary, bounds
   a full record inside the small response limit, and passes every pointer reply
   through the sanitizer with errors redacted. In real Chromium against a live
@@ -373,7 +385,11 @@ receipt is paid again on retry.
   peer pinned before the upgrade, and a pointer-leaves file from another
   snapshot attaches nothing.
 - Pruning keeps a pointer a retained commitment holds, and drops it once none
-  does.
+  does; it keeps a pointer its group can prove while the disk has room, and
+  drops it under pressure (ADR-0028). Candidates a spell of pressure could not
+  prove are tried after the rest, so they never starve them; proofs are taken without
+  waiting on a peer that stalls, and a group that can no longer reach the
+  threshold, or has too few capable members to, is given up at once.
 - Fresh offers, hints, fetches and state queries are covered by the replication
   protocol's per-variant tests: family, size ceiling, round-trip.
 - End to end against a live testnet with real settlement: create, update, read

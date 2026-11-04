@@ -13,8 +13,12 @@ use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
 
 use crate::ant_protocol::XorName;
-use crate::replication::config::{ReplicationConfig, REPLICATION_PROTOCOL_ID};
-use crate::replication::paid_list::PaidList;
+use crate::client::xor_distance;
+use crate::error::Result;
+use crate::replication::config::{
+    ReplicationConfig, PAID_HINT_FULL_SCAN_ENTRIES, REPLICATION_PROTOCOL_ID,
+};
+use crate::replication::paid_list::{near_bits_for_radius, PaidList, XORNAME_BITS};
 use crate::replication::protocol::{
     NeighborSyncRequest, NeighborSyncResponse, ReplicationMessage, ReplicationMessageBody,
 };
@@ -103,8 +107,53 @@ pub(crate) async fn build_replica_hints_for_peer_with_close_groups(
     hints
 }
 
+/// How many low bits of a key may differ from this node's for the key to count
+/// as near it, from the distance to its farthest paid-close-group peer. Every
+/// key counts as near until this node knows a full paid close group.
+///
+/// With evenly spread IDs, entries beyond this carry no vote and need no hint.
+/// Where few peers are known near a key, this node or a neighbour can still be in
+/// its paid close group.
+pub(crate) async fn paid_near_bits(p2p_node: &Arc<P2PNode>, group_size: usize) -> usize {
+    let self_xor: XorName = *p2p_node.peer_id().as_bytes();
+    let closest = p2p_node
+        .dht_manager()
+        .find_closest_nodes_local(&self_xor, group_size)
+        .await;
+    if closest.len() < group_size {
+        return XORNAME_BITS;
+    }
+    closest
+        .iter()
+        .map(|node| xor_distance(&self_xor, node.peer_id.as_bytes()))
+        .max()
+        .map_or(XORNAME_BITS, |radius| near_bits_for_radius(&radius))
+}
+
+/// How many low bits of a key may differ from this node's for a hint build to read
+/// it: all of them while the list is small enough to read whole.
+fn paid_hint_scan_bits(entries: u64, near_bits: usize) -> usize {
+    if entries <= PAID_HINT_FULL_SCAN_ENTRIES {
+        XORNAME_BITS
+    } else {
+        near_bits
+    }
+}
+
+/// The paid-list keys a hint build considers.
+async fn paid_hint_candidates(
+    paid_list: &PaidList,
+    p2p_node: &Arc<P2PNode>,
+    group_size: usize,
+) -> Result<Vec<XorName>> {
+    let self_xor: XorName = *p2p_node.peer_id().as_bytes();
+    let near_bits = paid_near_bits(p2p_node, group_size).await;
+    let scan_bits = paid_hint_scan_bits(paid_list.count()?, near_bits);
+    paid_list.keys_near(&self_xor, scan_bits)
+}
+
 /// Build outbound hint sets for a batch of peers with one scan over local
-/// storage and one scan over the paid list.
+/// storage and one scan over the paid-list entries it can afford to read.
 pub(crate) async fn build_sync_hints_for_peers(
     peers: &[PeerId],
     storage: &Arc<ChunkStore>,
@@ -150,16 +199,17 @@ pub(crate) async fn build_sync_hints_for_peers(
         }
     }
 
-    let all_paid_keys = match paid_list.all_keys() {
-        Ok(keys) => keys,
-        Err(e) => {
-            warn!("Failed to read PaidForList for batch hint construction: {e}");
-            Vec::new()
-        }
-    };
-    let paid_key_count = all_paid_keys.len();
+    let paid_keys =
+        match paid_hint_candidates(paid_list, p2p_node, paid_list_close_group_size).await {
+            Ok(keys) => keys,
+            Err(e) => {
+                warn!("Failed to read PaidForList for batch hint construction: {e}");
+                Vec::new()
+            }
+        };
+    let paid_key_count = paid_keys.len();
 
-    for key in all_paid_keys {
+    for key in paid_keys {
         let closest = dht
             .find_closest_nodes_local_with_self(&key, paid_list_close_group_size)
             .await;
@@ -217,17 +267,18 @@ pub async fn build_paid_hints_for_peer(
     p2p_node: &Arc<P2PNode>,
     paid_list_close_group_size: usize,
 ) -> Vec<XorName> {
-    let all_paid_keys = match paid_list.all_keys() {
-        Ok(keys) => keys,
-        Err(e) => {
-            warn!("Failed to read PaidForList for hint construction: {e}");
-            return Vec::new();
-        }
-    };
+    let paid_keys =
+        match paid_hint_candidates(paid_list, p2p_node, paid_list_close_group_size).await {
+            Ok(keys) => keys,
+            Err(e) => {
+                warn!("Failed to read PaidForList for hint construction: {e}");
+                return Vec::new();
+            }
+        };
 
     let dht = p2p_node.dht_manager();
     let mut hints = Vec::new();
-    for key in all_paid_keys {
+    for key in paid_keys {
         let closest = dht
             .find_closest_nodes_local_with_self(&key, paid_list_close_group_size)
             .await;
@@ -567,6 +618,49 @@ mod tests {
         PeerId::from_bytes(bytes)
     }
 
+    /// A key whose last byte is `b`, the rest zero.
+    fn key_ending_in(b: u8) -> XorName {
+        let mut key = [0u8; 32];
+        key[31] = b;
+        key
+    }
+
+    // -- paid hint candidates ------------------------------------------------
+
+    #[tokio::test]
+    async fn a_far_key_is_read_for_hints_until_the_list_is_too_large_to_read_whole() {
+        // This node is 0, its neighbours are 1 and 2, and a group is two, so its
+        // group reaches distance 2. Key 129 is far from all three, yet its two
+        // closest are neighbour 1 (distance 128) and this node (129).
+        const THIS_NODE: u8 = 0;
+        const GROUP_RADIUS: u8 = 2;
+        const FAR_KEY: u8 = 129;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paid_list = PaidList::new(dir.path()).await.expect("paid list");
+        paid_list
+            .insert(&key_ending_in(FAR_KEY))
+            .await
+            .expect("insert");
+        let near_bits = near_bits_for_radius(&key_ending_in(GROUP_RADIUS));
+        let read = |entries| {
+            paid_list
+                .keys_near(
+                    &key_ending_in(THIS_NODE),
+                    paid_hint_scan_bits(entries, near_bits),
+                )
+                .expect("keys")
+        };
+
+        assert_eq!(
+            read(PAID_HINT_FULL_SCAN_ENTRIES),
+            vec![key_ending_in(FAR_KEY)]
+        );
+        assert!(
+            read(PAID_HINT_FULL_SCAN_ENTRIES + 1).is_empty(),
+            "above the limit only near keys are read"
+        );
+    }
+
     // -- select_sync_batch ---------------------------------------------------
 
     #[test]
@@ -884,11 +978,9 @@ mod tests {
     ///
     /// Full `run_prune_pass` requires a live `P2PNode`. This test verifies
     /// the deterministic trigger condition (cycle completion) and the
-    /// combined record + paid-list pruning contract:
+    /// record-pruning contract:
     ///   (1) Cycle completes -> prune pass should run.
-    ///   (2) Both `RecordOutOfRangeFirstSeen` and `PaidOutOfRangeFirstSeen`
-    ///       are tracked independently in the same pass.
-    ///   (3) Keys within hysteresis window are retained.
+    ///   (2) Keys within hysteresis window are retained.
     #[test]
     fn scenario_36_post_cycle_triggers_combined_prune_pass() {
         let config = ReplicationConfig::default();

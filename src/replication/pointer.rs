@@ -19,9 +19,15 @@
 //!   them. The record verifies itself; the quorum stands in for the payment
 //!   proof, as presence quorum does for a chunk.
 //! - **Pruning.** A record this node has been out of range of for the
-//!   hysteresis period is deleted — at once if the node is far outside the
-//!   group, otherwise only once all but one of the current close group prove
-//!   they hold that state or a newer one by returning a valid record.
+//!   hysteresis period is eligible to be erased, never due (ADR-0028): while
+//!   the disk has room it is kept and nobody is asked. Under disk pressure it
+//!   is erased only once all but one of the current close group prove they
+//!   hold that state or a newer one by returning a valid record, however far
+//!   outside the group the node has moved. Each pass tries candidates farthest
+//!   from this node first, then those whose proof failed, oldest failure
+//!   first, and asks each one's group at once, so candidates nobody can prove
+//!   yet never keep the rest from a turn. A record whose group has too few
+//!   capable members to prove it is kept until it has enough.
 //! - **Possession.** Some minutes after offering a fresh state, the node asks
 //!   each close-group member for the record. A member that is still responsible
 //!   and cannot produce that state or a newer one is penalised — unless it holds
@@ -42,10 +48,10 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use ant_protocol::pointer::{Pointer, PointerState, POINTER_WIRE_LEN};
-use futures::future::BoxFuture;
+use futures::future::{join_all, BoxFuture};
 use futures::stream::{self, StreamExt};
 use parking_lot::Mutex;
 use rand::Rng;
@@ -71,12 +77,14 @@ use crate::replication::config::{
     storage_admission_width, ReplicationConfig, FRESH_REPLICATION_DELIVERY_MAX_RETRIES,
     REPLICATION_PROTOCOL_ID,
 };
+use crate::replication::out_of_range_clocks::{elapsed, OutOfRangeClocks};
 use crate::replication::protocol::{
     PointerFetchRequest, PointerFetchResponse, PointerFreshOffer, PointerHints,
     PointerStateRequest, PointerStateResponse, PointerStateSummary, ReplicationMessage,
     ReplicationMessageBody, MAX_POINTER_HINTS_PER_MESSAGE, MAX_POINTER_STATE_REQUEST_ADDRESSES,
 };
 use crate::replication::pruning::prune_proofs_needed;
+use crate::replication::retention::{DiskPressure, RecordKind};
 use crate::storage::{CapacityVerdict, ChunkStore};
 
 use super::REPLICATION_TRUST_WEIGHT;
@@ -154,6 +162,30 @@ const UNDECIDED_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Most prune candidates examined per pass.
 const MAX_PRUNE_CANDIDATES_PER_PASS: usize = 256;
+
+/// File beside the pointer store's directory holding saved out-of-range clocks.
+const OUT_OF_RANGE_CLOCKS_FILE: &str = "pointer_out_of_range.bin";
+
+/// Prune candidates proven at once: half of what this node may have
+/// outstanding at any one peer. Each candidate awaits every request it
+/// sends, so even when the candidates in flight share one group, pruning
+/// never queues behind its own requests, and repair and possession checks
+/// keep the other half of every peer's [`MAX_REQUESTS_PER_PEER`]. With
+/// [`PRUNE_PROOF_BUDGET`] for an answer, a pass takes about five minutes however
+/// many peers stay silent, and about eleven if each request also waits that long
+/// for one of this node's own slots.
+const PRUNE_CONCURRENCY: usize = MAX_REQUESTS_PER_PEER / 2;
+
+const _: () = assert!(
+    PRUNE_CONCURRENCY > 0,
+    "pruning must be able to prove at least one candidate at a time"
+);
+
+/// How long a prune proof request waits for a request slot, and again for
+/// its answer. A record is 5,303 bytes, so this is what a storage audit allows
+/// a peer for one small read over a cold connection (its round-two floor). A
+/// group slower than that keeps the record until a later pass.
+const PRUNE_PROOF_BUDGET: Duration = Duration::from_secs(5);
 
 /// How long a node spends asking its close group for a conflicting final
 /// state before taking one (ADR-0018).
@@ -479,7 +511,8 @@ pub struct PointerReplication {
     /// Hinted states awaiting verification, by address.
     pending: Mutex<HashMap<XorName, Pending>>,
     /// When each held address was first seen continuously out of range.
-    out_of_range: Mutex<HashMap<XorName, Instant>>,
+    /// Restored on start, and saved after each prune pass's classification.
+    out_of_range: OutOfRangeClocks,
     /// Hint pushes answering sync requests that may run at once.
     sync_answers: Arc<Semaphore>,
     /// When each peer was last answered with hints.
@@ -689,6 +722,8 @@ impl PointerReplication {
         shutdown: CancellationToken,
         tracker: TaskTracker,
     ) -> Self {
+        let out_of_range =
+            OutOfRangeClocks::load(store.dir().with_file_name(OUT_OF_RANGE_CLOCKS_FILE));
         Self {
             store,
             chunks,
@@ -704,7 +739,7 @@ impl PointerReplication {
             outbound: Mutex::new(HashMap::new()),
             capable: Mutex::new(HashSet::new()),
             pending: Mutex::new(HashMap::new()),
-            out_of_range: Mutex::new(HashMap::new()),
+            out_of_range,
             sync_answers: Arc::new(Semaphore::new(MAX_CONCURRENT_SYNC_ANSWERS)),
             answered_syncs: Mutex::new(AnsweredSyncs::default()),
             finality: FinalityLooks::new(),
@@ -850,22 +885,35 @@ impl PointerReplication {
     /// back: a valid signature and the right address. Anything else counts
     /// against the peer.
     async fn fetch_record(&self, peer: &PeerId, address: &XorName) -> Option<Pointer> {
-        match self.fetch_outcome(peer, address).await {
+        self.fetch_record_within(peer, address, self.config.fetch_request_timeout)
+            .await
+    }
+
+    /// [`Self::fetch_record`], waiting at most `timeout` for a request slot and
+    /// again for the answer.
+    async fn fetch_record_within(
+        &self,
+        peer: &PeerId,
+        address: &XorName,
+        timeout: Duration,
+    ) -> Option<Pointer> {
+        match self.fetch_outcome(peer, address, timeout).await {
             Fetched::Record(record) => Some(record),
             Fetched::Invalid | Fetched::Nothing | Fetched::LocalFailure => None,
         }
     }
 
-    /// [`Self::fetch_record`], saying whether a failure was a record that did
-    /// not verify, which has already cost the peer, or no record at all.
-    async fn fetch_outcome(&self, peer: &PeerId, address: &XorName) -> Fetched {
+    /// [`Self::fetch_record_within`], saying whether a failure was a record
+    /// that did not verify, which has already cost the peer, or no record at
+    /// all.
+    async fn fetch_outcome(&self, peer: &PeerId, address: &XorName, timeout: Duration) -> Fetched {
         let body = match self
             .ask(
                 peer,
                 ReplicationMessageBody::PointerFetchRequest(PointerFetchRequest {
                     address: *address,
                 }),
-                self.config.fetch_request_timeout,
+                timeout,
             )
             .await
         {
@@ -1774,7 +1822,9 @@ impl PointerReplication {
             if *peer == self_id || !self.owes(peer, &fresh.address).await {
                 continue;
             }
-            let fetched = self.fetch_outcome(peer, &fresh.address).await;
+            let fetched = self
+                .fetch_outcome(peer, &fresh.address, self.config.fetch_request_timeout)
+                .await;
             match judge_possession(fetched, &fresh) {
                 Possession::Missing => {}
                 // Two different final states: the owner signed both and each
@@ -1832,12 +1882,18 @@ impl PointerReplication {
     /// `allow_remote` is false while bootstrapping: candidacy is still tracked,
     /// but nothing that needs other peers' proof is decided.
     ///
+    /// Being out of range makes a record eligible, never due (ADR-0028): while
+    /// `disk_pressure` reports room on the disk, every candidate is kept and no
+    /// group is asked. Under pressure, candidates are tried farthest from this
+    /// node first, those whose group failed to prove them in this spell last.
+    ///
     /// A record a retained storage commitment still commits to is never
     /// deleted, exactly as for a chunk: an auditor pinning that commitment may
     /// still open it, and a node that deleted it would fail that audit.
     pub async fn prune_pass(
         &self,
         allow_remote: bool,
+        disk_pressure: &DiskPressure,
         commitment_state: Option<&ResponderCommitmentState>,
     ) {
         // Replaced records kept for audits go when their retention does,
@@ -1846,68 +1902,100 @@ impl PointerReplication {
         let committed = |address: &XorName| commitment_state.is_some_and(|cs| cs.is_held(address));
         let self_id = *self.p2p.peer_id();
         let retention = storage_admission_width(self.config.close_group_size);
-        let now = Instant::now();
+        let now = SystemTime::now();
         let held = self.store.held_states();
 
         let mut candidates = Vec::new();
         for state in &held {
             if admission::is_responsible(&self_id, &state.address, &self.p2p, retention).await {
-                self.out_of_range.lock().remove(&state.address);
+                // Until bootstrap has drained the routing table may still be
+                // filling, and a node that knows few peers looks in range for
+                // everything. The clocks restored after a restart have to
+                // survive that.
+                if allow_remote {
+                    self.out_of_range.clear(&state.address);
+                }
                 continue;
             }
-            let first_seen = *self.out_of_range.lock().entry(state.address).or_insert(now);
-            if now.duration_since(first_seen) >= self.config.prune_hysteresis_duration {
+            let first_seen = self.out_of_range.start(&state.address, now);
+            if elapsed(first_seen, now) >= self.config.prune_hysteresis_duration
+                && !committed(&state.address)
+            {
                 candidates.push(*state);
             }
         }
         {
             let held: HashSet<XorName> = held.iter().map(|state| state.address).collect();
-            self.out_of_range
-                .lock()
-                .retain(|address, _| held.contains(address));
+            self.out_of_range.retain(|address| held.contains(address));
         }
+        self.out_of_range.save().await;
 
-        let mut deleted = 0usize;
-        for state in candidates.into_iter().take(MAX_PRUNE_CANDIDATES_PER_PASS) {
-            if self.shutdown.is_cancelled() {
-                return;
-            }
-            if committed(&state.address) {
-                continue;
-            }
-            let wide = self
-                .p2p
-                .dht_manager()
-                .find_closest_nodes_local_with_self(
-                    &state.address,
-                    self.config.paid_list_close_group_size,
-                )
-                .await;
-            let far = wide.len() >= self.config.paid_list_close_group_size
-                && !wide.iter().any(|node| node.peer_id == self_id);
-            let confirmed = if far {
-                true
-            } else if allow_remote && !*self.is_bootstrapping.read().await {
-                self.others_hold(&state).await
-            } else {
-                false
-            };
-            // Revalidate just before deleting: the group may have moved back.
-            if confirmed
-                && !committed(&state.address)
-                && !admission::is_responsible(&self_id, &state.address, &self.p2p, retention).await
-                && self.delete(&state.address).await
-            {
-                deleted += 1;
-            }
+        // However far outside the group this node has moved, only the close
+        // group's proof makes a copy safe to drop: distance says who is
+        // closer, not that any of them holds the record.
+        if !allow_remote || *self.is_bootstrapping.read().await || candidates.is_empty() {
+            return;
         }
+        if !disk_pressure.observe_store(&self.chunks) {
+            debug!(
+                "Keeping {} out-of-range pointer records: the disk has room",
+                candidates.len()
+            );
+            return;
+        }
+        let batch = disk_pressure.erasure_order(
+            RecordKind::Pointer,
+            &self_id,
+            candidates,
+            MAX_PRUNE_CANDIDATES_PER_PASS,
+            |state| state.address,
+        );
+        let deleted = stream::iter(batch)
+            .map(|state| self.prune_candidate(state, &committed, disk_pressure))
+            .buffer_unordered(PRUNE_CONCURRENCY)
+            .filter(|deleted| std::future::ready(*deleted))
+            .count()
+            .await;
         if deleted > 0 {
             info!("Pruned {deleted} pointer records this node is no longer responsible for");
         }
     }
 
+    /// Delete `state`'s record if its close group proves it holds that state
+    /// or a newer one, and this node is still out of range, uncommitted and
+    /// under disk pressure once it has.
+    ///
+    /// Pressure is checked before the group is asked too: once earlier
+    /// deletions have ended it, a proof could no longer lead to a deletion.
+    async fn prune_candidate(
+        &self,
+        state: PointerState,
+        committed: &(impl Fn(&XorName) -> bool + Sync),
+        disk_pressure: &DiskPressure,
+    ) -> bool {
+        if self.shutdown.is_cancelled() || !disk_pressure.observe_store(&self.chunks) {
+            return false;
+        }
+        if !self.others_hold(&state).await {
+            disk_pressure.demote(RecordKind::Pointer, state.address);
+            return false;
+        }
+        // Revalidate just before deleting: the group may have moved back, and
+        // earlier deletions may have ended the pressure.
+        let retention = storage_admission_width(self.config.close_group_size);
+        !committed(&state.address)
+            && !admission::is_responsible(self.p2p.peer_id(), &state.address, &self.p2p, retention)
+                .await
+            && disk_pressure.observe_store(&self.chunks)
+            && self.delete(&state.address).await
+    }
+
     /// Whether all but one of the current close group prove they hold `ours`
-    /// or a newer state, by returning a valid record.
+    /// or a newer state, by returning a valid record within
+    /// [`PRUNE_PROOF_BUDGET`].
+    ///
+    /// Only capable members are asked, so a group with too few of them is
+    /// not asked at all and the record is kept.
     async fn others_hold(&self, ours: &PointerState) -> bool {
         let group: Vec<PeerId> = self
             .p2p
@@ -1918,30 +2006,23 @@ impl PointerReplication {
             .map(|node| node.peer_id)
             .collect();
         let needed = prune_proofs_needed(group.len());
-        if needed == 0 {
-            return false;
-        }
-        let mut proofs = 0usize;
-        for peer in group.iter().filter(|peer| self.is_capable(peer)) {
-            let proves = self
-                .fetch_record(peer, &ours.address)
+        let capable: Vec<PeerId> = group
+            .into_iter()
+            .filter(|peer| self.is_capable(peer))
+            .collect();
+        enough_prove(capable, needed, |peer| async move {
+            self.fetch_record_within(&peer, &ours.address, PRUNE_PROOF_BUDGET)
                 .await
                 .is_some_and(|record| {
                     let state = record.state();
                     state.state_id == ours.state_id || state.replaces(ours)
-                });
-            if proves {
-                proofs += 1;
-                if proofs >= needed {
-                    return true;
-                }
-            }
-        }
-        false
+                })
+        })
+        .await
     }
 
     async fn delete(&self, address: &XorName) -> bool {
-        self.out_of_range.lock().remove(address);
+        self.out_of_range.clear(address);
         match self.store.delete(address).await {
             Ok(true) => {
                 self.chunks.release(POINTER_WIRE_LEN as u64);
@@ -2012,6 +2093,22 @@ where
         }
     }
     None
+}
+
+/// Whether at least `needed` of `peers` prove possession with `prove`.
+///
+/// Every peer is asked at once and every answer is awaited, so no request
+/// outlives the check. A group too small to reach `needed` is never asked.
+async fn enough_prove<Prove, ProveFut>(peers: Vec<PeerId>, needed: usize, prove: Prove) -> bool
+where
+    Prove: Fn(PeerId) -> ProveFut,
+    ProveFut: Future<Output = bool>,
+{
+    if needed == 0 || peers.len() < needed {
+        return false;
+    }
+    let proofs = join_all(peers.into_iter().map(prove)).await;
+    proofs.into_iter().filter(|proves| *proves).count() >= needed
 }
 
 #[cfg(test)]
@@ -2685,5 +2782,38 @@ mod tests {
             FinalityCheck::Conflict(rival.state())
         );
         assert_eq!(asked.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn all_but_one_of_the_group_must_prove() {
+        let group: Vec<PeerId> = (1..=7).map(peer).collect();
+        let one_missing = peer(1);
+        let two_missing = [peer(1), peer(2)];
+
+        let proven = enough_prove(group.clone(), prune_proofs_needed(7), |asked| async move {
+            asked != one_missing
+        })
+        .await;
+        assert!(proven, "six of seven prove");
+
+        let proven = enough_prove(group, prune_proofs_needed(7), |asked| async move {
+            !two_missing.contains(&asked)
+        })
+        .await;
+        assert!(!proven, "five of seven fall short");
+    }
+
+    #[tokio::test]
+    async fn a_group_too_small_to_reach_the_threshold_is_never_asked() {
+        // Five capable members of a seven-member group cannot give six proofs.
+        let asked = AtomicUsize::new(0);
+        let capable: Vec<PeerId> = (1..=5).map(peer).collect();
+        let proven = enough_prove(capable, prune_proofs_needed(7), |_| {
+            asked.fetch_add(1, Ordering::SeqCst);
+            async { true }
+        })
+        .await;
+        assert!(!proven);
+        assert_eq!(asked.load(Ordering::SeqCst), 0, "a lost cause was asked");
     }
 }

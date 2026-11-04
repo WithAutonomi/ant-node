@@ -6,7 +6,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use super::testnet::{TestNetworkConfig, DEFAULT_CHUNK_OPERATION_TIMEOUT_SECS};
-use super::TestHarness;
+use super::{TestHarness, NEARLY_FULL_DISK, ROOMY_DISK};
 use ant_node::ant_protocol::{ChunkMessage, ChunkMessageBody, ChunkPutRequest, ChunkPutResponse};
 use ant_node::client::compute_address;
 use ant_node::replication::audit_coordinator::AuditChallengeCoordinator;
@@ -22,6 +22,7 @@ use ant_node::replication::protocol::{
     ReplicationMessageBody, VerificationRequest, ABSENT_KEY_DIGEST,
 };
 use ant_node::replication::pruning;
+use ant_node::replication::retention::DiskPressure;
 use ant_node::replication::scheduling::ReplicationQueues;
 use ant_node::replication::types::{NeighborSyncState, RepairProofs};
 use ant_node::storage::XorName;
@@ -42,6 +43,18 @@ const PROPAGATION_TIMEOUT: Duration = Duration::from_secs(15);
 const PROPAGATION_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// Checker node used by the full-node shunning regression.
 const FULL_NODE_SHUN_CHECKER_INDEX: usize = 3;
+/// Production close-group width, for tests that run at it.
+const PROD_CLOSE_GROUP_SIZE: usize = 7;
+/// Paid close group for the paid-entry retention test.
+const PAID_RETENTION_GROUP: usize = 2;
+/// Harness index of the node pruning in the paid-entry retention test.
+const PAID_RETENTION_PRUNER_INDEX: usize = 3;
+/// A paid-list eviction threshold every list is over.
+const PAID_EVICT_AT_ANY_SIZE: usize = 0;
+/// Last byte of a key, flipped in its lowest bit for a key as near as can be.
+const NEAR_KEY_BYTE: usize = 31;
+/// Top bit of a key's first byte, flipped for a key in the far half of the space.
+const FAR_KEY_MASK: u8 = 0x80;
 /// Target node made disk-full by the full-node shunning regression.
 const FULL_NODE_SHUN_TARGET_INDEX: usize = 4;
 /// Search budget for finding a key whose close group contains the full node.
@@ -121,9 +134,6 @@ fn prune_test_config(close_group_size: usize) -> ReplicationConfig {
     ReplicationConfig {
         close_group_size,
         quorum_threshold: 1,
-        // Keep the width-20 view incomplete in the five-node harness so these
-        // tests exercise the remote-audit path rather than the fast path.
-        paid_list_close_group_size: 20,
         prune_hysteresis_duration: Duration::ZERO,
         ..ReplicationConfig::default()
     }
@@ -1354,11 +1364,13 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
     let sync_state = Arc::new(RwLock::new(NeighborSyncState::new_cycle(vec![])));
     let repair_proofs = Arc::new(RwLock::new(RepairProofs::new()));
     let audit_challenge_coordinator = Arc::new(AuditChallengeCoordinator::new());
+    let disk_pressure = DiskPressure::default();
 
     let pruner = harness.test_node(pruner_idx).expect("pruner");
     let pruner_p2p = Arc::clone(pruner.p2p_node.as_ref().expect("pruner p2p"));
     let pruner_protocol = pruner.ant_protocol.as_ref().expect("pruner protocol");
     let pruner_storage = pruner_protocol.storage();
+    pruner_storage.set_test_disk_space(Some(NEARLY_FULL_DISK));
     let pruner_paid_list = Arc::clone(
         pruner
             .replication_engine
@@ -1390,6 +1402,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         allow_remote_prune_audits: false,
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
+        disk_pressure: &disk_pressure,
     })
     .await;
     assert_eq!(blocked.records_pruned, 0);
@@ -1418,6 +1431,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         allow_remote_prune_audits: false,
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
+        disk_pressure: &disk_pressure,
     })
     .await;
     assert_eq!(blocked_again.records_pruned, 0);
@@ -1438,6 +1452,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         allow_remote_prune_audits: true,
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
+        disk_pressure: &disk_pressure,
     })
     .await;
     assert_eq!(confirmed.records_audits_attempted, 1);
@@ -1474,6 +1489,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         allow_remote_prune_audits: true,
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
+        disk_pressure: &disk_pressure,
     })
     .await;
     assert_eq!(incomplete.records_pruned, 0);
@@ -1505,6 +1521,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         allow_remote_prune_audits: true,
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
+        disk_pressure: &disk_pressure,
     })
     .await;
     assert_eq!(complete.records_pruned, 1);
@@ -1537,10 +1554,12 @@ async fn test_prune_veto_for_committed_out_of_range_key() {
     let sync_state = Arc::new(RwLock::new(NeighborSyncState::new_cycle(vec![])));
     let repair_proofs = Arc::new(RwLock::new(RepairProofs::new()));
     let audit_challenge_coordinator = Arc::new(AuditChallengeCoordinator::new());
+    let disk_pressure = DiskPressure::default();
 
     let pruner = harness.test_node(pruner_idx).expect("pruner");
     let pruner_p2p = Arc::clone(pruner.p2p_node.as_ref().expect("pruner p2p"));
     let pruner_storage = pruner.ant_protocol.as_ref().expect("protocol").storage();
+    pruner_storage.set_test_disk_space(Some(NEARLY_FULL_DISK));
     let pruner_paid_list = Arc::clone(
         pruner
             .replication_engine
@@ -1593,6 +1612,7 @@ async fn test_prune_veto_for_committed_out_of_range_key() {
         allow_remote_prune_audits: true,
         commitment_state: Some(&committed),
         audit_challenge_coordinator: &audit_challenge_coordinator,
+        disk_pressure: &disk_pressure,
     })
     .await;
     assert_eq!(
@@ -1625,6 +1645,7 @@ async fn test_prune_veto_for_committed_out_of_range_key() {
         allow_remote_prune_audits: true,
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
+        disk_pressure: &disk_pressure,
     })
     .await;
     assert_eq!(
@@ -1659,8 +1680,6 @@ async fn test_prune_veto_for_committed_out_of_range_key() {
 #[tokio::test]
 #[serial]
 async fn prune_deletes_at_proof_threshold_and_retains_below_it() {
-    /// Production close-group size (`CLOSE_GROUP_SIZE` in ant-protocol).
-    const PROD_CLOSE_GROUP_SIZE: usize = 7;
     /// Prune proof threshold at production parameters: all but one, 6 of 7.
     const PRUNE_PROOFS_NEEDED: usize = 6;
 
@@ -1670,9 +1689,10 @@ async fn prune_deletes_at_proof_threshold_and_retains_below_it() {
     let pruner_idx = 3;
     let config = ReplicationConfig {
         close_group_size: PROD_CLOSE_GROUP_SIZE,
-        // The ten-node harness cannot complete width 20, so this test remains
-        // specifically about the 6-of-7 remote-proof path.
-        paid_list_close_group_size: 20,
+        // A paid width the ten-node harness completes, so the pruner is also
+        // outside a complete paid-width group: distance alone must still not
+        // let it delete without the 6-of-7 proofs.
+        paid_list_close_group_size: storage_admission_width(PROD_CLOSE_GROUP_SIZE),
         prune_hysteresis_duration: Duration::ZERO,
         ..ReplicationConfig::default()
     };
@@ -1681,11 +1701,13 @@ async fn prune_deletes_at_proof_threshold_and_retains_below_it() {
     // must not depend on neighbor-sync repair hints.
     let repair_proofs = Arc::new(RwLock::new(RepairProofs::new()));
     let audit_challenge_coordinator = Arc::new(AuditChallengeCoordinator::new());
+    let disk_pressure = DiskPressure::default();
 
     let pruner = harness.test_node(pruner_idx).expect("pruner");
     let pruner_p2p = Arc::clone(pruner.p2p_node.as_ref().expect("pruner p2p"));
     let pruner_protocol = pruner.ant_protocol.as_ref().expect("pruner protocol");
     let pruner_storage = pruner_protocol.storage();
+    pruner_storage.set_test_disk_space(Some(NEARLY_FULL_DISK));
     let pruner_paid_list = Arc::clone(
         pruner
             .replication_engine
@@ -1729,6 +1751,7 @@ async fn prune_deletes_at_proof_threshold_and_retains_below_it() {
             allow_remote_prune_audits: true,
             commitment_state: None,
             audit_challenge_coordinator: &audit_challenge_coordinator,
+            disk_pressure: &disk_pressure,
         })
         .await;
         assert_eq!(
@@ -1772,11 +1795,106 @@ async fn prune_deletes_at_proof_threshold_and_retains_below_it() {
         allow_remote_prune_audits: true,
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
+        disk_pressure: &disk_pressure,
     })
     .await;
     assert_eq!(
         at_threshold.records_pruned, 1,
         "a record proven on all but one of the close group must prune",
+    );
+    assert!(!pruner_storage.exists(&address).expect("exists"));
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// Pressure-gated retention (ADR-0028) against live nodes: a record whose
+/// whole close group holds it, and which this node has been out of range of
+/// for the full hysteresis, is still kept, and no group is asked, while the
+/// disk has room. Once the disk comes under pressure, the same record goes on
+/// the close group's proofs.
+#[tokio::test]
+#[serial]
+async fn out_of_range_records_stay_until_the_disk_needs_the_room() {
+    let harness = TestHarness::setup_small().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let pruner_idx = 3;
+    let config = ReplicationConfig {
+        close_group_size: PROD_CLOSE_GROUP_SIZE,
+        paid_list_close_group_size: storage_admission_width(PROD_CLOSE_GROUP_SIZE),
+        prune_hysteresis_duration: Duration::ZERO,
+        ..ReplicationConfig::default()
+    };
+    let sync_state = Arc::new(RwLock::new(NeighborSyncState::new_cycle(vec![])));
+    let repair_proofs = Arc::new(RwLock::new(RepairProofs::new()));
+    let audit_challenge_coordinator = Arc::new(AuditChallengeCoordinator::new());
+    let disk_pressure = DiskPressure::default();
+
+    let pruner = harness.test_node(pruner_idx).expect("pruner");
+    let pruner_p2p = Arc::clone(pruner.p2p_node.as_ref().expect("pruner p2p"));
+    let pruner_storage = pruner.ant_protocol.as_ref().expect("protocol").storage();
+    let pruner_paid_list = Arc::clone(
+        pruner
+            .replication_engine
+            .as_ref()
+            .expect("pruner replication engine")
+            .paid_list(),
+    );
+    let pruner_peer = *pruner_p2p.peer_id();
+
+    let (content, address, targets) =
+        find_remote_prune_candidate(&harness, pruner_idx, PROD_CLOSE_GROUP_SIZE, "retained").await;
+    pruner_storage
+        .put(&address, &content)
+        .await
+        .expect("put record on pruner");
+    store_record_on_peers(&harness, &targets, &address, &content).await;
+
+    pruner_storage.set_test_disk_space(Some(ROOMY_DISK));
+    let roomy = pruning::run_prune_pass_with_context(pruning::PrunePassContext {
+        self_id: &pruner_peer,
+        storage: &pruner_storage,
+        paid_list: &pruner_paid_list,
+        p2p_node: &pruner_p2p,
+        config: &config,
+        sync_state: &sync_state,
+        repair_proofs: &repair_proofs,
+        allow_remote_prune_audits: true,
+        commitment_state: None,
+        audit_challenge_coordinator: &audit_challenge_coordinator,
+        disk_pressure: &disk_pressure,
+    })
+    .await;
+    assert!(!roomy.disk_pressure);
+    assert_eq!(roomy.records_candidates, 1, "the record is a candidate");
+    assert_eq!(
+        roomy.records_retained, 1,
+        "and is kept while the disk has room"
+    );
+    assert_eq!(roomy.records_audits_attempted, 0, "no group is asked");
+    assert_eq!(roomy.records_pruned, 0);
+    assert!(pruner_storage.exists(&address).expect("exists"));
+
+    pruner_storage.set_test_disk_space(Some(NEARLY_FULL_DISK));
+    let pressed = pruning::run_prune_pass_with_context(pruning::PrunePassContext {
+        self_id: &pruner_peer,
+        storage: &pruner_storage,
+        paid_list: &pruner_paid_list,
+        p2p_node: &pruner_p2p,
+        config: &config,
+        sync_state: &sync_state,
+        repair_proofs: &repair_proofs,
+        allow_remote_prune_audits: true,
+        commitment_state: None,
+        audit_challenge_coordinator: &audit_challenge_coordinator,
+        disk_pressure: &disk_pressure,
+    })
+    .await;
+    assert!(pressed.disk_pressure);
+    assert_eq!(pressed.records_audits_attempted, 1);
+    assert_eq!(
+        pressed.records_pruned, 1,
+        "under pressure the record goes on the close group's proofs",
     );
     assert!(!pruner_storage.exists(&address).expect("exists"));
 
@@ -1808,10 +1926,12 @@ async fn prune_marks_immediately_and_candidacy_waits_for_hysteresis() {
     let sync_state = Arc::new(RwLock::new(NeighborSyncState::new_cycle(vec![])));
     let repair_proofs = Arc::new(RwLock::new(RepairProofs::new()));
     let audit_challenge_coordinator = Arc::new(AuditChallengeCoordinator::new());
+    let disk_pressure = DiskPressure::default();
 
     let pruner = harness.test_node(pruner_idx).expect("pruner");
     let pruner_p2p = Arc::clone(pruner.p2p_node.as_ref().expect("pruner p2p"));
     let pruner_storage = pruner.ant_protocol.as_ref().expect("protocol").storage();
+    pruner_storage.set_test_disk_space(Some(NEARLY_FULL_DISK));
     let pruner_paid_list = Arc::clone(
         pruner
             .replication_engine
@@ -1842,6 +1962,7 @@ async fn prune_marks_immediately_and_candidacy_waits_for_hysteresis() {
         allow_remote_prune_audits: true,
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
+        disk_pressure: &disk_pressure,
     })
     .await;
     assert_eq!(marked.records_marked_out_of_range, 1);
@@ -1864,6 +1985,7 @@ async fn prune_marks_immediately_and_candidacy_waits_for_hysteresis() {
         allow_remote_prune_audits: true,
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
+        disk_pressure: &disk_pressure,
     })
     .await;
     assert_eq!(pending.records_marked_out_of_range, 0);
@@ -1889,6 +2011,7 @@ async fn prune_marks_immediately_and_candidacy_waits_for_hysteresis() {
         allow_remote_prune_audits: true,
         commitment_state: None,
         audit_challenge_coordinator: &audit_challenge_coordinator,
+        disk_pressure: &disk_pressure,
     })
     .await;
     assert_eq!(matured.records_candidates, 1);
@@ -1902,42 +2025,83 @@ async fn prune_marks_immediately_and_candidacy_waits_for_hysteresis() {
     harness.teardown().await.expect("teardown");
 }
 
-/// Paid-list entry pruning requires confirmations from the current paid
-/// close group (three quarters rounded up, 15 of 20 at production
-/// parameters), independent of chunk possession.
-///
-/// An out-of-range `PaidForList` entry used to be removed on local state
-/// alone once the hysteresis elapsed. It is now retained until enough of
-/// the current paid close group confirm they track the key in their own
-/// paid lists, so a node never forgets an authorization the group has not
-/// already absorbed. Chunk pruning and paid pruning check their own gates
-/// only: this test stores no chunk anywhere.
-///
-/// Run with a 2-peer paid close group, where the threshold is both peers.
+/// A key far from a node can still have that node's neighbour among its closest,
+/// so a paid list small enough to read whole is read whole.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_neighbour_gets_a_paid_hint_for_a_key_far_from_this_node() {
+    const ONLY_THE_CLOSEST: usize = 1;
+    const EVERY_KNOWN_PEER: usize = 100;
+    const LAST_KEY_BYTE: usize = 31;
+    // A full network: with only a few peers, every key counts as near this node.
+    let harness = TestHarness::setup().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let node = harness.test_node(0).expect("node");
+    let p2p = Arc::clone(node.p2p_node.as_ref().expect("p2p"));
+    let self_xor: XorName = *p2p.peer_id().as_bytes();
+    let peers = p2p
+        .dht_manager()
+        .find_closest_nodes_local(&self_xor, EVERY_KNOWN_PEER)
+        .await;
+    let farthest = peers.last().expect("a known peer").peer_id;
+
+    // Beside the farthest peer, so that peer alone is its closest, well outside
+    // this node's distance to its own closest peer.
+    let mut key: XorName = *farthest.as_bytes();
+    key[LAST_KEY_BYTE] ^= 1;
+    let paid_dir = tempfile::tempdir().expect("tempdir");
+    let paid_list = Arc::new(
+        ant_node::replication::paid_list::PaidList::new(paid_dir.path())
+            .await
+            .expect("paid list"),
+    );
+    paid_list.insert(&key).await.expect("insert");
+
+    let hints = ant_node::replication::neighbor_sync::build_paid_hints_for_peer(
+        &farthest,
+        &paid_list,
+        &p2p,
+        ONLY_THE_CLOSEST,
+    )
+    .await;
+
+    assert_eq!(hints, vec![key]);
+    harness.teardown().await.expect("teardown");
+}
+
+/// Paid entries are evicted only once the list passes its threshold, and disk
+/// pressure alone never evicts one. Even over the threshold, an entry near this
+/// node stays. `PaidList`'s unit tests cover evicting far entries: in a network
+/// this small, a node's near range is most of the key space.
 #[tokio::test]
 #[serial]
-async fn paid_prune_requires_paid_close_group_confirmations() {
-    const PAID_GROUP: usize = 2;
-
+async fn paid_entries_stay_below_the_threshold_and_near_this_node() {
     let harness = TestHarness::setup_minimal().await.expect("setup");
     harness.warmup_dht().await.expect("warmup");
 
-    let pruner_idx = 3;
-    let config = ReplicationConfig {
-        close_group_size: 2,
+    let below_threshold = ReplicationConfig {
+        close_group_size: PAID_RETENTION_GROUP,
         quorum_threshold: 1,
-        paid_list_close_group_size: PAID_GROUP,
-        prune_hysteresis_duration: Duration::ZERO,
+        paid_list_close_group_size: PAID_RETENTION_GROUP,
         ..ReplicationConfig::default()
+    };
+    let over_threshold = ReplicationConfig {
+        paid_list_evict_start_entries: PAID_EVICT_AT_ANY_SIZE,
+        ..below_threshold.clone()
     };
     let sync_state = Arc::new(RwLock::new(NeighborSyncState::new_cycle(vec![])));
     let repair_proofs = Arc::new(RwLock::new(RepairProofs::new()));
     let audit_challenge_coordinator = Arc::new(AuditChallengeCoordinator::new());
+    let disk_pressure = DiskPressure::default();
 
-    let pruner = harness.test_node(pruner_idx).expect("pruner");
+    let pruner = harness
+        .test_node(PAID_RETENTION_PRUNER_INDEX)
+        .expect("pruner");
     let pruner_p2p = Arc::clone(pruner.p2p_node.as_ref().expect("pruner p2p"));
     let pruner_protocol = pruner.ant_protocol.as_ref().expect("pruner protocol");
     let pruner_storage = pruner_protocol.storage();
+    pruner_storage.set_test_disk_space(Some(NEARLY_FULL_DISK));
     let pruner_peer = *pruner_p2p.peer_id();
 
     // Standalone paid list so the engine's own paid state stays untouched.
@@ -1948,67 +2112,42 @@ async fn paid_prune_requires_paid_close_group_confirmations() {
             .expect("paid list"),
     );
 
-    let (_content, address, targets) =
-        find_remote_prune_candidate(&harness, pruner_idx, PAID_GROUP, "paid-prune").await;
-    paid_list.insert(&address).await.expect("insert paid key");
+    // The closest and the farthest keys to this node there can be, nearly.
+    let mut near_key: XorName = *pruner_peer.as_bytes();
+    near_key[NEAR_KEY_BYTE] ^= 1;
+    let mut far_key: XorName = *pruner_peer.as_bytes();
+    far_key[0] ^= FAR_KEY_MASK;
+    paid_list.insert(&near_key).await.expect("insert near key");
+    paid_list.insert(&far_key).await.expect("insert far key");
 
-    // The paid close group does not track the key yet: the entry must be
-    // retained even though it is out of range and past hysteresis.
-    let unconfirmed = pruning::run_prune_pass_with_context(pruning::PrunePassContext {
-        self_id: &pruner_peer,
-        storage: &pruner_storage,
-        paid_list: &paid_list,
-        p2p_node: &pruner_p2p,
-        config: &config,
-        sync_state: &sync_state,
-        repair_proofs: &repair_proofs,
-        allow_remote_prune_audits: true,
-        commitment_state: None,
-        audit_challenge_coordinator: &audit_challenge_coordinator,
-    })
-    .await;
+    let run_pass = |config| {
+        pruning::run_prune_pass_with_context(pruning::PrunePassContext {
+            self_id: &pruner_peer,
+            storage: &pruner_storage,
+            paid_list: &paid_list,
+            p2p_node: &pruner_p2p,
+            config,
+            sync_state: &sync_state,
+            repair_proofs: &repair_proofs,
+            allow_remote_prune_audits: true,
+            commitment_state: None,
+            audit_challenge_coordinator: &audit_challenge_coordinator,
+            disk_pressure: &disk_pressure,
+        })
+    };
+
+    let below = run_pass(&below_threshold).await;
     assert_eq!(
-        unconfirmed.paid_entries_pruned, 0,
-        "a paid entry without paid close-group confirmations must never prune",
+        below.paid_entries_evicted, 0,
+        "disk pressure evicts nothing"
     );
-    assert!(
-        paid_list.contains(&address).expect("contains"),
-        "unconfirmed paid entry should remain tracked",
-    );
+    assert!(paid_list.contains(&near_key).expect("contains"));
+    assert!(paid_list.contains(&far_key).expect("contains"));
 
-    // Once the whole paid close group confirms the key in their paid lists,
-    // the entry prunes.
-    for peer in &targets {
-        let idx = node_index_for_peer(&harness, peer).expect("target in harness");
-        let engine = harness
-            .test_node(idx)
-            .expect("target node")
-            .replication_engine
-            .as_ref()
-            .expect("target engine");
-        engine.paid_list().insert(&address).await.expect("insert");
-    }
-
-    let confirmed = pruning::run_prune_pass_with_context(pruning::PrunePassContext {
-        self_id: &pruner_peer,
-        storage: &pruner_storage,
-        paid_list: &paid_list,
-        p2p_node: &pruner_p2p,
-        config: &config,
-        sync_state: &sync_state,
-        repair_proofs: &repair_proofs,
-        allow_remote_prune_audits: true,
-        commitment_state: None,
-        audit_challenge_coordinator: &audit_challenge_coordinator,
-    })
-    .await;
-    assert_eq!(
-        confirmed.paid_entries_pruned, 1,
-        "a paid entry confirmed by the paid close group must prune",
-    );
+    run_pass(&over_threshold).await;
     assert!(
-        !paid_list.contains(&address).expect("contains"),
-        "confirmed paid entry should be removed",
+        paid_list.contains(&near_key).expect("contains"),
+        "an entry near this node stays over the threshold",
     );
 
     harness.teardown().await.expect("teardown");
