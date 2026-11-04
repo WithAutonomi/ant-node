@@ -1189,7 +1189,7 @@ where
 /// The auditor's verdict on a subtree-audit response, with round 2 answered by
 /// `serve` instead of the network.
 ///
-/// It runs the same composition as [`verify_subtree_response`]. Test-only: it
+/// It runs the same composition as `verify_subtree_response`. Test-only: it
 /// lets the attack proof-of-concept tests check that the shipped gates, in the
 /// shipped order, reject each attack.
 ///
