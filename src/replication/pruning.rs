@@ -685,10 +685,10 @@ fn select_record_prune_audits(
 /// Evict `PaidForList` entries once the list has passed its threshold, and
 /// return how many entries it now holds and how many went.
 ///
-/// Only entries far outside this node's range go, farthest first: this node has
-/// no vote on them and no neighbour needs a hint for them. An entry whose record
-/// is still stored stays, since it authorises that record's repair. So does
-/// everything while this node knows too few peers to say what is near.
+/// Only entries far outside this node's range go, farthest first: with evenly
+/// spread IDs this node has no vote on them. An entry whose record is still stored
+/// stays, since it authorises that record's repair. So does everything while this
+/// node knows too few peers to say what is near.
 async fn evict_excess_paid_entries(ctx: &PrunePassContext<'_>) -> (usize, usize) {
     let count = match ctx.paid_list.count() {
         Ok(count) => usize::try_from(count).unwrap_or(usize::MAX),

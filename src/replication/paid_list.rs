@@ -45,9 +45,10 @@ const RECORD_CLOCKS_FILE: &str = "record_out_of_range.bin";
 /// How many low bits of a key may differ from this node's for the key to count
 /// as near it, given the distance to its farthest paid-close-group peer.
 ///
-/// The margin covers the difference in peer density between here and the key:
-/// beyond it, neither this node nor any of its neighbours is in the key's paid
-/// close group, so an entry there carries no vote and needs no hint.
+/// The margin covers the usual difference in peer density between here and the
+/// key. With evenly spread IDs, neither this node nor any of its neighbours is in
+/// the paid close group of a key beyond it. Where few peers are known near a key,
+/// one of them still can be.
 #[must_use]
 pub fn near_bits_for_radius(radius: &XorName) -> usize {
     let significant = radius

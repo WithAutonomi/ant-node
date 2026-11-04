@@ -2025,6 +2025,51 @@ async fn prune_marks_immediately_and_candidacy_waits_for_hysteresis() {
     harness.teardown().await.expect("teardown");
 }
 
+/// A key far from a node can still have that node's neighbour among its closest,
+/// so a paid list small enough to read whole is read whole.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_neighbour_gets_a_paid_hint_for_a_key_far_from_this_node() {
+    const ONLY_THE_CLOSEST: usize = 1;
+    const EVERY_KNOWN_PEER: usize = 100;
+    const LAST_KEY_BYTE: usize = 31;
+    // A full network: with only a few peers, every key counts as near this node.
+    let harness = TestHarness::setup().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let node = harness.test_node(0).expect("node");
+    let p2p = Arc::clone(node.p2p_node.as_ref().expect("p2p"));
+    let self_xor: XorName = *p2p.peer_id().as_bytes();
+    let peers = p2p
+        .dht_manager()
+        .find_closest_nodes_local(&self_xor, EVERY_KNOWN_PEER)
+        .await;
+    let farthest = peers.last().expect("a known peer").peer_id;
+
+    // Beside the farthest peer, so that peer alone is its closest, well outside
+    // this node's distance to its own closest peer.
+    let mut key: XorName = *farthest.as_bytes();
+    key[LAST_KEY_BYTE] ^= 1;
+    let paid_dir = tempfile::tempdir().expect("tempdir");
+    let paid_list = Arc::new(
+        ant_node::replication::paid_list::PaidList::new(paid_dir.path())
+            .await
+            .expect("paid list"),
+    );
+    paid_list.insert(&key).await.expect("insert");
+
+    let hints = ant_node::replication::neighbor_sync::build_paid_hints_for_peer(
+        &farthest,
+        &paid_list,
+        &p2p,
+        ONLY_THE_CLOSEST,
+    )
+    .await;
+
+    assert_eq!(hints, vec![key]);
+    harness.teardown().await.expect("teardown");
+}
+
 /// Paid entries are evicted only once the list passes its threshold, and disk
 /// pressure alone never evicts one. Even over the threshold, an entry near this
 /// node stays. `PaidList`'s unit tests cover evicting far entries: in a network

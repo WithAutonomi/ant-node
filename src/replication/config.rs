@@ -108,6 +108,15 @@ pub const MAX_PAID_EVICTIONS_PER_PASS: usize = 100_000;
 /// in peer density between here and the key.
 pub const PAID_LIST_NEAR_MARGIN_BITS: usize = 2;
 
+/// Paid-list entries up to which a sync hint build reads every entry.
+///
+/// A neighbour can need a hint for a key far from this node, where few peers are
+/// known, so reading only near keys can miss one. But every entry read costs a
+/// routing table lookup, entries are no longer pruned by rank, and a node builds
+/// hints every round and for every inbound sync. So above this size a build reads
+/// only near keys (ADR-0028).
+pub const PAID_HINT_FULL_SCAN_ENTRIES: u64 = 100_000;
+
 /// Number of closest peers to self eligible for neighbor sync.
 pub const NEIGHBOR_SYNC_SCOPE: usize = 20;
 

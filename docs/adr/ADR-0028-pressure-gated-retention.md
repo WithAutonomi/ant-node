@@ -180,8 +180,13 @@ store shares that partition.
     stores. Near means within four to eight times the distance to its farthest paid-group
     peer, where it or a neighbour may still have a vote. While it knows too few peers to
     say, every entry counts as near.
-  - **Sync hints:** read only the entries near this node, so their cost doesn't grow with
-    the list.
+  - **Sync hints:** read every entry up to 100,000 entries, and only the entries near this
+    node above that, so their cost stops growing with the list. Each entry read costs a
+    routing-table lookup: measured at 4.7 µs with 4 peers and 14.5 µs with 24, which
+    extrapolates to about 100 µs with 200. A node builds hints every round and for every
+    inbound sync. Where few peers are known near a key far from this node, this node or a
+    neighbour can still be in its paid close group, so above that size such a hint can be
+    missed. With evenly spread IDs, a simulation of 100 to 2,000 nodes found none.
   - **Store size:** the LMDB map grows from 256 MiB to 1 GiB, which holds about 17.6
     million entries, measured at about 61 bytes each with single-key commits. The file
     grows as entries do, on every platform. A full store logs one error, since new paid
@@ -236,8 +241,9 @@ store shares that partition.
   does today.
 - **Under sustained pressure, a node keeps erasing** its farthest records on their groups'
   proofs. Records near it go last.
-- **Above the paid threshold, a node forgets far entries without asking anyone.** It has
-  no vote on those keys, and it keeps the entries of records it still stores.
+- **Above the paid threshold, a node forgets far entries without asking anyone.** With
+  evenly spread IDs it has no vote on those keys. Where few peers are known near a key it
+  may, and it then drops out of that vote. It keeps the entries of records it still stores.
 - **Records that can't be proven can't be erased.** If out-of-range records can't be
   proven, a node can reach its reserve and refuse in-range writes, and ADR-0003's
   penalties then apply.
@@ -283,12 +289,14 @@ store shares that partition.
   - a clock surviving "in range" during bootstrap;
   - paid-list eviction: farthest first, up to its limit, never what it keeps, never near;
   - near ranges, and reading only the keys in one;
+  - a far key read for hints while the list can be read whole, and only near keys above that;
   - the store's file not taking the whole map up front;
   - removing a paid entry leaving its record's clock;
   - a pointer needing all but one of its group to prove it.
 - **End-to-end tests:**
   - `out_of_range_records_stay_until_the_disk_needs_the_room`: with room, a record the
     whole group holds is kept and its group never asked; under pressure it goes.
+  - `a_neighbour_gets_a_paid_hint_for_a_key_far_from_this_node`: a small list is read whole.
   - `paid_entries_stay_below_the_threshold_and_near_this_node`: disk pressure evicts no
     paid entry, and an entry near this node stays over the threshold.
   - The existing chunk prune tests run under a simulated nearly full disk.
@@ -300,7 +308,7 @@ store shares that partition.
   - it stops at 15% free;
   - below the threshold, `paid ... evicted=0` holds on every node;
   - with a test build's low threshold, only far entries without a stored record go;
-  - hint-build times stay flat as `paid total=` grows;
+  - hint-build times stay flat as `paid total=` grows past 100,000;
   - how fast a node under pressure erases, against how fast it receives in-range data;
   - after restarting a node under pressure, `candidates=` doesn't fall to 0 once bootstrap
     has drained;
