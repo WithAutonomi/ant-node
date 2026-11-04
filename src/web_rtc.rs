@@ -319,7 +319,8 @@ struct ListenerResources {
     get_service_count: AtomicU64,
     /// Summed GET service time, including the bulk-slot wait.
     get_service_total_ms: AtomicU64,
-    /// Longest single GET service time, including the bulk-slot wait.
+    /// Longest single GET service time, including the bulk-slot wait. A
+    /// lifetime high-water mark: `fetch_max` only, never reset.
     get_service_max_ms: AtomicU64,
     /// GETs whose processing returned an error instead of a response.
     get_service_failures: AtomicU64,
@@ -327,7 +328,8 @@ struct ListenerResources {
     bulk_wait_count: AtomicU64,
     /// Summed time GETs spent waiting for their bulk-response permits.
     bulk_wait_total_ms: AtomicU64,
-    /// Longest single wait for the bulk-response permits.
+    /// Longest single wait for the bulk-response permits. A lifetime
+    /// high-water mark: `fetch_max` only, never reset.
     bulk_wait_max_ms: AtomicU64,
     connection_limit: Arc<Semaphore>,
     channel_limit: Arc<Semaphore>,
@@ -479,8 +481,10 @@ impl ListenerResources {
         self.bulk_wait_max_ms.fetch_max(waited, Ordering::Relaxed);
     }
 
-    /// Record one GET's service time, from request admission to its response.
-    /// Includes the bulk-slot wait recorded by [`Self::record_bulk_wait`].
+    /// Record one GET's service time: from the spawned request worker starting
+    /// to its response being prepared. Includes the bulk-slot wait recorded by
+    /// [`Self::record_bulk_wait`], and excludes admission, frame assembly and
+    /// decryption, which all finish before the worker is spawned.
     fn record_get_service(&self, served: Duration) {
         let served = duration_ms(served);
         self.get_service_count.fetch_add(1, Ordering::Relaxed);
@@ -619,10 +623,15 @@ pub struct WebRtcServerSnapshot {
     pub task_failures: u64,
     /// GETs served to a response, the denominator for `get_service_total_ms`.
     pub get_service_count: u64,
-    /// Summed GET service time, from request admission to the prepared
-    /// response. Includes the bulk-response slot wait.
+    /// Summed GET service time, measured from the spawned request worker
+    /// starting to its response being prepared. Includes the bulk-response
+    /// slot wait; excludes admission, frame assembly and decryption, which
+    /// complete before the worker is spawned.
     pub get_service_total_ms: u64,
-    /// Longest single GET service time, including the bulk-response slot wait.
+    /// Longest single GET service time, including the bulk-response slot
+    /// wait. A lifetime high-water mark: never reset, so it only rises. Do
+    /// not diff it — use the mean from `get_service_total_ms` over
+    /// `get_service_count` to see a window's latency.
     pub get_service_max_ms: u64,
     /// GETs whose processing returned an error instead of a response. They are
     /// excluded from `get_service_count` and the service-time totals.
@@ -633,7 +642,8 @@ pub struct WebRtcServerSnapshot {
     /// Summed time GETs spent waiting for their source and global
     /// bulk-response permits.
     pub bulk_wait_total_ms: u64,
-    /// Longest single wait for the bulk-response permits.
+    /// Longest single wait for the bulk-response permits. A lifetime
+    /// high-water mark like `get_service_max_ms`, with the same caveat.
     pub bulk_wait_max_ms: u64,
 }
 
@@ -704,10 +714,31 @@ impl WebRtcServerDiagnostics {
     /// transport beneath it (`group = 2`, each key prefixed `transport_`), so
     /// neither line approaches `tracing`'s 32-field cap.
     ///
-    /// The capacity and slot fields are instantaneous gauges read at emission.
-    /// Every other field is a counter accumulated since process start, so a
-    /// query diffs two lines to get a rate. Field names are a query contract
-    /// and are never renamed.
+    /// The fields fall into four classes, and only one of them may be
+    /// differenced. Field names are a query contract and are never renamed.
+    ///
+    /// * **Additive counters**, accumulated since process start: the rejection
+    ///   and error counts, `get_service_count`, `get_service_total_ms`,
+    ///   `get_service_failures`, `bulk_wait_count`, `bulk_wait_total_ms`, and
+    ///   every `transport_` field except the two active/connecting gauges.
+    ///   Diff two lines for a rate; mean GET latency over an interval is the
+    ///   `get_service_total_ms` diff over the `get_service_count` diff.
+    /// * **Instantaneous gauges**, sampled at emission and not cumulative:
+    ///   `running`, `active_connections`, `active_channels`,
+    ///   `active_requests`, `in_flight_bytes`, `bulk_slots_in_use`,
+    ///   `transport_active_connections` and
+    ///   `transport_connecting_connections`. Differencing these is
+    ///   meaningless; read the level, or average it over the window.
+    /// * **Lifetime maxima**: `get_service_max_ms` and `bulk_wait_max_ms` are
+    ///   high-water marks that are never reset, so they rise and never fall.
+    ///   A diff of either is 0 whenever the window's worst case did not beat
+    ///   the all-time worst case, which hides sustained high latency — watch
+    ///   the mean from the counters above for that, and read these two as the
+    ///   worst case seen since start.
+    /// * **Configured capacities**, constant for the process:
+    ///   `max_connections`, `max_channels`, `max_concurrent_requests`,
+    ///   `max_in_flight_bytes` and `bulk_slots_max`. They are emitted so a
+    ///   gauge can be read as a fraction of its limit.
     pub fn log_webrtc_listener_summary(&self) {
         let snapshot = self.snapshot();
         let transport = &snapshot.transport;
@@ -1729,7 +1760,10 @@ async fn start_request(
     let worker = listener.spawn_request(async move {
         // V2-1871: time the worker from the moment it starts, so the GET
         // service time below covers the bulk-slot wait as well as the work.
-        let admitted_at = Instant::now();
+        // This is deliberately not admission: the request permit, frame
+        // assembly and decryption all happen before the worker is spawned, so
+        // this clock excludes them.
+        let worker_started_at = Instant::now();
         let AdmittedRequest {
             request,
             content,
@@ -1749,7 +1783,9 @@ async fn start_request(
                 .acquire_owned()
                 .await
                 .map_err(|_| "bulk response admission closed".to_string())?;
-            resources.listener.record_bulk_wait(admitted_at.elapsed());
+            resources
+                .listener
+                .record_bulk_wait(worker_started_at.elapsed());
             Some((source, global))
         } else {
             None
@@ -1768,7 +1804,9 @@ async fn start_request(
             }
         };
         if is_get {
-            resources.listener.record_get_service(admitted_at.elapsed());
+            resources
+                .listener
+                .record_get_service(worker_started_at.elapsed());
         }
         Ok(CompletedRequest {
             _bulk_permits: bulk_permits,
