@@ -307,19 +307,15 @@ impl CapacityGuard {
             .saturating_add(ALLOC_UNIT)
     }
 
-    /// Free bytes right now, or `None` if the question could not be answered.
+    /// Free bytes right now, or why the question could not be answered.
     ///
-    /// Deliberately separate from [`Self::measure`], which folds a failure into an error
-    /// the caller cannot tell from "below the reserve".
-    fn measure_available(&self) -> Option<u64> {
+    /// Deliberately separate from [`Self::check`], which folds a failure into an error
+    /// the caller cannot tell from "below the reserve". Callers poll this, so it leaves
+    /// logging a failure to them.
+    fn measure_available(&self) -> Result<u64> {
         let mut snapshot = self.snapshot.lock();
-        match self.measure(&mut snapshot) {
-            Ok(()) => Some(snapshot.free_estimate()),
-            Err(e) => {
-                warn!("Cannot measure free space, so nothing is erased: {e}");
-                None
-            }
-        }
+        self.measure(&mut snapshot)?;
+        Ok(snapshot.free_estimate())
     }
 
     /// Query the filesystem and refresh the snapshot.
@@ -1767,7 +1763,13 @@ impl ChunkStore {
                 return reported;
             }
         }
-        let available = self.capacity.measure_available()?;
+        let available = match self.capacity.measure_available() {
+            Ok(available) => available,
+            Err(e) => {
+                warn!("Cannot measure free space, so nothing is erased: {e}");
+                return None;
+            }
+        };
         let total = self.usable_disk_total()?;
         Some(DiskSpace { available, total })
     }
@@ -1814,11 +1816,11 @@ impl ChunkStore {
     #[must_use]
     pub fn capacity_verdict(&self) -> crate::storage::CapacityVerdict {
         match self.capacity.measure_available() {
-            Some(available) if available < self.capacity.reserve => {
+            Ok(available) if available < self.capacity.reserve => {
                 crate::storage::CapacityVerdict::Full
             }
-            Some(_) => crate::storage::CapacityVerdict::Writable,
-            None => crate::storage::CapacityVerdict::Unknown,
+            Ok(_) => crate::storage::CapacityVerdict::Writable,
+            Err(_) => crate::storage::CapacityVerdict::Unknown,
         }
     }
 
