@@ -24,6 +24,7 @@ pub mod commitment_state;
 pub mod config;
 pub mod fresh;
 pub mod neighbor_sync;
+pub(crate) mod out_of_range_clocks;
 pub mod paid_list;
 pub mod pointer;
 pub mod possession;
@@ -31,6 +32,7 @@ pub mod protocol;
 pub mod pruning;
 pub mod quorum;
 pub mod recent_provers;
+pub mod retention;
 pub mod scheduling;
 pub mod slice;
 pub mod storage_commitment_audit;
@@ -39,6 +41,7 @@ pub mod types;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::io::Write as _;
 use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
@@ -3426,6 +3429,9 @@ impl ReplicationEngine {
         let sig_verify_attempts = Arc::clone(&self.sig_verify_attempts);
         let audit_challenge_coordinator = Arc::clone(&self.audit_challenge_coordinator);
         let detached_task_tracker = self.detached_task_tracker.clone();
+        // ADR-0028: one disk-pressure state per node, shared by the chunk and
+        // pointer prune passes, which only this loop runs.
+        let disk_pressure = retention::DiskPressure::default();
         // ADR-0002: a peer's commitment also arrives on the sync RESPONSE path
         // (we initiated, they piggybacked theirs). Carry a gossip-audit trigger
         // here too so a peer that only ever answers — never initiates sync —
@@ -3483,6 +3489,7 @@ impl ReplicationEngine {
                         &sig_verify_attempts,
                         &audit_challenge_coordinator,
                         &gossip_audit,
+                        &disk_pressure,
                         pointers.as_ref(),
                     ) => {}
                 }
@@ -3539,6 +3546,7 @@ impl ReplicationEngine {
     fn start_audit_loop(&mut self) {
         let p2p = Arc::clone(&self.p2p_node);
         let storage = Arc::clone(&self.storage);
+        let paid_list = Arc::clone(&self.paid_list);
         let config = Arc::clone(&self.config);
         let shutdown = self.shutdown.clone();
         let sync_history = Arc::clone(&self.sync_history);
@@ -3573,6 +3581,7 @@ impl ReplicationEngine {
                     audit::audit_tick_with_repair_proofs(
                         &p2p,
                         &storage,
+                        &paid_list,
                         &config,
                         &history,
                         &repair_proofs,
@@ -3598,6 +3607,7 @@ impl ReplicationEngine {
                             audit::audit_tick_with_repair_proofs(
                                 &p2p,
                                 &storage,
+                                &paid_list,
                                 &config,
                                 &history,
                                 &repair_proofs,
@@ -7738,6 +7748,7 @@ async fn run_neighbor_sync_round(
     sig_verify_attempts: &Arc<RwLock<HashMap<PeerId, Instant>>>,
     audit_challenge_coordinator: &Arc<AuditChallengeCoordinator>,
     gossip_audit: &GossipAuditTrigger,
+    disk_pressure: &retention::DiskPressure,
     pointers: Option<&Arc<pointer::PointerReplication>>,
 ) {
     let self_id = *p2p_node.peer_id();
@@ -7761,11 +7772,17 @@ async fn run_neighbor_sync_round(
             let mut epoch = sync_cycle_epoch.write().await;
             *epoch = epoch.saturating_add(1);
         }
+    }
 
-        // Post-cycle pruning (Section 11) — runs without holding sync_state.
-        // Prune candidacy is unconditional once the hysteresis elapses;
-        // bootstrap state only defers the remote prune-confirmation audits
-        // until bootstrap has drained.
+    // Pruning (Section 11) — runs without holding sync_state. Prune candidacy
+    // is unconditional once the hysteresis elapses, but a candidate is only
+    // erased under disk pressure (ADR-0028); bootstrap state also defers the
+    // remote prune-confirmation audits until bootstrap has drained. The passes
+    // run after every completed cycle and, while the disk is under pressure,
+    // on other rounds too, at most once per minimum sync interval: a cycle
+    // spans several rounds, and a node under pressure should not wait for one
+    // to end before it starts erasing.
+    if disk_pressure.prune_pass_due(cycle_complete, storage, config.neighbor_sync_interval_min) {
         let allow_remote_prune_audits = !bootstrapping && bootstrap_state.read().await.is_drained();
         pruning::run_prune_pass_with_context(pruning::PrunePassContext {
             self_id: &self_id,
@@ -7778,14 +7795,22 @@ async fn run_neighbor_sync_round(
             allow_remote_prune_audits,
             commitment_state: Some(commitment_state),
             audit_challenge_coordinator,
+            disk_pressure,
         })
         .await;
         if let Some(pointers) = pointers {
             pointers
-                .prune_pass(allow_remote_prune_audits, Some(commitment_state))
+                .prune_pass(
+                    allow_remote_prune_audits,
+                    disk_pressure,
+                    Some(commitment_state),
+                )
                 .await;
         }
+        disk_pressure.prune_pass_finished();
+    }
 
+    if cycle_complete {
         // Take fresh close-neighbor snapshot (DHT query, no lock held).
         let neighbors =
             neighbor_sync::snapshot_close_neighbors(p2p_node, &self_id, config.neighbor_sync_scope)
@@ -7800,12 +7825,10 @@ async fn run_neighbor_sync_round(
             let old_sync_times = std::mem::take(&mut state.last_sync_times);
             let old_bootstrap_claims = std::mem::take(&mut state.bootstrap_claims);
             let old_bootstrap_claim_history = std::mem::take(&mut state.bootstrap_claim_history);
-            let old_prune_cursor = state.prune_cursor;
             *state = NeighborSyncState::new_cycle(neighbors);
             state.last_sync_times = old_sync_times;
             state.bootstrap_claims = old_bootstrap_claims;
             state.bootstrap_claim_history = old_bootstrap_claim_history;
-            state.prune_cursor = old_prune_cursor;
         }
     }
 
@@ -10223,8 +10246,8 @@ async fn persist_retention_if_changed(
     if last.as_deref() == Some(combined.as_slice()) {
         return;
     }
-    if write_retention_atomic(&pointer_leaves_path(path), leaves).await
-        && write_retention_atomic(path, bytes).await
+    if write_file_atomic(&pointer_leaves_path(path), leaves).await
+        && write_file_atomic(path, bytes).await
     {
         *last = Some(combined);
     }
@@ -10237,34 +10260,40 @@ fn pointer_leaves_path(path: &Path) -> PathBuf {
 
 /// Durably write `bytes` to `path`: temp file → fsync temp → atomic rename →
 /// fsync parent dir (so the rename itself survives a crash). Returns `true` on
-/// success. Only the retention-persist loop writes this path, so a fixed temp
-/// name is safe.
-async fn write_retention_atomic(path: &Path, bytes: Vec<u8>) -> bool {
+/// success. Each path has a single writer, so a fixed temp name is safe.
+async fn write_file_atomic(path: &Path, bytes: Vec<u8>) -> bool {
     let path = path.to_path_buf();
+    let target = path.clone();
     let res = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, &bytes)?;
-        std::fs::File::open(&tmp)?.sync_all()?;
+        // Sync through the handle that wrote, and close it before the rename:
+        // Windows refuses to flush a read-only handle or to rename an open file.
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
         std::fs::rename(&tmp, &path)?;
         // Fsync the directory so the rename (the durable-commit point) is not
         // lost on a crash right after it. An empty parent (relative filename)
-        // means the current directory.
-        let dir = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        std::fs::File::open(dir)?.sync_all()?;
+        // means the current directory. Windows can't open a directory as a file.
+        if cfg!(unix) {
+            let dir = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            std::fs::File::open(dir)?.sync_all()?;
+        }
         Ok(())
     })
     .await;
     match res {
         Ok(Ok(())) => true,
         Ok(Err(e)) => {
-            warn!("Commitment retention: persist failed: {e}");
+            warn!("Failed to persist {target:?}: {e}");
             false
         }
         Err(e) => {
-            warn!("Commitment retention: persist task join failed: {e}");
+            warn!("Persist task for {target:?} failed to join: {e}");
             false
         }
     }

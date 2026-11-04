@@ -13,8 +13,9 @@ use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
 
 use crate::ant_protocol::XorName;
+use crate::client::xor_distance;
 use crate::replication::config::{ReplicationConfig, REPLICATION_PROTOCOL_ID};
-use crate::replication::paid_list::PaidList;
+use crate::replication::paid_list::{near_bits_for_radius, PaidList, XORNAME_BITS};
 use crate::replication::protocol::{
     NeighborSyncRequest, NeighborSyncResponse, ReplicationMessage, ReplicationMessageBody,
 };
@@ -103,8 +104,30 @@ pub(crate) async fn build_replica_hints_for_peer_with_close_groups(
     hints
 }
 
+/// How many low bits of a key may differ from this node's for the key to count
+/// as near it, from the distance to its farthest paid-close-group peer. Every
+/// key counts as near until this node knows a full paid close group.
+///
+/// Paid entries beyond this carry no vote and need no hint: neither this node
+/// nor its neighbours are in their paid close groups.
+pub(crate) async fn paid_near_bits(p2p_node: &Arc<P2PNode>, group_size: usize) -> usize {
+    let self_xor: XorName = *p2p_node.peer_id().as_bytes();
+    let closest = p2p_node
+        .dht_manager()
+        .find_closest_nodes_local(&self_xor, group_size)
+        .await;
+    if closest.len() < group_size {
+        return XORNAME_BITS;
+    }
+    closest
+        .iter()
+        .map(|node| xor_distance(&self_xor, node.peer_id.as_bytes()))
+        .max()
+        .map_or(XORNAME_BITS, |radius| near_bits_for_radius(&radius))
+}
+
 /// Build outbound hint sets for a batch of peers with one scan over local
-/// storage and one scan over the paid list.
+/// storage and one scan over the paid-list entries near this node.
 pub(crate) async fn build_sync_hints_for_peers(
     peers: &[PeerId],
     storage: &Arc<ChunkStore>,
@@ -150,16 +173,18 @@ pub(crate) async fn build_sync_hints_for_peers(
         }
     }
 
-    let all_paid_keys = match paid_list.all_keys() {
+    let self_xor: XorName = *p2p_node.peer_id().as_bytes();
+    let near_bits = paid_near_bits(p2p_node, paid_list_close_group_size).await;
+    let near_paid_keys = match paid_list.keys_near(&self_xor, near_bits) {
         Ok(keys) => keys,
         Err(e) => {
             warn!("Failed to read PaidForList for batch hint construction: {e}");
             Vec::new()
         }
     };
-    let paid_key_count = all_paid_keys.len();
+    let paid_key_count = near_paid_keys.len();
 
-    for key in all_paid_keys {
+    for key in near_paid_keys {
         let closest = dht
             .find_closest_nodes_local_with_self(&key, paid_list_close_group_size)
             .await;
@@ -217,7 +242,9 @@ pub async fn build_paid_hints_for_peer(
     p2p_node: &Arc<P2PNode>,
     paid_list_close_group_size: usize,
 ) -> Vec<XorName> {
-    let all_paid_keys = match paid_list.all_keys() {
+    let self_xor: XorName = *p2p_node.peer_id().as_bytes();
+    let near_bits = paid_near_bits(p2p_node, paid_list_close_group_size).await;
+    let near_paid_keys = match paid_list.keys_near(&self_xor, near_bits) {
         Ok(keys) => keys,
         Err(e) => {
             warn!("Failed to read PaidForList for hint construction: {e}");
@@ -227,7 +254,7 @@ pub async fn build_paid_hints_for_peer(
 
     let dht = p2p_node.dht_manager();
     let mut hints = Vec::new();
-    for key in all_paid_keys {
+    for key in near_paid_keys {
         let closest = dht
             .find_closest_nodes_local_with_self(&key, paid_list_close_group_size)
             .await;
@@ -884,11 +911,9 @@ mod tests {
     ///
     /// Full `run_prune_pass` requires a live `P2PNode`. This test verifies
     /// the deterministic trigger condition (cycle completion) and the
-    /// combined record + paid-list pruning contract:
+    /// record-pruning contract:
     ///   (1) Cycle completes -> prune pass should run.
-    ///   (2) Both `RecordOutOfRangeFirstSeen` and `PaidOutOfRangeFirstSeen`
-    ///       are tracked independently in the same pass.
-    ///   (3) Keys within hysteresis window are retained.
+    ///   (2) Keys within hysteresis window are retained.
     #[test]
     fn scenario_36_post_cycle_triggers_combined_prune_pass() {
         let config = ReplicationConfig::default();

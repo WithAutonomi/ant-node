@@ -186,6 +186,17 @@ pub enum CapacityVerdict {
     Unknown,
 }
 
+/// Free and total bytes on the partition holding the record store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskSpace {
+    /// Bytes free to this process, less what writes have already charged
+    /// against them.
+    pub available: u64,
+    /// Size of the partition less the blocks reserved for the root user, so
+    /// `available / total` reads as `df` reads it.
+    pub total: u64,
+}
+
 /// Configuration for [`ChunkStore`].
 #[derive(Debug, Clone)]
 pub struct ChunkStoreConfig {
@@ -304,7 +315,10 @@ impl CapacityGuard {
         let mut snapshot = self.snapshot.lock();
         match self.measure(&mut snapshot) {
             Ok(()) => Some(snapshot.free_estimate()),
-            Err(_) => None,
+            Err(e) => {
+                warn!("Cannot measure free space, so nothing is erased: {e}");
+                None
+            }
         }
     }
 
@@ -698,6 +712,9 @@ pub struct ChunkStore {
     /// build is an uncontended read taken on the blocking thread, not an await.
     #[cfg(any(test, feature = "test-utils"))]
     test_put_gate: Arc<parking_lot::RwLock<()>>,
+    /// Test-only: what [`Self::disk_space`] reports instead of measuring.
+    #[cfg(any(test, feature = "test-utils"))]
+    test_disk_space: parking_lot::RwLock<Option<DiskSpace>>,
 
     /// Test-only: parks a put after it has taken the key's lane and before it registers
     /// itself as in flight.
@@ -828,6 +845,8 @@ impl ChunkStore {
             corrupt_reported: Notify::new(),
             #[cfg(any(test, feature = "test-utils"))]
             test_put_gate: Arc::new(parking_lot::RwLock::new(())),
+            #[cfg(any(test, feature = "test-utils"))]
+            test_disk_space: parking_lot::RwLock::new(None),
             #[cfg(test)]
             test_pre_registration_gate: Arc::new(tokio::sync::RwLock::new(())),
             #[cfg(test)]
@@ -1734,6 +1753,48 @@ impl ChunkStore {
         &self.chunks_dir
     }
 
+    /// Free and total bytes on the partition holding this store, or `None` if
+    /// the filesystem could not say.
+    ///
+    /// The pointer store keeps its files on this partition too, so this is the
+    /// one measurement both record kinds' retention decides by (ADR-0028).
+    #[must_use]
+    pub fn disk_space(&self) -> Option<DiskSpace> {
+        #[cfg(any(test, feature = "test-utils"))]
+        {
+            let reported = *self.test_disk_space.read();
+            if reported.is_some() {
+                return reported;
+            }
+        }
+        let available = self.capacity.measure_available()?;
+        let total = self.usable_disk_total()?;
+        Some(DiskSpace { available, total })
+    }
+
+    /// [`DiskSpace::total`] for this store's partition.
+    fn usable_disk_total(&self) -> Option<u64> {
+        let measured = || -> std::io::Result<u64> {
+            let total = fs2::total_space(&self.chunks_dir)?;
+            let free = fs2::free_space(&self.chunks_dir)?;
+            let available = fs2::available_space(&self.chunks_dir)?;
+            Ok(total.saturating_sub(free.saturating_sub(available)))
+        };
+        match measured() {
+            Ok(total) => Some(total),
+            Err(e) => {
+                warn!("Cannot measure the record store's partition, so nothing is erased: {e}");
+                None
+            }
+        }
+    }
+
+    /// Free bytes this store keeps unused: below them it refuses writes.
+    #[must_use]
+    pub fn disk_reserve(&self) -> u64 {
+        self.capacity.reserve
+    }
+
     /// Reject work early when the disk cannot take another chunk at all.
     ///
     /// # Errors
@@ -1806,6 +1867,13 @@ impl ChunkStore {
     #[cfg(test)]
     pub(crate) fn capacity_charge_for(bytes: u64) -> u64 {
         CapacityGuard::charge(bytes)
+    }
+
+    /// Test-only: make [`Self::disk_space`] report `space` instead of measuring
+    /// the partition, or measure it again with `None`.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_test_disk_space(&self, space: Option<DiskSpace>) {
+        *self.test_disk_space.write() = space;
     }
 
     /// Test-only handle to the put gate.

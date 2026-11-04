@@ -76,6 +76,38 @@ const PAID_LIST_FLEX_EDGE_DIVISOR: usize = 5;
 /// size would make authorization impossible rather than merely strict.
 pub const PAID_LIST_ABSOLUTE_CONFIRM_FLOOR: usize = 3;
 
+/// LMDB map size for the paid list: 1 GiB.
+///
+/// A retained record keeps the entry that authorises its repair, so entries stay
+/// until the list nears this (ADR-0028). The store's file grows as entries do,
+/// so a node doesn't pay for the whole map up front.
+pub const PAID_LIST_MAP_SIZE: usize = 1_024 * 1_024 * 1_024;
+
+/// Map bytes a paid-list entry takes, measured with single-key commits.
+const PAID_LIST_MAP_BYTES_PER_ENTRY: usize = 61;
+
+/// Paid-list entry count above which prune passes evict entries (ADR-0028).
+///
+/// Removing entries frees no disk, since the store never shrinks its file. It
+/// only makes room for new keys, so this leaves some room in the store rather
+/// than reacting to the disk.
+pub const PAID_LIST_EVICT_START_ENTRIES: usize = 15_000_000;
+
+const _: () = assert!(
+    PAID_LIST_EVICT_START_ENTRIES * PAID_LIST_MAP_BYTES_PER_ENTRY < PAID_LIST_MAP_SIZE,
+    "the paid list must start evicting before its store is full"
+);
+
+/// Most paid-list entries one prune pass evicts.
+pub const MAX_PAID_EVICTIONS_PER_PASS: usize = 100_000;
+
+/// Bits beyond the distance to this node's farthest paid-close-group peer within
+/// which a key still counts as near this node.
+///
+/// Two bits is at least four times that distance, which covers the difference
+/// in peer density between here and the key.
+pub const PAID_LIST_NEAR_MARGIN_BITS: usize = 2;
+
 /// Number of closest peers to self eligible for neighbor sync.
 pub const NEIGHBOR_SYNC_SCOPE: usize = 20;
 
@@ -884,11 +916,11 @@ pub const MAX_PRUNE_AUDIT_CANDIDATES_PER_PASS: usize = 1024;
 /// A request may contain multiple keys. Keeping this separate from the
 /// candidate cap prevents the old candidate-to-peer-edge accounting from
 /// limiting a production pass to roughly nine records.
-pub const MAX_PRUNE_AUDIT_REQUESTS_PER_PASS: usize = 256;
-
-/// Maximum mature records deleted through the complete width-20 fast path per
-/// pass.
-pub const MAX_FAST_PRUNE_DELETIONS_PER_PASS: usize = 2048;
+///
+/// Prune audits are only sent under disk pressure (ADR-0028), and every
+/// erasure needs them. Far candidates rarely share a close group, so each
+/// costs about one request per group member: this allows about 146 per pass.
+pub const MAX_PRUNE_AUDIT_REQUESTS_PER_PASS: usize = 1024;
 
 /// Seconds to wait for `DhtNetworkEvent::BootstrapComplete` before proceeding
 /// with bootstrap sync. Covers bootstrap nodes with no peers to connect to.
@@ -909,6 +941,8 @@ pub struct ReplicationConfig {
     pub quorum_threshold: usize,
     /// Maximum closest nodes tracking paid status for a key.
     pub paid_list_close_group_size: usize,
+    /// Paid-list entry count above which prune passes evict entries.
+    pub paid_list_evict_start_entries: usize,
     /// Number of closest peers to self eligible for neighbor sync.
     pub neighbor_sync_scope: usize,
     /// Peers synced concurrently per round-robin repair round.
@@ -984,6 +1018,7 @@ impl Default for ReplicationConfig {
             close_group_size: CLOSE_GROUP_SIZE,
             quorum_threshold: QUORUM_THRESHOLD,
             paid_list_close_group_size: PAID_LIST_CLOSE_GROUP_SIZE,
+            paid_list_evict_start_entries: PAID_LIST_EVICT_START_ENTRIES,
             neighbor_sync_scope: NEIGHBOR_SYNC_SCOPE,
             neighbor_sync_peer_count: NEIGHBOR_SYNC_PEER_COUNT,
             neighbor_sync_interval_min: NEIGHBOR_SYNC_INTERVAL_MIN,
