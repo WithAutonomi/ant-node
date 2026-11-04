@@ -1069,37 +1069,40 @@ pub(crate) fn verify_slice_response(
     AuditVerdict::Pass { checked }
 }
 
-/// Verify a subtree-proof response (auditor side), ADR-0002 two-round audit.
+/// The auditor's verdict on one subtree-audit response (ADR-0002), in the order
+/// production runs the gates: round 1 ([`evaluate_subtree_structure`]: pin,
+/// identity, signature, structure, content-address binding), then a
+/// freshly-random round-2 sample, then [`verify_slice_response`] over what the
+/// responder served for it.
 ///
-/// **Round 1** (this proof): pin + identity + signature + structure. If the
-/// proof structurally rebuilds to the pinned root, the tree SHAPE is committed —
-/// but not yet that the bytes are held. **Round 2**: the auditor picks a small
-/// freshly-random (post-proof) sample of the just-proven leaves, draws a fresh
-/// block index for each, and sends a [`SubtreeSliceChallenge`] opening those
-/// blocks. It verifies each opened block against the committed `bytes_hash`
-/// (Bao slice → content address) and `nonced_root` (nonced block-tree opening →
-/// round-1 possession commit). A responder that committed to a chunk it no
-/// longer held cannot have committed a correct `nonced_root`, so it fails —
-/// regardless of what the auditor holds. On a full pass, credits the peer as a
-/// proven holder.
-async fn verify_subtree_response(
-    ctx: &AuditCtx<'_>,
+/// `round2` performs round 2: it is handed the openings the auditor drew and
+/// returns what came back. [`verify_subtree_response`] passes the network round
+/// trip; the test-utils entry [`verify_subtree_response_for_tests`] passes a
+/// modelled responder, so the attack proof-of-concept tests exercise this same
+/// composition rather than a copy of it. Logs each failure; the caller acts on the verdict.
+async fn subtree_audit_verdict<F, Fut>(
     commitment: &StorageCommitment,
     proof: &SubtreeProof,
-) -> AuditTickResult {
-    let challenged_peer = ctx.challenged_peer;
-    let challenge_id = ctx.challenge_id;
-
+    nonce: &[u8; 32],
+    expected_commitment_hash: &[u8; 32],
+    challenged_peer: &PeerId,
+    spotcheck_count: u32,
+    round2: F,
+) -> AuditVerdict
+where
+    F: FnOnce(Vec<SubtreeSliceOpening>) -> Fut,
+    Fut: std::future::Future<Output = SliceRound>,
+{
     // -- Round 1: pin/identity/signature + structure (no bytes). --
     if let Err(reason) = evaluate_subtree_structure(
         commitment,
         proof,
-        &ctx.nonce,
-        &ctx.expected_commitment_hash,
+        nonce,
+        expected_commitment_hash,
         challenged_peer.as_bytes(),
     ) {
         warn!("Audit: {challenged_peer} failed subtree structure ({reason:?})");
-        return failed(challenged_peer, challenge_id, reason);
+        return AuditVerdict::Fail(reason);
     }
 
     // -- Round 2: surprise slice challenge for a 3..=5 FRESHLY-RANDOM sample. --
@@ -1110,20 +1113,13 @@ async fn verify_subtree_response(
     // the opened blocks (cut-and-choose). The reply is a few KB per opening (a
     // 1 KiB block plus two short hash chains), so one round-2 message serves the
     // whole sample; no batching.
-    let sample_n = ctx
-        .config
-        .audit_spotcheck_count()
-        .clamp(BYTE_SPOTCHECK_MIN, BYTE_SPOTCHECK_MAX);
+    let sample_n = spotcheck_count.clamp(BYTE_SPOTCHECK_MIN, BYTE_SPOTCHECK_MAX);
     let sampled = random_spotcheck_leaves(proof, sample_n);
     if sampled.is_empty() {
         // Cannot happen after a valid structure (subtree is never empty), but
         // guard rather than credit an unproven peer.
         warn!("Audit: {challenged_peer} produced an empty spot-check sample; rejecting");
-        return failed(
-            challenged_peer,
-            challenge_id,
-            AuditFailureReason::DigestMismatch,
-        );
+        return AuditVerdict::Fail(AuditFailureReason::DigestMismatch);
     }
     // Pair each sampled leaf with up to two block indices: a fresh-random block
     // (possession) and the claimed final block (a length pin — see
@@ -1155,28 +1151,12 @@ async fn verify_subtree_response(
         })
         .collect();
 
-    let round = request_slice_proof(ctx, &openings).await;
-
-    // Round 2 ended without a completed possession proof: drop the holder credit
-    // this pinned commitment carries, before mapping the outcome to a verdict.
-    // Scoped to the commitment hash, so credit the peer re-earned for a newer
-    // commitment survives.
-    if round2_revokes_pinned_credit(&round) {
-        if let Some(credit) = ctx.credit {
-            credit
-                .recent_provers
-                .write()
-                .await
-                .forget_commitment(&ctx.expected_commitment_hash);
-        }
-    }
-
-    let verdict = match round {
+    let verdict = match round2(openings).await {
         // The responder served openings: verify both chains for every one. Any
         // failing chain is a confirmed cheat.
         SliceRound::Served(items) => verify_slice_response(
             &openings_with_leaves,
-            &ctx.nonce,
+            nonce,
             challenged_peer.as_bytes(),
             &items,
         ),
@@ -1192,20 +1172,119 @@ async fn verify_subtree_response(
         }
         // Round 2 produced no proof, either as an explicit `Transient` (a local
         // read error) or as silence. Both route to the timeout lane: no trust
-        // penalty, the strike policy still graces them, and the credit for the
-        // pinned commitment was already revoked above.
+        // penalty, the strike policy still graces them, and the caller has
+        // already revoked the credit for the pinned commitment.
         SliceRound::TransientReject | SliceRound::Timeout => {
             AuditVerdict::Fail(AuditFailureReason::Timeout)
         }
         // Malformed/unexpected round-2 body.
         SliceRound::Malformed => AuditVerdict::Fail(AuditFailureReason::MalformedResponse),
     };
+    if let AuditVerdict::Fail(reason) = &verdict {
+        warn!("Audit: {challenged_peer} failed subtree audit ({reason:?})");
+    }
+    verdict
+}
+
+/// The auditor's verdict on a subtree-audit response, with round 2 answered by
+/// `serve` instead of the network.
+///
+/// It runs the same composition as [`verify_subtree_response`]. Test-only: it
+/// lets the attack proof-of-concept tests check that the shipped gates, in the
+/// shipped order, reject each attack.
+///
+/// `serve` gets the openings the auditor drew (fresh randomness, after round 1,
+/// as in production) and returns the responder's items for them. Returns the
+/// number of verified openings on a pass, or the confirmed failure reason.
+///
+/// # Errors
+///
+/// The [`AuditFailureReason`] production would record for this response.
+#[cfg(any(test, feature = "test-utils"))]
+pub async fn verify_subtree_response_for_tests(
+    commitment: &StorageCommitment,
+    proof: &SubtreeProof,
+    nonce: &[u8; 32],
+    expected_commitment_hash: &[u8; 32],
+    challenged_peer_bytes: &[u8; 32],
+    spotcheck_count: u32,
+    serve: impl FnOnce(&[SubtreeSliceOpening]) -> Vec<SubtreeSliceItem>,
+) -> Result<usize, AuditFailureReason> {
+    let challenged_peer = PeerId::from_bytes(*challenged_peer_bytes);
+    let verdict = subtree_audit_verdict(
+        commitment,
+        proof,
+        nonce,
+        expected_commitment_hash,
+        &challenged_peer,
+        spotcheck_count,
+        |openings| {
+            let items = serve(&openings);
+            async move { SliceRound::Served(items) }
+        },
+    )
+    .await;
+    match verdict {
+        AuditVerdict::Pass { checked } => Ok(checked),
+        AuditVerdict::Fail(reason) => Err(reason),
+    }
+}
+
+/// Verify a subtree-proof response (auditor side), ADR-0002 two-round audit.
+///
+/// **Round 1** (this proof): pin + identity + signature + structure. If the
+/// proof structurally rebuilds to the pinned root, the tree SHAPE is committed —
+/// but not yet that the bytes are held. **Round 2**: the auditor picks a small
+/// freshly-random (post-proof) sample of the just-proven leaves, draws a fresh
+/// block index for each, and sends a [`SubtreeSliceChallenge`] opening those
+/// blocks. It verifies each opened block against the committed `bytes_hash`
+/// (Bao slice → content address) and `nonced_root` (nonced block-tree opening →
+/// round-1 possession commit). A responder that committed to a chunk it no
+/// longer held cannot have committed a correct `nonced_root`, so it fails —
+/// regardless of what the auditor holds. On a full pass, credits the peer as a
+/// proven holder.
+async fn verify_subtree_response(
+    ctx: &AuditCtx<'_>,
+    commitment: &StorageCommitment,
+    proof: &SubtreeProof,
+) -> AuditTickResult {
+    let challenged_peer = ctx.challenged_peer;
+    let challenge_id = ctx.challenge_id;
+
+    // Round 1, the round-2 sample and the round-2 verdict all run in
+    // `subtree_audit_verdict`, the composition the attack PoCs drive too
+    // (`tests/poc_commitment_audit_attacks.rs`). Only the round-2 transport and
+    // the credit revocation it triggers live here.
+    let verdict = subtree_audit_verdict(
+        commitment,
+        proof,
+        &ctx.nonce,
+        &ctx.expected_commitment_hash,
+        challenged_peer,
+        ctx.config.audit_spotcheck_count(),
+        |openings| async move {
+            let round = request_slice_proof(ctx, &openings).await;
+
+            // Round 2 ended without a completed possession proof: drop the
+            // holder credit this pinned commitment carries, before the outcome
+            // is mapped to a verdict. Scoped to the commitment hash, so credit
+            // the peer re-earned for a newer commitment survives.
+            if round2_revokes_pinned_credit(&round) {
+                if let Some(credit) = ctx.credit {
+                    credit
+                        .recent_provers
+                        .write()
+                        .await
+                        .forget_commitment(&ctx.expected_commitment_hash);
+                }
+            }
+            round
+        },
+    )
+    .await;
 
     match verdict {
-        AuditVerdict::Fail(reason) => {
-            warn!("Audit: {challenged_peer} failed subtree audit ({reason:?})");
-            failed(challenged_peer, challenge_id, reason)
-        }
+        AuditVerdict::Fail(reason) => failed(challenged_peer, challenge_id, reason),
         AuditVerdict::Pass { checked } => {
             // Closeness (ADR-0002, soft/observe-only) — see observe_closeness.
             observe_closeness(ctx.p2p_node, ctx.config, challenged_peer, proof).await;

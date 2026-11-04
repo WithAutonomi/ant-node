@@ -8,22 +8,32 @@
 //! "does the subtree audit actually close the storage-binding holes?" — each
 //! `#[test]` docstring describes the attack it closes.
 //!
-//! ## How the auditor is modelled here
+//! ## How the auditor is driven here
 //!
-//! The production auditor's `verify_subtree_response` (in
-//! `src/replication/storage_commitment_audit.rs`) is private, so this file
-//! reproduces the exact ordered gates it runs — pin, peer-id binding,
-//! signature, structural [`verify_subtree_proof`], then the **round-2 slice
-//! challenge** (V2-685): the auditor opens one 1 KiB block of a fresh-random
-//! sample of the just-proven leaves FROM THE RESPONDER and verifies each opened
-//! block against the leaf's committed `bytes_hash` (a Bao verified slice against
-//! the chunk address) and `nonced_root` (a nonced block-tree opening proving
-//! round-1 possession). Possession is non-delegable: the auditor needs to hold
-//! NONE of the responder's chunks, and a committed key the responder cannot
-//! serve is a deterministic, confirmed failure (`DigestMismatch` in production —
-//! never inconclusive, never graced). The helper [`auditor_accepts`] runs these
-//! gates in the same order with the same failure semantics, so a reviewer can
-//! see each attack is caught at the same gate the network code would catch it.
+//! The PoCs run the PRODUCTION auditor: [`auditor_accepts`] calls
+//! `storage_commitment_audit::verify_subtree_response_for_tests` (behind
+//! `test-utils`), which runs `subtree_audit_verdict`, the same composition the
+//! network auditor's `verify_subtree_response` runs. Round 1 is pin, peer-id
+//! binding, signature, structural [`verify_subtree_proof`] and the
+//! content-address binding. Round 2 is the **slice challenge** (V2-685): the
+//! auditor opens 1 KiB blocks of a fresh-random sample of the just-proven leaves
+//! FROM THE RESPONDER, and verifies each against the leaf's committed
+//! `bytes_hash` (a Bao verified slice against the chunk address) and
+//! `nonced_root` (a nonced block-tree opening proving round-1 possession). Only
+//! the round-2 transport is replaced: a modelled responder answers the openings
+//! the auditor drew instead of the network. So removing or reordering a gate in
+//! production makes the PoC for the attack it stops fail (V2-1807).
+//!
+//! Possession is non-delegable: the auditor holds NONE of the responder's
+//! chunks, and a committed key the responder cannot serve is a confirmed failure
+//! (`KeyAbsent` when it says so, `DigestMismatch` when it serves a block that
+//! does not verify), never inconclusive and never graced.
+//!
+//! Production reports the reason, not the gate: every round-1 identity gate
+//! (sender id, peer-id↔key binding, pin, signature) fails as
+//! `AuditFailureReason::Rejected`, and structural and possession failures as
+//! `DigestMismatch`. The assertions name those reasons; each test's doc says
+//! which gate it targets.
 //!
 //! ## What changed from the old per-key audit (and why)
 //!
@@ -68,15 +78,14 @@ use ant_node::replication::commitment::{
 };
 use ant_node::replication::commitment_state::{BuiltCommitment, ResponderCommitmentState};
 use ant_node::replication::config::AUDIT_SPOTCHECK_COUNT;
-use ant_node::replication::slice::{
-    extract_block_slice, nonced_block_root, nonced_block_siblings, verify_block_slice,
-    verify_nonced_block,
-};
+use ant_node::replication::protocol::{SubtreeSliceItem, SubtreeSliceOpening};
+use ant_node::replication::slice::{extract_block_slice, nonced_block_root, nonced_block_siblings};
+use ant_node::replication::storage_commitment_audit::verify_subtree_response_for_tests;
 use ant_node::replication::subtree::{
     build_subtree_proof, select_spotcheck_indices, select_subtree_path, verify_subtree_proof,
     StructureVerdict, SubtreeLeaf, SubtreeProof,
 };
-use rand::Rng;
+use ant_node::replication::types::AuditFailureReason;
 use saorsa_pqc::api::sig::{ml_dsa_65, MlDsaPublicKey, MlDsaSecretKey};
 
 // ---------------------------------------------------------------------------
@@ -159,18 +168,19 @@ fn honest_bytes(k: &[u8; 32]) -> Option<Vec<u8>> {
     None
 }
 
-/// The auditor's full ordered verification, mirroring the production
-/// `verify_subtree_response` gates. Returns `Ok(byte_checked_count)` on accept.
+/// The production auditor's verdict on this response, from
+/// `verify_subtree_response_for_tests`: the same gates, in the same order, as the
+/// network auditor's `verify_subtree_response`. Returns `Ok(verified_openings)`
+/// on accept, or the [`AuditFailureReason`] production would record.
 ///
-/// `responder_serves(k)` models round 2 (`SubtreeSliceChallenge`): the chunk
-/// content the RESPONDER can produce for sampled leaf `k`, from which it builds a
-/// Bao verified slice + nonced block opening exactly as
-/// `handle_subtree_slice_challenge` does. `Some(bytes)` is a
-/// `SubtreeSliceItem::Present`; `None` is an explicit `Absent` or an omitted key
-/// — a committed key the responder will not serve, which production
-/// `verify_slice_response` counts as a confirmed `DigestMismatch`. The auditor
-/// verifies the served block against the committed address and nonced root, so it
-/// needs to hold none of the responder's chunks and no inconclusive lane exists.
+/// `responder_serves(k)` models the responder in round 2: the chunk content it
+/// can produce for sampled leaf `k`. `Some(bytes)` becomes a
+/// `SubtreeSliceItem::Present` built from those bytes the way
+/// `handle_subtree_slice_challenge` builds one (a Bao verified slice plus a
+/// nonced block opening). `None` becomes an explicit `Absent`, which production
+/// records as `KeyAbsent`. The auditor draws the sample and the block indices
+/// itself, with fresh randomness after round 1, so the responder cannot choose
+/// what gets opened.
 fn auditor_accepts(
     challenged_peer_id: &[u8; 32],
     expected_commitment_hash: &[u8; 32],
@@ -178,135 +188,48 @@ fn auditor_accepts(
     commitment: &StorageCommitment,
     proof: &SubtreeProof,
     responder_serves: impl Fn(&[u8; 32]) -> Option<Vec<u8>>,
-) -> Result<usize, AuditError> {
-    // -- Gate: pin + peer-id binding + signature ----------------------------
-    if commitment.sender_peer_id != *challenged_peer_id {
-        return Err(AuditError::SenderPeerIdMismatch);
-    }
-    let derived = *blake3::hash(&commitment.sender_public_key).as_bytes();
-    if derived != commitment.sender_peer_id {
-        return Err(AuditError::PeerIdKeyMismatch);
-    }
-    match commitment_hash(commitment) {
-        Some(h) if &h == expected_commitment_hash => {}
-        _ => return Err(AuditError::CommitmentHashMismatch),
-    }
-    if !verify_commitment_signature(commitment) {
-        return Err(AuditError::SignatureInvalid);
-    }
-
-    // -- Gate: structure ----------------------------------------------------
-    if let StructureVerdict::Invalid(why) = verify_subtree_proof(proof, nonce, commitment) {
-        return Err(AuditError::StructureInvalid(why));
-    }
-
-    // -- Gate: content-address binding (possession-forgery guard) -----------
-    // Mirrors production `evaluate_subtree_structure`: a leaf whose `bytes_hash`
-    // is decoupled from its credited `key` is rejected at round 1 (content-
-    // addressed chunks always have `bytes_hash == key`).
-    if proof.leaves.iter().any(|l| l.bytes_hash != l.key) {
-        return Err(AuditError::StructureInvalid("leaf bytes_hash != key"));
-    }
-
-    // -- Gate: round-2 slice challenge (responder-served possession) ----------
-    // Mirrors `verify_subtree_response` round 2: the sample is chosen with FRESH
-    // randomness over the RECEIVED proof leaves (NOT nonce-derived), AFTER round
-    // 1, so the responder cannot predict which leaves — or which block within —
-    // will be opened (§1 cut-and-choose soundness). EVERY sampled leaf must
-    // verify from the slice the responder serves. There is no skip and no
-    // inconclusive lane: a committed key the responder cannot serve is a lie.
-    let spot = random_sample_indices(
-        proof.leaves.len(),
-        AUDIT_SPOTCHECK_COUNT.clamp(3, 5) as usize,
-    );
-    if spot.is_empty() {
-        // Cannot happen after a valid structure (the subtree is never empty),
-        // but mirror the production guard: never credit an unproven peer.
-        return Err(AuditError::StructureInvalid("empty spot-check sample"));
-    }
-    let mut checked = 0usize;
-    for idx in spot {
-        let leaf = proof
-            .leaves
-            .get(idx)
-            .ok_or(AuditError::StructureInvalid("spot index out of range"))?;
-        let Some(bytes) = responder_serves(&leaf.key) else {
-            // Absent/omitted committed key → confirmed failure (production
-            // maps this to `DigestMismatch`), NOT a skip.
-            return Err(AuditError::CommittedKeyUnserved);
-        };
-        // The fixtures use short (single-block) chunks, so the only block is 0;
-        // production draws a fresh random index. The responder builds its slice
-        // and nonced opening from the content it serves.
-        let block_index = 0u32;
-        let bao_slice = extract_block_slice(&bytes, block_index).unwrap();
-        let nonced_siblings = nonced_block_siblings(
-            nonce,
-            &commitment.sender_peer_id,
-            &leaf.key,
-            &bytes,
-            block_index,
-        )
-        .unwrap_or_default();
-
-        // Auditor chain 1: authenticate the block against the committed address.
-        let Some(block) = verify_block_slice(
-            &bao_slice,
-            &leaf.bytes_hash,
-            u64::from(leaf.content_len),
-            block_index,
-        ) else {
-            return Err(AuditError::RealBytesMismatch);
-        };
-        // Auditor chain 2: fold the nonced opening to the committed nonced_root.
-        if !verify_nonced_block(
-            nonce,
-            &commitment.sender_peer_id,
-            &leaf.key,
-            block_index,
-            &block,
-            &nonced_siblings,
-            &leaf.nonced_root,
-            ant_node::replication::slice::block_count(u64::from(leaf.content_len)),
-        ) {
-            return Err(AuditError::RealBytesMismatch);
+) -> Result<usize, AuditFailureReason> {
+    let serve = |openings: &[SubtreeSliceOpening]| -> Vec<SubtreeSliceItem> {
+        let mut items = Vec::new();
+        let mut absent = std::collections::HashSet::new();
+        for opening in openings {
+            match responder_serves(&opening.key) {
+                Some(bytes) => items.push(SubtreeSliceItem::Present {
+                    key: opening.key,
+                    block_index: opening.block_index,
+                    // A block the content doesn't have yields an empty slice,
+                    // which fails to verify like any other bad slice.
+                    bao_slice: extract_block_slice(&bytes, opening.block_index).unwrap_or_default(),
+                    nonced_siblings: nonced_block_siblings(
+                        nonce,
+                        &commitment.sender_peer_id,
+                        &opening.key,
+                        &bytes,
+                        opening.block_index,
+                    )
+                    .unwrap_or_default(),
+                }),
+                None => {
+                    if absent.insert(opening.key) {
+                        items.push(SubtreeSliceItem::Absent { key: opening.key });
+                    }
+                }
+            }
         }
-        checked += 1;
-    }
-    Ok(checked)
-}
-
-/// `count` distinct random indices in `0..n` — the auditor's FRESH round-2
-/// sample, chosen after the proof is in hand (mirrors production
-/// `random_spotcheck_leaves`). Not nonce-derived: that is the whole point of
-/// the §1 fix.
-fn random_sample_indices(n: usize, count: usize) -> Vec<usize> {
-    if n == 0 {
-        return Vec::new();
-    }
-    let want = count.min(n);
-    let mut rng = rand::thread_rng();
-    let mut picked = std::collections::BTreeSet::new();
-    while picked.len() < want {
-        picked.insert(rng.gen_range(0..n));
-    }
-    picked.into_iter().collect()
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum AuditError {
-    SenderPeerIdMismatch,
-    PeerIdKeyMismatch,
-    CommitmentHashMismatch,
-    SignatureInvalid,
-    StructureInvalid(&'static str),
-    /// Round 2: the responder's opened block failed a chain — the Bao slice did
-    /// not decode against the committed address, or the nonced opening did not
-    /// fold to the committed `nonced_root` (production: `DigestMismatch`).
-    RealBytesMismatch,
-    /// Round 2: the responder would not serve a committed, sampled key
-    /// (production: `DigestMismatch` — a deterministic, confirmed failure).
-    CommittedKeyUnserved,
+        items
+    };
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(verify_subtree_response_for_tests(
+            commitment,
+            proof,
+            nonce,
+            expected_commitment_hash,
+            challenged_peer_id,
+            AUDIT_SPOTCHECK_COUNT,
+            serve,
+        ))
 }
 
 /// Build an honest subtree proof for `nonce` against the responder's current
@@ -418,7 +341,7 @@ fn relay_holding_only_addresses_caught_by_real_bytes_check() {
     );
     assert_eq!(
         res,
-        Err(AuditError::CommittedKeyUnserved),
+        Err(AuditFailureReason::KeyAbsent),
         "a relay that cannot serve sampled bytes must fail round 2, got {res:?}"
     );
 
@@ -434,7 +357,7 @@ fn relay_holding_only_addresses_caught_by_real_bytes_check() {
     );
     assert_eq!(
         res,
-        Err(AuditError::RealBytesMismatch),
+        Err(AuditFailureReason::DigestMismatch),
         "fabricated served bytes must fail the content-address check, got {res:?}"
     );
 }
@@ -566,7 +489,7 @@ fn fabricated_fraction_is_caught_when_a_forged_leaf_is_sampled() {
     );
     assert_eq!(
         res,
-        Err(AuditError::RealBytesMismatch),
+        Err(AuditFailureReason::DigestMismatch),
         "a forged leaf landing under the slice challenge must fail, got {res:?}"
     );
 }
@@ -599,7 +522,7 @@ fn relay_unable_to_serve_bytes_fails_deterministically_regardless_of_auditor_ove
     );
     assert_eq!(
         res,
-        Err(AuditError::CommittedKeyUnserved),
+        Err(AuditFailureReason::KeyAbsent),
         "an unserved sampled key ⇒ deterministic confirmed failure, got {res:?}"
     );
 }
@@ -637,7 +560,7 @@ fn fresh_commitment_substitution_rejected_by_pin() {
     );
     assert_eq!(
         res,
-        Err(AuditError::CommitmentHashMismatch),
+        Err(AuditFailureReason::Rejected),
         "fresh-commitment substitution must trip the pin, got {res:?}"
     );
 }
@@ -672,7 +595,7 @@ fn cross_peer_commitment_substitution_rejected_by_sender_id() {
     );
     assert_eq!(
         res,
-        Err(AuditError::SenderPeerIdMismatch),
+        Err(AuditFailureReason::Rejected),
         "cross-peer substitution must trip the sender-id binding, got {res:?}"
     );
 }
@@ -725,7 +648,7 @@ fn throwaway_key_substitution_rejected_by_pubkey_binding() {
     let res = auditor_accepts(&p_peer_id, &pin, &nonce, &bad_commit, &proof, honest_bytes);
     assert_eq!(
         res,
-        Err(AuditError::PeerIdKeyMismatch),
+        Err(AuditFailureReason::Rejected),
         "throwaway-key attack must trip the peer-id↔key binding, got {res:?}"
     );
 }
@@ -766,7 +689,7 @@ fn wrong_signer_rejected_at_signature_gate() {
     );
     assert_eq!(
         res,
-        Err(AuditError::SignatureInvalid),
+        Err(AuditFailureReason::Rejected),
         "swapped embedded key must trip the signature gate, got {res:?}"
     );
 }
@@ -807,7 +730,7 @@ fn audit_response_replay_blocked_by_fresh_nonce() {
         honest_bytes,
     );
     assert!(
-        matches!(res, Err(AuditError::StructureInvalid(_))),
+        res == Err(AuditFailureReason::DigestMismatch),
         "replay under a fresh nonce must fail the structural gate, got {res:?}"
     );
 }
@@ -840,7 +763,7 @@ fn tampered_cut_hash_rejected() {
         honest_bytes,
     );
     assert!(
-        matches!(res, Err(AuditError::StructureInvalid(_))),
+        res == Err(AuditFailureReason::DigestMismatch),
         "tampered cut-hash must fail structure, got {res:?}"
     );
 }
@@ -855,6 +778,11 @@ fn wrong_leaf_count_rejected() {
     let pin = r.commit_to_range(100);
     let (mut proof, commitment) = honest_proof_and_commitment(&r, &nonce);
     proof.leaves.pop();
+    // The gate that catches it, by name; production reports it as DigestMismatch.
+    assert_eq!(
+        verify_subtree_proof(&proof, &nonce, &commitment),
+        StructureVerdict::Invalid("wrong leaf count")
+    );
     let res = auditor_accepts(
         &r.peer_id_bytes,
         &pin,
@@ -865,7 +793,7 @@ fn wrong_leaf_count_rejected() {
     );
     assert_eq!(
         res,
-        Err(AuditError::StructureInvalid("wrong leaf count")),
+        Err(AuditFailureReason::DigestMismatch),
         "dropped leaf must fail the leaf-count check, got {res:?}"
     );
 }
@@ -890,7 +818,7 @@ fn reordered_leaves_rejected() {
         honest_bytes,
     );
     assert!(
-        matches!(res, Err(AuditError::StructureInvalid(_))),
+        res == Err(AuditFailureReason::DigestMismatch),
         "reordered leaves must fail structure, got {res:?}"
     );
 }
@@ -913,7 +841,7 @@ fn tampered_leaf_bytes_hash_rejected() {
         honest_bytes,
     );
     assert!(
-        matches!(res, Err(AuditError::StructureInvalid(_))),
+        res == Err(AuditFailureReason::DigestMismatch),
         "tampered bytes_hash must fail structure, got {res:?}"
     );
 }
