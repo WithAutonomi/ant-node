@@ -382,8 +382,10 @@ replication), arriving in 48 upload bursts. Of those, 1,801 admissions over
      accepted the key. Above 100,000 entries a node builds paid hints only
      from keys near itself (ADR-0028), while replica hints have no such
      limit, so a marked key it stores is a paid-hint candidate at any
-     distance: a record it retains far from itself still reaches whichever
-     peers it knows in that key's paid close group. The node also keeps its
+     distance. It goes to the members of the key's close group the node
+     knows, the peers a replica hint would have reached, so a record it
+     retains far from itself still reaches them, and a sync message carries
+     no more such keys than replica hints would have. The node also keeps its
      marked keys in memory, so leaving them out of the hints it builds for a
      peer, or adding them, reads nothing on disk but each far stored marked
      key's paid entry. Each paid-list write updates that copy in commit order, a new

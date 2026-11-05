@@ -181,13 +181,48 @@ fn paid_hint_scan_bits(entries: u64, near_bits: usize) -> usize {
     }
 }
 
+/// The keys a paid-hint build considers: `near`, read from the paid list, each
+/// hinted to the members of its paid close group; and `far_marked`, the far
+/// stored keys counted as marked, each hinted only to the members of its close
+/// group, the peers a replica hint would have reached, so they add no more to
+/// a sync message than replica hints of the same keys would (see
+/// [`paid_hint_keys`]).
+#[derive(Default)]
+struct PaidHintKeys {
+    near: Vec<XorName>,
+    far_marked: Vec<XorName>,
+}
+
+impl PaidHintKeys {
+    fn len(&self) -> usize {
+        self.near.len() + self.far_marked.len()
+    }
+
+    /// Each key with the size of the group whose members it is hinted to.
+    fn with_group_sizes(
+        self,
+        paid_list_close_group_size: usize,
+        close_group_size: usize,
+    ) -> impl Iterator<Item = (XorName, usize)> {
+        let near = self
+            .near
+            .into_iter()
+            .map(move |key| (key, paid_list_close_group_size));
+        let far_marked = self
+            .far_marked
+            .into_iter()
+            .map(move |key| (key, close_group_size));
+        near.chain(far_marked)
+    }
+}
+
 /// The paid-list keys a hint build considers (see [`paid_hint_keys`]).
 async fn paid_hint_candidates(
     paid_list: &PaidList,
     stored_marked: &[XorName],
     p2p_node: &Arc<P2PNode>,
     group_size: usize,
-) -> Result<Vec<XorName>> {
+) -> Result<PaidHintKeys> {
     let self_xor: XorName = *p2p_node.peer_id().as_bytes();
     let near_bits = paid_near_bits(p2p_node, group_size).await;
     let scan_bits = paid_hint_scan_bits(paid_list.count()?, near_bits);
@@ -208,14 +243,20 @@ fn paid_hint_keys(
     stored_marked: &[XorName],
     center: &XorName,
     scan_bits: usize,
-) -> Result<Vec<XorName>> {
-    let mut keys = paid_list.keys_near(center, scan_bits)?;
-    if scan_bits < XORNAME_BITS {
-        keys.extend(stored_marked.iter().copied().filter(|key| {
-            !is_near(center, key, scan_bits) && paid_list.contains(key).unwrap_or(false)
-        }));
-    }
-    Ok(keys)
+) -> Result<PaidHintKeys> {
+    let near = paid_list.keys_near(center, scan_bits)?;
+    let far_marked = if scan_bits < XORNAME_BITS {
+        stored_marked
+            .iter()
+            .copied()
+            .filter(|key| {
+                !is_near(center, key, scan_bits) && paid_list.contains(key).unwrap_or(false)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Ok(PaidHintKeys { near, far_marked })
 }
 
 /// Build outbound hint sets for a batch of peers with one scan over local
@@ -270,14 +311,16 @@ pub(crate) async fn build_sync_hints_for_peers(
         Ok(keys) => keys,
         Err(e) => {
             warn!("Failed to read PaidForList for batch hint construction: {e}");
-            Vec::new()
+            PaidHintKeys::default()
         }
     };
     let paid_key_count = paid_keys.len();
 
-    for key in paid_keys {
+    for (key, group_size) in
+        paid_keys.with_group_sizes(paid_list_close_group_size, close_group_size)
+    {
         let closest = dht
-            .find_closest_nodes_local_with_self(&key, paid_list_close_group_size)
+            .find_closest_nodes_local_with_self(&key, group_size)
             .await;
         for node in closest {
             if target_peers.contains(&node.peer_id) {
@@ -328,13 +371,15 @@ pub(crate) async fn build_sync_hints_for_peers(
 /// Returns keys from our `PaidForList` that we believe the peer should
 /// track (peer is among `PAID_LIST_CLOSE_GROUP_SIZE` nearest to `K`).
 /// `storage` tells which price-contested keys this node stores, since those
-/// are hinted at any distance (see `paid_hint_keys`).
+/// are hinted at any distance, to the members of their close group of
+/// `close_group_size` (see `paid_hint_keys`).
 pub async fn build_paid_hints_for_peer(
     peer: &PeerId,
     storage: &Arc<ChunkStore>,
     paid_list: &Arc<PaidList>,
     p2p_node: &Arc<P2PNode>,
     paid_list_close_group_size: usize,
+    close_group_size: usize,
 ) -> Vec<XorName> {
     let stored = stored_hint_keys(storage, paid_list).await;
     paid_hints_from(
@@ -343,6 +388,7 @@ pub async fn build_paid_hints_for_peer(
         &stored.marked,
         p2p_node,
         paid_list_close_group_size,
+        close_group_size,
     )
     .await
 }
@@ -354,6 +400,7 @@ async fn paid_hints_from(
     stored_marked: &[XorName],
     p2p_node: &Arc<P2PNode>,
     paid_list_close_group_size: usize,
+    close_group_size: usize,
 ) -> Vec<XorName> {
     let paid_keys = match paid_hint_candidates(
         paid_list,
@@ -372,9 +419,11 @@ async fn paid_hints_from(
 
     let dht = p2p_node.dht_manager();
     let mut hints = Vec::new();
-    for key in paid_keys {
+    for (key, group_size) in
+        paid_keys.with_group_sizes(paid_list_close_group_size, close_group_size)
+    {
         let closest = dht
-            .find_closest_nodes_local_with_self(&key, paid_list_close_group_size)
+            .find_closest_nodes_local_with_self(&key, group_size)
             .await;
         if closest.iter().any(|n| n.peer_id == *peer) {
             hints.push(key);
@@ -677,6 +726,7 @@ pub(crate) async fn handle_sync_request_with_proofs(
         &stored.marked,
         p2p_node,
         config.paid_list_close_group_size,
+        config.close_group_size,
     )
     .await;
 
@@ -792,19 +842,21 @@ mod tests {
         let stored = stored_hint_keys(&storage, &paid_list).await;
         let narrow = paid_hint_keys(&paid_list, &stored.marked, &center, NARROW_SCAN_BITS)
             .expect("read keys");
-        assert_eq!(sorted(narrow), sorted(vec![near_marked, far_marked]));
+        assert_eq!(narrow.near, vec![near_marked]);
+        assert_eq!(narrow.far_marked, vec![far_marked]);
         let full =
             paid_hint_keys(&paid_list, &stored.marked, &center, XORNAME_BITS).expect("read keys");
         assert_eq!(
-            sorted(full),
+            sorted(full.near),
             sorted(vec![
                 near_marked,
                 far_marked,
                 far_plain,
                 far_marked_unstored
             ]),
-            "a full read covers every key once"
+            "a full read covers every key"
         );
+        assert!(full.far_marked.is_empty(), "and adds none twice");
 
         // While the marks are unknown any stored key may be marked, and none
         // is hinted as a replica, so every stored key with a paid entry is
@@ -823,9 +875,10 @@ mod tests {
         assert!(unknown_marks.replica.is_empty(), "no replica hint");
         let unknown = paid_hint_keys(&paid_list, &unknown_marks.marked, &center, NARROW_SCAN_BITS)
             .expect("read keys");
+        assert_eq!(unknown.near, vec![near_marked]);
         assert_eq!(
-            sorted(unknown),
-            sorted(vec![near_marked, far_marked, far_plain])
+            sorted(unknown.far_marked),
+            sorted(vec![far_marked, far_plain])
         );
     }
 

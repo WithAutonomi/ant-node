@@ -696,6 +696,7 @@ async fn possession_check_skips_a_write_the_floor_cannot_price() {
             paid_list_a,
             p2p_a,
             ReplicationConfig::default().paid_list_close_group_size,
+            close_group_size,
         )
         .await
         .contains(&address);
@@ -2496,6 +2497,7 @@ async fn a_neighbour_gets_a_paid_hint_for_a_key_far_from_this_node() {
         &storage,
         &paid_list,
         &p2p,
+        ONLY_THE_CLOSEST,
         ONLY_THE_CLOSEST,
     )
     .await;
