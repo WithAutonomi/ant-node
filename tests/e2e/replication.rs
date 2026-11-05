@@ -2025,16 +2025,16 @@ async fn prune_marks_immediately_and_candidacy_waits_for_hysteresis() {
     harness.teardown().await.expect("teardown");
 }
 
-/// A key far from a node can still have that node's neighbour among its closest,
-/// so a paid list small enough to read whole is read whole.
+/// In a small network, a node still sends a peer the hint for a key far from the node
+/// when that peer is the key's closest. `PaidList`'s unit tests cover the near range
+/// itself: a network this small can't set one.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn a_neighbour_gets_a_paid_hint_for_a_key_far_from_this_node() {
     const ONLY_THE_CLOSEST: usize = 1;
     const EVERY_KNOWN_PEER: usize = 100;
     const LAST_KEY_BYTE: usize = 31;
-    // A full network: with only a few peers, every key counts as near this node.
-    let harness = TestHarness::setup().await.expect("setup");
+    let harness = TestHarness::setup_minimal().await.expect("setup");
     harness.warmup_dht().await.expect("warmup");
 
     let node = harness.test_node(0).expect("node");
@@ -2044,10 +2044,10 @@ async fn a_neighbour_gets_a_paid_hint_for_a_key_far_from_this_node() {
         .dht_manager()
         .find_closest_nodes_local(&self_xor, EVERY_KNOWN_PEER)
         .await;
+    assert!(peers.len() < ant_node::replication::config::PAID_LIST_NEAR_RANK);
     let farthest = peers.last().expect("a known peer").peer_id;
 
-    // Beside the farthest peer, so that peer alone is its closest, well outside
-    // this node's distance to its own closest peer.
+    // Beside the farthest peer, so that peer alone is its closest.
     let mut key: XorName = *farthest.as_bytes();
     key[LAST_KEY_BYTE] ^= 1;
     let paid_dir = tempfile::tempdir().expect("tempdir");
@@ -2073,7 +2073,7 @@ async fn a_neighbour_gets_a_paid_hint_for_a_key_far_from_this_node() {
 /// Paid entries are evicted only once the list passes its threshold, and disk
 /// pressure alone never evicts one. Even over the threshold, an entry near this
 /// node stays. `PaidList`'s unit tests cover evicting far entries: in a network
-/// this small, a node's near range is most of the key space.
+/// this small, every key counts as near.
 #[tokio::test]
 #[serial]
 async fn paid_entries_stay_below_the_threshold_and_near_this_node() {

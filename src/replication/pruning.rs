@@ -701,7 +701,7 @@ async fn evict_excess_paid_entries(ctx: &PrunePassContext<'_>) -> (usize, usize)
     if excess == 0 {
         return (count, 0);
     }
-    let near_bits = paid_near_bits(ctx.p2p_node, ctx.config.paid_list_close_group_size).await;
+    let near_bits = paid_near_bits(ctx.p2p_node).await;
     let storage = Arc::clone(ctx.storage);
     let evicted = ctx
         .paid_list

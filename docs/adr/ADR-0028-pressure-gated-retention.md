@@ -177,16 +177,19 @@ store shares that partition.
   - **Above it:** each prune pass evicts down to the threshold, at most 100,000 entries,
     farthest from this node first. Eviction is local, with no confirmations.
   - **What stays even then:** entries near this node, and entries of records it still
-    stores. Near means within four to eight times the distance to its farthest paid-group
-    peer, where it or a neighbour may still have a vote. While it knows too few peers to
-    say, every entry counts as near.
-  - **Sync hints:** read every entry up to 100,000 entries, and only the entries near this
-    node above that, so their cost stops growing with the list. Each entry read costs a
-    routing-table lookup: measured at 4.7 µs with 4 peers and 14.5 µs with 24, which
-    extrapolates to about 100 µs with 200. A node builds hints every round and for every
-    inbound sync. Where few peers are known near a key far from this node, this node or a
-    neighbour can still be in its paid close group, so above that size such a hint can be
-    missed. With evenly spread IDs, a simulation of 100 to 2,000 nodes found none.
+    stores. A key is near when its distance has no more significant bits than the
+    distance to this node's 60th closest routing-table peer (`PAID_LIST_NEAR_RANK`). With
+    evenly spread IDs and at most 20 peers per ring, about 120 nodes count a given key as
+    near, from a simulation of 4,000 nodes. While a node knows fewer than 60 peers, every
+    entry counts as near.
+  - **Sync hints:** read only the entries near this node, so their cost doesn't grow with
+    entries outside that range. Each entry read costs a routing-table lookup: measured at
+    4.7 µs with 4 peers and 14.5 µs with 24, which extrapolates to about 100 µs with 200.
+    A node builds hints every round and for every inbound sync. With evenly spread IDs, a
+    simulation of 500 to 10,000 nodes found no key outside the near range that this node
+    or one of its 20 closest neighbours is among the closest 20 or 40 for, in about 48,000
+    sampled keys. A node knowing fewer than 60 peers reads every entry, which covers small
+    networks where a neighbour can be in the paid close group of a key far from this node.
   - **Store size:** the LMDB map grows from 256 MiB to 1 GiB, which holds about 17.6
     million entries, measured at about 61 bytes each with single-key commits. The file
     grows as entries do, on every platform. A full store logs one error, since new paid
@@ -289,14 +292,15 @@ store shares that partition.
   - a clock surviving "in range" during bootstrap;
   - paid-list eviction: farthest first, up to its limit, never what it keeps, never near;
   - near ranges, and reading only the keys in one;
-  - a far key read for hints while the list can be read whole, and only near keys above that;
+  - a far key read for hints until the node knows 60 peers, and only near keys after that;
   - the store's file not taking the whole map up front;
   - removing a paid entry leaving its record's clock;
   - a pointer needing all but one of its group to prove it.
 - **End-to-end tests:**
   - `out_of_range_records_stay_until_the_disk_needs_the_room`: with room, a record the
     whole group holds is kept and its group never asked; under pressure it goes.
-  - `a_neighbour_gets_a_paid_hint_for_a_key_far_from_this_node`: a small list is read whole.
+  - `a_neighbour_gets_a_paid_hint_for_a_key_far_from_this_node`: in a small network, a peer
+    far from a node still gets the hint for a key it is closest to.
   - `paid_entries_stay_below_the_threshold_and_near_this_node`: disk pressure evicts no
     paid entry, and an entry near this node stays over the threshold.
   - The existing chunk prune tests run under a simulated nearly full disk.
@@ -308,7 +312,8 @@ store shares that partition.
   - it stops at 15% free;
   - below the threshold, `paid ... evicted=0` holds on every node;
   - with a test build's low threshold, only far entries without a stored record go;
-  - hint-build times stay flat as `paid total=` grows past 100,000;
+  - on a network large enough for routing tables to pass 60 peers, hint-build times follow
+    the entries near a node rather than `paid total=`;
   - how fast a node under pressure erases, against how fast it receives in-range data;
   - after restarting a node under pressure, `candidates=` doesn't fall to 0 once bootstrap
     has drained;
