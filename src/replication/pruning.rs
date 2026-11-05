@@ -680,8 +680,8 @@ fn select_record_prune_audits(
 ///
 /// Only entries far outside this node's range go, farthest first: with evenly
 /// spread IDs this node has no vote on them. An entry whose record is still stored
-/// stays, since it authorises that record's repair. So does everything while this
-/// node knows too few peers to say what is near.
+/// stays, since it authorises that record's repair (see [`keeps_paid_entry`]). So
+/// does everything while this node knows too few peers to say what is near.
 async fn evict_excess_paid_entries(ctx: &PrunePassContext<'_>) -> (usize, usize) {
     let count = match ctx.paid_list.count() {
         Ok(count) => usize::try_from(count).unwrap_or(usize::MAX),
@@ -702,7 +702,7 @@ async fn evict_excess_paid_entries(ctx: &PrunePassContext<'_>) -> (usize, usize)
             *ctx.self_id.as_bytes(),
             near_bits,
             excess.min(MAX_PAID_EVICTIONS_PER_PASS),
-            move |key| storage.exists(key).unwrap_or(true),
+            move |key| keeps_paid_entry(&storage, key),
         )
         .await;
     match evicted {
@@ -712,6 +712,15 @@ async fn evict_excess_paid_entries(ctx: &PrunePassContext<'_>) -> (usize, usize)
             (count, 0)
         }
     }
+}
+
+/// Whether eviction keeps `key`'s paid entry: while its record is in the store's
+/// index, whether or not it can be read at the moment. The entry authorises the
+/// record's repair and carries its price-contested mark (ADR-0006); a record that
+/// failed a read is out of service, not gone, and losing its mark would let it be
+/// hinted as a replica once it reads again.
+fn keeps_paid_entry(storage: &ChunkStore, key: &XorName) -> bool {
+    storage.is_indexed(key)
 }
 
 fn remote_close_group_peers(close_group: &[PeerId], self_id: &PeerId) -> Vec<PeerId> {
@@ -1609,6 +1618,46 @@ mod tests {
 
     fn candidate(key: XorName, target_peers: Vec<PeerId>) -> RecordPruneCandidate {
         RecordPruneCandidate { key, target_peers }
+    }
+
+    /// ADR-0006 with ADR-0028: eviction keeps the paid entry of a record that
+    /// cannot be read for the moment, so a retained price-contested record keeps
+    /// its mark through a read fault; an entry with no record does not stay.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn eviction_keeps_the_entry_of_a_record_that_cannot_be_read_for_now() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().expect("temp dir");
+        let storage = ChunkStore::new(ChunkStoreConfig {
+            root_dir: dir.path().to_path_buf(),
+            ..ChunkStoreConfig::test_default()
+        })
+        .await
+        .expect("chunk store");
+        let bytes = b"retained price-contested record".to_vec();
+        let key = ChunkStore::compute_address(&bytes);
+        storage.put(&key, &bytes).await.expect("put");
+        let path = dir
+            .path()
+            .join(CHUNKS_DIR_NAME)
+            .join(format!("{:02x}", key.last().copied().unwrap_or(0)))
+            .join(hex::encode(key));
+        let mut perms = std::fs::metadata(&path).expect("meta").permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&path, perms).expect("chmod");
+
+        assert!(storage.get(&key).await.is_err(), "the read must fail");
+        assert!(!storage.exists(&key).expect("exists"), "out of service");
+        assert!(keeps_paid_entry(&storage, &key), "but its entry stays");
+        assert!(
+            !keeps_paid_entry(&storage, &[0x5A; 32]),
+            "an entry with no record does not"
+        );
+
+        let mut perms = std::fs::metadata(&path).expect("meta").permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&path, perms).expect("chmod back");
     }
 
     /// A prune audit judges holders against this node's own copy. A copy that

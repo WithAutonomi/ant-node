@@ -399,8 +399,8 @@ replication), arriving in 48 upload bursts. Of those, 1,801 admissions over
    - a prune audit, which is sent only under disk pressure (ADR-0028), still
      needs its proofs before deleting a marked key, but scores no absent peer
      for it. Paid-list eviction (ADR-0028) keeps the entry of every record
-     the node still holds, marked or not, and an entry it evicts takes its
-     mark with it;
+     still in the node's store, marked or not and readable or not, and an
+     entry it evicts takes its mark with it;
    - a mark that cannot be read counts as set: when in doubt, judge no one.
      While reads fail the node judges no peer on any key they hit, so it
      warns at the first failure of a run and, when a read succeeds again,
@@ -689,8 +689,9 @@ out of 1,801:
   - a marked key is left out of replica hints and of responsible-audit
     sampling, a marked key this node stores is a paid-hint candidate
     however far it is, while one it does not store, an unmarked one or a
-    near one is left to the near-key read, and paid-list eviction drops the
-    mark of an entry it evicts and leaves a kept entry marked;
+    near one is left to the near-key read, paid-list eviction drops the
+    mark of an entry it evicts and leaves a kept entry marked, and it keeps
+    the entry of a record that cannot be read for the moment;
   - the in-memory copy of the marks is filled on opening and follows every
     write and removal, and a marked insert and a batch removal change it
     only in the order writes take; a mark held in memory alone, as a failed
