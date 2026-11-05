@@ -20,7 +20,7 @@
 use crate::ant_protocol::XorName;
 use crate::error::{Error, Result};
 use crate::logging::{debug, error, trace, warn};
-use crate::replication::config::{PAID_LIST_MAP_SIZE, PAID_LIST_NEAR_MARGIN_BITS};
+use crate::replication::config::PAID_LIST_MAP_SIZE;
 use crate::replication::out_of_range_clocks::OutOfRangeClocks;
 use heed::types::Bytes;
 use heed::{Database, Env, EnvOpenOptions, MdbError, RoTxn};
@@ -43,22 +43,30 @@ pub const XORNAME_BITS: usize = XORNAME_LEN * BITS_PER_BYTE;
 const RECORD_CLOCKS_FILE: &str = "record_out_of_range.bin";
 
 /// How many low bits of a key may differ from this node's for the key to count
-/// as near it, given the distance to its farthest paid-close-group peer.
+/// as near it, given its distances to the closest `near_rank` peers it knows.
 ///
-/// The margin covers the usual difference in peer density between here and the
-/// key. With evenly spread IDs, neither this node nor any of its neighbours is in
-/// the paid close group of a key beyond it. Where few peers are known near a key,
-/// one of them still can be.
+/// Every key counts as near until it knows `near_rank` peers: in a network that
+/// small, this node or a neighbour can be in the paid close group of any key.
 #[must_use]
-pub fn near_bits_for_radius(radius: &XorName) -> usize {
-    let significant = radius
+pub fn near_bits_for_peer_distances(distances: &[XorName], near_rank: usize) -> usize {
+    if distances.len() < near_rank {
+        return XORNAME_BITS;
+    }
+    distances
+        .iter()
+        .max()
+        .map_or(XORNAME_BITS, significant_bits)
+}
+
+/// How many bits of `distance` count, from its highest set bit down.
+fn significant_bits(distance: &XorName) -> usize {
+    distance
         .iter()
         .enumerate()
         .find(|(_, byte)| **byte != 0)
         .map_or(0, |(index, byte)| {
             (XORNAME_LEN - index) * BITS_PER_BYTE - byte.leading_zeros() as usize
-        });
-    (significant + PAID_LIST_NEAR_MARGIN_BITS).min(XORNAME_BITS)
+        })
 }
 
 /// Mutable access to bit `bit` of `key`, counted from the least significant:
@@ -356,26 +364,33 @@ impl PaidList {
         Ok(entries as u64)
     }
 
-    /// The keys sharing all but the low `near_bits` bits with `center`.
-    ///
-    /// Reads only those keys, however long the list is. [`XORNAME_BITS`] gives
-    /// every key.
+    /// The keys in each of `ranges`, from its first key to its last, in ascending
+    /// order. Reads only those keys, however long the list is.
     ///
     /// # Errors
     ///
     /// Returns an error if the LMDB read transaction or iteration fails.
-    pub fn keys_near(&self, center: &XorName, near_bits: usize) -> Result<Vec<XorName>> {
+    pub(crate) fn keys_in_ranges(
+        &self,
+        ranges: &[(XorName, XorName)],
+    ) -> Result<Vec<Vec<XorName>>> {
         let rtxn = self
             .env
             .read_txn()
             .map_err(|e| Error::Storage(format!("Failed to create read txn: {e}")))?;
-        let (low, high) = prefix_range(center, near_bits);
-        let mut keys = Vec::new();
-        visit_range(self.db, &rtxn, (&low, &high), |key| {
-            keys.push(key);
-            true
-        })?;
-        Ok(keys)
+        ranges
+            .iter()
+            .map(|(low, high)| {
+                let mut keys = Vec::new();
+                if low <= high {
+                    visit_range(self.db, &rtxn, (low, high), |key| {
+                        keys.push(key);
+                        true
+                    })?;
+                }
+                Ok(keys)
+            })
+            .collect()
     }
 
     /// Remove up to `limit` entries outside the `near_bits` around `center`,
@@ -525,6 +540,10 @@ impl PaidList {
 mod tests {
     use super::*;
 
+    /// The default near rank: three paid close groups out.
+    const NEAR_RANK: usize = crate::replication::config::PAID_LIST_CLOSE_GROUP_SIZE
+        * crate::replication::config::PAID_LIST_NEAR_GROUPS;
+
     /// Short probe used to prove `wait_idle` is still blocked on a parked op.
     const WAIT_IDLE_BLOCKED_PROBE: std::time::Duration = std::time::Duration::from_millis(200);
     /// Generous ceiling for `wait_idle` to complete once the op is released.
@@ -544,24 +563,80 @@ mod tests {
         key
     }
 
+    fn key_ending_in(last: u8) -> XorName {
+        let mut key = [0u8; 32];
+        key[31] = last;
+        key
+    }
+
+    /// As many distances as a near range needs, all very small, then `farthest`.
+    fn distances_out_to(farthest: XorName) -> Vec<XorName> {
+        let mut distances = vec![key_ending_in(1); NEAR_RANK - 1];
+        distances.push(farthest);
+        distances
+    }
+
     #[test]
-    fn near_bits_follow_the_radius_plus_the_margin() {
-        let mut radius = [0u8; 32];
-        assert_eq!(near_bits_for_radius(&radius), PAID_LIST_NEAR_MARGIN_BITS);
+    fn significant_bits_run_from_the_highest_set_bit() {
+        let mut distance = [0u8; 32];
+        assert_eq!(significant_bits(&distance), 0);
 
-        radius[31] = 0b0000_0001;
+        distance[31] = 0b0000_0001;
+        assert_eq!(significant_bits(&distance), 1);
+
+        distance[30] = 0b0000_0100;
+        assert_eq!(significant_bits(&distance), 11);
+
+        assert_eq!(significant_bits(&[0xFF; 32]), XORNAME_BITS);
+    }
+
+    #[test]
+    fn every_key_is_near_until_enough_peers_are_known() {
+        assert_eq!(near_bits_for_peer_distances(&[], NEAR_RANK), XORNAME_BITS);
+
+        let one_short = vec![key_ending_in(1); NEAR_RANK - 1];
         assert_eq!(
-            near_bits_for_radius(&radius),
-            1 + PAID_LIST_NEAR_MARGIN_BITS
+            near_bits_for_peer_distances(&one_short, NEAR_RANK),
+            XORNAME_BITS
         );
+    }
 
-        radius[30] = 0b0000_0100;
+    #[test]
+    fn the_near_range_reaches_the_farthest_counted_peer_however_close_the_rest() {
+        const FARTHEST_BITS: usize = 7;
+        let distances = distances_out_to(key_ending_in(0b0100_0000));
         assert_eq!(
-            near_bits_for_radius(&radius),
-            11 + PAID_LIST_NEAR_MARGIN_BITS
+            near_bits_for_peer_distances(&distances, NEAR_RANK),
+            FARTHEST_BITS
         );
+    }
 
-        assert_eq!(near_bits_for_radius(&[0xFF; 32]), XORNAME_BITS);
+    #[tokio::test]
+    async fn a_far_key_is_kept_until_enough_peers_are_known() {
+        // This node is 0 and its neighbours are 1 and 2. Key 129 is far from all
+        // three, yet with a group of two its closest are neighbour 1 and this node.
+        const FAR_KEY: u8 = 129;
+        const EVICT_UP_TO: usize = 10;
+        let (pl, _temp) = create_test_paid_list().await;
+        pl.insert(&key_ending_in(FAR_KEY)).await.expect("insert");
+        let this_node = key_ending_in(0);
+
+        let few_known =
+            near_bits_for_peer_distances(&[key_ending_in(1), key_ending_in(2)], NEAR_RANK);
+        let evicted = pl
+            .evict_far(this_node, few_known, EVICT_UP_TO, |_| false)
+            .await
+            .expect("evict");
+        assert_eq!(evicted, 0, "too few peers known to call any key far");
+
+        let many_known =
+            near_bits_for_peer_distances(&distances_out_to(key_ending_in(2)), NEAR_RANK);
+        let evicted = pl
+            .evict_far(this_node, many_known, EVICT_UP_TO, |_| false)
+            .await
+            .expect("evict");
+        assert_eq!(evicted, 1);
+        assert!(!pl.contains(&key_ending_in(FAR_KEY)).expect("contains"));
     }
 
     #[test]
@@ -593,15 +668,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keys_near_reads_only_the_keys_around_the_center() {
+    async fn keys_in_ranges_reads_each_range_with_both_ends_included() {
         let (pl, _temp) = create_test_paid_list().await;
-        let center = key_with_first_byte(0x40);
-        let (near, far) = (key_with_first_byte(0x41), key_with_first_byte(0xC0));
-        pl.insert(&near).await.expect("insert");
-        pl.insert(&far).await.expect("insert");
+        let keys = [0x10, 0x20, 0x30, 0x40, 0xC0].map(key_with_first_byte);
+        for key in &keys {
+            pl.insert(key).await.expect("insert");
+        }
 
-        let near_bits = XORNAME_BITS - 4;
-        assert_eq!(pl.keys_near(&center, near_bits).expect("keys"), vec![near]);
+        let ranges = [
+            (key_with_first_byte(0x20), key_with_first_byte(0x30)),
+            (key_with_first_byte(0x41), key_with_first_byte(0xBF)),
+            (key_with_first_byte(0xC0), [0xFF; 32]),
+            (key_with_first_byte(0x30), key_with_first_byte(0x20)),
+        ];
+        assert_eq!(
+            pl.keys_in_ranges(&ranges).expect("keys"),
+            vec![vec![keys[1], keys[2]], vec![], vec![keys[4]], vec![]]
+        );
     }
 
     #[tokio::test]
@@ -756,7 +839,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keys_near_with_every_bit_free_gives_every_key() {
+    async fn keys_in_the_whole_key_space_are_every_key() {
         let (pl, _temp) = create_test_paid_list().await;
 
         let key_a: XorName = [0x01; 32];
@@ -767,7 +850,10 @@ mod tests {
         pl.insert(&key_b).await.expect("insert 2");
         pl.insert(&key_c).await.expect("insert 3");
 
-        let mut keys = pl.keys_near(&[0u8; 32], XORNAME_BITS).expect("keys");
+        let mut keys = pl
+            .keys_in_ranges(&[([0u8; 32], [0xFF; 32])])
+            .expect("keys")
+            .concat();
         keys.sort_unstable();
 
         let mut expected = vec![key_a, key_b, key_c];

@@ -76,19 +76,21 @@ use rand::Rng;
 use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
 use tokio::sync::RwLock;
+use tokio::task::coop::consume_budget;
 
 use crate::ant_protocol::XorName;
+use crate::client::xor_distance;
 use crate::replication::audit_coordinator::AuditChallengeCoordinator;
 use crate::replication::audit_metrics::{self, AuditFailureClass, AuditType};
+use crate::replication::close_group_map::{close_group_candidates, CloseGroupMap};
 use crate::replication::commitment_state::ResponderCommitmentState;
 use crate::replication::config::{
     storage_admission_width, ReplicationConfig, AUDIT_FAILURE_TRUST_WEIGHT,
     MAX_PAID_EVICTIONS_PER_PASS, MAX_PRUNE_AUDIT_CANDIDATES_PER_PASS,
-    MAX_PRUNE_AUDIT_REQUESTS_PER_PASS, REPLICATION_PROTOCOL_ID,
+    MAX_PRUNE_AUDIT_REQUESTS_PER_PASS, PAID_LIST_NEAR_GROUPS, REPLICATION_PROTOCOL_ID,
 };
-use crate::replication::neighbor_sync::paid_near_bits;
 use crate::replication::out_of_range_clocks::elapsed;
-use crate::replication::paid_list::PaidList;
+use crate::replication::paid_list::{near_bits_for_peer_distances, PaidList};
 use crate::replication::protocol::{
     compute_audit_digest, AuditChallenge, AuditResponse, ReplicationMessage,
     ReplicationMessageBody, ABSENT_KEY_DIGEST,
@@ -378,8 +380,13 @@ async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPrune
         commitment_state: ctx.commitment_state,
     };
 
+    let retention_groups =
+        retention_group_map(close_group_candidates(ctx.p2p_node).await, ctx.config);
     for key in &stored_keys {
-        let groups = record_prune_lookup_groups(key, ctx.p2p_node, ctx.config).await;
+        // A large store is a long loop: let other tasks run in between.
+        consume_budget().await;
+        let groups =
+            split_record_prune_groups(retention_groups.group_of(key), ctx.config.close_group_size);
 
         let outcome = evaluate_record_prune_key(&deps, key, &groups.retention, &groups.strict, now);
         if let Some(candidate) = tally_record_prune_outcome(&mut stats, outcome, key) {
@@ -501,7 +508,6 @@ async fn record_prune_lookup_groups(
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
 ) -> RecordPruneLookupGroups {
-    // Closest first, so the strict group is the head of the retention group.
     let retention: Vec<PeerId> = p2p_node
         .dht_manager()
         .find_closest_nodes_local_with_self(key, storage_admission_width(config.close_group_size))
@@ -509,11 +515,20 @@ async fn record_prune_lookup_groups(
         .iter()
         .map(|node| node.peer_id)
         .collect();
-    let strict = retention
-        .iter()
-        .take(config.close_group_size)
-        .copied()
-        .collect();
+    split_record_prune_groups(retention, config.close_group_size)
+}
+
+/// Every stored record's storage-retention group, for a whole pass.
+fn retention_group_map(candidates: Vec<PeerId>, config: &ReplicationConfig) -> CloseGroupMap {
+    CloseGroupMap::new(candidates, storage_admission_width(config.close_group_size))
+}
+
+/// The retention group, closest first, with its head as the strict close group.
+fn split_record_prune_groups(
+    retention: Vec<PeerId>,
+    close_group_size: usize,
+) -> RecordPruneLookupGroups {
+    let strict = retention.iter().take(close_group_size).copied().collect();
     RecordPruneLookupGroups { retention, strict }
 }
 
@@ -680,6 +695,22 @@ fn select_record_prune_audits(
         deferred,
         request_count,
     }
+}
+
+/// How many low bits of a key may differ from this node's for its paid entry to
+/// count as near: up to its closest peer [`PAID_LIST_NEAR_GROUPS`] paid close
+/// groups out. Near entries are never evicted.
+async fn paid_near_bits(p2p_node: &Arc<P2PNode>, paid_group_size: usize) -> usize {
+    let near_rank = paid_group_size.saturating_mul(PAID_LIST_NEAR_GROUPS);
+    let self_xor: XorName = *p2p_node.peer_id().as_bytes();
+    let distances: Vec<XorName> = p2p_node
+        .dht_manager()
+        .find_closest_nodes_local(&self_xor, near_rank)
+        .await
+        .iter()
+        .map(|node| xor_distance(&self_xor, node.peer_id.as_bytes()))
+        .collect();
+    near_bits_for_peer_distances(&distances, near_rank)
 }
 
 /// Evict `PaidForList` entries once the list has passed its threshold, and
@@ -1605,6 +1636,52 @@ mod tests {
         let mut bytes = [0u8; 32];
         bytes[0] = b;
         PeerId::from_bytes(bytes)
+    }
+
+    #[test]
+    fn the_strict_group_is_the_closest_part_of_the_retention_group() {
+        const RETENTION: u8 = 9;
+        const STRICT: usize = 7;
+        let retention: Vec<PeerId> = (1..=RETENTION).map(peer_id_from_byte).collect();
+        let groups = split_record_prune_groups(retention.clone(), STRICT);
+        assert_eq!(groups.strict, retention[..STRICT]);
+        assert_eq!(groups.retention, retention);
+    }
+
+    #[test]
+    fn a_node_ranked_just_inside_the_retention_width_is_in_range_but_not_strict() {
+        const CANDIDATES: u8 = 30;
+        let config = ReplicationConfig::default();
+        let width = storage_admission_width(config.close_group_size);
+        // A key of zeroes, so each candidate's rank is its first byte.
+        let candidates: Vec<PeerId> = (1..=CANDIDATES).map(peer_id_from_byte).collect();
+        let this_node = peer_id_from_byte(u8::try_from(width).expect("width fits"));
+        let map = retention_group_map(candidates, &config);
+        let groups = split_record_prune_groups(map.group_of(&[0u8; 32]), config.close_group_size);
+        assert!(groups.retention.contains(&this_node));
+        assert!(!groups.strict.contains(&this_node));
+    }
+
+    #[test]
+    fn a_retention_map_gives_the_groups_a_lookup_would() {
+        const CANDIDATES: u8 = 40;
+        const STRICT: usize = 7;
+        let candidates: Vec<PeerId> = (0..CANDIDATES)
+            .map(|b| peer_id_from_byte(b.wrapping_mul(37)))
+            .collect();
+        let map = CloseGroupMap::new(candidates.iter().copied(), storage_admission_width(STRICT));
+        for first in 0..=u8::MAX {
+            let mut key = [0u8; 32];
+            key[0] = first;
+            let mut by_distance = candidates.clone();
+            by_distance.sort_by_key(|peer| crate::client::xor_distance(&key, peer.as_bytes()));
+            let groups = split_record_prune_groups(map.group_of(&key), STRICT);
+            assert_eq!(
+                groups.retention,
+                by_distance[..storage_admission_width(STRICT)]
+            );
+            assert_eq!(groups.strict, by_distance[..STRICT]);
+        }
     }
 
     fn key_from_byte(b: u8) -> XorName {
