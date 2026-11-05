@@ -747,10 +747,13 @@ out of 1,801:
   survived makes prune-audit scoring count a mark that cannot be read as
   unset. Only the e2e prune test reaches that check, and it cannot make a
   node's paid-list read fail; the same read counts as set, under test, in
-  the audit and the fan-out. Two more were run on the code merged with
-  ADR-0028, and both fail: an eviction that leaves an evicted entry's mark
-  in memory fails four unit tests, and prune-audit scoring that ignores the
-  mark fails the e2e prune test, which runs under disk pressure.
+  the audit and the fan-out. Five more were run on the code merged with
+  ADR-0028, and each fails: an eviction that leaves an evicted entry's mark
+  in memory fails four unit tests; leaving far stored marked keys out of
+  paid hints, treating unknown marks as no marks, and keeping only readable
+  records' entries through eviction each fail their unit test; and
+  prune-audit scoring that ignores the mark fails the e2e prune test, which
+  runs under disk pressure.
 - `tests/e2e/price_floor_ab.rs` drives the same honest and near-empty-quoter
   uploads through a production-wired local testnet. Nodes are seeded to
   production-sized commitments, payments are real (on Anvil), and possession
