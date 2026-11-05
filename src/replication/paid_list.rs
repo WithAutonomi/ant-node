@@ -1064,6 +1064,32 @@ mod tests {
         assert!(marked_in_memory(&pl).is_empty());
     }
 
+    /// ADR-0006 with ADR-0028: eviction drops the in-memory mark of an entry
+    /// it evicts, so no mark outlives its entry in memory alone, and a marked
+    /// entry it keeps stays marked.
+    #[tokio::test]
+    async fn eviction_takes_an_evicted_entry_s_mark_and_leaves_a_kept_one() {
+        let (pl, _temp) = create_test_paid_list().await;
+        let (kept, evicted_key) = (key_with_first_byte(0x80), key_with_first_byte(0x81));
+        pl.insert_price_contested(&kept).await.expect("mark");
+        pl.insert_price_contested(&evicted_key)
+            .await
+            .expect("mark");
+
+        let evicted = pl
+            .evict_far([0u8; 32], XORNAME_BITS - 1, 10, move |key| *key == kept)
+            .await
+            .expect("evict");
+
+        assert_eq!(evicted, 1);
+        assert!(!pl.contains(&evicted_key).expect("contains"));
+        assert!(pl.is_price_contested(&kept).expect("read mark"));
+        assert_eq!(marked_in_memory(&pl), HashSet::from([kept]));
+        let mut keys = vec![kept, evicted_key];
+        pl.retain_unmarked(&mut keys);
+        assert_eq!(keys, vec![evicted_key]);
+    }
+
     /// ADR-0006: while a database write holds the write order, a marked
     /// insert or a batch removal neither commits nor changes the in-memory
     /// copy, so writes and the copy move in one order.
