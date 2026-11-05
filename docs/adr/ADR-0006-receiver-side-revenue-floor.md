@@ -585,17 +585,18 @@ out of 1,801:
   of the paid group, the refusers repair the key from those votes like any
   other, unmarked, since repair carries no proof to price; a refuser whose own
   quorum check fails while its neighbours' passes can then be judged on it.
-- **A marked copy is never a repair source.** A paid hint makes no
-  possession claim, so no node is asked for a key's bytes because it
-  paid-hinted the key: peers fetch from the close-group members that answer
-  present and from nodes that hinted the key as a replica. If no member of a
-  key's current close group holds it, and every copy outside the group is
-  marked on its holder, as after churn moves the group away from the nodes
-  that accepted a contested write, the group cannot repair the key from
-  those copies. The copies stay, since deleting a record still needs its
-  group's proofs. Making a marked holder a fetch source without letting
-  peers penalise it as a sole hinter needs a wire change, so it is not done
-  here.
+- **A marked copy outside a key's queried groups is not a repair source.**
+  A paid hint makes no possession claim, so no node is asked for a key's
+  bytes because it paid-hinted the key. A node repairing a key fetches from
+  the members of its close group and paid close group that answer present
+  when it verifies the key, and from nodes that hinted the key as a
+  replica. If no member of those groups holds the key, and every copy
+  outside them is marked on its holder, as after churn moves the groups
+  away from the nodes that accepted a contested write, the key cannot be
+  repaired from those copies. The copies stay, since deleting a record
+  still needs its group's proofs. Making such a holder a fetch source
+  without letting peers penalise it as a sole hinter needs a wire change,
+  so it is not done here.
 - **Narrow gaps remain on nodes running this release.**
   - On the PUT path the record is stored a moment before its paid-list
     entry is written. A sync that scans the store in that moment can hint
