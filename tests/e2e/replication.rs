@@ -692,6 +692,7 @@ async fn possession_check_skips_a_write_the_floor_cannot_price() {
         .contains(&address);
         let paid_hinted = neighbor_sync::build_paid_hints_for_peer(
             &close_peer,
+            &protocol_a.storage(),
             paid_list_a,
             p2p_a,
             ReplicationConfig::default().paid_list_close_group_size,
@@ -1935,7 +1936,10 @@ async fn prune_audit_scores_no_peer_for_a_price_contested_key() {
             disk_pressure: &disk_pressure,
         })
         .await;
-        assert!(result.disk_pressure, "the pass must run under disk pressure");
+        assert!(
+            result.disk_pressure,
+            "the pass must run under disk pressure"
+        );
         assert!(
             pruner_storage.exists(&address).expect("exists"),
             "a record no target proves must stay local"
@@ -2486,8 +2490,10 @@ async fn a_neighbour_gets_a_paid_hint_for_a_key_far_from_this_node() {
     );
     paid_list.insert(&key).await.expect("insert");
 
+    let storage = node.ant_protocol.as_ref().expect("protocol").storage();
     let hints = ant_node::replication::neighbor_sync::build_paid_hints_for_peer(
         &farthest,
+        &storage,
         &paid_list,
         &p2p,
         ONLY_THE_CLOSEST,

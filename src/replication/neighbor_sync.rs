@@ -18,7 +18,7 @@ use crate::error::Result;
 use crate::replication::config::{
     ReplicationConfig, PAID_HINT_FULL_SCAN_ENTRIES, REPLICATION_PROTOCOL_ID,
 };
-use crate::replication::paid_list::{near_bits_for_radius, PaidList, XORNAME_BITS};
+use crate::replication::paid_list::{is_near, near_bits_for_radius, PaidList, XORNAME_BITS};
 use crate::replication::protocol::{
     NeighborSyncRequest, NeighborSyncResponse, ReplicationMessage, ReplicationMessageBody,
 };
@@ -163,16 +163,40 @@ fn paid_hint_scan_bits(entries: u64, near_bits: usize) -> usize {
     }
 }
 
-/// The paid-list keys a hint build considers.
+/// The paid-list keys a hint build considers (see [`paid_hint_keys`]).
 async fn paid_hint_candidates(
     paid_list: &PaidList,
+    storage: &ChunkStore,
     p2p_node: &Arc<P2PNode>,
     group_size: usize,
 ) -> Result<Vec<XorName>> {
     let self_xor: XorName = *p2p_node.peer_id().as_bytes();
     let near_bits = paid_near_bits(p2p_node, group_size).await;
     let scan_bits = paid_hint_scan_bits(paid_list.count()?, near_bits);
-    paid_list.keys_near(&self_xor, scan_bits)
+    paid_hint_keys(paid_list, storage, &self_xor, scan_bits)
+}
+
+/// The paid-list keys within the `scan_bits` around `center`, and the keys
+/// marked price-contested (ADR-0006) beyond them that this node stores and
+/// still holds a paid entry for. A marked key goes out as a paid hint only,
+/// never as a replica hint, and replica hints have no distance limit: without
+/// this, a marked record this node retains far from itself (ADR-0028) would
+/// reach its close group in neither hint set. The marks and the store's index
+/// are in memory, and marks are few, so the far marked keys cost one paid-list
+/// read each.
+fn paid_hint_keys(
+    paid_list: &PaidList,
+    storage: &ChunkStore,
+    center: &XorName,
+    scan_bits: usize,
+) -> Result<Vec<XorName>> {
+    let mut keys = paid_list.keys_near(center, scan_bits)?;
+    keys.extend(paid_list.marked_keys().into_iter().filter(|key| {
+        !is_near(center, key, scan_bits)
+            && storage.exists(key).unwrap_or(false)
+            && paid_list.contains(key).unwrap_or(false)
+    }));
+    Ok(keys)
 }
 
 /// Build outbound hint sets for a batch of peers with one scan over local
@@ -222,14 +246,20 @@ pub(crate) async fn build_sync_hints_for_peers(
         }
     }
 
-    let paid_keys =
-        match paid_hint_candidates(paid_list, p2p_node, paid_list_close_group_size).await {
-            Ok(keys) => keys,
-            Err(e) => {
-                warn!("Failed to read PaidForList for batch hint construction: {e}");
-                Vec::new()
-            }
-        };
+    let paid_keys = match paid_hint_candidates(
+        paid_list,
+        storage,
+        p2p_node,
+        paid_list_close_group_size,
+    )
+    .await
+    {
+        Ok(keys) => keys,
+        Err(e) => {
+            warn!("Failed to read PaidForList for batch hint construction: {e}");
+            Vec::new()
+        }
+    };
     let paid_key_count = paid_keys.len();
 
     for key in paid_keys {
@@ -284,20 +314,29 @@ pub(crate) async fn build_sync_hints_for_peers(
 ///
 /// Returns keys from our `PaidForList` that we believe the peer should
 /// track (peer is among `PAID_LIST_CLOSE_GROUP_SIZE` nearest to `K`).
+/// `storage` tells which price-contested keys this node stores, since those
+/// are hinted at any distance (see `paid_hint_keys`).
 pub async fn build_paid_hints_for_peer(
     peer: &PeerId,
+    storage: &Arc<ChunkStore>,
     paid_list: &Arc<PaidList>,
     p2p_node: &Arc<P2PNode>,
     paid_list_close_group_size: usize,
 ) -> Vec<XorName> {
-    let paid_keys =
-        match paid_hint_candidates(paid_list, p2p_node, paid_list_close_group_size).await {
-            Ok(keys) => keys,
-            Err(e) => {
-                warn!("Failed to read PaidForList for hint construction: {e}");
-                return Vec::new();
-            }
-        };
+    let paid_keys = match paid_hint_candidates(
+        paid_list,
+        storage,
+        p2p_node,
+        paid_list_close_group_size,
+    )
+    .await
+    {
+        Ok(keys) => keys,
+        Err(e) => {
+            warn!("Failed to read PaidForList for hint construction: {e}");
+            return Vec::new();
+        }
+    };
 
     let dht = p2p_node.dht_manager();
     let mut hints = Vec::new();
@@ -606,6 +645,7 @@ pub(crate) async fn handle_sync_request_with_proofs(
         .collect::<Vec<_>>();
     let paid_hints = build_paid_hints_for_peer(
         sender,
+        storage,
         paid_list,
         p2p_node,
         config.paid_list_close_group_size,
@@ -679,6 +719,67 @@ mod tests {
         expected.sort_unstable();
 
         assert_eq!(hinted, expected);
+    }
+
+    /// ADR-0006 with ADR-0028: a price-contested key this node stores is read
+    /// for paid hints at any distance, as it would be for replica hints, while
+    /// a far key it does not store or one with no mark is left out of a narrow
+    /// read, and a full read lists each key once.
+    #[tokio::test]
+    async fn a_stored_marked_key_is_a_paid_hint_candidate_at_any_distance() {
+        const NARROW_SCAN_BITS: usize = 8;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = ChunkStore::new(ChunkStoreConfig {
+            root_dir: dir.path().join("chunks"),
+            ..ChunkStoreConfig::test_default()
+        })
+        .await
+        .expect("chunk store");
+        let paid_list = PaidList::new(dir.path()).await.expect("paid list");
+        let contents: [&[u8]; 3] = [
+            b"near marked record",
+            b"far marked record",
+            b"far plain record",
+        ];
+        let [near_marked, far_marked, far_plain] = contents.map(ChunkStore::compute_address);
+        for (key, content) in [near_marked, far_marked, far_plain].iter().zip(contents) {
+            storage.put(key, content).await.expect("put");
+        }
+        let far_marked_unstored = ChunkStore::compute_address(b"far marked, not stored");
+        for key in [near_marked, far_marked, far_marked_unstored] {
+            paid_list.insert_price_contested(&key).await.expect("mark");
+        }
+        paid_list.insert(&far_plain).await.expect("insert");
+        let center = near_marked;
+        for key in [far_marked, far_plain, far_marked_unstored] {
+            assert!(!is_near(&center, &key, NARROW_SCAN_BITS), "a far key");
+        }
+
+        let read = |scan_bits| {
+            let mut keys =
+                paid_hint_keys(&paid_list, &storage, &center, scan_bits).expect("read keys");
+            keys.sort_unstable();
+            keys
+        };
+        let sorted = |mut keys: Vec<XorName>| {
+            keys.sort_unstable();
+            keys
+        };
+
+        assert_eq!(
+            read(NARROW_SCAN_BITS),
+            sorted(vec![near_marked, far_marked])
+        );
+        assert_eq!(
+            read(XORNAME_BITS),
+            sorted(vec![
+                near_marked,
+                far_marked,
+                far_plain,
+                far_marked_unstored
+            ]),
+            "a full read covers every key once"
+        );
     }
 
     /// A key whose last byte is `b`, the rest zero.

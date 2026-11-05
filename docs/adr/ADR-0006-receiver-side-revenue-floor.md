@@ -379,9 +379,14 @@ replication), arriving in 48 upload bursts. Of those, 1,801 admissions over
      repair proof is recorded for it, so no responsible audit challenges a
      peer on it, and no peer can penalise this node as its sole hinter. A
      paid hint is never punished, and repair still works wherever the group
-     accepted the key. The node also keeps its marked keys in memory, so
-     leaving them out of the hints it builds for a peer reads nothing on
-     disk. Each paid-list write updates that copy in commit order, a new
+     accepted the key. Above 100,000 entries a node builds paid hints only
+     from keys near itself (ADR-0028), while replica hints have no such
+     limit, so a marked key it stores is a paid-hint candidate at any
+     distance: a record it retains far from itself still reaches whichever
+     peers it knows in that key's paid close group. The node also keeps its
+     marked keys in memory, so leaving them out of the hints it builds for a
+     peer, or adding them, reads nothing on disk but each far stored marked
+     key's paid entry. Each paid-list write updates that copy in commit order, a new
      mark just before its commit, so the copy never lacks a committed mark,
      and a write that commits the key unmarked, a plain insert that adds it
      or a removal, drops any mark the copy holds for it. If the marks cannot be read when the node starts, it still starts, as
@@ -679,8 +684,10 @@ out of 1,801:
     is written only with a new entry, survives a restart and a later plain
     insert, and goes with the entry;
   - a marked key is left out of replica hints and of responsible-audit
-    sampling, and paid-list eviction drops the mark of an entry it evicts
-    and leaves a kept entry marked;
+    sampling, a marked key this node stores is a paid-hint candidate
+    however far it is, while one it does not store, an unmarked one or a
+    near one is left to the near-key read, and paid-list eviction drops the
+    mark of an entry it evicts and leaves a kept entry marked;
   - the in-memory copy of the marks is filled on opening and follows every
     write and removal, and a marked insert and a batch removal change it
     only in the order writes take; a mark held in memory alone, as a failed

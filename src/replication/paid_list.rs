@@ -97,6 +97,14 @@ fn prefix_range(key: &XorName, free_bits: usize) -> (XorName, XorName) {
     (low, high)
 }
 
+/// Whether `key` shares all but the low `near_bits` bits with `center`, so
+/// [`PaidList::keys_near`] reads it.
+#[must_use]
+pub fn is_near(center: &XorName, key: &XorName, near_bits: usize) -> bool {
+    let (low, high) = prefix_range(center, near_bits);
+    low <= *key && *key <= high
+}
+
 /// The key ranges outside the `near_bits` around `center`, farthest first: each
 /// holds the keys whose highest bit differing from `center` is one given bit.
 fn far_ranges(center: &XorName, near_bits: usize) -> impl Iterator<Item = (XorName, XorName)> {
@@ -290,8 +298,8 @@ impl PaidList {
                     price_contested,
                 ))
             })
-        .await
-        .map_err(|e| Error::Storage(format!("Paid-list init task failed: {e}")))??;
+            .await
+            .map_err(|e| Error::Storage(format!("Paid-list init task failed: {e}")))??;
         // A paid list whose marks cannot be read still opens; the node then
         // sends no replica hints until it restarts (see `retain_unmarked`).
         let price_contested = price_contested
@@ -469,6 +477,14 @@ impl PaidList {
             Some(marked) => keys.retain(|key| !marked.contains(key)),
             None => keys.clear(),
         }
+    }
+
+    /// The keys marked price-contested in the in-memory copy, read without
+    /// touching the database. It is empty if the marks could not be read when
+    /// the paid list opened.
+    pub fn marked_keys(&self) -> Vec<XorName> {
+        let snapshot = self.price_contested.read().clone();
+        snapshot.map_or_else(Vec::new, |marked| marked.iter().copied().collect())
     }
 
     /// Describe a failed insert. A full store is also reported, once, as an
@@ -1072,9 +1088,7 @@ mod tests {
         let (pl, _temp) = create_test_paid_list().await;
         let (kept, evicted_key) = (key_with_first_byte(0x80), key_with_first_byte(0x81));
         pl.insert_price_contested(&kept).await.expect("mark");
-        pl.insert_price_contested(&evicted_key)
-            .await
-            .expect("mark");
+        pl.insert_price_contested(&evicted_key).await.expect("mark");
 
         let evicted = pl
             .evict_far([0u8; 32], XORNAME_BITS - 1, 10, move |key| *key == kept)
