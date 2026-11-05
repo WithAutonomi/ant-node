@@ -11,6 +11,7 @@ use crate::logging::{debug, info, warn};
 use rand::Rng;
 use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
+use tokio::task::coop::consume_budget;
 
 use crate::ant_protocol::XorName;
 use crate::error::Result;
@@ -71,7 +72,7 @@ pub async fn build_replica_hints_for_peer(
 ) -> Vec<XorName> {
     let targets = HashSet::from([*peer]);
     let groups = CloseGroupMap::new(close_group_candidates(p2p_node).await, close_group_size);
-    let (mut hints, _) = replica_hints(&groups, storage, &targets);
+    let (mut hints, _) = replica_hints(&groups, storage, &targets).await;
     hints
         .remove(peer)
         .unwrap_or_default()
@@ -80,78 +81,82 @@ pub async fn build_replica_hints_for_peer(
         .collect()
 }
 
-/// Call `hint` with each key `read` returns whose close group in `groups` holds
-/// one of `targets`, and with that group. `read` is asked only for the ranges
-/// where one of them can be in the group. Returns how many keys were read.
-fn for_each_hinted_key(
-    groups: &CloseGroupMap,
+/// The ranges where one of `targets` can be in the close group, with their bounds.
+fn ranges_holding<'a>(
+    groups: &'a CloseGroupMap,
     targets: &HashSet<PeerId>,
-    read: impl FnOnce(&[(XorName, XorName)]) -> Result<Vec<Vec<XorName>>>,
-    mut hint: impl FnMut(XorName, Vec<PeerId>),
-) -> Result<usize> {
+) -> (Vec<&'a GroupRange>, Vec<(XorName, XorName)>) {
     let ranges: Vec<&GroupRange> = groups
         .ranges()
         .iter()
         .filter(|range| groups.may_include_any(range, targets))
         .collect();
-    let bounds: Vec<(XorName, XorName)> = ranges.iter().map(|range| range.bounds()).collect();
-    let mut keys_read = 0;
-    for (range, keys) in ranges.into_iter().zip(read(&bounds)?) {
-        keys_read += keys.len();
+    let bounds = ranges.iter().map(|range| range.bounds()).collect();
+    (ranges, bounds)
+}
+
+/// Call `hint` with each key of `keys`, read range by range from `ranges`, whose
+/// close group in `groups` holds one of `targets`, and with that group.
+async fn for_each_hinted_key(
+    groups: &CloseGroupMap,
+    ranges: Vec<&GroupRange>,
+    keys: Vec<Vec<XorName>>,
+    targets: &HashSet<PeerId>,
+    mut hint: impl FnMut(XorName, Vec<PeerId>),
+) {
+    for (range, keys) in ranges.into_iter().zip(keys) {
         for key in keys {
+            // A large store is a long loop: let other tasks run in between.
+            consume_budget().await;
             let group = groups.group_in(range, &key);
             if group.iter().any(|peer| targets.contains(peer)) {
                 hint(key, group);
             }
         }
     }
-    Ok(keys_read)
 }
 
 /// Replica hints from the stored records for each of `targets`, and how many
 /// stored keys were read.
-fn replica_hints(
+async fn replica_hints(
     groups: &CloseGroupMap,
     storage: &ChunkStore,
     targets: &HashSet<PeerId>,
 ) -> (HashMap<PeerId, Vec<SentReplicaHint>>, usize) {
+    let (ranges, bounds) = ranges_holding(groups, targets);
+    let keys = storage.keys_in_ranges(&bounds);
+    let keys_read = keys.iter().map(Vec::len).sum();
     let mut hints: HashMap<PeerId, Vec<SentReplicaHint>> = HashMap::new();
-    let keys_read = for_each_hinted_key(
-        groups,
-        targets,
-        |ranges| Ok(storage.keys_in_ranges(ranges)),
-        |key, group| {
-            let close_peers: HashSet<PeerId> = group.into_iter().collect();
-            for peer in close_peers.intersection(targets) {
-                hints.entry(*peer).or_default().push(SentReplicaHint {
-                    key,
-                    close_peers: close_peers.clone(),
-                });
-            }
-        },
-    )
-    .unwrap_or_default();
+    for_each_hinted_key(groups, ranges, keys, targets, |key, group| {
+        let close_peers: HashSet<PeerId> = group.into_iter().collect();
+        for peer in close_peers.intersection(targets) {
+            hints.entry(*peer).or_default().push(SentReplicaHint {
+                key,
+                close_peers: close_peers.clone(),
+            });
+        }
+    })
+    .await;
     (hints, keys_read)
 }
 
 /// Paid hints from the paid list for each of `targets`, and how many entries
 /// were read.
-fn paid_hints(
+async fn paid_hints(
     groups: &CloseGroupMap,
     paid_list: &PaidList,
     targets: &HashSet<PeerId>,
 ) -> Result<(HashMap<PeerId, Vec<XorName>>, usize)> {
+    let (ranges, bounds) = ranges_holding(groups, targets);
+    let keys = paid_list.keys_in_ranges(&bounds)?;
+    let keys_read = keys.iter().map(Vec::len).sum();
     let mut hints: HashMap<PeerId, Vec<XorName>> = HashMap::new();
-    let keys_read = for_each_hinted_key(
-        groups,
-        targets,
-        |ranges| paid_list.keys_in_ranges(ranges),
-        |key, group| {
-            for peer in group.iter().filter(|peer| targets.contains(*peer)) {
-                hints.entry(*peer).or_default().push(key);
-            }
-        },
-    )?;
+    for_each_hinted_key(groups, ranges, keys, targets, |key, group| {
+        for peer in group.iter().filter(|peer| targets.contains(*peer)) {
+            hints.entry(*peer).or_default().push(key);
+        }
+    })
+    .await;
     Ok((hints, keys_read))
 }
 
@@ -181,18 +186,22 @@ pub(crate) async fn build_sync_hints_for_peers(
     }
 
     let candidates = close_group_candidates(p2p_node).await;
+    // A peer outside the routing table is in no group this node can see.
+    if !candidates.iter().any(|peer| targets.contains(peer)) {
+        return hints_by_peer;
+    }
     let candidate_count = candidates.len();
     let record_groups = CloseGroupMap::new(candidates.iter().copied(), close_group_size);
     let paid_groups = CloseGroupMap::new(candidates, paid_list_close_group_size);
 
-    let (replica, stored_keys_read) = replica_hints(&record_groups, storage, &targets);
+    let (replica, stored_keys_read) = replica_hints(&record_groups, storage, &targets).await;
     for (peer, hints) in replica {
         if let Some(peer_hints) = hints_by_peer.get_mut(&peer) {
             peer_hints.sent_replica_hints = hints;
         }
     }
 
-    let paid_keys_read = match paid_hints(&paid_groups, paid_list, &targets) {
+    let paid_keys_read = match paid_hints(&paid_groups, paid_list, &targets).await {
         Ok((paid, keys_read)) => {
             for (peer, hints) in paid {
                 if let Some(peer_hints) = hints_by_peer.get_mut(&peer) {
@@ -249,7 +258,7 @@ pub async fn build_paid_hints_for_peer(
         close_group_candidates(p2p_node).await,
         paid_list_close_group_size,
     );
-    match paid_hints(&groups, paid_list, &targets) {
+    match paid_hints(&groups, paid_list, &targets).await {
         Ok((mut hints, _)) => hints.remove(peer).unwrap_or_default(),
         Err(e) => {
             warn!("Failed to read PaidForList for hint construction: {e}");
@@ -588,8 +597,8 @@ mod tests {
 
     // -- hint builds ----------------------------------------------------------
 
-    #[test]
-    fn only_keys_whose_group_holds_a_target_are_hinted() {
+    #[tokio::test]
+    async fn only_keys_whose_group_holds_a_target_are_hinted() {
         // Peers 0000, 0001, 0101, 1000 and 1110 in the top four bits, a group of
         // two. Keys starting 01 take 0101 and whichever of 0000 and 0001 is closer.
         const GROUP: usize = 2;
@@ -606,31 +615,29 @@ mod tests {
         let keys = [0b0000_0000, 0b0100_0000, 0b0101_0000, 0b1100_0000]
             .map(|first| *peer_id_from_byte(first).as_bytes());
 
+        let (ranges, bounds) = ranges_holding(&groups, &targets);
+        let read: Vec<Vec<XorName>> = bounds
+            .iter()
+            .map(|(low, high)| {
+                keys.iter()
+                    .copied()
+                    .filter(|key| low <= key && key <= high)
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            read.iter().map(Vec::len).sum::<usize>(),
+            3,
+            "keys from 1000 on aren't read"
+        );
         let mut hinted = Vec::new();
-        let keys_read = for_each_hinted_key(
-            &groups,
-            &targets,
-            |ranges| {
-                Ok(ranges
-                    .iter()
-                    .map(|(low, high)| {
-                        keys.iter()
-                            .copied()
-                            .filter(|key| low <= key && key <= high)
-                            .collect()
-                    })
-                    .collect())
-            },
-            |key, _| hinted.push(key),
-        )
-        .expect("hints");
+        for_each_hinted_key(&groups, ranges, read, &targets, |key, _| hinted.push(key)).await;
 
         assert_eq!(
             hinted,
             vec![keys[0], keys[2]],
             "0100 goes to 0000, not 0001"
         );
-        assert_eq!(keys_read, 3, "keys from 1000 on aren't read");
     }
 
     // -- select_sync_batch ---------------------------------------------------

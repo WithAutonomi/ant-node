@@ -101,15 +101,16 @@ const _: () = assert!(
 /// Most paid-list entries one prune pass evicts.
 pub const MAX_PAID_EVICTIONS_PER_PASS: usize = 100_000;
 
-/// Which routing-table peer, counting out from this node, sets how far its near
-/// range reaches.
+/// How many paid close groups of routing-table peers, counting out from this
+/// node, set how far its near range reaches: with the default group of 20, to the
+/// 60th closest peer.
 ///
 /// A key is near when its distance has no more significant bits than the distance
-/// to this peer, and a paid entry near this node is never evicted. Reading this
+/// to that peer, and a paid entry near this node is never evicted. Reading this
 /// far out gives a steadier measure of local peer density than the closest few
 /// peers do, and reaches past every key this node or a neighbour is in the paid
 /// close group of when IDs are evenly spread (ADR-0028).
-pub const PAID_LIST_NEAR_RANK: usize = 60;
+pub const PAID_LIST_NEAR_GROUPS: usize = 3;
 
 /// Number of closest peers to self eligible for neighbor sync.
 pub const NEIGHBOR_SYNC_SCOPE: usize = 20;

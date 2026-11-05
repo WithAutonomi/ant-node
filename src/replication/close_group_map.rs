@@ -13,7 +13,7 @@
 //! The walk stops once every key under a prefix has the same group, or once the
 //! peers still competing don't differ at the next bit. Those few are then compared
 //! for each key. A routing table of a few hundred peers gives tens to a few hundred
-//! ranges.
+//! ranges, and the walk stops splitting past [`MAX_SPLIT_RANGES`] whatever the peers.
 //!
 //! Each key's group is the one sorting every candidate by distance to it would
 //! give: the map applies the same order, once per range. Hint builds use it to read
@@ -28,6 +28,7 @@ use saorsa_core::P2PNode;
 
 use crate::ant_protocol::{XorName, XORNAME_LEN};
 use crate::client::xor_distance;
+use crate::replication::paid_list::XORNAME_BITS;
 
 #[cfg(test)]
 use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -35,11 +36,13 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 /// Bits in one byte of a key.
 const BITS_PER_BYTE: usize = 8;
 
-/// Bits in a key.
-const KEY_BITS: usize = XORNAME_LEN * BITS_PER_BYTE;
-
 /// A byte's highest bit, which comes first in a key's bit order.
 const HIGHEST_BIT_IN_BYTE: u8 = 0x80;
+
+/// Ranges after which a map stops splitting. Routing tables gave 13 to 202, but a
+/// skewed set of candidates could need millions. Past this, each prefix left is one
+/// range whose open candidates each key compares: the same groups, at more cost a key.
+const MAX_SPLIT_RANGES: usize = 1_024;
 
 /// Every candidate for a key's close group in this node's view: its routing table
 /// and itself, the set a self-inclusive lookup sorts. Take it once for a whole
@@ -202,9 +205,14 @@ impl Walk<'_> {
         // run from those with this bit clear to those with it set.
         let run = self.candidates.get(open.clone()).unwrap_or(&[]);
         let set_from = open.start + run.partition_point(|peer| !bit(peer.as_bytes(), depth));
-        if depth >= KEY_BITS || set_from == open.start || set_from == open.end {
+        if depth >= XORNAME_BITS
+            || set_from == open.start
+            || set_from == open.end
+            || self.ranges.len() >= MAX_SPLIT_RANGES
+        {
             // No open candidate differs from another at this bit, so a key's bit
-            // here can't change which of them are closer: each key decides.
+            // here can't change which of them are closer, or the map has split
+            // enough: each key decides.
             let settled = self.settled.clone();
             self.push(prefix, depth, settled, open, need);
             return;
@@ -237,7 +245,7 @@ impl Walk<'_> {
         need: usize,
     ) {
         let mut high = prefix;
-        for free in depth..KEY_BITS {
+        for free in depth..XORNAME_BITS {
             high = with_bit(high, free, true);
         }
         self.ranges.push(GroupRange {
@@ -330,7 +338,7 @@ mod tests {
         for candidate in candidates {
             let id = *candidate.as_bytes();
             keys.push(id);
-            keys.push(with_bit(id, KEY_BITS - 1, !bit(&id, KEY_BITS - 1)));
+            keys.push(with_bit(id, XORNAME_BITS - 1, !bit(&id, XORNAME_BITS - 1)));
             keys.push(with_bit(id, 0, !bit(&id, 0)));
         }
         keys.extend((0..KEYS_PER_CASE).map(|_| rng.gen::<XorName>()));
@@ -391,6 +399,24 @@ mod tests {
             })
             .collect();
         for group_size in GROUP_SIZES {
+            assert_matches_brute_force(&candidates, group_size, &mut rng);
+        }
+    }
+
+    #[test]
+    fn a_skewed_set_of_candidates_stays_within_the_range_limit() {
+        // Zero, then one candidate with each successive high bit set. Without the
+        // limit, a group of 20 would split into C(30, 20), about 30 million, ranges.
+        const ONE_HOT_CANDIDATES: usize = 29;
+        let mut candidates = vec![peer([0u8; XORNAME_LEN])];
+        for depth in 0..ONE_HOT_CANDIDATES {
+            candidates.push(peer(with_bit([0u8; XORNAME_LEN], depth, true)));
+        }
+        let mut rng = StdRng::seed_from_u64(SEED);
+        for group_size in GROUP_SIZES {
+            let map = CloseGroupMap::new(candidates.iter().copied(), group_size);
+            // Past the limit, each prefix still pending on the walk adds one range.
+            assert!(map.ranges().len() <= MAX_SPLIT_RANGES + XORNAME_BITS);
             assert_matches_brute_force(&candidates, group_size, &mut rng);
         }
     }

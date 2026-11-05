@@ -76,6 +76,7 @@ use rand::Rng;
 use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
 use tokio::sync::RwLock;
+use tokio::task::coop::consume_budget;
 
 use crate::ant_protocol::XorName;
 use crate::client::xor_distance;
@@ -86,7 +87,7 @@ use crate::replication::commitment_state::ResponderCommitmentState;
 use crate::replication::config::{
     storage_admission_width, ReplicationConfig, AUDIT_FAILURE_TRUST_WEIGHT,
     MAX_PAID_EVICTIONS_PER_PASS, MAX_PRUNE_AUDIT_CANDIDATES_PER_PASS,
-    MAX_PRUNE_AUDIT_REQUESTS_PER_PASS, PAID_LIST_NEAR_RANK, REPLICATION_PROTOCOL_ID,
+    MAX_PRUNE_AUDIT_REQUESTS_PER_PASS, PAID_LIST_NEAR_GROUPS, REPLICATION_PROTOCOL_ID,
 };
 use crate::replication::out_of_range_clocks::elapsed;
 use crate::replication::paid_list::{near_bits_for_peer_distances, PaidList};
@@ -382,6 +383,8 @@ async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPrune
     let retention_groups =
         retention_group_map(close_group_candidates(ctx.p2p_node).await, ctx.config);
     for key in &stored_keys {
+        // A large store is a long loop: let other tasks run in between.
+        consume_budget().await;
         let groups =
             split_record_prune_groups(retention_groups.group_of(key), ctx.config.close_group_size);
 
@@ -695,18 +698,19 @@ fn select_record_prune_audits(
 }
 
 /// How many low bits of a key may differ from this node's for its paid entry to
-/// count as near, from the distance to its [`PAID_LIST_NEAR_RANK`]th closest
-/// peer. Near entries are never evicted.
-async fn paid_near_bits(p2p_node: &Arc<P2PNode>) -> usize {
+/// count as near: up to its closest peer [`PAID_LIST_NEAR_GROUPS`] paid close
+/// groups out. Near entries are never evicted.
+async fn paid_near_bits(p2p_node: &Arc<P2PNode>, paid_group_size: usize) -> usize {
+    let near_rank = paid_group_size.saturating_mul(PAID_LIST_NEAR_GROUPS);
     let self_xor: XorName = *p2p_node.peer_id().as_bytes();
     let distances: Vec<XorName> = p2p_node
         .dht_manager()
-        .find_closest_nodes_local(&self_xor, PAID_LIST_NEAR_RANK)
+        .find_closest_nodes_local(&self_xor, near_rank)
         .await
         .iter()
         .map(|node| xor_distance(&self_xor, node.peer_id.as_bytes()))
         .collect();
-    near_bits_for_peer_distances(&distances)
+    near_bits_for_peer_distances(&distances, near_rank)
 }
 
 /// Evict `PaidForList` entries once the list has passed its threshold, and
@@ -728,7 +732,7 @@ async fn evict_excess_paid_entries(ctx: &PrunePassContext<'_>) -> (usize, usize)
     if excess == 0 {
         return (count, 0);
     }
-    let near_bits = paid_near_bits(ctx.p2p_node).await;
+    let near_bits = paid_near_bits(ctx.p2p_node, ctx.config.paid_list_close_group_size).await;
     let storage = Arc::clone(ctx.storage);
     let evicted = ctx
         .paid_list

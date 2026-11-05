@@ -20,7 +20,7 @@
 use crate::ant_protocol::XorName;
 use crate::error::{Error, Result};
 use crate::logging::{debug, error, trace, warn};
-use crate::replication::config::{PAID_LIST_MAP_SIZE, PAID_LIST_NEAR_RANK};
+use crate::replication::config::PAID_LIST_MAP_SIZE;
 use crate::replication::out_of_range_clocks::OutOfRangeClocks;
 use heed::types::Bytes;
 use heed::{Database, Env, EnvOpenOptions, MdbError, RoTxn};
@@ -43,14 +43,13 @@ pub const XORNAME_BITS: usize = XORNAME_LEN * BITS_PER_BYTE;
 const RECORD_CLOCKS_FILE: &str = "record_out_of_range.bin";
 
 /// How many low bits of a key may differ from this node's for the key to count
-/// as near it, given its distances to the closest peers it knows.
+/// as near it, given its distances to the closest `near_rank` peers it knows.
 ///
-/// Every key counts as near until it knows [`PAID_LIST_NEAR_RANK`] peers: in a
-/// network that small, this node or a neighbour can be in the paid close group of
-/// any key.
+/// Every key counts as near until it knows `near_rank` peers: in a network that
+/// small, this node or a neighbour can be in the paid close group of any key.
 #[must_use]
-pub fn near_bits_for_peer_distances(distances: &[XorName]) -> usize {
-    if distances.len() < PAID_LIST_NEAR_RANK {
+pub fn near_bits_for_peer_distances(distances: &[XorName], near_rank: usize) -> usize {
+    if distances.len() < near_rank {
         return XORNAME_BITS;
     }
     distances
@@ -541,6 +540,10 @@ impl PaidList {
 mod tests {
     use super::*;
 
+    /// The default near rank: three paid close groups out.
+    const NEAR_RANK: usize = crate::replication::config::PAID_LIST_CLOSE_GROUP_SIZE
+        * crate::replication::config::PAID_LIST_NEAR_GROUPS;
+
     /// Short probe used to prove `wait_idle` is still blocked on a parked op.
     const WAIT_IDLE_BLOCKED_PROBE: std::time::Duration = std::time::Duration::from_millis(200);
     /// Generous ceiling for `wait_idle` to complete once the op is released.
@@ -568,7 +571,7 @@ mod tests {
 
     /// As many distances as a near range needs, all very small, then `farthest`.
     fn distances_out_to(farthest: XorName) -> Vec<XorName> {
-        let mut distances = vec![key_ending_in(1); PAID_LIST_NEAR_RANK - 1];
+        let mut distances = vec![key_ending_in(1); NEAR_RANK - 1];
         distances.push(farthest);
         distances
     }
@@ -589,17 +592,23 @@ mod tests {
 
     #[test]
     fn every_key_is_near_until_enough_peers_are_known() {
-        assert_eq!(near_bits_for_peer_distances(&[]), XORNAME_BITS);
+        assert_eq!(near_bits_for_peer_distances(&[], NEAR_RANK), XORNAME_BITS);
 
-        let one_short = vec![key_ending_in(1); PAID_LIST_NEAR_RANK - 1];
-        assert_eq!(near_bits_for_peer_distances(&one_short), XORNAME_BITS);
+        let one_short = vec![key_ending_in(1); NEAR_RANK - 1];
+        assert_eq!(
+            near_bits_for_peer_distances(&one_short, NEAR_RANK),
+            XORNAME_BITS
+        );
     }
 
     #[test]
     fn the_near_range_reaches_the_farthest_counted_peer_however_close_the_rest() {
         const FARTHEST_BITS: usize = 7;
         let distances = distances_out_to(key_ending_in(0b0100_0000));
-        assert_eq!(near_bits_for_peer_distances(&distances), FARTHEST_BITS);
+        assert_eq!(
+            near_bits_for_peer_distances(&distances, NEAR_RANK),
+            FARTHEST_BITS
+        );
     }
 
     #[tokio::test]
@@ -612,14 +621,16 @@ mod tests {
         pl.insert(&key_ending_in(FAR_KEY)).await.expect("insert");
         let this_node = key_ending_in(0);
 
-        let few_known = near_bits_for_peer_distances(&[key_ending_in(1), key_ending_in(2)]);
+        let few_known =
+            near_bits_for_peer_distances(&[key_ending_in(1), key_ending_in(2)], NEAR_RANK);
         let evicted = pl
             .evict_far(this_node, few_known, EVICT_UP_TO, |_| false)
             .await
             .expect("evict");
         assert_eq!(evicted, 0, "too few peers known to call any key far");
 
-        let many_known = near_bits_for_peer_distances(&distances_out_to(key_ending_in(2)));
+        let many_known =
+            near_bits_for_peer_distances(&distances_out_to(key_ending_in(2)), NEAR_RANK);
         let evicted = pl
             .evict_far(this_node, many_known, EVICT_UP_TO, |_| false)
             .await

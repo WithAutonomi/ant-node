@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
+use tokio::task::coop::consume_budget;
 
 use crate::ant_protocol::XorName;
 use crate::replication::close_group_map::{close_group_candidates, CloseGroupMap};
@@ -138,6 +139,7 @@ pub async fn admit_hints(
         if !seen_replica.insert(key) {
             continue;
         }
+        consume_budget().await;
         if is_relevant(
             self_id,
             &key,
@@ -163,6 +165,7 @@ pub async fn admit_hints(
         if seen_replica.contains(&key) {
             continue;
         }
+        consume_budget().await;
         if is_relevant(
             self_id,
             &key,

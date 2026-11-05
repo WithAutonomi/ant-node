@@ -2098,7 +2098,7 @@ async fn hint_builds_match_a_lookup_per_key() {
     const EVERY_KNOWN_PEER: usize = 100;
     // The routing table can change while expected hints are worked out, so a peer
     // is checked again until two lookups in a row agree.
-    const ATTEMPTS: usize = 3;
+    const ATTEMPTS: usize = 5;
     let harness = TestHarness::setup().await.expect("setup");
     harness.warmup_dht().await.expect("warmup");
 

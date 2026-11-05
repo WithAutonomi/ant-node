@@ -61,6 +61,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{mpsc, Notify, RwLock, Semaphore};
+use tokio::task::coop::consume_budget;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -79,6 +80,7 @@ use crate::replication::audit_metrics::{
     AuditResponderClass, AuditResponderDropReason, AuditResponderMetrics,
     ReplicationResponderClass, ResponderAdmissionCeiling,
 };
+use crate::replication::close_group_map::{close_group_candidates, CloseGroupMap};
 use crate::replication::commitment::{commitment_hash, StorageCommitment};
 use crate::replication::commitment_state::{
     PeerCommitmentRecord, PersistedRetention, ResponderCommitmentState, GOSSIP_ANSWERABILITY_TTL,
@@ -10346,9 +10348,12 @@ async fn rebuild_and_rotate_commitment(
     // forever (the rebuild reads all_keys, so a retained-on-disk key would be
     // re-committed and re-gossiped every rotation — a permanent pin).
     let self_id = *p2p.peer_id();
+    // One routing-table snapshot for every key, instead of a lookup per key.
+    let groups = CloseGroupMap::new(close_group_candidates(p2p).await, config.close_group_size);
     let mut keys = Vec::with_capacity(stored_keys.len());
     for k in stored_keys {
-        if admission::is_responsible(&self_id, &k, p2p, config.close_group_size).await {
+        consume_budget().await;
+        if groups.includes(&k, &self_id) {
             keys.push(k);
         }
     }
@@ -10356,7 +10361,7 @@ async fn rebuild_and_rotate_commitment(
     // commitment, and the pruner reclaims it once no retained slot holds it.
     let mut pointer_keys = Vec::new();
     for state in pointers.map(PointerStore::held_states).unwrap_or_default() {
-        if admission::is_responsible(&self_id, &state.address, p2p, config.close_group_size).await {
+        if groups.includes(&state.address, &self_id) {
             pointer_keys.push(state.address);
         }
     }

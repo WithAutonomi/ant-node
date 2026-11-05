@@ -178,10 +178,11 @@ store shares that partition.
     farthest from this node first. Eviction is local, with no confirmations.
   - **What stays even then:** entries near this node, and entries of records it still
     stores. A key is near when its distance has no more significant bits than the
-    distance to this node's 60th closest routing-table peer (`PAID_LIST_NEAR_RANK`). With
-    evenly spread IDs and at most 20 peers per ring, about 120 nodes count a given key as
-    near, from a simulation of 4,000 nodes. While a node knows fewer than 60 peers, every
-    entry counts as near.
+    distance to this node's closest routing-table peer three paid close groups out
+    (`PAID_LIST_NEAR_GROUPS`): the 60th with the default group of 20. With evenly spread
+    IDs and at most 20 peers per ring, about 120 nodes count a given key as near, from a
+    simulation of 4,000 nodes. While a node knows fewer peers than that, every entry
+    counts as near.
   - **Sync hints:** each build takes one copy of the routing table and works out each
     key's close group once per key range, rather than once per key
     (`src/replication/close_group_map.rs`). It then reads only the ranges where a peer it
@@ -202,11 +203,16 @@ store shares that partition.
       0.35 ms instead of 179–195 ms, with the same hints. Those keys were spread over the
       whole key space, so the neighbour's ranges held under a tenth of them. A real node's
       keys cluster around it, so a build reads a larger share, at well under 1 µs a key.
-  - **Prune passes and hint admission** use the same map in place of a lookup per key: a
-    prune pass checks every stored record, including the out-of-range ones this ADR keeps,
-    and admission checks every hinted key this node doesn't already know. The check just
-    before an erasure still does a fresh lookup, since the routing table may have changed
-    while the proofs were gathered.
+  - **Prune passes, hint admission and commitment rotation** use the same map in place of
+    a lookup per key: a prune pass and a rotation check every stored record, including the
+    out-of-range ones this ADR keeps, and admission checks every hinted key this node
+    doesn't already know. The check just before an erasure still does a fresh lookup,
+    since the routing table may have changed while the proofs were gathered.
+  - **Bounds:** a map stops splitting after 1,024 ranges, where routing tables gave 13 to
+    202. A skewed set of peer IDs could otherwise need millions. Past that, each remaining
+    range compares its competing peers for each key, which gives the same groups at more
+    cost a key. These loops let other tasks run between keys, as the per-key lookups'
+    awaits did.
   - **Store size:** the LMDB map grows from 256 MiB to 1 GiB, which holds about 17.6
     million entries, measured at about 61 bytes each with single-key commits. The file
     grows as entries do, on every platform. A full store logs one error, since new paid
@@ -313,11 +319,14 @@ store shares that partition.
   - record clocks surviving a reopen of the paid list;
   - a clock surviving "in range" during bootstrap;
   - paid-list eviction: farthest first, up to its limit, never what it keeps, never near;
-  - near ranges, and reading only the keys in one;
+  - near ranges reaching the counted peer, and every key near until enough peers are
+    known;
   - a far paid entry kept until the node knows 60 peers;
   - close-group maps matching, in order, a sort of every candidate by distance, for 0 to
     250 candidates and groups of 1 to 20, with IDs evenly spread, clustered beside one
     candidate, or sharing their top bits, and ranges covering every key once;
+  - a skewed set of IDs that would split into millions of ranges staying within the limit,
+    with the same groups;
   - only keys whose group holds a peer being hinted;
   - a map of the retention width giving a prune pass the retention and strict groups, in
     the order a lookup gives them;
