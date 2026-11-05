@@ -21,7 +21,8 @@ pub struct Cli {
     #[arg(long)]
     pub bootstrap_count: Option<usize>,
 
-    /// Base port for node allocation (0 for auto).
+    /// Fixed base port: node `i` binds `base_port + i`. Without it (or with
+    /// 0) each node binds a port the OS assigns.
     #[arg(long)]
     pub base_port: Option<u16>,
 
@@ -61,7 +62,9 @@ pub struct Cli {
     #[arg(long, requires = "evm-payment")]
     pub webrtc_direct: bool,
 
-    /// First UDP port assigned to devnet WebRTC Direct listeners (0 = allocate).
+    /// Fixed first UDP port for devnet WebRTC Direct listeners. Without it (or
+    /// with 0) loopback listeners bind ports the OS assigns, and a `--host`
+    /// devnet's are given a free fixed range.
     #[arg(long, requires = "webrtc_direct")]
     pub webrtc_direct_base_port: Option<u16>,
 

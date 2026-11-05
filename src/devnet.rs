@@ -14,6 +14,7 @@ use crate::replication::config::ReplicationConfig;
 use crate::storage::{AntProtocol, ChunkRequestContext, ChunkStore, ChunkStoreConfig};
 use evmlib::Network as EvmNetwork;
 use evmlib::RewardsAddress;
+#[cfg(feature = "webrtc-direct")]
 use rand::Rng;
 use saorsa_core::identity::NodeIdentity;
 use saorsa_core::{
@@ -203,14 +204,24 @@ pub type Result<T> = std::result::Result<T, DevnetError>;
 
 /// Configuration for the devnet.
 ///
-/// Each configuration is automatically isolated with unique ports and
-/// data directories to prevent collisions when running multiple devnets.
+/// Each configuration is automatically isolated with its own data directory,
+/// and by default its nodes bind ports the OS assigns, to prevent collisions
+/// when running multiple devnets.
 #[derive(Debug, Clone)]
 pub struct DevnetConfig {
     /// Number of nodes to spawn (default: 25).
     pub node_count: usize,
 
-    /// Base port for node allocation (0 = auto).
+    /// Base port for node allocation. 0 (the default) means OS-assigned: each
+    /// node binds port 0, and [`Devnet::bootstrap_addrs`] reports the port it
+    /// was given. Otherwise node `i` binds `base_port + i`, up to
+    /// `DEVNET_PORT_RANGE_MAX`.
+    ///
+    /// Fixed ports used to be the only mode, with 0 meaning a random range.
+    /// That range overlaps the OS ephemeral range, so a node could fail with
+    /// "Failed to create transport" on a port another socket had just been
+    /// given, such as an earlier node's `UPnP` gateway search, or on a port a
+    /// Windows runner had reserved (V2-1896). The OS never assigns either.
     pub base_port: u16,
 
     /// Number of bootstrap nodes (first N nodes, default: 3).
@@ -261,21 +272,18 @@ pub struct DevnetConfig {
     /// Run one direct-browser WebRTC Direct listener per devnet node.
     pub webrtc_direct: bool,
 
-    /// First UDP port in the WebRTC Direct node range (0 = allocate).
+    /// First UDP port in the WebRTC Direct node range. 0 (the default) means
+    /// OS-assigned on a loopback devnet, whose listeners then advertise the
+    /// address they bound. A LAN devnet ([`Self::advertise_ip`]) must advertise
+    /// a port up front, so 0 allocates it a fixed range (V2-1897).
     pub webrtc_direct_base_port: u16,
 }
 
 impl Default for DevnetConfig {
     fn default() -> Self {
-        let mut rng = rand::thread_rng();
-
-        #[allow(clippy::cast_possible_truncation)] // DEFAULT_NODE_COUNT is 25, always fits u16
-        let max_base_port = DEVNET_PORT_RANGE_MAX.saturating_sub(DEFAULT_NODE_COUNT as u16);
-        let base_port = rng.gen_range(DEVNET_PORT_RANGE_MIN..max_base_port);
-
         Self {
             node_count: DEFAULT_NODE_COUNT,
-            base_port,
+            base_port: 0,
             bootstrap_count: DEFAULT_BOOTSTRAP_COUNT,
             data_dir: default_root_dir().join(DEVNETS_SUBDIR),
             spawn_delay: Duration::from_millis(DEFAULT_SPAWN_DELAY_MS),
@@ -414,6 +422,39 @@ pub struct Devnet {
     browser_endpoint_catalog: Arc<crate::web_rtc::BrowserEndpointCatalog>,
 }
 
+/// A fixed WebRTC Direct port range for `node_count` listeners: next to the
+/// native range when the native ports are fixed, and disjoint from it,
+/// otherwise anywhere in the local test range.
+#[cfg(feature = "webrtc-direct")]
+fn allocate_webrtc_direct_range(native_range: Option<(u16, u16)>, node_count: u16) -> Result<u16> {
+    let mut rng = rand::thread_rng();
+    let max_base = DEVNET_PORT_RANGE_MAX.saturating_sub(node_count);
+    let Some((base_port, max_port)) = native_range else {
+        return Ok(rng.gen_range(DEVNET_PORT_RANGE_MIN..max_base));
+    };
+    if max_port
+        .checked_add(node_count)
+        .is_some_and(|end| end <= DEVNET_PORT_RANGE_MAX)
+    {
+        return Ok(max_port);
+    }
+    if let Some(before) = base_port
+        .checked_sub(node_count)
+        .filter(|before| *before >= DEVNET_PORT_RANGE_MIN)
+    {
+        return Ok(before);
+    }
+    (0..128)
+        .map(|_| rng.gen_range(DEVNET_PORT_RANGE_MIN..max_base))
+        .find(|candidate| {
+            let end = candidate.saturating_add(node_count);
+            end <= base_port || *candidate >= max_port
+        })
+        .ok_or_else(|| {
+            DevnetError::Config("Could not allocate a disjoint WebRtcDirect port range".to_string())
+        })
+}
+
 impl Devnet {
     /// Create a new devnet with the given configuration.
     ///
@@ -445,25 +486,24 @@ impl Devnet {
             DevnetError::Config(format!("Node count {node_count} exceeds u16::MAX"))
         })?;
 
-        if config.base_port == 0 {
-            let mut rng = rand::thread_rng();
-            let max_base_port = DEVNET_PORT_RANGE_MAX.saturating_sub(node_count_u16);
-            config.base_port = rng.gen_range(DEVNET_PORT_RANGE_MIN..max_base_port);
-        }
-
-        let base_port = config.base_port;
-        let max_port = base_port
-            .checked_add(node_count_u16)
-            .ok_or_else(|| {
+        // The native range, when the ports are fixed. With `base_port == 0`
+        // the OS assigns each node's port, and there is nothing to check.
+        let native_range = if config.base_port == 0 {
+            None
+        } else {
+            let base_port = config.base_port;
+            let max_port = base_port.checked_add(node_count_u16).ok_or_else(|| {
                 DevnetError::Config(format!(
                     "Port range overflow: base_port {base_port} + node_count {node_count} exceeds u16::MAX"
                 ))
             })?;
-        if max_port > DEVNET_PORT_RANGE_MAX {
-            return Err(DevnetError::Config(format!(
-                "Port range overflow: max port {max_port} exceeds DEVNET_PORT_RANGE_MAX {DEVNET_PORT_RANGE_MAX}"
-            )));
-        }
+            if max_port > DEVNET_PORT_RANGE_MAX {
+                return Err(DevnetError::Config(format!(
+                    "Port range overflow: max port {max_port} exceeds DEVNET_PORT_RANGE_MAX {DEVNET_PORT_RANGE_MAX}"
+                )));
+            }
+            Some((base_port, max_port))
+        };
 
         #[cfg(not(feature = "webrtc-direct"))]
         if config.webrtc_direct {
@@ -471,55 +511,41 @@ impl Devnet {
                 "WebRtcDirect devnet support requires the 'webrtc-direct' feature".to_string(),
             ));
         }
+        // Only the WebRtcDirect range checks below read it.
+        #[cfg(not(feature = "webrtc-direct"))]
+        let _ = native_range;
 
         #[cfg(feature = "webrtc-direct")]
         if config.webrtc_direct {
-            if config.webrtc_direct_base_port == 0 {
-                let adjacent = max_port;
-                let adjacent_end = adjacent.checked_add(node_count_u16);
-                config.webrtc_direct_base_port = if adjacent_end
-                    .is_some_and(|end| end <= DEVNET_PORT_RANGE_MAX)
-                {
-                    adjacent
-                } else if let Some(before) = base_port
-                    .checked_sub(node_count_u16)
-                    .filter(|before| *before >= DEVNET_PORT_RANGE_MIN)
-                {
-                    before
-                } else {
-                    let mut rng = rand::thread_rng();
-                    let max_base = DEVNET_PORT_RANGE_MAX.saturating_sub(node_count_u16);
-                    (0..128)
-                        .map(|_| rng.gen_range(DEVNET_PORT_RANGE_MIN..max_base))
-                        .find(|candidate| {
-                            let end = candidate.saturating_add(node_count_u16);
-                            end <= base_port || *candidate >= max_port
-                        })
-                        .ok_or_else(|| {
-                            DevnetError::Config(
-                                "Could not allocate a disjoint WebRtcDirect port range".to_string(),
-                            )
-                        })?
-                };
+            // A loopback listener on port 0 advertises the address it bound. A
+            // LAN listener has to advertise its port up front, so it gets a
+            // fixed range (V2-1897).
+            if config.webrtc_direct_base_port == 0 && config.advertise_ip.is_some() {
+                config.webrtc_direct_base_port =
+                    allocate_webrtc_direct_range(native_range, node_count_u16)?;
             }
 
-            let webrtc_direct_end = config
-                .webrtc_direct_base_port
-                .checked_add(node_count_u16)
-                .ok_or_else(|| {
-                    DevnetError::Config("WebRtcDirect port range overflow".to_string())
-                })?;
-            if config.webrtc_direct_base_port < DEVNET_PORT_RANGE_MIN
-                || webrtc_direct_end > DEVNET_PORT_RANGE_MAX
-            {
-                return Err(DevnetError::Config(format!(
-                    "WebRtcDirect ports must remain in the local test range {DEVNET_PORT_RANGE_MIN}..{DEVNET_PORT_RANGE_MAX}"
-                )));
-            }
-            if base_port < webrtc_direct_end && config.webrtc_direct_base_port < max_port {
-                return Err(DevnetError::Config(
-                    "Native and WebRtcDirect devnet port ranges overlap".to_string(),
-                ));
+            if config.webrtc_direct_base_port != 0 {
+                let webrtc_direct_end = config
+                    .webrtc_direct_base_port
+                    .checked_add(node_count_u16)
+                    .ok_or_else(|| {
+                        DevnetError::Config("WebRtcDirect port range overflow".to_string())
+                    })?;
+                if config.webrtc_direct_base_port < DEVNET_PORT_RANGE_MIN
+                    || webrtc_direct_end > DEVNET_PORT_RANGE_MAX
+                {
+                    return Err(DevnetError::Config(format!(
+                        "WebRtcDirect ports must remain in the local test range {DEVNET_PORT_RANGE_MIN}..{DEVNET_PORT_RANGE_MAX}"
+                    )));
+                }
+                if let Some((base_port, max_port)) = native_range {
+                    if base_port < webrtc_direct_end && config.webrtc_direct_base_port < max_port {
+                        return Err(DevnetError::Config(
+                            "Native and WebRtcDirect devnet port ranges overlap".to_string(),
+                        ));
+                    }
+                }
             }
         }
 
@@ -1027,7 +1053,13 @@ impl Devnet {
     ) -> Result<DevnetNode> {
         let index_u16 = u16::try_from(index)
             .map_err(|_| DevnetError::Config(format!("Node index {index} exceeds u16::MAX")))?;
-        let port = self.config.base_port + index_u16;
+        // 0 until the node starts, when `start_node` records the port the OS
+        // assigned.
+        let port = if self.config.base_port == 0 {
+            0
+        } else {
+            self.config.base_port + index_u16
+        };
 
         // Generate identity first so we can use peer_id as the directory name
         let identity = NodeIdentity::generate()
@@ -1129,7 +1161,7 @@ impl Devnet {
 
     #[allow(clippy::too_many_lines)]
     async fn start_node(&mut self, mut node: DevnetNode) -> Result<()> {
-        debug!("Starting node {} on port {}", node.index, node.port);
+        debug!("Starting node {}", node.index);
         *node.state.write().await = NodeState::Starting;
 
         let mut core_config = CoreNodeConfig::builder()
@@ -1174,22 +1206,46 @@ impl Devnet {
             .nodes
             .last_mut()
             .ok_or_else(|| DevnetError::Startup(format!("Node {index} was not registered")))?;
+        // Bootstrap addresses are IPv4 (`bootstrap_addrs`). A dual-stack node
+        // on port 0 gets a different port for each stack, so record the IPv4 one.
+        if node.port == 0 {
+            let p2p = node
+                .p2p_node
+                .clone()
+                .ok_or_else(|| DevnetError::Startup(format!("Node {index} lost its P2P handle")))?;
+            node.port = p2p
+                .listen_addrs()
+                .await
+                .iter()
+                .filter_map(MultiAddr::socket_addr)
+                .find(SocketAddr::is_ipv4)
+                .map(|addr| addr.port())
+                .ok_or_else(|| {
+                    DevnetError::Startup(format!("Node {index} has no IPv4 listen address"))
+                })?;
+        }
+        debug!("Node {index} listening on port {}", node.port);
 
         #[cfg(feature = "webrtc-direct")]
         if self.config.webrtc_direct {
             let index_u16 = u16::try_from(node.index).map_err(|_| {
                 DevnetError::Config(format!("Node index {} exceeds u16::MAX", node.index))
             })?;
-            let port = self
-                .config
-                .webrtc_direct_base_port
-                .checked_add(index_u16)
-                .ok_or_else(|| {
-                    DevnetError::Config(format!(
-                        "WebRtcDirect port overflow for node {}",
-                        node.index
-                    ))
-                })?;
+            // 0: the OS assigns the port. `Devnet::new` gives a LAN devnet a
+            // fixed range, so this only happens for a loopback listener.
+            let port = if self.config.webrtc_direct_base_port == 0 {
+                0
+            } else {
+                self.config
+                    .webrtc_direct_base_port
+                    .checked_add(index_u16)
+                    .ok_or_else(|| {
+                        DevnetError::Config(format!(
+                            "WebRtcDirect port overflow for node {}",
+                            node.index
+                        ))
+                    })?
+            };
             let advertised_ip = self.config.advertise_ip.unwrap_or(Ipv4Addr::LOCALHOST);
             let bind_ip = self
                 .config
@@ -1198,7 +1254,8 @@ impl Devnet {
             let webrtc_direct_config = WebRtcDirectConfig {
                 enabled: true,
                 bind: SocketAddr::from((bind_ip, port)),
-                advertised_addr: Some(SocketAddr::from((advertised_ip, port))),
+                // A loopback listener on port 0 advertises the address it bound.
+                advertised_addr: (port != 0).then(|| SocketAddr::from((advertised_ip, port))),
                 ..WebRtcDirectConfig::default()
             };
 
@@ -1472,6 +1529,37 @@ mod tests {
         Ok(())
     }
 
+    /// A default devnet's nodes bind ports the OS assigns, and the bootstrap
+    /// addresses carry the ports they were given (V2-1896).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_default_devnet_binds_os_assigned_ports(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let config = two_nodes(temp.path());
+        assert_eq!(config.base_port, 0);
+        let mut devnet = Devnet::new(config).await?;
+        assert_eq!(
+            devnet.config().base_port,
+            0,
+            "0 is no longer resolved to a range"
+        );
+        devnet.start().await?;
+
+        let ports: Vec<u16> = devnet.nodes.iter().map(|node| node.port).collect();
+        assert!(ports.iter().all(|port| *port != 0), "{ports:?}");
+        assert_ne!(ports[0], ports[1], "{ports:?}");
+        let bootstrap: Vec<u16> = devnet
+            .bootstrap_addrs()
+            .iter()
+            .filter_map(MultiAddr::socket_addr)
+            .map(|addr| addr.port())
+            .collect();
+        assert_eq!(bootstrap, ports[..1], "the bootstrap node's bound port");
+
+        devnet.shutdown().await?;
+        Ok(())
+    }
+
     /// A devnet of two nodes, quick to start, running in `parent`.
     fn two_nodes(parent: &std::path::Path) -> DevnetConfig {
         let mut config = DevnetConfig::minimal();
@@ -1581,11 +1669,17 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let mut config = two_nodes(temp.path());
         config.webrtc_direct = true;
+        // Hold a port in the devnet range and make it node 0's browser port,
+        // so node 0's native transport starts and its listener then fails.
+        let taken = (0..64)
+            .find_map(|_| {
+                let port =
+                    rand::thread_rng().gen_range(DEVNET_PORT_RANGE_MIN..DEVNET_PORT_RANGE_MAX - 2);
+                std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).ok()
+            })
+            .ok_or("no free port in the devnet range")?;
+        config.webrtc_direct_base_port = taken.local_addr()?.port();
         let mut devnet = Devnet::new(config).await?;
-        let taken = std::net::UdpSocket::bind((
-            Ipv4Addr::LOCALHOST,
-            devnet.config().webrtc_direct_base_port,
-        ))?;
 
         let started = devnet.start().await;
 
