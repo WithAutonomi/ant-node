@@ -38,7 +38,6 @@ use saorsa_core::{
     NodeConfig as CoreNodeConfig, P2PEvent, P2PNode,
 };
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,25 +51,21 @@ use tracing::{debug, info, warn};
 // Test Isolation Constants
 // =============================================================================
 //
-// NOTE: E2E tests use a SEPARATE port range from production ant-node.
-//
-// - Production ant-node: 10000-10999 (see CLAUDE.md)
-// - E2E tests: 20000-60000 (this file)
-//
-// This separation prevents test conflicts with:
-// 1. Running local development nodes (which use 10000-10999)
-// 2. Parallel test execution (via random port allocation)
+// NOTE: E2E test nodes bind port 0, so the OS assigns each one a free port
+// from its ephemeral range (by default Linux 32768-60999, macOS and Windows
+// 49152-65535). That keeps them clear of:
+// 1. Running local development nodes (which use 10000-10999, see CLAUDE.md)
+// 2. Parallel test execution
 // 3. Other Autonomi services (ant-quic: 9000-9999, communitas: 11000-11999)
-
-/// Minimum port for random test allocation.
-/// Avoids well-known ports, production ranges, and other Autonomi services.
-pub const TEST_PORT_RANGE_MIN: u16 = 20_000;
-
-/// Maximum port for random test allocation.
-pub const TEST_PORT_RANGE_MAX: u16 = 60_000;
+//
+// The harness used to pick a random port in 20000-60000 for each node, which
+// overlaps the ephemeral range. Every node and client starts a UPnP gateway
+// search that holds a `0.0.0.0:<ephemeral>` UDP socket for up to 2 s, and a
+// 127.0.0.1 bind to a port a wildcard socket holds fails with "address in
+// use", so node creation now and then failed with "Failed to create
+// transport" (V2-1894). The OS never assigns a port that is in use.
 
 /// Maximum nodes supported in a test network.
-/// Limited to ensure port calculations don't overflow u16.
 pub const MAX_TEST_NODE_COUNT: usize = 1000;
 
 // =============================================================================
@@ -195,15 +190,13 @@ pub type Result<T> = std::result::Result<T, TestnetError>;
 
 /// Configuration for the test network.
 ///
-/// Each configuration is automatically isolated with unique ports and
-/// data directories to prevent test pollution when running in parallel.
+/// Each configuration is automatically isolated with a unique data directory,
+/// and its nodes bind OS-assigned ports, to prevent test pollution when
+/// running in parallel.
 #[derive(Debug, Clone)]
 pub struct TestNetworkConfig {
     /// Number of nodes to spawn (default: 25).
     pub node_count: usize,
-
-    /// Base port for node allocation (auto-generated for isolation).
-    pub base_port: u16,
 
     /// Number of bootstrap nodes (first N nodes, default: 3).
     pub bootstrap_count: usize,
@@ -245,43 +238,14 @@ pub struct TestNetworkConfig {
     pub storage_disk_reserve_overrides: HashMap<usize, u64>,
 }
 
-impl TestNetworkConfig {
-    /// The same configuration on a freshly drawn port range and data
-    /// directory, for a network whose first bring-up could not bind.
-    #[must_use]
-    pub fn with_fresh_ports(self) -> Self {
-        let fresh = Self::default();
-        Self {
-            base_port: fresh.base_port,
-            test_data_dir: fresh.test_data_dir,
-            ..self
-        }
-    }
-}
-
 impl Default for TestNetworkConfig {
     fn default() -> Self {
-        let mut rng = rand::thread_rng();
-
-        // Random port in isolated range to avoid collisions in parallel tests.
-        // Ensure we have room for DEFAULT_NODE_COUNT consecutive ports.
-        // Calculation: base_port + (DEFAULT_NODE_COUNT - 1) must be < TEST_PORT_RANGE_MAX
-        // Safety: DEFAULT_NODE_COUNT (25) fits in u16.
-        #[allow(clippy::cast_possible_truncation)]
-        let max_base_port = TEST_PORT_RANGE_MAX.saturating_sub(DEFAULT_NODE_COUNT as u16);
-        let base_port = if max_base_port > TEST_PORT_RANGE_MIN {
-            rng.gen_range(TEST_PORT_RANGE_MIN..max_base_port)
-        } else {
-            TEST_PORT_RANGE_MIN
-        };
-
         // Random suffix for unique temp directory
-        let suffix: u64 = rng.gen();
+        let suffix: u64 = rand::thread_rng().gen();
         let test_data_dir = std::env::temp_dir().join(format!("ant_test_{suffix:x}"));
 
         Self {
             node_count: DEFAULT_NODE_COUNT,
-            base_port,
             bootstrap_count: DEFAULT_BOOTSTRAP_COUNT,
             test_data_dir,
             spawn_delay: Duration::from_millis(DEFAULT_SPAWN_DELAY_MS),
@@ -408,9 +372,6 @@ pub struct TestNode {
 
     /// Unique node ID.
     pub node_id: String,
-
-    /// Port this node listens on.
-    pub port: u16,
 
     /// Root directory for this node's data.
     pub data_dir: PathBuf,
@@ -959,30 +920,10 @@ impl TestNetwork {
             ));
         }
 
-        // Validate node count fits in u16 for port calculations
         if config.node_count > MAX_TEST_NODE_COUNT {
             return Err(TestnetError::Config(format!(
                 "Node count {} exceeds maximum {}",
                 config.node_count, MAX_TEST_NODE_COUNT
-            )));
-        }
-
-        // Validate port range doesn't overflow
-        let node_count_u16 = u16::try_from(config.node_count).map_err(|_| {
-            TestnetError::Config(format!("Node count {} exceeds u16::MAX", config.node_count))
-        })?;
-        let max_port = config
-            .base_port
-            .checked_add(node_count_u16)
-            .ok_or_else(|| {
-                TestnetError::Config(format!(
-                    "Port range overflow: base_port {} + node_count {} exceeds u16::MAX",
-                    config.base_port, config.node_count
-                ))
-            })?;
-        if max_port > TEST_PORT_RANGE_MAX {
-            return Err(TestnetError::Config(format!(
-                "Port range overflow: max port {max_port} exceeds TEST_PORT_RANGE_MAX {TEST_PORT_RANGE_MAX}"
             )));
         }
 
@@ -1065,7 +1006,7 @@ impl TestNetwork {
             let node = self.create_node(i, true, vec![]).await?;
             self.start_node(node).await?;
 
-            // Delay between spawns to prevent port conflicts
+            // Delay between spawns
             tokio::time::sleep(self.config.spawn_delay).await;
         }
 
@@ -1082,13 +1023,7 @@ impl TestNetwork {
         let regular_count = self.config.node_count - self.config.bootstrap_count;
         info!("Starting {} regular nodes", regular_count);
 
-        let bootstrap_addrs: Vec<MultiAddr> = self
-            .nodes
-            .get(0..self.config.bootstrap_count)
-            .unwrap_or_default()
-            .iter()
-            .map(|n| MultiAddr::quic(SocketAddr::from((Ipv4Addr::LOCALHOST, n.port))))
-            .collect();
+        let bootstrap_addrs = self.bootstrap_addrs().await;
 
         for i in self.config.bootstrap_count..self.config.node_count {
             let node = self.create_node(i, false, bootstrap_addrs.clone()).await?;
@@ -1100,6 +1035,22 @@ impl TestNetwork {
 
         info!("All regular nodes started");
         Ok(())
+    }
+
+    /// The addresses the running bootstrap nodes bound. Nodes bind port 0, so
+    /// these come from each node's `listen_addrs()`, not from the config.
+    async fn bootstrap_addrs(&self) -> Vec<MultiAddr> {
+        let mut addrs = Vec::new();
+        for node in self
+            .nodes
+            .get(0..self.config.bootstrap_count)
+            .unwrap_or_default()
+        {
+            if let Some(ref p2p) = node.p2p_node {
+                addrs.extend(p2p.listen_addrs().await);
+            }
+        }
+        addrs
     }
 
     /// Create a test node (but don't start it yet).
@@ -1114,10 +1065,6 @@ impl TestNetwork {
         is_bootstrap: bool,
         bootstrap_addrs: Vec<MultiAddr>,
     ) -> Result<TestNode> {
-        // Safe: node_count is validated in TestNetwork::new() to fit in u16
-        let index_u16 = u16::try_from(index)
-            .map_err(|_| TestnetError::Config(format!("Node index {index} exceeds u16::MAX")))?;
-        let port = self.config.base_port + index_u16;
         let node_id = format!("test_node_{index}");
         let data_dir = self.config.test_data_dir.join(&node_id);
 
@@ -1151,7 +1098,6 @@ impl TestNetwork {
         Ok(TestNode {
             index,
             node_id,
-            port,
             data_dir,
             p2p_node: None,
             ant_protocol: Some(Arc::new(ant_protocol)),
@@ -1272,74 +1218,35 @@ impl TestNetwork {
     /// Start a single node.
     #[allow(clippy::too_many_lines)]
     async fn start_node(&mut self, mut node: TestNode) -> Result<()> {
-        debug!("Starting node {} on port {}", node.index, node.port);
+        debug!("Starting node {}", node.index);
         *node.state.write().await = NodeState::Starting;
 
-        // Retry budget for a transient transport/port-bind race at node
-        // creation (a `let`, not an item, to avoid clippy's items-after-
-        // statements in this scope). See the loop below for the rationale.
-        let node_create_attempts: u32 = 4;
-
-        // Build the saorsa-core config (a fresh one per creation attempt, since
-        // P2PNode::new consumes it). Factored into a closure so the transient-
-        // error retry below can rebuild it.
+        // .port(0): the OS assigns a free port (see the note at the top of this
+        // file); `bootstrap_addrs` reads it back from `listen_addrs()`.
         // .local(true) auto-enables allow_loopback for test nodes on 127.0.0.1.
         // .ipv6(false) keeps the bind on 127.0.0.1 only; Windows GitHub
         // Actions runners (and some macOS runners) can't bind a dual-stack
         // v6 socket and the whole testnet startup fails with
         // "Failed to create dual-stack network nodes: Failed to create transport".
         // Loopback-only tests don't need v6.
-        let build_core_config = || -> Result<CoreNodeConfig> {
-            let mut core_config = CoreNodeConfig::builder()
-                .port(node.port)
-                .ipv6(false)
-                .local(true)
-                .connection_timeout(Duration::from_secs(TEST_CORE_CONNECTION_TIMEOUT_SECS))
-                .max_message_size(MAX_REPLICATION_MESSAGE_SIZE.max(MAX_WIRE_MESSAGE_SIZE))
-                .build()
-                .map_err(|e| TestnetError::Core(format!("Failed to create core config: {e}")))?;
-            core_config
-                .bootstrap_peers
-                .clone_from(&node.bootstrap_addrs);
-            core_config.diversity_config = Some(CoreDiversityConfig::permissive());
-            // Inject the ML-DSA identity so the P2PNode's transport peer ID
-            // matches the pub_key embedded in payment quotes.
-            core_config.node_identity.clone_from(&node.node_identity);
-            Ok(core_config)
-        };
+        let mut core_config = CoreNodeConfig::builder()
+            .port(0)
+            .ipv6(false)
+            .local(true)
+            .connection_timeout(Duration::from_secs(TEST_CORE_CONNECTION_TIMEOUT_SECS))
+            .max_message_size(MAX_REPLICATION_MESSAGE_SIZE.max(MAX_WIRE_MESSAGE_SIZE))
+            .build()
+            .map_err(|e| TestnetError::Core(format!("Failed to create core config: {e}")))?;
+        core_config
+            .bootstrap_peers
+            .clone_from(&node.bootstrap_addrs);
+        core_config.diversity_config = Some(CoreDiversityConfig::permissive());
+        // Inject the ML-DSA identity so the P2PNode's transport peer ID
+        // matches the pub_key embedded in payment quotes.
+        core_config.node_identity.clone_from(&node.node_identity);
 
-        // Create the P2P node, retrying a transient transport/port-bind failure.
-        // On Windows (and occasionally macOS) GitHub runners, node creation can
-        // intermittently fail with "Failed to create transport" when the freshly
-        // chosen loopback port is momentarily still held by a just-released
-        // socket — a flaky-setup race, not a logic error. A few retries with a
-        // short backoff (same port; the race clears in milliseconds) makes the
-        // multi-node bring-up deterministic without masking a real transport
-        // misconfiguration (which fails every attempt).
-        let mut p2p_node = None;
-        let mut last_err = String::new();
-        for attempt in 1..=node_create_attempts {
-            match P2PNode::new(build_core_config()?).await {
-                Ok(n) => {
-                    p2p_node = Some(n);
-                    break;
-                }
-                Err(e) => {
-                    last_err = e.to_string();
-                    debug!(
-                        "Node {} creation attempt {attempt}/{node_create_attempts} failed \
-                         (transient transport/port race?): {last_err}",
-                        node.index
-                    );
-                    tokio::time::sleep(Duration::from_millis(250 * u64::from(attempt))).await;
-                }
-            }
-        }
-        let p2p_node = p2p_node.ok_or_else(|| {
-            TestnetError::Startup(format!(
-                "Failed to create node {} after {node_create_attempts} attempts: {last_err}",
-                node.index
-            ))
+        let p2p_node = P2PNode::new(core_config).await.map_err(|e| {
+            TestnetError::Startup(format!("Failed to create node {}: {e}", node.index))
         })?;
 
         p2p_node.start().await.map_err(|e| {
@@ -1804,13 +1711,7 @@ impl TestNetwork {
 
         let index = self.nodes.len();
 
-        let bootstrap_addrs: Vec<MultiAddr> = self
-            .nodes
-            .get(0..self.config.bootstrap_count)
-            .unwrap_or_default()
-            .iter()
-            .map(|n| MultiAddr::quic(SocketAddr::from((Ipv4Addr::LOCALHOST, n.port))))
-            .collect();
+        let bootstrap_addrs = self.bootstrap_addrs().await;
 
         let node = self.create_node(index, false, bootstrap_addrs).await?;
         self.start_node(node).await?;
@@ -1950,8 +1851,6 @@ mod tests {
         let config = TestNetworkConfig::default();
         assert_eq!(config.node_count, 25);
         assert_eq!(config.bootstrap_count, 3);
-        // Port is randomly generated in range 20000-60000
-        assert!(config.base_port >= 20000 && config.base_port < 60000);
         // Data dir has unique suffix
         assert!(config.test_data_dir.to_string_lossy().contains("ant_test_"));
     }
@@ -1965,7 +1864,7 @@ mod tests {
 
     #[test]
     fn test_config_isolation() {
-        // Each config should get unique port and data dir
+        // Each config should get a unique data dir
         let config1 = TestNetworkConfig::default();
         let config2 = TestNetworkConfig::default();
 

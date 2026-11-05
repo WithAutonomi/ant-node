@@ -4,23 +4,14 @@
 //! both the ant node network and optional Anvil EVM testnet.
 
 use super::anvil::TestAnvil;
-use super::testnet::{TestNetwork, TestNetworkConfig, TestNode, TestnetError};
+use super::testnet::{TestNetwork, TestNetworkConfig, TestNode};
 use ant_node::client::XorName;
 use ant_node::storage::DiskSpace;
 use evmlib::common::TxHash;
 use saorsa_core::P2PNode;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tracing::{info, warn};
-
-/// How many port ranges a network is brought up on before its bind failure
-/// is reported.
-///
-/// A node retries its own port, which clears a socket still being released.
-/// It cannot clear a port the host will not hand out at all, as happens on
-/// Windows runners whose reserved port ranges move between runs, so a network
-/// that cannot create a node moves to a fresh random range instead.
-const NETWORK_START_ATTEMPTS: u32 = 3;
+use tracing::info;
 
 /// Size of the partition the prune tests report: 1 TiB.
 const TEST_DISK_BYTES: u64 = 1 << 40;
@@ -36,32 +27,15 @@ pub const ROOMY_DISK: DiskSpace = DiskSpace {
     total: TEST_DISK_BYTES,
 };
 
-/// Create and start a network from `config`, moving it to a fresh port range
-/// if a node cannot be created.
-async fn start_network(mut config: TestNetworkConfig) -> Result<TestNetwork> {
-    let mut attempt = 1;
-    loop {
-        let mut network = TestNetwork::new(config.clone()).await?;
-        match network.start().await {
-            Ok(()) => return Ok(network),
-            Err(TestnetError::Startup(reason))
-                if attempt < NETWORK_START_ATTEMPTS
-                    && reason.starts_with("Failed to create node ") =>
-            {
-                let base_port = config.base_port;
-                warn!(
-                    "Test network on base port {base_port} could not create a node \
-                     ({reason}); retrying on a fresh port range"
-                );
-                if let Err(e) = network.shutdown().await {
-                    warn!("Cleanup after a failed bring-up failed: {e}");
-                }
-                config = config.with_fresh_ports();
-                attempt += 1;
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
+/// Create and start a network from `config`.
+///
+/// Its nodes bind OS-assigned ports, so a bring-up never fails on a port that
+/// is in use or reserved. This used to retry the whole network on a fresh port
+/// range when a node could not be created (V2-1894).
+async fn start_network(config: TestNetworkConfig) -> Result<TestNetwork> {
+    let mut network = TestNetwork::new(config).await?;
+    network.start().await?;
+    Ok(network)
 }
 
 /// Error type for test harness operations.

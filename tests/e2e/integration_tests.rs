@@ -6,12 +6,11 @@
 
 use super::testnet::{
     DEFAULT_BOOTSTRAP_COUNT, DEFAULT_NODE_COUNT, MINIMAL_BOOTSTRAP_COUNT, MINIMAL_NODE_COUNT,
-    SMALL_NODE_COUNT, TEST_PORT_RANGE_MAX, TEST_PORT_RANGE_MIN,
+    SMALL_NODE_COUNT,
 };
 use super::{NetworkState, TestHarness, TestNetwork, TestNetworkConfig};
 use saorsa_core::P2PEvent;
 use serial_test::serial;
-use std::net::UdpSocket;
 use std::time::Duration;
 
 /// Test that a minimal network (5 nodes) can form and stabilize.
@@ -172,8 +171,6 @@ fn test_config_presets() {
     let default = TestNetworkConfig::default();
     assert_eq!(default.node_count, DEFAULT_NODE_COUNT);
     assert_eq!(default.bootstrap_count, DEFAULT_BOOTSTRAP_COUNT);
-    // Ports are randomly generated in a wide range to avoid collisions
-    assert!(default.base_port >= TEST_PORT_RANGE_MIN && default.base_port < TEST_PORT_RANGE_MAX);
 
     let minimal = TestNetworkConfig::minimal();
     assert_eq!(minimal.node_count, MINIMAL_NODE_COUNT);
@@ -278,23 +275,32 @@ async fn test_node_to_node_messaging() {
         .expect("Failed to teardown test harness");
 }
 
-/// A network whose first node cannot bind its port is brought up on a fresh
-/// port range rather than failing the test that asked for it.
+/// Test nodes bind port 0, and every node reports the port the OS assigned it:
+/// later nodes bootstrap from those addresses, so a node reporting port 0, or
+/// two nodes sharing a port, would break the network (V2-1894).
 #[tokio::test]
 #[serial]
-async fn a_network_whose_port_is_taken_moves_to_a_fresh_range() {
-    let config = TestNetworkConfig::minimal();
-    let taken = config.base_port;
-    let _holder = UdpSocket::bind(("127.0.0.1", taken)).expect("hold the first node's port");
-
-    let harness = TestHarness::setup_with_config(config)
+async fn nodes_listen_on_distinct_os_assigned_ports() {
+    let harness = TestHarness::setup_with_config(TestNetworkConfig::minimal())
         .await
-        .expect("the network comes up on another range");
-    assert_ne!(
-        harness.network().config().base_port,
-        taken,
-        "the network moved off the port it could not bind"
-    );
+        .expect("setup");
+
+    let mut ports = Vec::new();
+    for node in harness.network().nodes() {
+        let p2p = node.p2p_node.as_ref().expect("node is running");
+        let port = p2p
+            .listen_addrs()
+            .await
+            .iter()
+            .find_map(saorsa_core::MultiAddr::port)
+            .expect("node has a listen port");
+        assert_ne!(port, 0, "node {} reports port 0", node.index);
+        ports.push(port);
+    }
+    let mut distinct = ports.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(distinct.len(), ports.len(), "nodes share a port: {ports:?}");
 
     harness.teardown().await.expect("teardown");
 }
