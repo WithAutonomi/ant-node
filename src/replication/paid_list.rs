@@ -479,12 +479,16 @@ impl PaidList {
         }
     }
 
-    /// The keys marked price-contested in the in-memory copy, read without
-    /// touching the database, or `None` if the marks could not be read when
-    /// the paid list opened, so that any key may be marked.
-    pub fn marked_keys(&self) -> Option<Vec<XorName>> {
+    /// Split `keys` into those known to be unmarked and those marked
+    /// price-contested, using the in-memory copy rather than the database. If
+    /// the marks could not be read on open, no key is known to be unmarked, so
+    /// every key counts as marked.
+    pub fn split_marked(&self, keys: Vec<XorName>) -> (Vec<XorName>, Vec<XorName>) {
         let snapshot = self.price_contested.read().clone();
-        snapshot.map(|marked| marked.iter().copied().collect())
+        match snapshot {
+            Some(marked) => keys.into_iter().partition(|key| !marked.contains(key)),
+            None => (Vec::new(), keys),
+        }
     }
 
     /// Describe a failed insert. A full store is also reported, once, as an
