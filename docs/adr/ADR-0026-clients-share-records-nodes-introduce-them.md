@@ -507,11 +507,13 @@ saorsa-transport's WebRTC Direct already uses).
   the read in all, from its first ask; a peer that stalls or runs past its record's time is
   passed over for 30 s (the read's own time running out does not count
   against it). A
-  browser download asks for its records in an order of its own, picked at
-  random, as BitTorrent picks pieces: a download keeps up to 8 records in
+  browser client asks for a file's records in an order of its own, picked at
+  random once, as BitTorrent picks pieces: a download keeps up to 8 records in
   flight (4 at first outside Chromium), and readers of one file who start together and ask in the same
   order would hold the same records at every moment, and want the same next
-  ones, so none would have a record another is still waiting for. A
+  ones, so none would have a record another is still waiting for. Two
+  downloads of a file in one client ask in the same order, so they still
+  share each record's fetch. A
   download delivers its chunks in any order, so its order costs it nothing;
   a stream or a range read asks in the order its reader reads. A client asks one link for one record at a time: in
   Chromium, two records sent at once on one data channel, a few pieces of
