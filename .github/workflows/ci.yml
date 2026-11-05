@@ -65,8 +65,8 @@ jobs:
   # text, or a new crate that compiles bundled C code, before release.
   #
   # Generation downloads licence texts from crate repositories and from
-  # musl.libc.org, so a PR that doesn't change the dependency set or the
-  # generator would only be testing those sites (V2-1815). Such a PR passes this
+  # musl.libc.org, so a PR that doesn't change the dependency set, the toolchain
+  # pin or the generator would only be testing those sites (V2-1815). Such a PR passes this
   # job without generating anything. The job still runs and succeeds rather than
   # being skipped, because CI Gate counts a skipped job as a failure. A rustc
   # release can move the musl version, and no PR changes that; the release
@@ -94,14 +94,29 @@ jobs:
             echo "generate=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          changed=$(git diff --name-only 'HEAD^1' HEAD -- \
-            Cargo.lock Cargo.toml scripts/third_party_notices .github/workflows/ci.yml)
+          # Everything the generated notices depend on that a PR can change:
+          # every Cargo manifest and the lockfile (cargo tree, cargo metadata);
+          # cargo's own config (source replacement, path overrides); the
+          # toolchain pin (rustup prefers it to the stable toolchain installed
+          # below, `rustc -vV` picks the musl release, and the toolchain ships
+          # the standard library's copyright text); the generator; and this
+          # workflow, which holds the generator's arguments.
+          watched=(
+            Cargo.lock
+            ':(glob)**/Cargo.toml'
+            .cargo
+            rust-toolchain
+            rust-toolchain.toml
+            scripts/third_party_notices
+            .github/workflows/ci.yml
+          )
+          changed=$(git diff --name-only 'HEAD^1' HEAD -- "${watched[@]}")
           if [ -n "$changed" ]; then
             echo "inputs changed:"
             echo "$changed"
             echo "generate=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::notice::No change to Cargo.lock, Cargo.toml, scripts/third_party_notices or this workflow; notices not regenerated"
+            echo "::notice::No change to a Cargo manifest, Cargo.lock, .cargo, the toolchain pin, scripts/third_party_notices or this workflow; notices not regenerated"
             echo "generate=false" >> "$GITHUB_OUTPUT"
           fi
       - uses: dtolnay/rust-toolchain@stable
