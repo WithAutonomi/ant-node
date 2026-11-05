@@ -166,9 +166,15 @@ pub struct WebRtcDirectConfig {
 
     /// Literal public UDP address advertised to browsers.
     ///
-    /// When omitted, a wildcard listener uses the native self-address view's
-    /// first non-relay IP in the bind family and the actual WebRTC bound port.
-    /// Publication waits when native address discovery has no usable IP.
+    /// When omitted, a wildcard IPv4 listener on a node that is not in
+    /// development mode asks the local gateway to forward its port, and
+    /// advertises the forwarded public address while the gateway holds the
+    /// mapping (ADR-0027); the external port is usually the bound port, but
+    /// may differ.
+    /// Otherwise a wildcard listener uses the native self-address view's first
+    /// non-relay IP in the bind family and the actual WebRTC bound port.
+    /// Publication waits when neither yields an address. Setting this, or an
+    /// explicit bind IP, turns the mapping off.
     pub advertised_addr: Option<SocketAddr>,
 
     /// PEM file used to persist the stable DTLS certificate and private key.

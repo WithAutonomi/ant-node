@@ -4,41 +4,60 @@ on:
   pull_request:
     branches: [main, "rc-*"]
 
+# A new push to a PR cancels the run still going for the previous push, so a
+# superseded commit doesn't keep ~200 job-minutes of runners busy.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
   FOUNDRY_VERSION: v1.7.1
 
+# Layout (V2-1811). Each piece of work runs once, in the job that needs that
+# build, and `CI Gate` is the single "is this PR green" check:
+#   quick-checks   fmt, clippy, docs, the no-default-features lib check
+#   msrv           the declared minimum toolchain
+#   notices        THIRD-PARTY-NOTICES.txt generation
+#   test (3 OS)    every lib, bin and integration test target; Linux also runs
+#                  the doc tests, the ignored five-node devnet test and the lib
+#                  tests without default features
+#   filesystems    the storage tests on ext4, XFS and btrfs
+#   build-release  the shipped Linux binary, built exactly as release.yml does
 jobs:
+  quick-checks:
+    name: Quick checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      # Compile without cfg(test) too: browser unit tests can otherwise hide
+      # unused helpers whose production callers require webrtc-direct.
+      - name: Check library without default features
+        run: cargo check --lib --no-default-features --locked
+      - name: Documentation
+        run: cargo doc --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
   msrv:
     name: Rust 1.95 MSRV
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets --all-features --locked
-
-  fmt:
-    name: Format Check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - run: cargo fmt --all -- --check
-
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --all-features -- -D warnings
 
   # The release workflow ships THIRD-PARTY-NOTICES.txt in every archive.
   # Generating it on each pull request catches a dependency that ships no
@@ -46,6 +65,7 @@ jobs:
   notices:
     name: Third-party notices
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -68,6 +88,7 @@ jobs:
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -80,40 +101,93 @@ jobs:
         uses: foundry-rs/foundry-toolchain@v1
         with:
           version: ${{ env.FOUNDRY_VERSION }}
-      - name: Run unit tests
-        run: cargo test --lib --features test-utils
-      - name: Kill a node mid-write and check what survived
+      - name: Unit tests (lib and bins)
+        run: cargo test --lib --bins --features test-utils
+      # Build every integration test binary in one cargo invocation, so they compile
+      # and link in parallel. When each target was built in its own step, each spent
+      # 2-5 minutes building its binary for tests that finish in under a second.
+      - name: Build integration test binaries
+        shell: bash
+        run: cargo test --test '*' --features test-utils --no-run
+      # Every integration target Cargo knows about, read from `cargo metadata`,
+      # so a new tests/*.rs runs without anyone editing this file. Each target
+      # runs on its own, serially, and must pass at least one test: a target
+      # whose required features are not passed is skipped with a warning and a
+      # zero exit, and a cfg can compile a target down to nothing, so "exit 0"
+      # alone doesn't show that anything ran. All targets run even after one
+      # fails, and the step fails at the end listing them.
+      - name: Integration tests (every target)
         shell: bash
         run: |
-          set -euo pipefail
-          cargo test --test chunk_store_crash_safety --features test-utils -- --test-threads=1 2>&1 | tee /tmp/crash_safety.log
-          grep -qE 'test result: ok\. [1-9]' /tmp/crash_safety.log \
-            || { echo 'chunk_store_crash_safety ran no tests'; exit 1; }
-      - name: Startup scan, index memory and inode cost at scale
+          # GitHub runs `shell: bash` with -e; turn it off so one failing target
+          # doesn't stop the rest from running.
+          set +e -uo pipefail
+          targets=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "ant-node") | .targets[] | select(.kind | index("test")) | .name' | tr -d '\r')
+          echo "integration targets: $(echo $targets)"
+          [ -n "$targets" ] || { echo "cargo metadata listed no integration targets"; exit 1; }
+          failed=""
+          for t in $targets; do
+            extra=""
+            if [ "$t" = devnet_lifecycle ] && [ "$RUNNER_OS" = Windows ]; then
+              # It stops ant-devnet with SIGTERM and SIGKILL, so it is Unix
+              # only, and compiles to nothing on Windows.
+              echo "skipping $t on $RUNNER_OS (Unix only)"
+              continue
+            fi
+            if [ "$t" = storage_scale ]; then
+              # Its gates compare the store scan against timed directory walks, and
+              # were measured on Linux; it has only ever run there.
+              if [ "$RUNNER_OS" != Linux ]; then
+                echo "skipping $t on $RUNNER_OS (Linux only)"
+                continue
+              fi
+              # Prints the measured index memory and inode cost, which is the point of it.
+              extra="--nocapture"
+            fi
+            echo "::group::$t"
+            cargo test --test "$t" --features test-utils -- --test-threads=1 $extra 2>&1 | tee "/tmp/$t.log"
+            status=${PIPESTATUS[0]}
+            echo "::endgroup::"
+            if [ "$status" -ne 0 ]; then
+              failed="$failed $t"
+            elif ! grep -qE 'test result: ok\. [1-9][0-9]* passed' "/tmp/$t.log"; then
+              echo "::error::$t ran no tests"
+              failed="$failed $t(ran-nothing)"
+            fi
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::failing integration targets:$failed"
+            exit 1
+          fi
+      - name: Doc tests
+        if: runner.os == 'Linux'
+        run: cargo test --doc --all-features
+      - name: WebRTC Direct five-node devnet (ignored by default)
+        if: runner.os == 'Linux'
+        run: >-
+          cargo test --test webrtc_direct_devnet --features test-utils
+          -- --ignored --test-threads=1
+      - name: Unit tests without default features (no logging, no webrtc-direct)
+        if: runner.os == 'Linux'
+        run: cargo test --lib --no-default-features
+      # The run-directory tests that mount a tmpfs and bind mounts inside run
+      # directories, make directories another user owns, or act as another
+      # user. They need root, which the runner gives through sudo, so
+      # `cargo test` alone skips them.
+      - name: ant-devnet run directories against real mounts and other users
         if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --test storage_scale --features test-utils -- --nocapture --test-threads=1 2>&1 | tee /tmp/scale.log
-          # A target whose required features are not passed is skipped with a
-          # warning and a zero exit, so a harness can stop running without anyone
-          # noticing. This is what makes that loud.
-          grep -qE 'test result: ok\. [1-9]' /tmp/scale.log \
-            || { echo 'scale ran no tests'; exit 1; }
-      - name: Run browser RPC privacy regressions
-        run: cargo test --test webrtc_direct_devnet
-      - name: Run e2e tests
-        run: cargo test --test e2e --features test-utils -- --test-threads=1
-      - name: Run v12 storage-bound audit attack PoCs
-        run: cargo test --test poc_commitment_audit_attacks --features test-utils
-      - name: Run v12 live audit-handler tests
-        run: cargo test --test poc_audit_handler_live --features test-utils
-      - name: Run bootstrap-stall PoC regression marker
-        run: cargo test --test poc_bootstrap_stall --features test-utils
+          cargo test --lib --features test-utils with_sudo_ -- --ignored --test-threads=1 2>&1 | tee /tmp/run_dir_sudo.log
+          grep -qE 'test result: ok\. [1-9]' /tmp/run_dir_sudo.log \
+            || { echo 'the run-directory sudo tests ran nothing'; exit 1; }
 
   filesystems:
     name: Storage on ${{ matrix.fs }}
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -159,92 +233,56 @@ jobs:
           grep -qE 'test result: ok\. [1-9]' /tmp/storage.log \
             || { echo 'the storage tests ran nothing'; exit 1; }
 
-  doc:
-    name: Documentation
-    runs-on: ubuntu-latest
+  # PR CI used to build `--release --no-default-features` on three OSes, a
+  # configuration nobody ships. This builds the Linux x64 archive's binary the
+  # way release.yml does (default features, musl, via cross), so a dependency
+  # that breaks under musl or cross shows up on the PR rather than at the tag.
+  # The test jobs already compile default features on macOS and Windows.
+  build-release:
+    name: Build release (x86_64-unknown-linux-musl)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
-      - name: Build documentation
-        run: cargo doc --all-features --no-deps
-        env:
-          RUSTDOCFLAGS: "-D warnings"
-
-  build:
-    name: Build (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build release (no logging)
-        run: cargo build --release --no-default-features
+        with:
+          key: x86_64-unknown-linux-musl
+      - name: Install cross (as release.yml does)
+        run: cargo install cross --git https://github.com/cross-rs/cross
+      - name: Build
+        run: cross build --release --target x86_64-unknown-linux-musl
       # The crash harness drives the store through a failpoint that parks the process
       # forever on an environment variable, and the store's own tests use the same one. It
-      # is compiled only under `test-utils`, which
-      # is not a default feature and is not passed by the release workflow, so a shipped
-      # binary does not contain it. This proves that rather than trusting it: the variable
-      # name is a string literal, so it survives into the binary whenever the code that
-      # reads it is compiled, and its absence is the absence of the failpoint.
-      - name: A shipped binary carries no failpoint
-        if: runner.os == 'Linux'
+      # is compiled only under `test-utils`, which is not a default feature and is not
+      # passed by the release workflow, so a shipped binary does not contain it. This proves
+      # that on the binary that ships rather than trusting it: the variable name is a string
+      # literal, so it survives into the binary (stripping removes symbols, not string data)
+      # whenever the code that reads it is compiled, and its absence is the absence of the
+      # failpoint. The exact number is one per failpoint and is deliberately not asserted,
+      # so that adding a failpoint does not fail this check.
+      - name: The shipped binary carries no failpoint
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --bin ant-node
-          found=$(strings -a target/debug/ant-node | grep -c 'ANT_HALT_' || true)
-          # With --features test-utils this count is not zero, which is what makes a zero
-          # here evidence rather than an accident of how the binary was stripped. The exact
-          # number is one per failpoint and is deliberately not asserted, so that adding a
-          # failpoint does not fail this check.
+          bin=target/x86_64-unknown-linux-musl/release/ant-node
+          ls -la "$bin"
+          found=$(strings -a "$bin" | grep -c 'ANT_HALT_' || true)
           if [ "$found" != "0" ]; then
-            echo "the publish failpoint is compiled into a default-feature build"
+            echo "the publish failpoint is compiled into the release build"
             exit 1
           fi
-          echo "no failpoint in a default-feature build"
+          echo "no failpoint in the release build"
 
-  test-no-logging:
-    name: Test (no logging)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@v1
-        with:
-          version: ${{ env.FOUNDRY_VERSION }}
-      # Compile without cfg(test) too: browser unit tests can otherwise hide
-      # unused helpers whose production callers require webrtc-direct.
-      - name: Check library without default features
-        run: cargo check --lib --no-default-features --locked
-      - name: Run unit tests without logging
-        run: cargo test --lib --no-default-features
-
-  browser-devnet:
-    name: WebRTC Direct five-node devnet
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@v1
-        with:
-          version: ${{ env.FOUNDRY_VERSION }}
-      - name: Run persistent-session discovery and transfer test
-        run: >-
-          cargo test --test webrtc_direct_devnet --features test-utils
-          -- --ignored --test-threads=1
-
+  # Kept outside CI Gate until V2-1800 settles how advisories are handled: an
+  # advisory comes from the RustSec database, not from the PR, so today this
+  # reds every PR (RUSTSEC-2026-0387, V2-1743).
   security:
     name: Security Audit
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -252,3 +290,19 @@ jobs:
         run: cargo install cargo-audit
       - name: Run security audit
         run: cargo audit
+
+  # The single check that says whether a PR is green. It fails unless every job
+  # it needs succeeded; a skipped or cancelled job counts as a failure.
+  gate:
+    name: CI Gate
+    if: always()
+    needs: [quick-checks, msrv, notices, test, filesystems, build-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every required job succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          echo "$NEEDS" | jq -e 'to_entries | all(.value.result == "success")' > /dev/null

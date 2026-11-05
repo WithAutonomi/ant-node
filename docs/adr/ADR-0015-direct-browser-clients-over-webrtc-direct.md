@@ -321,6 +321,66 @@ Counters survive shutdown; live connection entries are removed on close or owner
 Unexpected UDP-driver termination wakes accept and ends the accept loop rather
 than repeatedly logging errors while reporting a live listener.
 
+Snapshots are also logged, so a fleet node's browser-listener pressure is
+visible without a diagnostics consumer. The listener task emits
+`webrtc listener summary (cumulative)` at INFO on target
+`ant_node::web_rtc::traffic` every `WEBRTC_SUMMARY_INTERVAL_SECS` (300 s, the
+cadence of the replication and chunk-RPC summaries), in two lines sharing that
+target and message and told apart by `group`. `group = 1` carries the
+application listener: `running`, the live-versus-configured gauges
+(`active_connections`/`max_connections`, `active_channels`/`max_channels`,
+`active_requests`/`max_concurrent_requests`,
+`in_flight_bytes`/`max_in_flight_bytes`,
+`bulk_slots_in_use`/`bulk_slots_max`), the rejection and error counters
+(`connection_rejections`, `channel_rejections`, `request_rejections`,
+`rate_rejections`, `byte_rejections`, `listener_errors`, `connection_errors`,
+`channel_errors`, `task_failures`), and the browser GET latency counters
+(`get_service_count`, `get_service_total_ms`, `get_service_max_ms`,
+`get_service_failures`, `bulk_wait_count`, `bulk_wait_total_ms`,
+`bulk_wait_max_ms`). `group = 2` carries the transport beneath it, each key
+prefixed `transport_`: `active_connections`, `connecting_connections`,
+`connection_attempts`, `successful_connections`, `failed_connections`,
+`closed_connections`, `disconnections`, `rejected_connections`,
+`listener_errors`, `bytes_sent`, `bytes_received`.
+
+The fields fall into four classes, and only one of them may be differenced.
+Field names are a query contract and are never renamed.
+
+- **Additive counters**, accumulated since process start: the rejection and
+  handler-error counts, `get_service_count`, `get_service_total_ms`,
+  `get_service_failures`, `bulk_wait_count`, `bulk_wait_total_ms`, and every
+  `transport_` field except the two active/connecting gauges. These are the
+  only fields a query may diff for a rate. Mean browser GET latency over an
+  interval is the `get_service_total_ms` diff divided by the
+  `get_service_count` diff; mean bulk-slot wait is the same over
+  `bulk_wait_count`.
+- **Instantaneous gauges**, sampled when the line is emitted: `running`,
+  `active_connections`, `active_channels`, `active_requests`,
+  `in_flight_bytes`, `bulk_slots_in_use`, `transport_active_connections` and
+  `transport_connecting_connections`. These are levels, not totals.
+  Differencing them reports a meaningless rate; read the level, or average it
+  across the window.
+- **Lifetime maxima**: `get_service_max_ms` and `bulk_wait_max_ms` are
+  high-water marks that are never reset, so they only rise. A diff of either
+  is 0 for every window that does not beat the all-time worst case, so
+  differencing them conceals sustained high latency rather than revealing it.
+  Alert on the counter-derived mean above, and read these two as the worst
+  case seen since process start.
+- **Configured capacities**, constant for the life of the process:
+  `max_connections`, `max_channels`, `max_concurrent_requests`,
+  `max_in_flight_bytes` and `bulk_slots_max`. They ride along so a gauge can
+  be read as a fraction of its limit without consulting the node's config.
+
+GET service time is measured from the spawned request worker starting to its
+response being prepared, so it includes the wait for the source and global
+bulk-response slots that `bulk_wait_*` reports on its own — the queueing that
+V2-1795 could not see in production logs. That start is deliberately not
+request admission: the request permit, frame assembly and decryption all
+complete before the worker is spawned, so none of them are inside this
+measurement. A GET whose processing errors is
+counted in `get_service_failures` only, and is absent from
+`get_service_count` and the service-time totals.
+
 These are internal diagnostics, without a new HTTP endpoint or relay/reachability
 probes. A running listener is not proof of external connectivity. Traffic counts
 exclude UDP/DTLS/SCTP overhead. RTT and packet loss are unavailable (`None`),
@@ -740,7 +800,9 @@ address, and this implementation has no WebRTC relay transport. An endpoint
 that cannot be reached is simply a failed browser dial and is suppressed by
 the negative-endpoint cache. Supporting NATed WebRTC nodes would require a
 separate signaling and relay design; it is not represented by the current
-reachability field.
+reachability field. [ADR-0027](./ADR-0027-map-the-browser-listener-port-through-upnp.md)
+maps a wildcard listener's port through the local gateway's UPnP where it allows
+one, which makes nodes behind such routers directly reachable.
 
 ### Implemented proof-of-concept slice
 

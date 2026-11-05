@@ -122,12 +122,18 @@ self_encryption = { version = "0.36", optional = true }
 libc = "0.2"
 # Safe wrappers for `openat`/`unlinkat`, so the storage-migration cleanup can delete relative
 # to a directory handle it opened `O_NOFOLLOW` rather than by re-resolving a path it has
-# already checked. Adds nothing to the build: `tempfile`, a direct dependency, already pulls
-# this exact crate and version in with the `fs` feature on.
-rustix = { version = "1", features = ["fs"] }
+# already checked. Adds no crate to the build: `tempfile`, a direct dependency, already pulls
+# this exact crate and version in with the `fs` feature on. `process` is for `geteuid`, which
+# the devnet uses to tell a run directory it created from one another user put in its place.
+rustix = { version = "1", features = ["fs", "process"] }
 
 [target.'cfg(windows)'.dependencies]
 self-replace = "1"
+# The volume serial number and file index of a directory handle, which tells
+# a devnet run directory from a copy put in its place. Already in Cargo.lock
+# (through walkdir), and what it needs, windows-sys 0.48, already ships in the
+# Windows build through `directories`.
+winapi-util = "0.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
@@ -213,6 +219,13 @@ webrtc-direct = [
     "saorsa-transport/default",
     "saorsa-transport/webrtc-direct",
 ]
+
+[patch.crates-io]
+# ADR-0020 (V2-1358): saorsa-core's closer-peers encoding and
+# ant-protocol's get-or-closer request, each rebased onto its main. Drop
+# both once releases include them.
+saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core", rev = "c3c4c81e63db7e3048f488f7cf0fec4cff3131d4" }
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", rev = "0c6ae27b6261227a32e6fe0f976163c42bde960e" }
 
 [profile.release]
 lto = true

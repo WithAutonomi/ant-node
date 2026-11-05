@@ -91,5 +91,5 @@ mod verify_storage_gate;
 mod settlement_version_gate;
 
 pub use anvil::TestAnvil;
-pub use harness::TestHarness;
+pub use harness::{TestHarness, NEARLY_FULL_DISK, ROOMY_DISK};
 pub use testnet::{NetworkState, NodeState, TestNetwork, TestNetworkConfig, TestNode};

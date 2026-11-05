@@ -25,11 +25,17 @@ pub struct Cli {
     #[arg(long)]
     pub base_port: Option<u16>,
 
-    /// Data directory for node state.
+    /// Directory to create this run's own data directory in (default:
+    /// `devnets/` in the ant data root). The run directory is removed on
+    /// shutdown unless `--no-cleanup` is set; this directory, and anything else
+    /// in it, never is. Run directories left here by runs that were killed
+    /// are removed when the next run starts. On Unix only you and root may be
+    /// able to change it, or any directory above it.
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
 
-    /// Keep node data directories on shutdown instead of removing them.
+    /// Keep this run's data directory on shutdown. Later runs leave it alone
+    /// too.
     #[arg(long)]
     pub no_cleanup: bool,
 

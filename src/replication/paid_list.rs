@@ -1,13 +1,16 @@
 //! Persistent `PaidForList` backed by LMDB.
 //!
 //! Tracks keys this node believes are paid-authorized. Survives restarts
-//! (Invariant 15). Bounded by `PaidCloseGroup` membership with
-//! hysteresis-based pruning.
+//! (Invariant 15). A retained record keeps the entry that authorises its repair,
+//! so entries stay until the list nears its store's capacity (ADR-0028). Then
+//! entries far outside this node's range go first, and those of records it still
+//! stores stay.
 //!
 //! ## Storage layout
 //!
 //! ```text
-//! {root}/paid_list.mdb/   -- LMDB environment directory
+//! {root}/paid_list.mdb/           -- LMDB environment directory
+//! {root}/record_out_of_range.bin  -- saved `RecordOutOfRangeFirstSeen` clocks
 //! ```
 //!
 //! One unnamed database stores set membership: key = 32-byte `XorName`,
@@ -15,29 +18,26 @@
 //! payment the price floor contested here (ADR-0006). Releases before that
 //! marker only ever test presence, so they read a marked key as paid. The
 //! marked keys are also held in memory, so hint construction never scans the
-//! database for them.
-//!
-//! ## Out-of-range timestamps
-//!
-//! Per-key `PaidOutOfRangeFirstSeen` and `RecordOutOfRangeFirstSeen`
-//! timestamps live in memory only. On restart the hysteresis clock
-//! restarts from zero, which is safe: the prune timer simply starts
-//! fresh.
+//! database for them. Keys sort by their bytes, so the keys sharing a prefix
+//! with a given key are one contiguous range.
 
 use crate::ant_protocol::XorName;
 use crate::error::{Error, Result};
-use crate::logging::{debug, info, trace, warn};
+use crate::logging::{debug, error, info, trace, warn};
+use crate::replication::config::{PAID_LIST_MAP_SIZE, PAID_LIST_NEAR_MARGIN_BITS};
+use crate::replication::out_of_range_clocks::OutOfRangeClocks;
 use heed::types::Bytes;
 #[cfg(test)]
 use heed::WithTls;
-use heed::{Database, Env, EnvOpenOptions, RoTxn};
+use heed::{Database, Env, EnvOpenOptions, MdbError, RoTxn};
 use parking_lot::{Mutex, RwLock};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+use std::ops::Bound;
 use std::path::Path;
 use std::slice;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::SystemTime;
 use tokio::task::spawn_blocking;
 use tokio_util::task::TaskTracker;
 
@@ -47,15 +47,113 @@ use crate::ant_protocol::XORNAME_LEN;
 /// `fresh::record_paid_key`).
 const PRICE_CONTESTED_VALUE: &[u8] = &[1];
 
-/// Default LMDB map size for the paid list: 256 MiB.
-///
-/// The paid list stores only 32-byte keys with empty or one-byte values, so
-/// this is generous even for very large close-group memberships.
-const DEFAULT_MAP_SIZE: usize = 256 * 1_024 * 1_024;
+/// Bits in one byte of a key.
+const BITS_PER_BYTE: usize = 8;
 
-/// What the open task returns: the environment, the database and the keys
-/// marked price-contested in it, if they could be read.
-type OpenedPaidList = (Env, Database<Bytes, Bytes>, Result<HashSet<XorName>>);
+/// Bits in a key. A key is near any other within this many low bits.
+pub const XORNAME_BITS: usize = XORNAME_LEN * BITS_PER_BYTE;
+
+/// File under the root directory holding saved record clocks.
+const RECORD_CLOCKS_FILE: &str = "record_out_of_range.bin";
+
+/// How many low bits of a key may differ from this node's for the key to count
+/// as near it, given the distance to its farthest paid-close-group peer.
+///
+/// The margin covers the usual difference in peer density between here and the
+/// key. With evenly spread IDs, neither this node nor any of its neighbours is in
+/// the paid close group of a key beyond it. Where few peers are known near a key,
+/// one of them still can be.
+#[must_use]
+pub fn near_bits_for_radius(radius: &XorName) -> usize {
+    let significant = radius
+        .iter()
+        .enumerate()
+        .find(|(_, byte)| **byte != 0)
+        .map_or(0, |(index, byte)| {
+            (XORNAME_LEN - index) * BITS_PER_BYTE - byte.leading_zeros() as usize
+        });
+    (significant + PAID_LIST_NEAR_MARGIN_BITS).min(XORNAME_BITS)
+}
+
+/// Mutable access to bit `bit` of `key`, counted from the least significant:
+/// its byte's index and its mask.
+const fn bit_position(bit: usize) -> (usize, u8) {
+    (
+        XORNAME_LEN - 1 - bit / BITS_PER_BYTE,
+        1 << (bit % BITS_PER_BYTE),
+    )
+}
+
+/// The inclusive range of keys sharing all but the low `free_bits` bits with `key`.
+fn prefix_range(key: &XorName, free_bits: usize) -> (XorName, XorName) {
+    let (mut low, mut high) = (*key, *key);
+    for bit in 0..free_bits.min(XORNAME_BITS) {
+        let (index, mask) = bit_position(bit);
+        if let (Some(low_byte), Some(high_byte)) = (low.get_mut(index), high.get_mut(index)) {
+            *low_byte &= !mask;
+            *high_byte |= mask;
+        }
+    }
+    (low, high)
+}
+
+/// The key ranges outside the `near_bits` around `center`, farthest first: each
+/// holds the keys whose highest bit differing from `center` is one given bit.
+fn far_ranges(center: &XorName, near_bits: usize) -> impl Iterator<Item = (XorName, XorName)> {
+    let center = *center;
+    (near_bits.min(XORNAME_BITS)..XORNAME_BITS)
+        .rev()
+        .map(move |bit| {
+            let mut flipped = center;
+            let (index, mask) = bit_position(bit);
+            if let Some(byte) = flipped.get_mut(index) {
+                *byte ^= mask;
+            }
+            prefix_range(&flipped, bit)
+        })
+}
+
+/// Call `visit` with each key from `low` to `high`, until it returns `false`.
+/// Returns whether it was never told to stop.
+fn visit_range(
+    db: Database<Bytes, Bytes>,
+    rtxn: &RoTxn<'_>,
+    (low, high): (&XorName, &XorName),
+    mut visit: impl FnMut(XorName) -> bool,
+) -> Result<bool> {
+    let bounds = (
+        Bound::Included(low.as_slice()),
+        Bound::Included(high.as_slice()),
+    );
+    let iter = db
+        .range(rtxn, &bounds)
+        .map_err(|e| Error::Storage(format!("Failed to iterate paid-list: {e}")))?;
+    for result in iter {
+        let (key_bytes, _) =
+            result.map_err(|e| Error::Storage(format!("Failed to read paid-list entry: {e}")))?;
+        let Ok(key) = XorName::try_from(key_bytes) else {
+            warn!(
+                "PaidList: skipping entry with unexpected key length {} (expected {XORNAME_LEN})",
+                key_bytes.len()
+            );
+            continue;
+        };
+        if !visit(key) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// What the open task returns: the environment, the database, the saved record
+/// clocks and the keys marked price-contested in the database, if they could
+/// be read.
+type OpenedPaidList = (
+    Env,
+    Database<Bytes, Bytes>,
+    OutOfRangeClocks,
+    Result<HashSet<XorName>>,
+);
 
 /// Every key whose entry in `db` carries the price-contested mark.
 fn read_price_contested_keys(db: &Database<Bytes, Bytes>, txn: &RoTxn) -> Result<HashSet<XorName>> {
@@ -118,15 +216,10 @@ pub struct PaidList {
     /// Mark reads that have failed since the last one that succeeded, so a
     /// run of failures is logged once (see `counts_as_price_contested`).
     failed_mark_reads: AtomicU64,
-    /// In-memory: when each paid key first went out of `PaidCloseGroup` range.
-    /// Cleared on restart (safe: hysteresis clock restarts from zero).
-    paid_out_of_range: RwLock<HashMap<XorName, Instant>>,
-    /// In-memory: when each stored record first went out of
-    /// storage-responsibility range.
-    record_out_of_range: RwLock<HashMap<XorName, Instant>>,
-    /// Cursor used by paid-list pruning to rotate through expired entries when
-    /// the per-pass remote confirmation cap is exhausted.
-    paid_prune_cursor: RwLock<usize>,
+    /// When each stored record first went out of storage-responsibility range.
+    record_out_of_range: OutOfRangeClocks,
+    /// Whether a full store has been reported, so it is reported only once.
+    full_reported: AtomicBool,
     /// Tracks every paid-list LMDB blocking task.
     ///
     /// Same rationale as `ChunkStore::blocking_tracker`: a `spawn_blocking`
@@ -151,44 +244,52 @@ impl PaidList {
             .map_err(|e| Error::Storage(format!("Failed to create paid-list directory: {e}")))?;
 
         let env_dir_clone = env_dir.clone();
+        let record_clocks_path = root_dir.join(RECORD_CLOCKS_FILE);
         // Constructor-only blocking task: it runs before `self` (and its
         // `blocking_tracker`) exists, so it is deliberately untracked.  The
         // constructor awaits it right here, so it cannot outlive this call.
-        let (env, db, price_contested) = spawn_blocking(move || -> Result<OpenedPaidList> {
-            // SAFETY: `EnvOpenOptions::open()` is unsafe because LMDB uses
-            // memory-mapped I/O and relies on OS file-locking to prevent
-            // corruption from concurrent access by multiple processes. We
-            // satisfy this by giving each node instance a unique `root_dir`
-            // (typically named by its full 64-hex peer ID), ensuring no two
-            // processes open the same LMDB environment.
-            let env = unsafe {
-                EnvOpenOptions::new()
-                    .map_size(DEFAULT_MAP_SIZE)
-                    .max_dbs(1)
-                    .open(&env_dir_clone)
-                    .map_err(|e| {
-                        Error::Storage(format!("Failed to open paid-list LMDB env: {e}"))
-                    })?
-            };
+        let (env, db, record_out_of_range, price_contested) =
+            spawn_blocking(move || -> Result<OpenedPaidList> {
+                // SAFETY: `EnvOpenOptions::open()` is unsafe because LMDB uses
+                // memory-mapped I/O and relies on OS file-locking to prevent
+                // corruption from concurrent access by multiple processes. We
+                // satisfy this by giving each node instance a unique `root_dir`
+                // (typically named by its full 64-hex peer ID), ensuring no two
+                // processes open the same LMDB environment.
+                let env = unsafe {
+                    EnvOpenOptions::new()
+                        .map_size(PAID_LIST_MAP_SIZE)
+                        .max_dbs(1)
+                        .open(&env_dir_clone)
+                        .map_err(|e| {
+                            Error::Storage(format!("Failed to open paid-list LMDB env: {e}"))
+                        })?
+                };
 
-            let mut wtxn = env
-                .write_txn()
-                .map_err(|e| Error::Storage(format!("Failed to create write txn: {e}")))?;
-            let db: Database<Bytes, Bytes> = env
-                .create_database(&mut wtxn, None)
-                .map_err(|e| Error::Storage(format!("Failed to create paid-list database: {e}")))?;
-            wtxn.commit()
-                .map_err(|e| Error::Storage(format!("Failed to commit db creation: {e}")))?;
-            // A failed read leaves its transaction unable to commit, so the
-            // scan gets one of its own, dropped uncommitted. A write
-            // transaction takes no reader slot on this thread.
-            let price_contested = env
-                .write_txn()
-                .map_err(|e| Error::Storage(format!("Failed to create write txn: {e}")))
-                .and_then(|scan| read_price_contested_keys(&db, &scan));
+                let mut wtxn = env
+                    .write_txn()
+                    .map_err(|e| Error::Storage(format!("Failed to create write txn: {e}")))?;
+                let db: Database<Bytes, Bytes> =
+                    env.create_database(&mut wtxn, None).map_err(|e| {
+                        Error::Storage(format!("Failed to create paid-list database: {e}"))
+                    })?;
+                wtxn.commit()
+                    .map_err(|e| Error::Storage(format!("Failed to commit db creation: {e}")))?;
+                // A failed read leaves its transaction unable to commit, so the
+                // scan gets one of its own, dropped uncommitted. A write
+                // transaction takes no reader slot on this thread.
+                let price_contested = env
+                    .write_txn()
+                    .map_err(|e| Error::Storage(format!("Failed to create write txn: {e}")))
+                    .and_then(|scan| read_price_contested_keys(&db, &scan));
 
-            Ok((env, db, price_contested))
-        })
+                Ok((
+                    env,
+                    db,
+                    OutOfRangeClocks::load(record_clocks_path),
+                    price_contested,
+                ))
+            })
         .await
         .map_err(|e| Error::Storage(format!("Paid-list init task failed: {e}")))??;
         // A paid list whose marks cannot be read still opens; the node then
@@ -209,9 +310,8 @@ impl PaidList {
             price_contested: Arc::new(RwLock::new(price_contested)),
             write_order: Arc::new(Mutex::new(())),
             failed_mark_reads: AtomicU64::new(0),
-            paid_out_of_range: RwLock::new(HashMap::new()),
-            record_out_of_range: RwLock::new(HashMap::new()),
-            paid_prune_cursor: RwLock::new(0),
+            record_out_of_range,
+            full_reported: AtomicBool::new(false),
             blocking_tracker: TaskTracker::new(),
         };
 
@@ -262,33 +362,22 @@ impl PaidList {
 
         let was_new = self
             .blocking_tracker
-            .spawn_blocking(move || -> Result<bool> {
+            .spawn_blocking(move || -> heed::Result<bool> {
                 let ordered = write_order.lock();
-                let mut wtxn = env
-                    .write_txn()
-                    .map_err(|e| Error::Storage(format!("Failed to create write txn: {e}")))?;
+                let mut wtxn = env.write_txn()?;
 
                 // Authoritative existence check inside the serialized write txn.
-                if db
-                    .get(&wtxn, &key_owned)
-                    .map_err(|e| {
-                        Error::Storage(format!("Failed to check paid-list existence: {e}"))
-                    })?
-                    .is_some()
-                {
+                if db.get(&wtxn, &key_owned)?.is_some() {
                     return Ok(false);
                 }
 
-                db.put(&mut wtxn, &key_owned, value)
-                    .map_err(|e| Error::Storage(format!("Failed to insert into paid-list: {e}")))?;
+                db.put(&mut wtxn, &key_owned, value)?;
                 if !value.is_empty() {
                     if let Some(keys) = price_contested.write().as_mut() {
                         Arc::make_mut(keys).insert(key_owned);
                     }
                 }
-                wtxn.commit().map_err(|e| {
-                    Error::Storage(format!("Failed to commit paid-list insert: {e}"))
-                })?;
+                wtxn.commit()?;
                 if value.is_empty() {
                     unmark_in_memory(&price_contested, slice::from_ref(&key_owned));
                 }
@@ -297,7 +386,8 @@ impl PaidList {
                 Ok(true)
             })
             .await
-            .map_err(|e| Error::Storage(format!("Paid-list insert task failed: {e}")))??;
+            .map_err(|e| Error::Storage(format!("Paid-list insert task failed: {e}")))?
+            .map_err(|e| self.insert_error(&e))?;
 
         if was_new {
             debug!(
@@ -381,9 +471,23 @@ impl PaidList {
         }
     }
 
+    /// Describe a failed insert. A full store is also reported, once, as an
+    /// error: from then on the node can't record that a new key was paid for.
+    fn insert_error(&self, e: &heed::Error) -> Error {
+        if matches!(e, heed::Error::Mdb(MdbError::MapFull))
+            && !self.full_reported.swap(true, Ordering::Relaxed)
+        {
+            error!(
+                "Paid-list store is full ({PAID_LIST_MAP_SIZE} bytes): new paid keys are not recorded"
+            );
+        }
+        Error::Storage(format!("Failed to insert into paid-list: {e}"))
+    }
+
     /// Remove a key from the paid-for set.
     ///
-    /// Also clears any in-memory out-of-range timestamps for this key.
+    /// Its `RecordOutOfRangeFirstSeen` timestamp stays: a record's eligibility
+    /// to be erased doesn't depend on its paid-list entry.
     ///
     /// Returns `true` if the key existed and was removed, `false` otherwise.
     ///
@@ -418,8 +522,6 @@ impl PaidList {
             .map_err(|e| Error::Storage(format!("Paid-list remove task failed: {e}")))??;
 
         if existed {
-            self.paid_out_of_range.write().remove(key);
-            self.record_out_of_range.write().remove(key);
             debug!("Removed key {} from paid-list", hex::encode(key));
         }
 
@@ -466,63 +568,69 @@ impl PaidList {
         Ok(entries as u64)
     }
 
-    /// Return all keys in the paid-for set.
+    /// The keys sharing all but the low `near_bits` bits with `center`.
     ///
-    /// Used during hint construction to advertise which keys this node holds.
+    /// Reads only those keys, however long the list is. [`XORNAME_BITS`] gives
+    /// every key.
     ///
     /// # Errors
     ///
     /// Returns an error if the LMDB read transaction or iteration fails.
-    pub fn all_keys(&self) -> Result<Vec<XorName>> {
+    pub fn keys_near(&self, center: &XorName, near_bits: usize) -> Result<Vec<XorName>> {
         let rtxn = self
             .env
             .read_txn()
             .map_err(|e| Error::Storage(format!("Failed to create read txn: {e}")))?;
+        let (low, high) = prefix_range(center, near_bits);
         let mut keys = Vec::new();
-        let iter = self
-            .db
-            .iter(&rtxn)
-            .map_err(|e| Error::Storage(format!("Failed to iterate paid-list: {e}")))?;
-        for result in iter {
-            let (key_bytes, _) = result
-                .map_err(|e| Error::Storage(format!("Failed to read paid-list entry: {e}")))?;
-            if key_bytes.len() == XORNAME_LEN {
-                let mut key = [0u8; XORNAME_LEN];
-                key.copy_from_slice(key_bytes);
-                keys.push(key);
-            } else {
-                warn!(
-                    "PaidList: skipping entry with unexpected key length {} (expected {XORNAME_LEN})",
-                    key_bytes.len()
-                );
-            }
-        }
+        visit_range(self.db, &rtxn, (&low, &high), |key| {
+            keys.push(key);
+            true
+        })?;
         Ok(keys)
     }
 
-    /// Record the `PaidOutOfRangeFirstSeen` timestamp for a key.
+    /// Remove up to `limit` entries outside the `near_bits` around `center`,
+    /// farthest first, leaving those `keep` accepts. Returns how many went.
     ///
-    /// Only sets the timestamp if one is not already recorded (first
-    /// observation wins).
-    pub fn set_paid_out_of_range(&self, key: &XorName) {
-        self.paid_out_of_range
-            .write()
-            .entry(*key)
-            .or_insert_with(Instant::now);
-    }
-
-    /// Clear the `PaidOutOfRangeFirstSeen` timestamp for a key.
+    /// # Errors
     ///
-    /// Called when the key moves back into `PaidCloseGroup` range.
-    pub fn clear_paid_out_of_range(&self, key: &XorName) {
-        self.paid_out_of_range.write().remove(key);
-    }
-
-    /// Get the `PaidOutOfRangeFirstSeen` timestamp for a key.
-    ///
-    /// Returns `None` if the key is currently in range (no timestamp set).
-    pub fn paid_out_of_range_since(&self, key: &XorName) -> Option<Instant> {
-        self.paid_out_of_range.read().get(key).copied()
+    /// Returns an error if an LMDB transaction fails.
+    pub async fn evict_far(
+        &self,
+        center: XorName,
+        near_bits: usize,
+        limit: usize,
+        keep: impl Fn(&XorName) -> bool + Send + 'static,
+    ) -> Result<usize> {
+        if limit == 0 {
+            return Ok(0);
+        }
+        let env = self.env.clone();
+        let db = self.db;
+        let evictable = self
+            .blocking_tracker
+            .spawn_blocking(move || -> Result<Vec<XorName>> {
+                let rtxn = env
+                    .read_txn()
+                    .map_err(|e| Error::Storage(format!("Failed to create read txn: {e}")))?;
+                let mut evictable = Vec::new();
+                for (low, high) in far_ranges(&center, near_bits) {
+                    let more = visit_range(db, &rtxn, (&low, &high), |key| {
+                        if !keep(&key) {
+                            evictable.push(key);
+                        }
+                        evictable.len() < limit
+                    })?;
+                    if !more {
+                        break;
+                    }
+                }
+                Ok(evictable)
+            })
+            .await
+            .map_err(|e| Error::Storage(format!("Paid-list eviction scan failed: {e}")))??;
+        self.remove_batch(&evictable).await
     }
 
     /// Record the `RecordOutOfRangeFirstSeen` timestamp for a key.
@@ -530,80 +638,38 @@ impl PaidList {
     /// Only sets the timestamp if one is not already recorded (first
     /// observation wins).
     pub fn set_record_out_of_range(&self, key: &XorName) {
-        self.record_out_of_range
-            .write()
-            .entry(*key)
-            .or_insert_with(Instant::now);
+        self.record_out_of_range.start(key, SystemTime::now());
     }
 
     /// Clear the `RecordOutOfRangeFirstSeen` timestamp for a key.
     ///
     /// Called when the record moves back into storage-responsibility range.
     pub fn clear_record_out_of_range(&self, key: &XorName) {
-        self.record_out_of_range.write().remove(key);
+        self.record_out_of_range.clear(key);
+    }
+
+    /// Forget the `RecordOutOfRangeFirstSeen` timestamp of every key `keep`
+    /// rejects.
+    pub fn retain_record_out_of_range(&self, keep: impl Fn(&XorName) -> bool) {
+        self.record_out_of_range.retain(keep);
+    }
+
+    /// Save the `RecordOutOfRangeFirstSeen` timestamps if they have changed, so
+    /// a restart doesn't restart their clocks.
+    pub async fn persist_record_out_of_range(&self) {
+        self.record_out_of_range.save().await;
     }
 
     /// Get the `RecordOutOfRangeFirstSeen` timestamp for a key.
     ///
     /// Returns `None` if the record is currently in range (no timestamp set).
-    pub fn record_out_of_range_since(&self, key: &XorName) -> Option<Instant> {
-        self.record_out_of_range.read().get(key).copied()
-    }
-
-    /// Starting offset for the next paid-list prune scan.
-    ///
-    /// LMDB iteration order is stable, so a bounded prune pass must rotate its
-    /// verification window or later expired entries can be starved behind
-    /// earlier unconfirmed entries.
-    pub(crate) fn paid_prune_scan_start(&self, paid_key_count: usize) -> usize {
-        if paid_key_count == 0 {
-            return 0;
-        }
-
-        *self.paid_prune_cursor.read() % paid_key_count
-    }
-
-    /// Advance the paid-list prune cursor after one pass.
-    pub(crate) fn advance_paid_prune_cursor(
-        &self,
-        paid_key_count: usize,
-        scan_start: usize,
-        last_selected_offset: Option<usize>,
-    ) {
-        let mut cursor = self.paid_prune_cursor.write();
-        if paid_key_count == 0 {
-            *cursor = 0;
-            return;
-        }
-
-        let advance_by = last_selected_offset.map_or(1, |offset| offset.saturating_add(1));
-        *cursor = (scan_start + advance_by) % paid_key_count;
+    pub fn record_out_of_range_since(&self, key: &XorName) -> Option<SystemTime> {
+        self.record_out_of_range.since(key)
     }
 
     /// Remove multiple keys in a single write transaction.
     ///
-    /// Also clears any in-memory out-of-range timestamps for removed keys.
-    ///
     /// Returns the number of keys that were actually present and removed.
-    ///
-    /// # Cancellation
-    ///
-    /// The delete commits inside `spawn_blocking`, which cancellation cannot
-    /// reach; the timestamp clear below happens only after that await resumes.
-    /// Dropping this future in between therefore leaves keys deleted on disk
-    /// with their `paid_out_of_range` entries still set.
-    ///
-    /// That window is deliberately left open. The only caller is the prune pass
-    /// (`pruning::prune_paid_entries`), reached from `run_neighbor_sync_round`,
-    /// which is awaited inside a `select!` racing the engine's shutdown token —
-    /// so shutdown is the only way to hit it. `paid_out_of_range` is in-memory
-    /// only (never persisted), so the stale entries die with the process that
-    /// cancelled the prune, and a reopened `PaidList` starts with an empty map.
-    ///
-    /// Do NOT "fix" this by clearing the timestamps before the commit: a failed
-    /// commit would then leave a live key with a cleared hysteresis clock,
-    /// restarting its prune countdown from zero. That is a real correctness
-    /// regression in exchange for a window with no observable effect.
     ///
     /// # Errors
     ///
@@ -648,23 +714,6 @@ impl PaidList {
             })
             .await
             .map_err(|e| Error::Storage(format!("Paid-list batch remove task failed: {e}")))??;
-
-        // Clear in-memory timestamps for all removed keys.
-        // Acquire and release each lock separately to minimize hold time.
-        if !removed_keys.is_empty() {
-            {
-                let mut paid_oor = self.paid_out_of_range.write();
-                for key in &removed_keys {
-                    paid_oor.remove(key);
-                }
-            }
-            {
-                let mut record_oor = self.record_out_of_range.write();
-                for key in &removed_keys {
-                    record_oor.remove(key);
-                }
-            }
-        }
 
         let count = removed_keys.len();
         debug!("Batch-removed {count} keys from paid-list");
@@ -736,6 +785,151 @@ mod tests {
             .await
             .expect("create paid list");
         (paid_list, temp_dir)
+    }
+
+    fn key_with_first_byte(first: u8) -> XorName {
+        let mut key = [0u8; 32];
+        key[0] = first;
+        key
+    }
+
+    #[test]
+    fn near_bits_follow_the_radius_plus_the_margin() {
+        let mut radius = [0u8; 32];
+        assert_eq!(near_bits_for_radius(&radius), PAID_LIST_NEAR_MARGIN_BITS);
+
+        radius[31] = 0b0000_0001;
+        assert_eq!(
+            near_bits_for_radius(&radius),
+            1 + PAID_LIST_NEAR_MARGIN_BITS
+        );
+
+        radius[30] = 0b0000_0100;
+        assert_eq!(
+            near_bits_for_radius(&radius),
+            11 + PAID_LIST_NEAR_MARGIN_BITS
+        );
+
+        assert_eq!(near_bits_for_radius(&[0xFF; 32]), XORNAME_BITS);
+    }
+
+    #[test]
+    fn prefix_ranges_free_exactly_the_low_bits() {
+        let key = [0xAB; 32];
+        assert_eq!(prefix_range(&key, 0), (key, key));
+        assert_eq!(prefix_range(&key, XORNAME_BITS), ([0x00; 32], [0xFF; 32]));
+
+        let (low, high) = prefix_range(&key, 12);
+        let mut expected_low = key;
+        expected_low[30] = 0xA0;
+        expected_low[31] = 0x00;
+        let mut expected_high = key;
+        expected_high[30] = 0xAF;
+        expected_high[31] = 0xFF;
+        assert_eq!((low, high), (expected_low, expected_high));
+    }
+
+    #[test]
+    fn far_ranges_run_farthest_first_and_stop_at_the_near_range() {
+        let center = [0u8; 32];
+        let near_bits = XORNAME_BITS - 3;
+        let ranges: Vec<_> = far_ranges(&center, near_bits).collect();
+        let lows: Vec<u8> = ranges.iter().map(|(low, _)| low[0]).collect();
+        let highs: Vec<u8> = ranges.iter().map(|(_, high)| high[0]).collect();
+        assert_eq!(lows, vec![0x80, 0x40, 0x20]);
+        assert_eq!(highs, vec![0xFF, 0x7F, 0x3F]);
+        assert_eq!(far_ranges(&center, XORNAME_BITS).count(), 0);
+    }
+
+    #[tokio::test]
+    async fn keys_near_reads_only_the_keys_around_the_center() {
+        let (pl, _temp) = create_test_paid_list().await;
+        let center = key_with_first_byte(0x40);
+        let (near, far) = (key_with_first_byte(0x41), key_with_first_byte(0xC0));
+        pl.insert(&near).await.expect("insert");
+        pl.insert(&far).await.expect("insert");
+
+        let near_bits = XORNAME_BITS - 4;
+        assert_eq!(pl.keys_near(&center, near_bits).expect("keys"), vec![near]);
+    }
+
+    #[tokio::test]
+    async fn eviction_takes_the_farthest_first_up_to_its_limit() {
+        let (pl, _temp) = create_test_paid_list().await;
+        let center = [0u8; 32];
+        let near_bits = XORNAME_BITS - 2;
+        let (near, mid, far) = (
+            key_with_first_byte(0x01),
+            key_with_first_byte(0x40),
+            key_with_first_byte(0x80),
+        );
+        for key in [near, mid, far] {
+            pl.insert(&key).await.expect("insert");
+        }
+
+        let evicted = pl
+            .evict_far(center, near_bits, 1, |_| false)
+            .await
+            .expect("evict");
+        assert_eq!(evicted, 1);
+        assert!(
+            !pl.contains(&far).expect("contains"),
+            "the farthest goes first"
+        );
+        assert!(pl.contains(&mid).expect("contains"));
+
+        let evicted = pl
+            .evict_far(center, near_bits, 10, |_| false)
+            .await
+            .expect("evict");
+        assert_eq!(evicted, 1, "only the far entry was left to evict");
+        assert!(pl.contains(&near).expect("contains"), "near entries stay");
+    }
+
+    #[tokio::test]
+    async fn eviction_leaves_what_the_caller_keeps() {
+        let (pl, _temp) = create_test_paid_list().await;
+        let (kept, evicted_key) = (key_with_first_byte(0x80), key_with_first_byte(0x81));
+        pl.insert(&kept).await.expect("insert");
+        pl.insert(&evicted_key).await.expect("insert");
+
+        let near_bits = XORNAME_BITS - 1;
+        let evicted = pl
+            .evict_far([0u8; 32], near_bits, 10, move |key| *key == kept)
+            .await
+            .expect("evict");
+
+        assert_eq!(evicted, 1);
+        assert!(pl.contains(&kept).expect("contains"));
+        assert!(!pl.contains(&evicted_key).expect("contains"));
+    }
+
+    #[tokio::test]
+    async fn nothing_is_evicted_when_every_key_counts_as_near() {
+        let (pl, _temp) = create_test_paid_list().await;
+        let key = key_with_first_byte(0x80);
+        pl.insert(&key).await.expect("insert");
+
+        let evicted = pl
+            .evict_far([0u8; 32], XORNAME_BITS, 10, |_| false)
+            .await
+            .expect("evict");
+
+        assert_eq!(evicted, 0);
+        assert!(pl.contains(&key).expect("contains"));
+    }
+
+    /// The store's file grows with its entries instead of taking the whole map
+    /// up front, on every platform this runs on.
+    #[tokio::test]
+    async fn opening_the_store_does_not_allocate_the_whole_map() {
+        let (pl, temp) = create_test_paid_list().await;
+        pl.insert(&[0x01; 32]).await.expect("insert");
+
+        let data_file = temp.path().join("paid_list.mdb").join("data.mdb");
+        let size = std::fs::metadata(data_file).expect("metadata").len();
+        let map_size = u64::try_from(PAID_LIST_MAP_SIZE).expect("map size fits");
+        assert!(size < map_size, "file is {size} bytes, map {map_size}");
     }
 
     #[tokio::test]
@@ -1122,7 +1316,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_all_keys() {
+    async fn keys_near_with_every_bit_free_gives_every_key() {
         let (pl, _temp) = create_test_paid_list().await;
 
         let key_a: XorName = [0x01; 32];
@@ -1133,7 +1327,7 @@ mod tests {
         pl.insert(&key_b).await.expect("insert 2");
         pl.insert(&key_c).await.expect("insert 3");
 
-        let mut keys = pl.all_keys().expect("all_keys");
+        let mut keys = pl.keys_near(&[0u8; 32], XORNAME_BITS).expect("keys");
         keys.sort_unstable();
 
         let mut expected = vec![key_a, key_b, key_c];
@@ -1162,39 +1356,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_paid_out_of_range_timestamps() {
-        let (pl, _temp) = create_test_paid_list().await;
-
-        let key: XorName = [0xF0; 32];
-
-        // Initially no timestamp.
-        assert!(pl.paid_out_of_range_since(&key).is_none());
-
-        // Set timestamp.
-        let before = Instant::now();
-        pl.set_paid_out_of_range(&key);
-        let after = Instant::now();
-
-        let ts = pl
-            .paid_out_of_range_since(&key)
-            .expect("timestamp should exist");
-        assert!(ts >= before);
-        assert!(ts <= after);
-
-        // Setting again should not update (first observation wins).
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        pl.set_paid_out_of_range(&key);
-        let ts2 = pl
-            .paid_out_of_range_since(&key)
-            .expect("timestamp should still exist");
-        assert_eq!(ts, ts2);
-
-        // Clear.
-        pl.clear_paid_out_of_range(&key);
-        assert!(pl.paid_out_of_range_since(&key).is_none());
-    }
-
-    #[tokio::test]
     async fn test_record_out_of_range_timestamps() {
         let (pl, _temp) = create_test_paid_list().await;
 
@@ -1202,9 +1363,9 @@ mod tests {
 
         assert!(pl.record_out_of_range_since(&key).is_none());
 
-        let before = Instant::now();
+        let before = SystemTime::now();
         pl.set_record_out_of_range(&key);
-        let after = Instant::now();
+        let after = SystemTime::now();
 
         let ts = pl
             .record_out_of_range_since(&key)
@@ -1226,20 +1387,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_remove_clears_timestamps() {
+    async fn removing_an_entry_leaves_its_records_clock() {
         let (pl, _temp) = create_test_paid_list().await;
 
         let key: XorName = [0xA0; 32];
         pl.insert(&key).await.expect("insert");
 
-        pl.set_paid_out_of_range(&key);
         pl.set_record_out_of_range(&key);
-        assert!(pl.paid_out_of_range_since(&key).is_some());
         assert!(pl.record_out_of_range_since(&key).is_some());
 
         pl.remove(&key).await.expect("remove");
-        assert!(pl.paid_out_of_range_since(&key).is_none());
-        assert!(pl.record_out_of_range_since(&key).is_none());
+        assert!(
+            pl.record_out_of_range_since(&key).is_some(),
+            "a record's clock doesn't depend on its paid-list entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_clocks_survive_a_reopen() {
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        let (saved, unsaved): (XorName, XorName) = ([0xB0; 32], [0xB1; 32]);
+
+        let saved_clock = {
+            let pl = PaidList::new(temp_dir.path())
+                .await
+                .expect("create paid list");
+            pl.set_record_out_of_range(&saved);
+            pl.persist_record_out_of_range().await;
+            pl.set_record_out_of_range(&unsaved);
+            pl.record_out_of_range_since(&saved).expect("clock set")
+        };
+
+        let pl = PaidList::new(temp_dir.path())
+            .await
+            .expect("reopen paid list");
+        let restored = pl
+            .record_out_of_range_since(&saved)
+            .expect("clock restored");
+        assert!(
+            restored <= saved_clock + std::time::Duration::from_secs(1),
+            "a restored clock must not restart"
+        );
+        assert!(pl.record_out_of_range_since(&unsaved).is_none());
+    }
+
+    #[tokio::test]
+    async fn retaining_record_clocks_forgets_only_rejected_keys() {
+        let (pl, _temp) = create_test_paid_list().await;
+        let (kept, dropped): (XorName, XorName) = ([0xC0; 32], [0xC1; 32]);
+        pl.set_record_out_of_range(&kept);
+        pl.set_record_out_of_range(&dropped);
+
+        pl.retain_record_out_of_range(|key| *key == kept);
+
+        assert!(pl.record_out_of_range_since(&kept).is_some());
+        assert!(pl.record_out_of_range_since(&dropped).is_none());
     }
 
     #[tokio::test]
@@ -1255,8 +1457,6 @@ mod tests {
         pl.insert(&key2).await.expect("insert 2");
         pl.insert(&key3).await.expect("insert 3");
 
-        // Set timestamps to verify they get cleared.
-        pl.set_paid_out_of_range(&key1);
         pl.set_record_out_of_range(&key2);
 
         let removed = pl
@@ -1270,9 +1470,8 @@ mod tests {
         assert!(pl.contains(&key3).expect("key3 still present"));
         assert_eq!(pl.count().expect("count"), 1);
 
-        // Timestamps should be cleared for removed keys.
-        assert!(pl.paid_out_of_range_since(&key1).is_none());
-        assert!(pl.record_out_of_range_since(&key2).is_none());
+        // A record's clock doesn't depend on its paid-list entry.
+        assert!(pl.record_out_of_range_since(&key2).is_some());
     }
 
     #[tokio::test]
@@ -1408,52 +1607,6 @@ mod tests {
         assert!(pl.insert(&key_a).await.expect("insert after wait_idle"));
     }
 
-    #[tokio::test]
-    async fn paid_prune_cursor_advances_past_selected_window() {
-        const PAID_KEY_COUNT: usize = 10;
-        const START_CURSOR: usize = 2;
-        const LAST_SELECTED_OFFSET: usize = 3;
-        const EXPECTED_CURSOR: usize = 6;
-
-        let (pl, _temp) = create_test_paid_list().await;
-        *pl.paid_prune_cursor.write() = START_CURSOR;
-
-        let scan_start = pl.paid_prune_scan_start(PAID_KEY_COUNT);
-        pl.advance_paid_prune_cursor(PAID_KEY_COUNT, scan_start, Some(LAST_SELECTED_OFFSET));
-
-        assert_eq!(*pl.paid_prune_cursor.read(), EXPECTED_CURSOR);
-    }
-
-    #[tokio::test]
-    async fn paid_prune_cursor_advances_even_without_selected_entry() {
-        const PAID_KEY_COUNT: usize = 10;
-        const START_CURSOR: usize = 9;
-        const EXPECTED_CURSOR: usize = 0;
-
-        let (pl, _temp) = create_test_paid_list().await;
-        *pl.paid_prune_cursor.write() = START_CURSOR;
-
-        let scan_start = pl.paid_prune_scan_start(PAID_KEY_COUNT);
-        pl.advance_paid_prune_cursor(PAID_KEY_COUNT, scan_start, None);
-
-        assert_eq!(*pl.paid_prune_cursor.read(), EXPECTED_CURSOR);
-    }
-
-    #[tokio::test]
-    async fn paid_prune_cursor_resets_for_empty_paid_list() {
-        const STALE_CURSOR: usize = 7;
-        const EMPTY_PAID_KEY_COUNT: usize = 0;
-        const EXPECTED_CURSOR: usize = 0;
-
-        let (pl, _temp) = create_test_paid_list().await;
-        *pl.paid_prune_cursor.write() = STALE_CURSOR;
-
-        let scan_start = pl.paid_prune_scan_start(EMPTY_PAID_KEY_COUNT);
-        pl.advance_paid_prune_cursor(EMPTY_PAID_KEY_COUNT, scan_start, Some(STALE_CURSOR));
-
-        assert_eq!(*pl.paid_prune_cursor.read(), EXPECTED_CURSOR);
-    }
-
     // -- Scenario tests -------------------------------------------------------
 
     /// #50: Key goes out of range. `set_record_out_of_range` called.
@@ -1475,7 +1628,7 @@ mod tests {
             .expect("timestamp should exist after set");
 
         // Elapsed time is effectively zero — well below hysteresis threshold.
-        let elapsed = since.elapsed();
+        let elapsed = since.elapsed().expect("clock in the past");
         assert!(
             elapsed < hysteresis,
             "elapsed ({elapsed:?}) should be far below PRUNE_HYSTERESIS_DURATION ({hysteresis:?})",
@@ -1504,7 +1657,7 @@ mod tests {
         );
 
         // Key goes out of range again — clock must restart.
-        let before_second = Instant::now();
+        let before_second = SystemTime::now();
         pl.set_record_out_of_range(&key);
         let second_ts = pl
             .record_out_of_range_since(&key)
@@ -1515,50 +1668,18 @@ mod tests {
         );
     }
 
-    /// #52: Paid and record out-of-range timestamps are independent.
-    /// Clearing one must not affect the other.
-    #[tokio::test]
-    async fn scenario_52_paid_and_record_timestamps_independent() {
-        let (pl, _temp) = create_test_paid_list().await;
-        let key: XorName = [0x52; 32];
-
-        // Set both timestamps.
-        pl.set_paid_out_of_range(&key);
-        pl.set_record_out_of_range(&key);
-        assert!(pl.paid_out_of_range_since(&key).is_some());
-        assert!(pl.record_out_of_range_since(&key).is_some());
-
-        // Clear record — paid must survive.
-        pl.clear_record_out_of_range(&key);
-        assert!(
-            pl.paid_out_of_range_since(&key).is_some(),
-            "paid timestamp should survive clearing record timestamp"
-        );
-        assert!(pl.record_out_of_range_since(&key).is_none());
-
-        // Re-set record, then clear paid — record must survive.
-        pl.set_record_out_of_range(&key);
-        pl.clear_paid_out_of_range(&key);
-        assert!(
-            pl.record_out_of_range_since(&key).is_some(),
-            "record timestamp should survive clearing paid timestamp"
-        );
-        assert!(pl.paid_out_of_range_since(&key).is_none());
-    }
-
-    /// #23: Inserting then removing a key from the paid list clears both
-    /// the persistence entry and any in-memory out-of-range timestamps.
+    /// #23: Inserting then removing a key from the paid list removes its
+    /// persistent entry and leaves its record's out-of-range timestamp.
     #[tokio::test]
     async fn scenario_23_paid_list_entry_removed() {
         let (pl, _temp) = create_test_paid_list().await;
         let key: XorName = [0x23; 32];
 
-        // Insert key and attach out-of-range timestamps.
+        // Insert key and attach an out-of-range timestamp.
         pl.insert(&key).await.expect("insert");
-        pl.set_paid_out_of_range(&key);
         pl.set_record_out_of_range(&key);
 
-        // Remove — should clear everything.
+        // Remove.
         let removed = pl.remove(&key).await.expect("remove");
         assert!(removed, "key should have existed");
         assert!(
@@ -1566,12 +1687,8 @@ mod tests {
             "key should be gone from paid list"
         );
         assert!(
-            pl.paid_out_of_range_since(&key).is_none(),
-            "paid timestamp should be cleaned up on remove"
-        );
-        assert!(
-            pl.record_out_of_range_since(&key).is_none(),
-            "record timestamp should be cleaned up on remove"
+            pl.record_out_of_range_since(&key).is_some(),
+            "record timestamp doesn't depend on the paid-list entry"
         );
     }
 
@@ -1601,7 +1718,7 @@ mod tests {
             .expect("timestamp should be recorded for out-of-range key");
 
         // Key must NOT be pruned yet — elapsed time is far below hysteresis.
-        let elapsed = first_seen.elapsed();
+        let elapsed = first_seen.elapsed().expect("clock in the past");
         assert!(
             elapsed < hysteresis,
             "elapsed {elapsed:?} should be below PRUNE_HYSTERESIS_DURATION \
@@ -1641,9 +1758,9 @@ mod tests {
         let peer = saorsa_core::identity::PeerId::from_bytes([0x46; 32]);
         let mut state = crate::replication::types::NeighborSyncState::new_cycle(vec![peer]);
 
-        let first_ts = Instant::now()
+        let first_ts = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(3))
-            .unwrap_or_else(Instant::now);
+            .unwrap_or_else(std::time::Instant::now);
         let observed = state.observe_bootstrap_claim(peer, first_ts, grace_period);
         assert_eq!(
             observed,
@@ -1666,7 +1783,7 @@ mod tests {
 
         // Observe again while still active — must NOT overwrite
         // (first-observation-wins).
-        let later_ts = Instant::now();
+        let later_ts = std::time::Instant::now();
         let observed = state.observe_bootstrap_claim(peer, later_ts, grace_period);
         assert_eq!(
             observed,
@@ -1691,20 +1808,20 @@ mod tests {
         let mut state = crate::replication::types::NeighborSyncState::new_cycle(vec![peer]);
 
         // Record a first-seen timestamp >24 h ago.
-        // `Instant::checked_sub` can fail on Windows where the epoch is
+        // `std::time::Instant::checked_sub` can fail on Windows where the epoch is
         // process-start, so fall back to a recent instant when the platform
         // cannot represent the backdated time (the claim-age assertion is
         // skipped in that case since the subtraction itself proves nothing
         // about production behaviour).
         let grace_plus_margin = grace_period + std::time::Duration::from_hours(1);
-        let first_seen = Instant::now()
+        let first_seen = std::time::Instant::now()
             .checked_sub(grace_plus_margin)
-            .unwrap_or_else(Instant::now);
+            .unwrap_or_else(std::time::Instant::now);
         state.bootstrap_claims.insert(peer, first_seen);
         state.bootstrap_claim_history.insert(peer, first_seen);
 
         // On platforms that support the backdated instant, verify claim age.
-        let claim_age = Instant::now().duration_since(first_seen);
+        let claim_age = std::time::Instant::now().duration_since(first_seen);
         if claim_age > std::time::Duration::from_secs(1) {
             assert!(
                 claim_age > grace_period,
@@ -1735,7 +1852,7 @@ mod tests {
         let mut state = crate::replication::types::NeighborSyncState::new_cycle(vec![peer]);
 
         // Record a bootstrap claim.
-        let first_seen = Instant::now();
+        let first_seen = std::time::Instant::now();
         let _ = state.observe_bootstrap_claim(peer, first_seen, grace_period);
         assert!(
             state.bootstrap_claims.contains_key(&peer),
@@ -1753,7 +1870,7 @@ mod tests {
             "claim history should remain so the peer cannot claim bootstrapping again"
         );
 
-        let repeated = state.observe_bootstrap_claim(peer, Instant::now(), grace_period);
+        let repeated = state.observe_bootstrap_claim(peer, std::time::Instant::now(), grace_period);
         assert_eq!(
             repeated,
             crate::replication::types::BootstrapClaimObservation::Repeated { first_seen },

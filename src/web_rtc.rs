@@ -27,6 +27,7 @@ use futures::{stream::FuturesUnordered, StreamExt};
 use parking_lot::{Mutex, RwLock};
 use saorsa_core::identity::NodeIdentity;
 use saorsa_core::{AddressType, DHTNode, MultiAddr, P2PNode, PeerId};
+use saorsa_transport::upnp::{UpnpConfig, UpnpMappingService, UpnpState, UpnpStateRx};
 use saorsa_transport::webrtc::{
     accept_pq_session, decode_pq_frame, encode_response_frame, parse_request_header,
     pq_frame_length, source_ip_bucket, BrowserCommitmentArtifact, BrowserNode,
@@ -70,6 +71,12 @@ const FIRST_DATA_CHANNEL_TIMEOUT: Duration = Duration::from_secs(15);
 const REQUEST_IDLE_TIMEOUT: Duration = Duration::from_mins(1);
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const ADDRESS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+/// Cadence of the `webrtc listener summary (cumulative)` INFO lines (V2-1871).
+/// Matches `TRAFFIC_SUMMARY_INTERVAL_SECS` so browser-listener pressure lines
+/// up with the replication and chunk-RPC summaries in fleet logs. A `const` so
+/// testnets can drop it to 60s; 300s is the production default that keeps log
+/// volume negligible.
+const WEBRTC_SUMMARY_INTERVAL_SECS: u64 = 300;
 const TRACKED_SOURCE_MULTIPLIER: usize = 4;
 const MIN_TRACKED_SOURCES: usize = 64;
 const CONNECTION_CAPACITY_ERROR: &str = "global connection capacity exhausted";
@@ -101,6 +108,10 @@ pub struct BrowserEndpointCatalog {
 impl BrowserEndpointCatalog {
     fn insert(&self, peer_id: PeerId, endpoint: BrowserEndpoint) {
         self.endpoints.write().insert(peer_id, endpoint);
+    }
+
+    fn remove(&self, peer_id: &PeerId) {
+        self.endpoints.write().remove(peer_id);
     }
 
     fn get(&self, peer_id: &PeerId) -> Option<BrowserEndpoint> {
@@ -285,6 +296,13 @@ struct SourceAdmissionState {
     sources: HashMap<IpAddr, SourceEntry>,
 }
 
+/// Saturating millisecond conversion for the listener's latency counters.
+/// Mirrors `replication::audit_metrics::duration_ms`; the crate denies
+/// `unwrap_used`, so the overflow case clamps rather than panicking.
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 /// Admission and accounting shared by every association on one listener.
 struct ListenerResources {
     running: AtomicBool,
@@ -297,6 +315,22 @@ struct ListenerResources {
     connection_errors: AtomicU64,
     channel_errors: AtomicU64,
     task_failures: AtomicU64,
+    /// GETs that reached a response, counted where `get_service_total_ms` is added.
+    get_service_count: AtomicU64,
+    /// Summed GET service time, including the bulk-slot wait.
+    get_service_total_ms: AtomicU64,
+    /// Longest single GET service time, including the bulk-slot wait. A
+    /// lifetime high-water mark: `fetch_max` only, never reset.
+    get_service_max_ms: AtomicU64,
+    /// GETs whose processing returned an error instead of a response.
+    get_service_failures: AtomicU64,
+    /// GETs that acquired both bulk-response permits.
+    bulk_wait_count: AtomicU64,
+    /// Summed time GETs spent waiting for their bulk-response permits.
+    bulk_wait_total_ms: AtomicU64,
+    /// Longest single wait for the bulk-response permits. A lifetime
+    /// high-water mark: `fetch_max` only, never reset.
+    bulk_wait_max_ms: AtomicU64,
     connection_limit: Arc<Semaphore>,
     channel_limit: Arc<Semaphore>,
     request_limit: Arc<Semaphore>,
@@ -325,6 +359,13 @@ impl ListenerResources {
             connection_errors: AtomicU64::new(0),
             channel_errors: AtomicU64::new(0),
             task_failures: AtomicU64::new(0),
+            get_service_count: AtomicU64::new(0),
+            get_service_total_ms: AtomicU64::new(0),
+            get_service_max_ms: AtomicU64::new(0),
+            get_service_failures: AtomicU64::new(0),
+            bulk_wait_count: AtomicU64::new(0),
+            bulk_wait_total_ms: AtomicU64::new(0),
+            bulk_wait_max_ms: AtomicU64::new(0),
             byte_rejections: Arc::clone(&byte_rejections),
             connection_limit: Arc::new(Semaphore::new(config.max_connections)),
             channel_limit: Arc::new(Semaphore::new(config.max_channels)),
@@ -430,6 +471,26 @@ impl ListenerResources {
             entry.active_connections = entry.active_connections.saturating_sub(1);
             entry.last_seen = Instant::now();
         }
+    }
+
+    /// Record how long one GET waited for both bulk-response permits.
+    fn record_bulk_wait(&self, waited: Duration) {
+        let waited = duration_ms(waited);
+        self.bulk_wait_count.fetch_add(1, Ordering::Relaxed);
+        self.bulk_wait_total_ms.fetch_add(waited, Ordering::Relaxed);
+        self.bulk_wait_max_ms.fetch_max(waited, Ordering::Relaxed);
+    }
+
+    /// Record one GET's service time: from the spawned request worker starting
+    /// to its response being prepared. Includes the bulk-slot wait recorded by
+    /// [`Self::record_bulk_wait`], and excludes admission, frame assembly and
+    /// decryption, which all finish before the worker is spawned.
+    fn record_get_service(&self, served: Duration) {
+        let served = duration_ms(served);
+        self.get_service_count.fetch_add(1, Ordering::Relaxed);
+        self.get_service_total_ms
+            .fetch_add(served, Ordering::Relaxed);
+        self.get_service_max_ms.fetch_max(served, Ordering::Relaxed);
     }
 
     fn spawn_request<F>(&self, work: F) -> ServerResult<JoinHandle<F::Output>>
@@ -538,6 +599,10 @@ pub struct WebRtcServerSnapshot {
     pub in_flight_bytes: usize,
     /// Configured frame-memory capacity.
     pub max_in_flight_bytes: usize,
+    /// Global bulk-response preparation slots currently held by GETs.
+    pub bulk_slots_in_use: usize,
+    /// Global bulk-response preparation slots derived from `max_in_flight_bytes`.
+    pub bulk_slots_max: usize,
     /// Application connection admissions denied by capacity policy.
     pub connection_rejections: u64,
     /// `DataChannels` rejected by global or per-connection capacity policy.
@@ -556,6 +621,30 @@ pub struct WebRtcServerSnapshot {
     pub channel_errors: u64,
     /// Connection or `DataChannel` tasks that panicked or were unexpectedly cancelled.
     pub task_failures: u64,
+    /// GETs served to a response, the denominator for `get_service_total_ms`.
+    pub get_service_count: u64,
+    /// Summed GET service time, measured from the spawned request worker
+    /// starting to its response being prepared. Includes the bulk-response
+    /// slot wait; excludes admission, frame assembly and decryption, which
+    /// complete before the worker is spawned.
+    pub get_service_total_ms: u64,
+    /// Longest single GET service time, including the bulk-response slot
+    /// wait. A lifetime high-water mark: never reset, so it only rises. Do
+    /// not diff it — use the mean from `get_service_total_ms` over
+    /// `get_service_count` to see a window's latency.
+    pub get_service_max_ms: u64,
+    /// GETs whose processing returned an error instead of a response. They are
+    /// excluded from `get_service_count` and the service-time totals.
+    pub get_service_failures: u64,
+    /// GETs that acquired both bulk-response permits, the denominator for
+    /// `bulk_wait_total_ms`.
+    pub bulk_wait_count: u64,
+    /// Summed time GETs spent waiting for their source and global
+    /// bulk-response permits.
+    pub bulk_wait_total_ms: u64,
+    /// Longest single wait for the bulk-response permits. A lifetime
+    /// high-water mark like `get_service_max_ms`, with the same caveat.
+    pub bulk_wait_max_ms: u64,
 }
 
 /// Cloneable diagnostics handle for a running or stopped browser listener.
@@ -593,6 +682,9 @@ impl WebRtcServerDiagnostics {
             max_concurrent_requests: self.config.max_concurrent_requests,
             in_flight_bytes: resources.global_bytes.in_use.load(Ordering::Acquire),
             max_in_flight_bytes: self.config.max_in_flight_bytes,
+            bulk_slots_in_use: bulk_response_slots(self.config.max_in_flight_bytes)
+                .saturating_sub(resources.bulk_responses.available_permits()),
+            bulk_slots_max: bulk_response_slots(self.config.max_in_flight_bytes),
             connection_rejections: resources.connection_rejections.load(Ordering::Relaxed),
             channel_rejections: resources.channel_rejections.load(Ordering::Relaxed),
             request_rejections: resources.request_rejections.load(Ordering::Relaxed),
@@ -602,7 +694,104 @@ impl WebRtcServerDiagnostics {
             connection_errors: resources.connection_errors.load(Ordering::Relaxed),
             channel_errors: resources.channel_errors.load(Ordering::Relaxed),
             task_failures: resources.task_failures.load(Ordering::Relaxed),
+            get_service_count: resources.get_service_count.load(Ordering::Relaxed),
+            get_service_total_ms: resources.get_service_total_ms.load(Ordering::Relaxed),
+            get_service_max_ms: resources.get_service_max_ms.load(Ordering::Relaxed),
+            get_service_failures: resources.get_service_failures.load(Ordering::Relaxed),
+            bulk_wait_count: resources.bulk_wait_count.load(Ordering::Relaxed),
+            bulk_wait_total_ms: resources.bulk_wait_total_ms.load(Ordering::Relaxed),
+            bulk_wait_max_ms: resources.bulk_wait_max_ms.load(Ordering::Relaxed),
         }
+    }
+
+    /// Emit the browser listener's state as INFO summary lines, target
+    /// `ant_node::web_rtc::traffic`, message `webrtc listener summary
+    /// (cumulative)`.
+    ///
+    /// Flat snake-case integer keys like the storage and replication
+    /// summaries. Two lines sharing the same target and message, told apart by
+    /// `group`: the application listener (`group = 1`) and the WebRTC
+    /// transport beneath it (`group = 2`, each key prefixed `transport_`), so
+    /// neither line approaches `tracing`'s 32-field cap.
+    ///
+    /// The fields fall into four classes, and only one of them may be
+    /// differenced. Field names are a query contract and are never renamed.
+    ///
+    /// * **Additive counters**, accumulated since process start: the rejection
+    ///   and error counts, `get_service_count`, `get_service_total_ms`,
+    ///   `get_service_failures`, `bulk_wait_count`, `bulk_wait_total_ms`, and
+    ///   every `transport_` field except the two active/connecting gauges.
+    ///   Diff two lines for a rate; mean GET latency over an interval is the
+    ///   `get_service_total_ms` diff over the `get_service_count` diff.
+    /// * **Instantaneous gauges**, sampled at emission and not cumulative:
+    ///   `running`, `active_connections`, `active_channels`,
+    ///   `active_requests`, `in_flight_bytes`, `bulk_slots_in_use`,
+    ///   `transport_active_connections` and
+    ///   `transport_connecting_connections`. Differencing these is
+    ///   meaningless; read the level, or average it over the window.
+    /// * **Lifetime maxima**: `get_service_max_ms` and `bulk_wait_max_ms` are
+    ///   high-water marks that are never reset, so they rise and never fall.
+    ///   A diff of either is 0 whenever the window's worst case did not beat
+    ///   the all-time worst case, which hides sustained high latency — watch
+    ///   the mean from the counters above for that, and read these two as the
+    ///   worst case seen since start.
+    /// * **Configured capacities**, constant for the process:
+    ///   `max_connections`, `max_channels`, `max_concurrent_requests`,
+    ///   `max_in_flight_bytes` and `bulk_slots_max`. They are emitted so a
+    ///   gauge can be read as a fraction of its limit.
+    pub fn log_webrtc_listener_summary(&self) {
+        let snapshot = self.snapshot();
+        let transport = &snapshot.transport;
+
+        crate::logging::info!(
+            target: "ant_node::web_rtc::traffic",
+            group = 1,
+            running = u64::from(snapshot.running),
+            active_connections = snapshot.active_connections as u64,
+            max_connections = snapshot.max_connections as u64,
+            active_channels = snapshot.active_channels as u64,
+            max_channels = snapshot.max_channels as u64,
+            active_requests = snapshot.active_requests as u64,
+            max_concurrent_requests = snapshot.max_concurrent_requests as u64,
+            in_flight_bytes = snapshot.in_flight_bytes as u64,
+            max_in_flight_bytes = snapshot.max_in_flight_bytes as u64,
+            bulk_slots_in_use = snapshot.bulk_slots_in_use as u64,
+            bulk_slots_max = snapshot.bulk_slots_max as u64,
+            connection_rejections = snapshot.connection_rejections,
+            channel_rejections = snapshot.channel_rejections,
+            request_rejections = snapshot.request_rejections,
+            rate_rejections = snapshot.rate_rejections,
+            byte_rejections = snapshot.byte_rejections,
+            listener_errors = snapshot.listener_errors,
+            connection_errors = snapshot.connection_errors,
+            channel_errors = snapshot.channel_errors,
+            task_failures = snapshot.task_failures,
+            get_service_count = snapshot.get_service_count,
+            get_service_total_ms = snapshot.get_service_total_ms,
+            get_service_max_ms = snapshot.get_service_max_ms,
+            get_service_failures = snapshot.get_service_failures,
+            bulk_wait_count = snapshot.bulk_wait_count,
+            bulk_wait_total_ms = snapshot.bulk_wait_total_ms,
+            bulk_wait_max_ms = snapshot.bulk_wait_max_ms,
+            "webrtc listener summary (cumulative)"
+        );
+
+        crate::logging::info!(
+            target: "ant_node::web_rtc::traffic",
+            group = 2,
+            transport_active_connections = transport.active_connections as u64,
+            transport_connecting_connections = transport.connecting_connections as u64,
+            transport_connection_attempts = transport.connection_attempts,
+            transport_successful_connections = transport.successful_connections,
+            transport_failed_connections = transport.failed_connections,
+            transport_closed_connections = transport.closed_connections,
+            transport_disconnections = transport.disconnections,
+            transport_rejected_connections = transport.rejected_connections,
+            transport_listener_errors = transport.listener_errors,
+            transport_bytes_sent = transport.bytes_sent,
+            transport_bytes_received = transport.bytes_received,
+            "webrtc listener summary (cumulative)"
+        );
     }
 }
 
@@ -653,6 +842,10 @@ pub async fn spawn(
     .await
     .map_err(|error| Error::Startup(format!("failed to bind WebRTC Direct listener: {error}")))?;
     let local_addr = listener.local_addr();
+    // Like the native QUIC endpoint, ask the gateway to forward the listener's
+    // port. Best effort: without a mapping, publication is unchanged (ADR-0027).
+    let upnp = maps_port_with_upnp(config, local_addr, p2p.config().local)
+        .then(|| UpnpMappingService::start(local_addr.port(), UpnpConfig::default()));
     let identity = Arc::clone(p2p.transport().node_identity());
     let state = Arc::new(ServerState {
         config: config.clone(),
@@ -660,19 +853,17 @@ pub async fn spawn(
         p2p,
         ant_protocol,
         payment,
-        endpoint: RwLock::new(None),
+        publication: RwLock::new(Publication::default()),
         endpoint_catalog,
+        port_mapping: upnp
+            .as_ref()
+            .map(|service| Box::new(service.subscribe()) as Box<dyn PortMapping>),
     });
     refresh_browser_endpoint(&state, root_dir, local_addr, certificate_sha256).await?;
-    let browser_endpoint = state.endpoint.read().clone();
+    let browser_endpoint = state.publication.read().endpoint().cloned();
     if browser_endpoint.is_none() {
         // Do not leave a previous run's socket advertised while discovery is pending.
-        let path = root_dir.join(WEBRTC_DIRECT_MULTIADDR_FILENAME);
-        match tokio::fs::remove_file(path).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
+        remove_persisted_browser_endpoint(root_dir).await?;
     }
     let resources = ListenerResources::new(config);
     let diagnostics = WebRtcServerDiagnostics {
@@ -686,9 +877,11 @@ pub async fn spawn(
     info!(bind = %local_addr, certificate = %certificate_path.display(),
         "ADR-0015 WebRTC Direct listening");
     let root_dir = root_dir.to_path_buf();
+    let summary_diagnostics = diagnostics.clone();
     let task = tokio::spawn(async move {
-        // Both futures are owned by the listener task. Address publication cannot
-        // block accepting sessions, and shutdown cancels a pending publication.
+        // All three futures are owned by the listener task. Neither address
+        // publication nor the diagnostics summary can block accepting sessions,
+        // and shutdown cancels a pending publication.
         tokio::join!(
             serve_webrtc(
                 listener,
@@ -697,29 +890,19 @@ pub async fn spawn(
                 shutdown.clone(),
                 run_guard
             ),
-            async {
-                let refresh = async {
-                    let mut interval = tokio::time::interval(ADDRESS_REFRESH_INTERVAL);
-                    loop {
-                        interval.tick().await;
-                        if let Err(error) = refresh_browser_endpoint(
-                            &state,
-                            &root_dir,
-                            local_addr,
-                            certificate_sha256,
-                        )
-                        .await
-                        {
-                            warn!(%error, "Failed to update WebRTC Direct endpoint");
-                        }
-                    }
-                };
-                tokio::select! {
-                    () = shutdown.cancelled() => {},
-                    () = refresh => {},
-                }
-            },
+            refresh_browser_endpoint_loop(
+                state,
+                root_dir,
+                local_addr,
+                certificate_sha256,
+                shutdown.clone(),
+            ),
+            log_listener_summaries(summary_diagnostics, shutdown.clone()),
         );
+        // Remove the gateway mapping rather than leave it to its lease.
+        if let Some(upnp) = upnp {
+            upnp.shutdown().await;
+        }
     });
     Ok(WebRtcDirectServer {
         diagnostics,
@@ -728,22 +911,79 @@ pub async fn spawn(
     })
 }
 
+/// Republish the listener's advertised address every
+/// `ADDRESS_REFRESH_INTERVAL` until shutdown.
+///
+/// Owned by the listener task so publication cannot block accepting sessions,
+/// and shutdown cancels a pending publication.
+async fn refresh_browser_endpoint_loop(
+    state: Arc<ServerState>,
+    root_dir: PathBuf,
+    local_addr: SocketAddr,
+    certificate_sha256: [u8; 32],
+    shutdown: CancellationToken,
+) {
+    let refresh = async {
+        let mut interval = tokio::time::interval(ADDRESS_REFRESH_INTERVAL);
+        loop {
+            interval.tick().await;
+            if let Err(error) =
+                refresh_browser_endpoint(&state, &root_dir, local_addr, certificate_sha256).await
+            {
+                warn!(%error, "Failed to update WebRTC Direct endpoint");
+            }
+        }
+    };
+    tokio::select! {
+        () = shutdown.cancelled() => {},
+        () = refresh => {},
+    }
+}
+
+/// Emit the browser listener summary every `WEBRTC_SUMMARY_INTERVAL_SECS`
+/// until shutdown.
+///
+/// Sampling only reads atomics and semaphore permit counts, so this loop never
+/// holds a lock across an await and never blocks the accept loop or a request
+/// worker.
+async fn log_listener_summaries(diagnostics: WebRtcServerDiagnostics, shutdown: CancellationToken) {
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => break,
+            () = tokio::time::sleep(Duration::from_secs(WEBRTC_SUMMARY_INTERVAL_SECS)) => {
+                diagnostics.log_webrtc_listener_summary();
+            }
+        }
+    }
+    debug!("WebRTC Direct listener summary loop shut down");
+}
+
 async fn refresh_browser_endpoint(
     state: &ServerState,
     root_dir: &Path,
     local_addr: SocketAddr,
     certificate_sha256: [u8; 32],
 ) -> Result<()> {
-    let native = state.p2p.dht_manager().local_dht_node().await;
-    let Some(address) = advertised_addr(&state.config, local_addr, &native.typed_addresses())
+    let native = state
+        .p2p
+        .dht_manager()
+        .local_dht_node()
+        .await
+        .typed_addresses();
+    let mapped = state
+        .port_mapping
+        .as_ref()
+        .and_then(|mapping| mapping.external());
+    let Some((address, source)) = advertised_addr(&state.config, local_addr, mapped, &native)
     else {
-        // As with native publication, keep the last nonempty address set.
-        return Ok(());
+        // As with native publication, keep the last nonempty address set,
+        // unless it came from a mapping the gateway no longer holds.
+        return withdraw_mapped_endpoint(state, root_dir).await;
     };
     let peer_id = *state.p2p.peer_id();
     let endpoint = BrowserEndpoint::new(address, peer_id.to_bytes(), certificate_sha256)
         .map_err(|error| Error::Config(error.to_string()))?;
-    if state.endpoint.read().as_ref() == Some(&endpoint) {
+    if state.publication.write().reconfirm(&endpoint, source) {
         return Ok(());
     }
     let supplemental = endpoint
@@ -754,13 +994,55 @@ async fn refresh_browser_endpoint(
     if let Some(catalog) = state.endpoint_catalog.as_ref() {
         catalog.insert(peer_id, endpoint.clone());
     }
-    *state.endpoint.write() = Some(endpoint);
+    *state.publication.write() = Publication::Published { endpoint, source };
     state
         .p2p
         .dht_manager()
         .set_supplemental_self_addresses(vec![supplemental])
         .await;
     Ok(())
+}
+
+/// Withdraw an endpoint whose address only a gateway mapping that has ended
+/// provided, everywhere it was published: HELLO, the in-process catalog and
+/// the DHT address record first, once, then the endpoint file. Any other
+/// publication is kept.
+///
+/// The first three cannot fail, so a file error never keeps the endpoint
+/// advertised. It leaves the publication [`Publication::Withdrawing`], and the
+/// next call retries only the file.
+async fn withdraw_mapped_endpoint(state: &ServerState, root_dir: &Path) -> Result<()> {
+    let withdrawn = state.publication.write().begin_withdrawal();
+    if let Some(withdrawn) = withdrawn {
+        info!(endpoint = %withdrawn.multiaddr,
+            "WebRTC Direct endpoint withdrawn: its gateway mapping ended");
+        if let Some(catalog) = state.endpoint_catalog.as_ref() {
+            catalog.remove(state.p2p.peer_id());
+        }
+        state
+            .p2p
+            .dht_manager()
+            .set_supplemental_self_addresses(Vec::new())
+            .await;
+    }
+    if *state.publication.read() != Publication::Withdrawing {
+        return Ok(());
+    }
+    remove_persisted_browser_endpoint(root_dir).await?;
+    *state.publication.write() = Publication::Unpublished;
+    Ok(())
+}
+
+async fn remove_persisted_browser_endpoint(root_dir: &Path) -> Result<()> {
+    let path = root_dir.join(WEBRTC_DIRECT_MULTIADDR_FILENAME);
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(Error::Startup(format!(
+            "failed to remove WebRTC Direct endpoint {}: {error}",
+            path.display()
+        ))),
+    }
 }
 
 async fn persist_browser_endpoint(root_dir: &Path, endpoint: &BrowserEndpoint) -> Result<()> {
@@ -871,25 +1153,142 @@ fn certificate_path(config: &WebRtcDirectConfig, root_dir: &Path) -> PathBuf {
     }
 }
 
+/// Whether the listener chooses its own public address, and so may ask the
+/// gateway to forward its port: a wildcard IPv4 listener the operator gave no
+/// advertised address, on a node whose native endpoint is not confined to
+/// loopback.
+///
+/// An explicit bind or advertisement is the operator's. A loopback-only
+/// (development) node stays off the Internet, and its browsers dial the
+/// native loopback view. Gateway mappings are IPv4, which an IPv6 listener
+/// would not advertise.
+fn maps_port_with_upnp(
+    config: &WebRtcDirectConfig,
+    local_addr: SocketAddr,
+    loopback_only: bool,
+) -> bool {
+    !loopback_only
+        && config.advertised_addr.is_none()
+        && local_addr.ip().is_unspecified()
+        && local_addr.is_ipv4()
+}
+
+/// The gateway's mapping of the listener's port, while it holds one.
+trait PortMapping: Send + Sync {
+    fn external(&self) -> Option<SocketAddr>;
+}
+
+impl PortMapping for UpnpStateRx {
+    fn external(&self) -> Option<SocketAddr> {
+        match self.current() {
+            UpnpState::Mapped { external, .. } => Some(external),
+            UpnpState::Probing | UpnpState::Unavailable => None,
+        }
+    }
+}
+
+/// Where an advertised browser address came from, in order of precedence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddressSource {
+    /// The operator's `advertised_addr`.
+    Operator,
+    /// An explicit bind address.
+    Bind,
+    /// The gateway's mapping of the listener's port, which the native view
+    /// does not yield. It is valid only while the gateway holds the mapping.
+    Mapped,
+    /// The native self-address view's IP with the listener's port.
+    Native,
+}
+
+/// What the listener advertises to browsers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum Publication {
+    /// Nothing: no address is known yet, or a mapped endpoint was withdrawn.
+    #[default]
+    Unpublished,
+    /// The endpoint browsers dial, and where its address came from.
+    Published {
+        endpoint: BrowserEndpoint,
+        source: AddressSource,
+    },
+    /// A mapped endpoint was withdrawn from peers, but its endpoint file is
+    /// not removed yet.
+    Withdrawing,
+}
+
+impl Publication {
+    fn endpoint(&self) -> Option<&BrowserEndpoint> {
+        match self {
+            Self::Published { endpoint, .. } => Some(endpoint),
+            Self::Unpublished | Self::Withdrawing => None,
+        }
+    }
+
+    /// Whether `endpoint` is already published, recording `source` for it if
+    /// so: the same address may come from another source than before.
+    fn reconfirm(&mut self, endpoint: &BrowserEndpoint, source: AddressSource) -> bool {
+        match self {
+            Self::Published {
+                endpoint: published,
+                source: published_source,
+            } if published == endpoint => {
+                *published_source = source;
+                true
+            }
+            Self::Published { .. } | Self::Unpublished | Self::Withdrawing => false,
+        }
+    }
+
+    /// Start withdrawing a mapped endpoint, returning it. Any other
+    /// publication is kept, and `None` returned.
+    fn begin_withdrawal(&mut self) -> Option<BrowserEndpoint> {
+        match std::mem::take(self) {
+            Self::Published {
+                endpoint,
+                source: AddressSource::Mapped,
+            } => {
+                *self = Self::Withdrawing;
+                Some(endpoint)
+            }
+            kept => {
+                *self = kept;
+                None
+            }
+        }
+    }
+}
+
+/// The address browsers dial and its source: the operator's advertisement, an
+/// explicit bind, the gateway's mapping of the listener's port (`mapped`), or
+/// else the native self-address view's IP with the listener's port.
 fn advertised_addr(
     config: &WebRtcDirectConfig,
     local_addr: SocketAddr,
+    mapped: Option<SocketAddr>,
     native_addresses: &[(MultiAddr, AddressType)],
-) -> Option<SocketAddr> {
+) -> Option<(SocketAddr, AddressSource)> {
     if let Some(addr) = config.advertised_addr {
-        return Some(addr);
+        return Some((addr, AddressSource::Operator));
     }
     if !local_addr.ip().is_unspecified() {
-        return Some(local_addr);
+        return Some((local_addr, AddressSource::Bind));
     }
     // The native self-address view already applies observation, scope and
     // priority policy. Relay sockets belong to the relay, not this listener.
-    native_addresses
+    let native = native_addresses
         .iter()
         .filter(|(_, kind)| *kind != AddressType::Relay)
         .filter_map(|(address, _)| address.socket_addr())
         .find(|addr| addr.is_ipv4() == local_addr.is_ipv4())
-        .map(|addr| SocketAddr::new(addr.ip(), local_addr.port()))
+        .map(|addr| SocketAddr::new(addr.ip(), local_addr.port()));
+    // Behind NAT the gateway drops unsolicited traffic to the listener's own
+    // port, so the address it forwards is the one browsers can reach. When
+    // the native view yields that same address, it does not need the mapping.
+    match mapped.filter(|addr| addr.is_ipv4() == local_addr.is_ipv4()) {
+        Some(mapped) if native != Some(mapped) => Some((mapped, AddressSource::Mapped)),
+        _ => native.map(|addr| (addr, AddressSource::Native)),
+    }
 }
 
 #[allow(clippy::significant_drop_tightening)]
@@ -1359,16 +1758,23 @@ async fn start_request(
 ) -> ServerResult<CompletedRequest> {
     let listener = Arc::clone(&resources.listener);
     let worker = listener.spawn_request(async move {
+        // V2-1871: time the worker from the moment it starts, so the GET
+        // service time below covers the bulk-slot wait as well as the work.
+        // This is deliberately not admission: the request permit, frame
+        // assembly and decryption all happen before the worker is spawned, so
+        // this clock excludes them.
+        let worker_started_at = Instant::now();
         let AdmittedRequest {
             request,
             content,
             _request_permit: request_permit,
             _in_flight_bytes: in_flight_bytes,
         } = admitted;
+        let is_get = request_is_get(&request, &content);
         // Reserve enough preparation capacity for one complete response to
         // make progress under the existing byte limits. Acquire source first:
         // queued work from one source cannot occupy every global bulk slot.
-        let bulk_permits = if request_is_get(&request, &content) {
+        let bulk_permits = if is_get {
             let source = Arc::clone(&resources.source.bulk_responses)
                 .acquire_owned()
                 .await
@@ -1377,11 +1783,31 @@ async fn start_request(
                 .acquire_owned()
                 .await
                 .map_err(|_| "bulk response admission closed".to_string())?;
+            resources
+                .listener
+                .record_bulk_wait(worker_started_at.elapsed());
             Some((source, global))
         } else {
             None
         };
-        let (response, content) = process_request(request, content, &state, &resources).await?;
+        let (response, content) = match process_request(request, content, &state, &resources).await
+        {
+            Ok(processed) => processed,
+            Err(error) => {
+                if is_get {
+                    resources
+                        .listener
+                        .get_service_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                return Err(error);
+            }
+        };
+        if is_get {
+            resources
+                .listener
+                .record_get_service(worker_started_at.elapsed());
+        }
         Ok(CompletedRequest {
             _bulk_permits: bulk_permits,
             response,
@@ -1772,7 +2198,7 @@ fn encode_binary_response(message: &ChunkMessage, limit: usize) -> ServerResult<
 }
 
 fn hello_response(request_id: u64, state: &ServerState) -> Response {
-    let Some(endpoint) = state.endpoint.read().clone() else {
+    let Some(endpoint) = state.publication.read().endpoint().cloned() else {
         return Response::error(
             request_id,
             "endpoint_unavailable",
@@ -2270,8 +2696,10 @@ struct ServerState {
     p2p: Arc<P2PNode>,
     ant_protocol: Option<Arc<AntProtocol>>,
     payment: BrowserPaymentNetwork,
-    endpoint: RwLock<Option<BrowserEndpoint>>,
+    publication: RwLock<Publication>,
     endpoint_catalog: Option<Arc<BrowserEndpointCatalog>>,
+    /// The gateway mapping of the listener's port, when the listener asked for one.
+    port_mapping: Option<Box<dyn PortMapping>>,
 }
 
 #[cfg(test)]
@@ -2287,7 +2715,14 @@ mod tests {
         PointerGetRequest, PointerGetResponse, PointerPutRequest, PointerPutResponse,
     };
     use ant_protocol::pointer::POINTER_WIRE_LEN;
+    use saorsa_core::NodeConfig as CoreNodeConfig;
+    use saorsa_transport::webrtc_direct::WebRtcCertificate;
     use std::net::Ipv4Addr;
+
+    /// Any listener certificate digest, for publication tests.
+    const CERTIFICATE_SHA256: [u8; 32] = [7; 32];
+    /// Arbitrum Sepolia, a payment network that needs no RPC.
+    const ARBITRUM_SEPOLIA_CHAIN_ID: u64 = 421_614;
 
     #[test]
     fn diagnostics_report_capacity_rate_and_byte_pressure_without_leaking_slots() {
@@ -2307,6 +2742,17 @@ mod tests {
             resources: Arc::clone(&resources),
             config,
         };
+        let fresh = diagnostics.snapshot();
+        assert_eq!(fresh.get_service_count, 0);
+        assert_eq!(fresh.get_service_total_ms, 0);
+        assert_eq!(fresh.get_service_max_ms, 0);
+        assert_eq!(fresh.get_service_failures, 0);
+        assert_eq!(fresh.bulk_wait_count, 0);
+        assert_eq!(fresh.bulk_wait_total_ms, 0);
+        assert_eq!(fresh.bulk_wait_max_ms, 0);
+        assert_eq!(fresh.bulk_slots_in_use, 0);
+        // This config's 8-byte frame budget floors the bulk queue at one slot.
+        assert_eq!(fresh.bulk_slots_max, 1);
         let first = resources
             .try_admit_connection("192.0.2.1:1000".parse().unwrap())
             .unwrap();
@@ -2340,6 +2786,102 @@ mod tests {
         assert_eq!(idle.in_flight_bytes, 0);
         assert_eq!(idle.active_connections, 0);
         assert_eq!(idle.byte_rejections, 2);
+    }
+
+    #[test]
+    fn latency_counters_accumulate_and_the_summary_logs_the_snapshot() {
+        let config = WebRtcDirectConfig::default();
+        let resources = ListenerResources::new(&config);
+        let diagnostics = WebRtcServerDiagnostics {
+            local_addr: "127.0.0.1:1234".parse().unwrap(),
+            transport: WebRtcDiagnostics::default(),
+            resources: Arc::clone(&resources),
+            config,
+        };
+        resources.record_bulk_wait(Duration::from_millis(5));
+        resources.record_bulk_wait(Duration::from_millis(11));
+        resources.record_get_service(Duration::from_millis(40));
+        resources.record_get_service(Duration::from_millis(17));
+        let snapshot = diagnostics.snapshot();
+        assert_eq!(snapshot.bulk_wait_count, 2);
+        assert_eq!(snapshot.bulk_wait_total_ms, 16);
+        assert_eq!(snapshot.bulk_wait_max_ms, 11);
+        assert_eq!(snapshot.get_service_count, 2);
+        assert_eq!(snapshot.get_service_total_ms, 57);
+        assert_eq!(snapshot.get_service_max_ms, 40);
+        // The four global bulk slots whose queueing V2-1795 could not observe.
+        assert_eq!(snapshot.bulk_slots_max, 4);
+        assert_eq!(snapshot.bulk_slots_in_use, 0);
+        diagnostics.log_webrtc_listener_summary();
+    }
+
+    /// A `ServerState` with storage disabled: enough for the real request
+    /// worker to serve one GET without a node or a chunk store.
+    async fn storage_disabled_state() -> Arc<ServerState> {
+        let p2p = Arc::new(
+            P2PNode::new(
+                CoreNodeConfig::builder()
+                    .local(true)
+                    .ipv6(false)
+                    .build()
+                    .expect("core config"),
+            )
+            .await
+            .expect("P2P node"),
+        );
+        Arc::new(ServerState {
+            config: WebRtcDirectConfig::default(),
+            identity: Arc::clone(p2p.transport().node_identity()),
+            p2p,
+            ant_protocol: None,
+            payment: BrowserPaymentNetwork {
+                chain_id: ARBITRUM_SEPOLIA_CHAIN_ID,
+                payment_token_address: String::new(),
+                payment_vault_address: String::new(),
+            },
+            publication: RwLock::new(Publication::default()),
+            endpoint_catalog: None,
+            port_mapping: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn one_get_records_a_bulk_wait_and_a_service_time() {
+        let config = WebRtcDirectConfig::default();
+        let resources = ListenerResources::new(&config);
+        let state = storage_disabled_state().await;
+        let connection = resources
+            .try_admit_connection("192.0.2.1:1000".parse().expect("source"))
+            .expect("connection");
+        let admitted = AdmittedRequest {
+            request: Request::new(
+                1,
+                RequestBody::GetChunk {
+                    address: hex::encode([7_u8; 32]),
+                },
+                0,
+            ),
+            content: Vec::new(),
+            _request_permit: connection
+                .context
+                .try_admit_request()
+                .expect("request slot"),
+            _in_flight_bytes: connection.context.try_reserve_bytes(1024).expect("bytes"),
+        };
+        let completed = start_request(admitted, state, Arc::clone(&connection.context))
+            .await
+            .expect("GET completed");
+        let slots = bulk_response_slots(config.max_in_flight_bytes);
+        assert_eq!(
+            resources.bulk_responses.available_permits(),
+            slots - 1,
+            "the prepared response still holds its bulk-response slot"
+        );
+        assert_eq!(resources.bulk_wait_count.load(Ordering::Relaxed), 1);
+        assert_eq!(resources.get_service_count.load(Ordering::Relaxed), 1);
+        assert_eq!(resources.get_service_failures.load(Ordering::Relaxed), 0);
+        drop(completed);
+        assert_eq!(resources.bulk_responses.available_permits(), slots);
     }
 
     #[tokio::test]
@@ -2914,7 +3456,7 @@ mod tests {
     fn wildcard_publication_waits_for_native_discovery_and_excludes_relays() {
         let config = WebRtcDirectConfig::default();
         let local = "0.0.0.0:43210".parse().expect("bound listener");
-        assert_eq!(advertised_addr(&config, local, &[]), None);
+        assert_eq!(advertised_addr(&config, local, None, &[]), None);
         let addresses = vec![
             (
                 MultiAddr::quic("203.0.113.1:1000".parse().expect("relay")),
@@ -2925,26 +3467,31 @@ mod tests {
                 AddressType::Direct,
             ),
         ];
-        assert_eq!(advertised_addr(&config, local, &addresses), None);
+        assert_eq!(advertised_addr(&config, local, None, &addresses), None);
         let mut addresses = addresses;
         addresses.push((
             MultiAddr::quic("198.51.100.2:1000".parse().expect("observed")),
             AddressType::Unverified,
         ));
         assert_eq!(
-            advertised_addr(&config, local, &addresses),
-            Some("198.51.100.2:43210".parse().expect("WebRTC"))
+            advertised_addr(&config, local, None, &addresses),
+            Some((
+                "198.51.100.2:43210".parse().expect("WebRTC"),
+                AddressSource::Native
+            ))
         );
         addresses[2].0 = MultiAddr::quic("198.51.100.3:2000".parse().expect("new observed"));
         assert_eq!(
-            advertised_addr(&config, local, &addresses),
-            Some("198.51.100.3:43210".parse().expect("updated WebRTC"))
+            advertised_addr(&config, local, None, &addresses),
+            Some((
+                "198.51.100.3:43210".parse().expect("updated WebRTC"),
+                AddressSource::Native
+            ))
         );
     }
 
     #[tokio::test]
     async fn automatic_port_is_os_assigned_and_explicit_advertisement_is_independent() {
-        use saorsa_transport::webrtc_direct::WebRtcCertificate;
         let certificate = WebRtcCertificate::generate().expect("certificate");
         let listener =
             WebRtcDirectListener::bind("127.0.0.1:0".parse().expect("bind"), certificate)
@@ -2953,15 +3500,314 @@ mod tests {
         let local = listener.local_addr();
         assert_ne!(local.port(), 0);
         assert_eq!(
-            advertised_addr(&WebRtcDirectConfig::default(), local, &[]),
-            Some(local)
+            advertised_addr(&WebRtcDirectConfig::default(), local, None, &[]),
+            Some((local, AddressSource::Bind))
         );
         let config = WebRtcDirectConfig {
             advertised_addr: Some("198.51.100.4:11000".parse().expect("advertised")),
             ..WebRtcDirectConfig::default()
         };
-        assert_eq!(advertised_addr(&config, local, &[]), config.advertised_addr);
+        assert_eq!(
+            advertised_addr(&config, local, None, &[]),
+            config
+                .advertised_addr
+                .map(|addr| (addr, AddressSource::Operator))
+        );
         listener.close().await.expect("close listener");
+    }
+
+    #[test]
+    fn only_a_listener_choosing_its_own_address_maps_its_port() {
+        let wildcard = "0.0.0.0:43210".parse().expect("wildcard listener");
+        let explicit = "192.0.2.7:43210".parse().expect("explicit listener");
+        let default = WebRtcDirectConfig::default();
+        assert!(maps_port_with_upnp(&default, wildcard, false));
+        assert!(!maps_port_with_upnp(&default, explicit, false));
+        let advertised = WebRtcDirectConfig {
+            advertised_addr: Some("198.51.100.4:11000".parse().expect("advertised")),
+            ..WebRtcDirectConfig::default()
+        };
+        assert!(!maps_port_with_upnp(&advertised, wildcard, false));
+    }
+
+    #[test]
+    fn a_development_node_does_not_map_its_port() {
+        let wildcard = "0.0.0.0:43210".parse().expect("wildcard listener");
+        assert!(!maps_port_with_upnp(
+            &WebRtcDirectConfig::default(),
+            wildcard,
+            true
+        ));
+    }
+
+    #[test]
+    fn an_ipv6_listener_does_not_map_its_port() {
+        // Gateway mappings are IPv4, which an IPv6 listener never advertises.
+        let wildcard = "[::]:43210".parse().expect("IPv6 wildcard listener");
+        assert!(!maps_port_with_upnp(
+            &WebRtcDirectConfig::default(),
+            wildcard,
+            false
+        ));
+    }
+
+    #[test]
+    fn a_gateway_mapping_is_advertised_before_the_native_view() {
+        let local = "0.0.0.0:43210".parse().expect("wildcard listener");
+        let native = vec![(
+            MultiAddr::quic("198.51.100.2:1000".parse().expect("observed")),
+            AddressType::Direct,
+        )];
+        let mapped: SocketAddr = "198.51.100.2:51000".parse().expect("mapped");
+        let native_view: SocketAddr = "198.51.100.2:43210".parse().expect("native view");
+        let default = WebRtcDirectConfig::default();
+        // The gateway may forward another external port than the listener's.
+        assert_eq!(
+            advertised_addr(&default, local, Some(mapped), &native),
+            Some((mapped, AddressSource::Mapped))
+        );
+        // A mapping needs no native discovery to be published.
+        assert_eq!(
+            advertised_addr(&default, local, Some(mapped), &[]),
+            Some((mapped, AddressSource::Mapped))
+        );
+        // A mapping in the other address family cannot reach this listener.
+        let mapped_v6 = "[2001:db8::2]:51000".parse().expect("IPv6 mapping");
+        assert_eq!(
+            advertised_addr(&default, local, Some(mapped_v6), &native),
+            Some((native_view, AddressSource::Native))
+        );
+        // Losing the mapping falls back to the native view.
+        assert_eq!(
+            advertised_addr(&default, local, None, &native),
+            Some((native_view, AddressSource::Native))
+        );
+        // An operator's advertisement still wins.
+        let advertised = WebRtcDirectConfig {
+            advertised_addr: Some("198.51.100.4:11000".parse().expect("advertised")),
+            ..WebRtcDirectConfig::default()
+        };
+        assert_eq!(
+            advertised_addr(&advertised, local, Some(mapped), &native),
+            advertised
+                .advertised_addr
+                .map(|addr| (addr, AddressSource::Operator))
+        );
+    }
+
+    #[test]
+    fn a_mapping_the_native_view_also_yields_comes_from_the_native_view() {
+        let local = "0.0.0.0:43210".parse().expect("wildcard listener");
+        let native = vec![(
+            MultiAddr::quic("198.51.100.2:1000".parse().expect("observed")),
+            AddressType::Direct,
+        )];
+        // The gateway kept the listener's port, so the native view yields the
+        // same address, which stays published without the mapping, as before.
+        let kept: SocketAddr = "198.51.100.2:43210".parse().expect("mapped");
+        assert_eq!(
+            advertised_addr(&WebRtcDirectConfig::default(), local, Some(kept), &native),
+            Some((kept, AddressSource::Native))
+        );
+    }
+
+    /// A mapping the test can grant and take away.
+    struct TestMapping(Arc<Mutex<Option<SocketAddr>>>);
+
+    impl PortMapping for TestMapping {
+        fn external(&self) -> Option<SocketAddr> {
+            *self.0.lock()
+        }
+    }
+
+    /// A wildcard listener whose only publishable address is a gateway
+    /// mapping the test controls: a node that has not started has no native
+    /// self-address.
+    struct MappedOnlyListener {
+        p2p: Arc<P2PNode>,
+        mapping: Arc<Mutex<Option<SocketAddr>>>,
+        catalog: Arc<BrowserEndpointCatalog>,
+        state: ServerState,
+        root: tempfile::TempDir,
+        local: SocketAddr,
+    }
+
+    impl MappedOnlyListener {
+        async fn new() -> Self {
+            let p2p = Arc::new(
+                P2PNode::new(
+                    CoreNodeConfig::builder()
+                        .local(true)
+                        .ipv6(false)
+                        .build()
+                        .expect("core config"),
+                )
+                .await
+                .expect("P2P node"),
+            );
+            let mapping = Arc::new(Mutex::new(Some(
+                "198.51.100.2:51000".parse().expect("mapped"),
+            )));
+            let catalog = Arc::new(BrowserEndpointCatalog::default());
+            let state = ServerState {
+                config: WebRtcDirectConfig::default(),
+                identity: Arc::clone(p2p.transport().node_identity()),
+                p2p: Arc::clone(&p2p),
+                ant_protocol: None,
+                payment: BrowserPaymentNetwork {
+                    chain_id: ARBITRUM_SEPOLIA_CHAIN_ID,
+                    payment_token_address: String::new(),
+                    payment_vault_address: String::new(),
+                },
+                publication: RwLock::new(Publication::default()),
+                endpoint_catalog: Some(Arc::clone(&catalog)),
+                port_mapping: Some(Box::new(TestMapping(Arc::clone(&mapping)))),
+            };
+            Self {
+                p2p,
+                mapping,
+                catalog,
+                state,
+                root: tempfile::tempdir().expect("root directory"),
+                local: "0.0.0.0:43210".parse().expect("wildcard listener"),
+            }
+        }
+
+        async fn refresh(&self) -> Result<()> {
+            refresh_browser_endpoint(
+                &self.state,
+                self.root.path(),
+                self.local,
+                CERTIFICATE_SHA256,
+            )
+            .await
+        }
+
+        fn file(&self) -> PathBuf {
+            self.root.path().join(WEBRTC_DIRECT_MULTIADDR_FILENAME)
+        }
+
+        fn peer_id(&self) -> PeerId {
+            *self.p2p.peer_id()
+        }
+
+        fn publication(&self) -> Publication {
+            self.state.publication.read().clone()
+        }
+
+        async fn supplemental(&self) -> Vec<MultiAddr> {
+            self.p2p
+                .dht_manager()
+                .supplemental_addresses_for_peer(&self.peer_id())
+                .await
+        }
+
+        /// Assert that peers and browsers no longer see the endpoint.
+        async fn assert_unpublished(&self) {
+            assert_eq!(self.publication().endpoint(), None);
+            assert_eq!(self.catalog.get(&self.peer_id()), None);
+            assert_eq!(self.supplemental().await, Vec::<MultiAddr>::new());
+        }
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_only_its_mapping_reached_is_withdrawn_when_the_mapping_ends() {
+        let listener = MappedOnlyListener::new().await;
+
+        listener.refresh().await.expect("publish the mapping");
+        let published = listener
+            .publication()
+            .endpoint()
+            .cloned()
+            .expect("published endpoint");
+        assert_eq!(
+            listener.publication(),
+            Publication::Published {
+                endpoint: published.clone(),
+                source: AddressSource::Mapped
+            }
+        );
+        assert!(published.multiaddr.contains("/198.51.100.2/udp/51000/"));
+        assert!(tokio::fs::read_to_string(listener.file())
+            .await
+            .expect("endpoint file")
+            .contains(&published.multiaddr));
+        assert_eq!(listener.catalog.get(&listener.peer_id()), Some(published));
+        assert_eq!(listener.supplemental().await.len(), 1);
+
+        *listener.mapping.lock() = None;
+        listener.refresh().await.expect("withdraw the mapping");
+        listener.assert_unpublished().await;
+        assert!(!listener.file().exists());
+
+        // With nothing published, a later refresh without a mapping is a no-op.
+        listener.refresh().await.expect("nothing to withdraw");
+        assert_eq!(listener.publication(), Publication::Unpublished);
+    }
+
+    #[tokio::test]
+    async fn a_withdrawal_the_endpoint_file_blocks_still_unpublishes_and_is_retried() {
+        let listener = MappedOnlyListener::new().await;
+        listener.refresh().await.expect("publish the mapping");
+
+        // A directory in the file's place makes removing it fail.
+        tokio::fs::remove_file(listener.file())
+            .await
+            .expect("remove the endpoint file");
+        tokio::fs::create_dir(listener.file())
+            .await
+            .expect("block the endpoint file");
+        *listener.mapping.lock() = None;
+        listener
+            .refresh()
+            .await
+            .expect_err("the endpoint file cannot be removed");
+        listener.assert_unpublished().await;
+        assert_eq!(listener.publication(), Publication::Withdrawing);
+
+        // Once the file can be removed, the next refresh finishes the withdrawal.
+        tokio::fs::remove_dir(listener.file())
+            .await
+            .expect("unblock the endpoint file");
+        tokio::fs::write(listener.file(), "stale endpoint\n")
+            .await
+            .expect("stale endpoint file");
+        listener.refresh().await.expect("finish the withdrawal");
+        assert!(!listener.file().exists());
+        listener.assert_unpublished().await;
+        assert_eq!(listener.publication(), Publication::Unpublished);
+    }
+
+    #[test]
+    fn only_a_mapped_publication_is_withdrawn() {
+        let endpoint = BrowserEndpoint::new(
+            "198.51.100.2:43210".parse().expect("socket address"),
+            PeerId::from_bytes([0x42; 32]).to_bytes(),
+            CERTIFICATE_SHA256,
+        )
+        .expect("browser endpoint");
+        for source in [
+            AddressSource::Operator,
+            AddressSource::Bind,
+            AddressSource::Native,
+        ] {
+            let kept = Publication::Published {
+                endpoint: endpoint.clone(),
+                source,
+            };
+            let mut publication = kept.clone();
+            assert_eq!(publication.begin_withdrawal(), None);
+            assert_eq!(publication, kept);
+        }
+        let mut mapped = Publication::Published {
+            endpoint: endpoint.clone(),
+            source: AddressSource::Mapped,
+        };
+        assert_eq!(mapped.begin_withdrawal(), Some(endpoint));
+        assert_eq!(mapped, Publication::Withdrawing);
+        // A withdrawal already under way has nothing left to take.
+        assert_eq!(mapped.begin_withdrawal(), None);
+        assert_eq!(mapped, Publication::Withdrawing);
     }
 
     #[test]
@@ -3067,9 +3913,11 @@ mod tests {
     #[test]
     fn derives_ipv6_advertised_address() {
         let config = WebRtcDirectConfig::default();
-        let addr = advertised_addr(&config, "[::1]:23456".parse().expect("socket"), &[])
-            .expect("advertised address");
+        let (addr, source) =
+            advertised_addr(&config, "[::1]:23456".parse().expect("socket"), None, &[])
+                .expect("advertised address");
         assert_eq!(addr, "[::1]:23456".parse().expect("socket"));
+        assert_eq!(source, AddressSource::Bind);
     }
 
     #[tokio::test]

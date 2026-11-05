@@ -174,14 +174,22 @@ pub async fn audit_tick_with_repair_proofs(
         }
     };
 
-    if all_keys.is_empty() {
+    // Sample only records this node is in range for. Records it retains out
+    // of range (ADR-0028) are mostly far from the neighbours it audits, so
+    // the close-group filter below would drop them, and every sample slot
+    // they took would be one key fewer audited.
+    let in_range_keys: Vec<XorName> = all_keys
+        .into_iter()
+        .filter(|key| paid_list.record_out_of_range_since(key).is_none())
+        .collect();
+    if in_range_keys.is_empty() {
         return AuditTickResult::Idle;
     }
 
-    let sample_count = ReplicationConfig::responsible_audit_key_limit(all_keys.len());
+    let sample_count = ReplicationConfig::responsible_audit_key_limit(in_range_keys.len());
     let sampled_keys: Vec<XorName> = {
         let mut rng = rand::thread_rng();
-        all_keys
+        in_range_keys
             .choose_multiple(&mut rng, sample_count)
             .copied()
             .collect()

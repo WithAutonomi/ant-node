@@ -623,6 +623,17 @@ pub struct PaymentVerifier {
     /// as `bytes16` in the `completedPayments` slot.
     #[cfg(any(test, feature = "test-utils"))]
     test_completed_payments_override: RwLock<HashMap<QuoteHash, TestSettlementOverride>>,
+    /// Test-only switch: while set, a verifier with no attached [`P2PNode`]
+    /// skips the paid-quote issuer and merkle candidate closeness checks
+    /// instead of rejecting the payment.
+    ///
+    /// Test builds start with it set, so unit tests that build a bare verifier
+    /// keep working. Clearing it (see
+    /// [`Self::set_skip_closeness_without_p2p_for_tests`]) runs the same
+    /// fail-closed code production does. Outside test builds the field doesn't
+    /// exist and the checks always fail closed.
+    #[cfg(any(test, feature = "test-utils"))]
+    test_skip_closeness_without_p2p: std::sync::atomic::AtomicBool,
     // NOTE: the test-only own-peer-id override was removed with the ADR-retired
     // quote-freshness/staleness gate (ADR-0004 binds price to the committed
     // count instead), so it no longer has any reader.
@@ -815,6 +826,8 @@ impl PaymentVerifier {
             test_paid_quote_k_closest_override: RwLock::new(None),
             #[cfg(any(test, feature = "test-utils"))]
             test_completed_payments_override: RwLock::new(HashMap::new()),
+            #[cfg(any(test, feature = "test-utils"))]
+            test_skip_closeness_without_p2p: std::sync::atomic::AtomicBool::new(true),
             commitment_cache: RwLock::new(None),
             pin_fetch_negative_cache: Arc::new(Mutex::new(LruCache::new(
                 NonZeroUsize::new(crate::replication::config::PIN_FETCH_NEGATIVE_CACHE_CAPACITY)
@@ -1009,6 +1022,29 @@ impl PaymentVerifier {
     pub fn merkle_parity_emission_count(&self) -> usize {
         self.merkle_parity_emissions
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test-only setter for what the closeness checks do when no [`P2PNode`]
+    /// is attached: `true` (the test-build default) skips them, `false`
+    /// rejects the payment as production does.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_skip_closeness_without_p2p_for_tests(&self, skip: bool) {
+        self.test_skip_closeness_without_p2p
+            .store(skip, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the closeness checks are skipped when no [`P2PNode`] is
+    /// attached. Always `false` outside test builds, so production fails
+    /// closed; test builds read the switch that
+    /// [`Self::set_skip_closeness_without_p2p_for_tests`] sets.
+    fn skips_closeness_without_p2p(&self) -> bool {
+        #[cfg(any(test, feature = "test-utils"))]
+        let skip = self
+            .test_skip_closeness_without_p2p
+            .load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(any(test, feature = "test-utils")))]
+        let skip = false;
+        skip
     }
 
     /// Test-only setter for local closest peers used by the paid-quote
@@ -2047,8 +2083,9 @@ impl PaymentVerifier {
 
         let attached = self.p2p_node.read().as_ref().map(Arc::clone);
         let Some(p2p_node) = attached else {
-            #[cfg(any(test, feature = "test-utils"))]
-            {
+            // Production must call attach_p2p_node at startup, so fail CLOSED
+            // here. Only a test build can opt into skipping the check.
+            if self.skips_closeness_without_p2p() {
                 crate::logging::warn!(
                     "PaymentVerifier: no P2PNode attached; paid-quote issuer \
                      K-closest check SKIPPED (test build). Production startup MUST call \
@@ -2056,20 +2093,17 @@ impl PaymentVerifier {
                 );
                 return Ok(());
             }
-            #[cfg(not(any(test, feature = "test-utils")))]
-            {
-                crate::logging::error!(
-                    "PaymentVerifier: no P2PNode attached; rejecting paid-quote \
-                     payment. This is a node-startup bug — \
-                     PaymentVerifier::attach_p2p_node must be called before \
-                     any PUT handler runs."
-                );
-                return Err(Error::Payment(
-                    "Paid quote rejected: verifier is not wired to the P2P \
-                     layer; cannot verify issuer closeness."
-                        .into(),
-                ));
-            }
+            crate::logging::error!(
+                "PaymentVerifier: no P2PNode attached; rejecting paid-quote \
+                 payment. This is a node-startup bug — \
+                 PaymentVerifier::attach_p2p_node must be called before \
+                 any PUT handler runs."
+            );
+            return Err(Error::Payment(
+                "Paid quote rejected: verifier is not wired to the P2P \
+                 layer; cannot verify issuer closeness."
+                    .into(),
+            ));
         };
 
         // Closeness *verification* must mirror the uploader's pure XOR-distance
@@ -3266,12 +3300,11 @@ impl PaymentVerifier {
         let Some(p2p_node) = attached else {
             // Production must call attach_p2p_node at startup. Fail CLOSED
             // to avoid silently disabling the defence if a startup path
-            // regresses and loses the attach call. Unit-test builds that
-            // construct a PaymentVerifier directly without exercising merkle
-            // verification are opted-in via `test-utils` to fall back to
-            // fail-open.
-            #[cfg(any(test, feature = "test-utils"))]
-            {
+            // regresses and loses the attach call. Only a test build can opt
+            // into skipping the check (the default there, so unit tests that
+            // build a bare verifier without exercising merkle closeness keep
+            // working).
+            if self.skips_closeness_without_p2p() {
                 crate::logging::warn!(
                     "PaymentVerifier: no P2PNode attached; merkle pay-yourself \
                      defence SKIPPED (test build). Production startup MUST call \
@@ -3279,20 +3312,17 @@ impl PaymentVerifier {
                 );
                 return Ok(());
             }
-            #[cfg(not(any(test, feature = "test-utils")))]
-            {
-                crate::logging::error!(
-                    "PaymentVerifier: no P2PNode attached; rejecting merkle \
-                     payment. This is a node-startup bug — \
-                     PaymentVerifier::attach_p2p_node must be called before \
-                     any PUT handler runs."
-                );
-                return Err(Error::Payment(
-                    "Merkle candidate pool rejected: verifier is not wired to \
-                     the P2P layer; cannot verify candidate closeness."
-                        .into(),
-                ));
-            }
+            crate::logging::error!(
+                "PaymentVerifier: no P2PNode attached; rejecting merkle \
+                 payment. This is a node-startup bug — \
+                 PaymentVerifier::attach_p2p_node must be called before \
+                 any PUT handler runs."
+            );
+            return Err(Error::Payment(
+                "Merkle candidate pool rejected: verifier is not wired to \
+                 the P2P layer; cannot verify candidate closeness."
+                    .into(),
+            ));
         };
 
         let pool_address = pool.midpoint_proof.address();
@@ -7023,6 +7053,56 @@ mod tests {
             msg.contains("duplicate candidate PeerId"),
             "rejection must be the duplicate-PeerId branch, got: {msg}"
         );
+    }
+
+    // ---- No P2PNode attached: the fail-closed path production runs (V2-1808) ----
+
+    #[tokio::test]
+    async fn issuer_closeness_without_p2p_node_rejects_unless_a_test_opts_out() {
+        let verifier = create_test_verifier();
+        let xorname = [0x11u8; 32];
+        let issuer = PeerId::from_bytes([0x22u8; 32]);
+
+        verifier.set_skip_closeness_without_p2p_for_tests(false);
+        let err = verifier
+            .validate_paid_quote_issuer_k_closest(&xorname, &issuer)
+            .await
+            .expect_err("with no P2PNode and no opt-out, the issuer check must fail closed");
+        assert!(
+            err.to_string().contains("not wired to the P2P layer"),
+            "rejection must be the no-P2PNode branch, got: {err}"
+        );
+
+        verifier.set_skip_closeness_without_p2p_for_tests(true);
+        verifier
+            .validate_paid_quote_issuer_k_closest(&xorname, &issuer)
+            .await
+            .expect("a test that opts out skips the issuer check");
+    }
+
+    #[tokio::test]
+    async fn merkle_closeness_without_p2p_node_rejects_unless_a_test_opts_out() {
+        let verifier = create_test_verifier();
+        let pool = MerklePaymentCandidatePool {
+            midpoint_proof: fake_midpoint_proof(),
+            candidate_nodes: make_candidate_nodes(1_700_000_000),
+        };
+
+        verifier.set_skip_closeness_without_p2p_for_tests(false);
+        let err = verifier
+            .verify_merkle_candidate_closeness_inner(&pool)
+            .await
+            .expect_err("with no P2PNode and no opt-out, merkle closeness must fail closed");
+        assert!(
+            err.to_string().contains("not wired to"),
+            "rejection must be the no-P2PNode branch, got: {err}"
+        );
+
+        verifier.set_skip_closeness_without_p2p_for_tests(true);
+        verifier
+            .verify_merkle_candidate_closeness_inner(&pool)
+            .await
+            .expect("a test that opts out skips merkle closeness");
     }
 
     /// Build a deterministic but otherwise-unused `MidpointProof` so unit

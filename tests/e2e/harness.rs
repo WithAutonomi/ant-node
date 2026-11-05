@@ -7,6 +7,7 @@ use super::anvil::TestAnvil;
 use super::testnet::{TestNetwork, TestNetworkConfig, TestNode, TestnetError};
 use ant_node::client::XorName;
 use ant_node::payment::{serialize_single_node_proof, PaymentProof};
+use ant_node::storage::DiskSpace;
 use evmlib::common::{Amount, TxHash};
 use evmlib::{EncodedPeerId, PaymentQuote, ProofOfPayment, RewardsAddress};
 use saorsa_core::P2PNode;
@@ -53,6 +54,20 @@ pub fn parseable_single_node_proof(content: XorName) -> Vec<u8> {
 /// Windows runners whose reserved port ranges move between runs, so a network
 /// that cannot create a node moves to a fresh random range instead.
 const NETWORK_START_ATTEMPTS: u32 = 3;
+
+/// Size of the partition the prune tests report: 1 TiB.
+const TEST_DISK_BYTES: u64 = 1 << 40;
+/// A partition with no room left: prune passes run under disk pressure
+/// (ADR-0028) and stay under it however much they erase.
+pub const NEARLY_FULL_DISK: DiskSpace = DiskSpace {
+    available: 0,
+    total: TEST_DISK_BYTES,
+};
+/// A partition half free: prune passes keep every record they hold.
+pub const ROOMY_DISK: DiskSpace = DiskSpace {
+    available: TEST_DISK_BYTES / 2,
+    total: TEST_DISK_BYTES,
+};
 
 /// Create and start a network from `config`, moving it to a fresh port range
 /// if a node cannot be created.
