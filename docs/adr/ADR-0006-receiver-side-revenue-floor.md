@@ -10,7 +10,8 @@
 - **Related:** ADR-0004 (commitment-bound quote pricing), ant-node #136
   (flexible 1..=7 proof bundles), ant-node #176 (first implementation, the
   approach withdrawn below), ant-node #193 (close-group pricing),
-  ant-client #150 (one-quote uploads)
+  ant-client #150 (one-quote uploads), ADR-0028 (pressure-gated retention,
+  which replaced the paid-list pruning Amendment 2 first relied on)
 
 ## Context
 
@@ -387,9 +388,11 @@ replication), arriving in 48 upload bursts. Of those, 1,801 admissions over
      before, and hints no key as a replica until a restart can read them;
    - the responsible audit never samples a marked key, which also covers one
      hinted in the moment before its mark was written;
-   - a prune audit still needs its proofs before deleting a marked key, but
-     scores no absent peer for it, and paid-list pruning keeps a marked entry
-     while the record is held;
+   - a prune audit, which is sent only under disk pressure (ADR-0028), still
+     needs its proofs before deleting a marked key, but scores no absent peer
+     for it. Paid-list eviction (ADR-0028) keeps the entry of every record
+     the node still holds, marked or not, and an entry it evicts takes its
+     mark with it;
    - a mark that cannot be read counts as set: when in doubt, judge no one.
      While reads fail the node judges no peer on any key they hit, so it
      warns at the first failure of a run and, when a read succeeds again,
@@ -593,11 +596,12 @@ out of 1,801:
     while the mark stays. A later plain insert that adds the key, or a
     removal of it, drops the mark once that write commits, and a restart
     rebuilds the copy from the database.
-  - Paid-list pruning checks for the record before and after its network
-    round, but a record admitted between that check and the delete would
-    lose its mark. Both store paths require this node inside the same width
-    the prune requires it outside, so that needs its routing view to change
-    at that moment.
+  - Paid-list eviction checks for the record when it scans, but a record
+    admitted between that scan and the delete would lose its entry, and the
+    mark with it. Eviction takes only entries far outside this node's range,
+    where with evenly spread IDs neither store path admits the record, so
+    that needs a key whose peers this node barely knows, or a routing view
+    that changes at that moment.
 - **The first paid-list record decides a key's mark, which a quoter can
   front-run.** A quoter in the 20 closest to an honest key can pay itself
   for the key, for gas only, and announce it before the client's write
@@ -636,6 +640,13 @@ out of 1,801:
   on-chain read included: up to 20 targets over 4 rounds. The load falls on
   below-floor proofs, including the honest residuals above (a lone baseline
   quote, an aged proof).
+- **Opening the paid list reads every entry once**, to fill the in-memory
+  copy of the marks, and the node starts only after that read. Since
+  pressure-gated retention (ADR-0028) the list can hold 15 million entries
+  before it evicts any. A local probe read 4 million entries in 85 ms with
+  the file already in the page cache, about 21 ns an entry, so a list at
+  that size takes about a third of a second, plus the time to read the file
+  from disk on a cold start.
 - Floor refusals stay economic. The refusal itself feeds no trust or
   misbehaviour scoring, and on nodes running this release item 4 keeps the
   checks that judge peers on held data from turning it into a penalty, within
@@ -668,8 +679,8 @@ out of 1,801:
     is written only with a new entry, survives a restart and a later plain
     insert, and goes with the entry;
   - a marked key is left out of replica hints and of responsible-audit
-    sampling, and its paid entry outlives paid pruning while its record is
-    held;
+    sampling, and paid-list eviction drops the mark of an entry it evicts
+    and leaves a kept entry marked;
   - the in-memory copy of the marks is filled on opening and follows every
     write and removal, and a marked insert and a batch removal change it
     only in the order writes take; a mark held in memory alone, as a failed
@@ -678,8 +689,8 @@ out of 1,801:
     replica hints works while the paid list cannot be read at all, and a
     paid list whose marks cannot be read on opening still opens and hints no
     replica;
-  - a mark that cannot be read counts as set in the responsible audit, paid
-    pruning and a write's fan-out, and a run of such reads logs one
+  - a mark that cannot be read counts as set in the responsible audit and a
+    write's fan-out, and a run of such reads logs one
     warning. The tests make the read fail by holding the thread's one LMDB
     reader slot;
   - a record reports the winning record's mark, or its own when that is
@@ -696,19 +707,24 @@ out of 1,801:
     one, while the control write is penalised;
   - a fresh pointer state the storer cannot price is not used to judge its
     peers, while the control is;
-  - a prune audit of a marked record keeps it but scores none of the absent
-    peers, while the control scores them;
+  - a prune audit of a marked record, run under disk pressure, keeps it but
+    scores none of the absent peers, while the control scores them;
   - a PUT, a fresh offer and a `PaidNotify`, each admitted from the payment
     cache with a forged proof the floor would contest, mark the key exactly
     when the recording node's own verified decision was contested, and never
     from that proof.
 - 54 mutations of the floor, the contest decision, the verifier's memory,
   the mark, its in-memory copy and every check that reads the mark were run
-  against these unit and e2e tests on this amendment's code, and 53 fail at
-  least one of them. The one that survives makes prune-audit scoring count
-  a mark that cannot be read as unset. Only the e2e prune test reaches that
-  check, and it cannot make a node's paid-list read fail; the same read
-  counts as set, under test, in the audit, paid pruning and the fan-out.
+  against these unit and e2e tests on this amendment's code before ADR-0028
+  merged, and 53 failed at least one of them. Two of the 54 targeted the
+  paid-pruning rule ADR-0028 made unnecessary, which is gone. The one that
+  survived makes prune-audit scoring count a mark that cannot be read as
+  unset. Only the e2e prune test reaches that check, and it cannot make a
+  node's paid-list read fail; the same read counts as set, under test, in
+  the audit and the fan-out. Two more were run on the code merged with
+  ADR-0028, and both fail: an eviction that leaves an evicted entry's mark
+  in memory fails four unit tests, and prune-audit scoring that ignores the
+  mark fails the e2e prune test, which runs under disk pressure.
 - `tests/e2e/price_floor_ab.rs` drives the same honest and near-empty-quoter
   uploads through a production-wired local testnet. Nodes are seeded to
   production-sized commitments, payments are real (on Anvil), and possession
