@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fail if a lockfile has a RustSec vulnerability that its base lockfile doesn't.
 #
-#   audit_regressions.sh HEAD_LOCK [BASE_LOCK]
+#   audit_regressions.sh [--config AUDIT_TOML] HEAD_LOCK [BASE_LOCK]
 #
 # A PR's Security Audit should fail on an advisory the PR brings in, and not on
 # one that was published against a dependency main already had: that one would
@@ -11,21 +11,40 @@
 # an already-vulnerable crate to another vulnerable version is not new. The
 # vulnerabilities both share are listed as warnings, so they stay visible.
 #
-# With no BASE_LOCK every vulnerability in HEAD_LOCK counts as new. Ignores in
-# .cargo/audit.toml in the working directory apply to both audits.
+# With no BASE_LOCK every vulnerability in HEAD_LOCK counts as new.
+#
+# Only the ignores in AUDIT_TOML apply, to both audits; with no --config, none
+# do. cargo audit reads .cargo/audit.toml from its working directory, so it runs
+# from a scratch directory holding only AUDIT_TOML. CI passes the base branch's
+# copy: if a PR's own ignores applied, the PR could add an ignore for the
+# advisory it introduces and hide it from both audits. (cargo audit also reads
+# $CARGO_HOME/audit.toml, which belongs to the runner, not the PR.)
 set -euo pipefail
 
-head_lock=$1
-base_lock=${2:-}
+config=
+if [ "${1:-}" = --config ]; then
+  config=$2
+  shift 2
+  [ -f "$config" ] || { echo "::error::no audit config at $config"; exit 1; }
+fi
+# Absolute, since cargo audit runs from the scratch directory.
+head_name=$1
+absolute() { case $1 in /*) echo "$1" ;; *) echo "$PWD/$1" ;; esac; }
+head_lock=$(absolute "$1")
+base_lock=${2:+$(absolute "$2")}
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+mkdir -p "$work/cwd/.cargo"
+if [ -n "$config" ]; then
+  cp "$config" "$work/cwd/.cargo/audit.toml"
+fi
 
 # audit LOCKFILE REPORT [cargo audit args]
 audit() {
   # cargo audit exits non-zero when it finds a vulnerability, so its status
   # can't tell a finding from a crash. A run that didn't produce a report fails
   # the check on the jq test below instead.
-  cargo audit --json --file "$1" "${@:3}" > "$2" || true
+  (cd "$work/cwd" && cargo audit --json --file "$1" "${@:3}") > "$2" || true
   if ! jq -e '.vulnerabilities.list | type == "array"' "$2" > /dev/null 2>&1; then
     echo "::error::cargo audit produced no report for $1"
     cat "$2"
@@ -48,6 +67,7 @@ warnings() {
 # The first audit fetches the advisory database; the second reuses that copy,
 # so both lockfiles are judged against the same advisories.
 audit "$head_lock" "$work/head.json"
+echo "ignores applied: $(jq -r '.settings.ignore | if length == 0 then "none" else join(", ") end' "$work/head.json")"
 vulnerabilities "$work/head.json" > "$work/head.txt"
 warnings "$work/head.json" > "$work/head-warnings.txt"
 if [ -n "$base_lock" ]; then
@@ -76,7 +96,7 @@ while IFS= read -r line; do
   echo "::warning::new informational advisory: $line"
 done < "$work/new-warnings.txt"
 
-echo "vulnerabilities: $(wc -l < "$work/head.txt") in $head_lock," \
+echo "vulnerabilities: $(wc -l < "$work/head.txt") in $head_name," \
   "$(wc -l < "$work/existing.txt") already in the base, $(wc -l < "$work/new.txt") new"
 if [ -s "$work/new.txt" ]; then
   while IFS= read -r line; do

@@ -318,7 +318,22 @@ jobs:
           set -euo pipefail
           if [ "${{ steps.inputs.outputs.base }}" = true ]; then
             git show 'HEAD^1:Cargo.lock' > "$RUNNER_TEMP/base.lock"
-            bash .github/scripts/audit_regressions.sh Cargo.lock "$RUNNER_TEMP/base.lock"
+            # The base branch's ignores, not the PR's: an ignore the PR adds
+            # would hide the advisory it is meant to catch from both audits.
+            # A change to them takes effect once it is on the base branch.
+            if git cat-file -e 'HEAD^1:.cargo/audit.toml' 2> /dev/null; then
+              git show 'HEAD^1:.cargo/audit.toml' > "$RUNNER_TEMP/base-audit.toml"
+            else
+              : > "$RUNNER_TEMP/base-audit.toml"
+            fi
+            if ! git diff --quiet 'HEAD^1' HEAD -- .cargo/audit.toml; then
+              echo "::warning::This PR changes .cargo/audit.toml. The audit applies the base branch's ignores; the PR's apply once it merges."
+              git diff 'HEAD^1' HEAD -- .cargo/audit.toml
+            fi
+            bash .github/scripts/audit_regressions.sh --config "$RUNNER_TEMP/base-audit.toml" \
+              Cargo.lock "$RUNNER_TEMP/base.lock"
+          elif [ -f .cargo/audit.toml ]; then
+            bash .github/scripts/audit_regressions.sh --config .cargo/audit.toml Cargo.lock
           else
             bash .github/scripts/audit_regressions.sh Cargo.lock
           fi
