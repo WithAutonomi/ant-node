@@ -105,11 +105,18 @@ const SMALL_STABILIZATION_TIMEOUT_SECS: u64 = 60;
 /// no production code path reads this constant.
 pub const DEFAULT_CHUNK_OPERATION_TIMEOUT_SECS: u64 = 90;
 
-/// Short node-level network timeout for E2E test harness.
+/// The test nodes' saorsa-core `connection_timeout`.
 ///
-/// This bounds DHT leave/request waits during shutdown so tests do not spend
-/// most of their runtime in graceful teardown.
-const TEST_CORE_CONNECTION_TIMEOUT_SECS: u64 = 2;
+/// saorsa-core also uses it as the request timeout for every DHT operation
+/// (`DhtNetworkConfig::request_timeout` is set from it), so it bounds how long
+/// a witnessed close-group lookup waits for each peer, as well as the DHT leave
+/// waits in `shutdown` (which runs them concurrently, so they don't add up).
+/// It was 2 s to keep teardown short (857398c). In ant-client's harness, 5 s
+/// dropped slow but live peers on loaded CI runners, and uploads failed with
+/// "found 6 peers, need 7" (V2-1852); 10 s held on dev2 with the test capped
+/// to one CPU core. Production uses 25 s. ant-client's e2e harness uses the
+/// same value; keep the two in step.
+const TEST_CORE_CONNECTION_TIMEOUT_SECS: u64 = 10;
 
 // =============================================================================
 // AntProtocol Test Configuration
