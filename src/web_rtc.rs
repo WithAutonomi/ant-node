@@ -41,7 +41,7 @@ use saorsa_transport::webrtc::{
 };
 use saorsa_transport::webrtc_direct::{
     WebRtcAdmissionLimits, WebRtcDataChannel, WebRtcDiagnostics, WebRtcDiagnosticsSnapshot,
-    WebRtcDirectConnection, WebRtcDirectListener,
+    WebRtcDirectConnection, WebRtcDirectError, WebRtcDirectListener,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -567,6 +567,39 @@ enum FrameCharge {
     Swarm,
 }
 
+/// A frame's charge to the swarm's own budget while the frame is not yet
+/// known for a swarm request. Dropping it gives the charge back, so a frame
+/// that fails to arrive, open or parse, whose buffers are refused, that turns
+/// out to be no swarm request, or whose read is abandoned spends none of the
+/// swarm's budget; [`Self::keep`] holds the charge once the frame is a swarm
+/// request.
+struct ProvisionalSwarmCharge<'a> {
+    /// The connection charged, or `None` once kept or for a frame the reads'
+    /// budget took.
+    resources: Option<&'a ConnectionResources>,
+}
+
+impl<'a> ProvisionalSwarmCharge<'a> {
+    fn new(resources: &'a ConnectionResources, charge: FrameCharge) -> Self {
+        Self {
+            resources: (charge == FrameCharge::Swarm).then_some(resources),
+        }
+    }
+
+    /// The frame is a swarm request: it keeps its charge.
+    fn keep(mut self) {
+        self.resources = None;
+    }
+}
+
+impl Drop for ProvisionalSwarmCharge<'_> {
+    fn drop(&mut self) {
+        if let Some(resources) = self.resources.take() {
+            resources.refund_swarm();
+        }
+    }
+}
+
 struct ConnectionResources {
     listener: Arc<ListenerResources>,
     source: Arc<SourceQuota>,
@@ -664,7 +697,7 @@ impl ConnectionResources {
     }
 
     /// Gives the swarm's budget back a frame's charge: it was no swarm
-    /// request.
+    /// request (see [`ProvisionalSwarmCharge`]).
     fn refund_swarm(&self) {
         self.source.swarm_rate.lock().refund();
         self.listener.global_swarm_rate.lock().refund();
@@ -2012,8 +2045,25 @@ async fn start_request(
     })?
 }
 
+/// The messages a request frame arrives in: a browser's `DataChannel`, or a
+/// test's. Shared by the request futures, which must be `Send`.
+trait FrameChannel: Sync {
+    /// One binary message; an empty one means the channel closed.
+    fn receive(
+        &self,
+    ) -> impl Future<Output = std::result::Result<Vec<u8>, WebRtcDirectError>> + Send;
+}
+
+impl FrameChannel for WebRtcDataChannel {
+    fn receive(
+        &self,
+    ) -> impl Future<Output = std::result::Result<Vec<u8>, WebRtcDirectError>> + Send {
+        Self::receive(self)
+    }
+}
+
 async fn read_webrtc_request(
-    channel: &WebRtcDataChannel,
+    channel: &impl FrameChannel,
     pq_session: &Mutex<PqSession>,
     resources: &ConnectionResources,
     active_requests: &watch::Receiver<usize>,
@@ -2031,6 +2081,9 @@ async fn read_webrtc_request(
     // Admission happens as soon as a client starts a frame. Idle persistent
     // channels consume neither request-rate tokens nor request worker slots.
     let (request_permit, charge) = resources.try_admit_frame()?;
+    // Every exit before the frame is known for a swarm request, cancellation
+    // included, gives a swarm charge back.
+    let swarm_charge = ProvisionalSwarmCharge::new(resources, charge);
     let max_plaintext_bytes = MAX_BROWSER_FRAME_BYTES;
     let mut encrypted = read_pq_payload_after_first(
         first_message,
@@ -2070,13 +2123,13 @@ async fn read_webrtc_request(
     if charge == FrameCharge::Swarm
         && !(matches!(request.body, RequestBody::ChunkProtocol) && is_swarm_request_bytes(&content))
     {
-        resources.refund_swarm();
         resources
             .listener
             .rate_rejections
             .fetch_add(1, Ordering::Relaxed);
         return Err(REQUEST_RATE_ERROR.to_string());
     }
+    swarm_charge.keep();
     Ok(AdmittedRequest {
         request,
         content,
@@ -2125,7 +2178,7 @@ async fn receive_first_message(
 
 async fn read_pq_payload_after_first(
     first_message: Vec<u8>,
-    channel: &WebRtcDataChannel,
+    channel: &impl FrameChannel,
     max_payload_bytes: usize,
     frame_timeout_message: &str,
     resources: &ConnectionResources,
@@ -3001,7 +3054,9 @@ mod tests {
         PointerGetRequest, PointerGetResponse, PointerPutRequest, PointerPutResponse,
     };
     use ant_protocol::pointer::POINTER_WIRE_LEN;
+    use futures::FutureExt;
     use saorsa_core::NodeConfig as CoreNodeConfig;
+    use saorsa_transport::webrtc::{encode_pq_frame, PqClientHandshake};
     use saorsa_transport::webrtc_direct::WebRtcCertificate;
     use std::net::Ipv4Addr;
 
@@ -3563,6 +3618,239 @@ mod tests {
         };
         assert_eq!(left(&browser.context.request_rate), 9);
         assert_eq!(left(&browser.context.source.request_rate), 9);
+    }
+
+    /// A request frame's `DataChannel` messages, after which the channel stays
+    /// open with nothing more to read.
+    struct QueuedMessages(Mutex<VecDeque<Vec<u8>>>);
+
+    impl QueuedMessages {
+        fn new(messages: Vec<Vec<u8>>) -> Self {
+            Self(Mutex::new(messages.into()))
+        }
+    }
+
+    impl FrameChannel for QueuedMessages {
+        fn receive(
+            &self,
+        ) -> impl Future<Output = std::result::Result<Vec<u8>, WebRtcDirectError>> + Send {
+            let next = self.0.lock().pop_front();
+            async move {
+                match next {
+                    Some(message) => Ok(message),
+                    None => std::future::pending().await,
+                }
+            }
+        }
+    }
+
+    /// Both ends of a PQ session, the browser's and the node's.
+    fn pq_session_pair() -> (PqSession, Mutex<PqSession>) {
+        let identity = NodeIdentity::generate().expect("identity");
+        let peer_id = *identity.peer_id().to_bytes();
+        let (handshake, hello) = PqClientHandshake::start().expect("client hello");
+        let (accept, server) = accept_pq_session(
+            &hello,
+            &peer_id,
+            identity.public_key().as_bytes(),
+            |transcript| {
+                identity
+                    .sign(transcript)
+                    .map(|signature| signature.as_bytes().to_vec())
+            },
+        )
+        .expect("server accept");
+        let client = handshake.finish(&accept, &peer_id).expect("client session");
+        (client, Mutex::new(server))
+    }
+
+    /// A browser request frame: its header names `content`'s length.
+    fn sealed_request(client: &mut PqSession, kind: &str, content: &[u8]) -> Vec<u8> {
+        let header = serde_json::json!({
+            "version": BROWSER_PROTOCOL_VERSION,
+            "request_id": 1,
+            "type": kind,
+            "content_length": content.len(),
+        });
+        let mut plaintext = serde_json::to_vec(&header).expect("header");
+        plaintext.extend_from_slice(content);
+        sealed(client, &plaintext)
+    }
+
+    fn sealed(client: &mut PqSession, plaintext: &[u8]) -> Vec<u8> {
+        encode_pq_frame(&client.seal(plaintext).expect("seal")).expect("frame")
+    }
+
+    /// A well-formed frame of `payload`, sealed by no session: the frames that
+    /// never reach the session must not spend the browser's sequence numbers.
+    fn unsealed(payload: &[u8]) -> Vec<u8> {
+        encode_pq_frame(payload).expect("frame")
+    }
+
+    fn chunk_message(body: ChunkMessageBody) -> Vec<u8> {
+        ChunkMessage {
+            request_id: 7,
+            body,
+        }
+        .encode()
+        .expect("chunk message")
+    }
+
+    fn swarm_leave() -> Vec<u8> {
+        chunk_message(ChunkMessageBody::SwarmLeaveRequest(
+            ant_protocol::swarm::SwarmLeaveRequest {
+                room: [1; 32],
+                node: [2; 32],
+                membership: 1,
+            },
+        ))
+    }
+
+    /// The swarm tokens left in a bucket, as of its last charge or refund.
+    fn swarm_tokens(bucket: &Mutex<RequestRateBucket>) -> u128 {
+        bucket.lock().token_units / 1_000_000_000
+    }
+
+    #[tokio::test]
+    async fn a_frame_on_the_swarms_budget_gives_it_back_on_every_early_exit() {
+        let config = WebRtcDirectConfig {
+            max_requests_per_second: 1000,
+            max_requests_per_second_per_ip: 1,
+            max_requests_per_second_per_connection: 1,
+            ..WebRtcDirectConfig::default()
+        };
+        let resources = ListenerResources::new(&config);
+        let address = "198.51.100.1:1000".parse().expect("browser address");
+        let browser = resources
+            .try_admit_connection(address)
+            .expect("browser connection");
+        let context = &browser.context;
+        let (mut client, server) = pq_session_pair();
+        let (_activity, active_requests) = watch::channel(0_usize);
+        // The reads' budget is spent, so every frame below is taken on the
+        // swarm's (the reads' token comes back only a second later).
+        let spend_reads = || {
+            while context.take_request_tokens(Instant::now()) {}
+        };
+        let read = |messages: Vec<Vec<u8>>| {
+            spend_reads();
+            let channel = QueuedMessages::new(messages);
+            let server = &server;
+            let active_requests = &active_requests;
+            async move { read_webrtc_request(&channel, server, context, active_requests).await }
+        };
+        let full_source = swarm_tokens(&context.source.swarm_rate);
+        let full_listener = swarm_tokens(&resources.global_swarm_rate);
+        assert_eq!(full_source, SWARM_REQUESTS_PER_SECOND_PER_SOURCE as u128);
+        assert_eq!(full_listener, SWARM_REQUESTS_PER_SECOND as u128);
+        let assert_restored = |exit: &str| {
+            assert_eq!(
+                swarm_tokens(&context.source.swarm_rate),
+                full_source,
+                "{exit}"
+            );
+            assert_eq!(
+                swarm_tokens(&resources.global_swarm_rate),
+                full_listener,
+                "{exit}"
+            );
+        };
+
+        // Twice the source's swarm budget of each, so a charge kept by any of
+        // them would leave the later ones refused as over the request rate.
+        for _ in 0..2 * SWARM_REQUESTS_PER_SECOND_PER_SOURCE {
+            // Bytes after the frame's declared end.
+            let mut frame = unsealed(&[0; 64]);
+            frame.push(0);
+            let error = read(vec![frame]).await.err().expect("trailing bytes");
+            assert!(error.contains("after its declared payload"), "{error}");
+            assert_restored("trailing bytes");
+
+            // The channel closes partway through a frame.
+            let frame = unsealed(&[0; 64]);
+            let (start, _) = frame.split_at(frame.len() / 2);
+            let error = read(vec![start.to_vec(), Vec::new()])
+                .await
+                .err()
+                .expect("closed mid-frame");
+            assert_eq!(error, "DataChannel closed");
+            assert_restored("closed mid-frame");
+
+            // A frame that does not open under the session.
+            let frame = unsealed(&[0xa5; PQ_ENCRYPTED_OVERHEAD_BYTES + 16]);
+            let error = read(vec![frame]).await.err().expect("unopenable frame");
+            assert!(error.starts_with("PQ session:"), "{error}");
+            assert_restored("unopenable frame");
+
+            // A frame that opens to no request header.
+            let frame = sealed(&mut client, b"not a request header");
+            let error = read(vec![frame]).await.err().expect("malformed header");
+            assert_ne!(error, REQUEST_RATE_ERROR);
+            assert_restored("malformed header");
+
+            // A frame that is no swarm request.
+            let frame = sealed_request(
+                &mut client,
+                "chunk_protocol",
+                &chunk_message(ChunkMessageBody::GetRequest(
+                    crate::ant_protocol::ChunkGetRequest::new([3; 32]),
+                )),
+            );
+            let error = read(vec![frame]).await.err().expect("chunk read");
+            assert_eq!(error, REQUEST_RATE_ERROR);
+            assert_restored("no swarm request");
+
+            // A read abandoned partway through a frame.
+            let frame = unsealed(&[0; 64]);
+            let (start, _) = frame.split_at(frame.len() / 2);
+            assert!(read(vec![start.to_vec()]).now_or_never().is_none());
+            assert_restored("abandoned read");
+        }
+
+        // A swarm request is still admitted on the swarm's budget, and keeps
+        // its charge there.
+        let frame = sealed_request(&mut client, "chunk_protocol", &swarm_leave());
+        let admitted = read(vec![frame]).await.expect("swarm request admitted");
+        assert_eq!(admitted.charge, FrameCharge::Swarm);
+        assert_eq!(swarm_tokens(&context.source.swarm_rate), full_source - 1);
+        assert_eq!(
+            swarm_tokens(&resources.global_swarm_rate),
+            full_listener - 1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_frame_whose_buffers_are_refused_gives_the_swarm_its_charge_back() {
+        let config = WebRtcDirectConfig {
+            max_requests_per_second: 1000,
+            max_requests_per_second_per_ip: 1,
+            max_requests_per_second_per_connection: 1,
+            max_in_flight_bytes_per_ip: 64,
+            ..WebRtcDirectConfig::default()
+        };
+        let resources = ListenerResources::new(&config);
+        let address = "198.51.100.1:1000".parse().expect("browser address");
+        let browser = resources
+            .try_admit_connection(address)
+            .expect("browser connection");
+        let context = &browser.context;
+        let (_client, server) = pq_session_pair();
+        let (_activity, active_requests) = watch::channel(0_usize);
+        let full_source = swarm_tokens(&context.source.swarm_rate);
+        let full_listener = swarm_tokens(&resources.global_swarm_rate);
+        for _ in 0..2 * SWARM_REQUESTS_PER_SECOND_PER_SOURCE {
+            while context.take_request_tokens(Instant::now()) {}
+            // A frame larger than the source's byte budget.
+            let frame = unsealed(&[0; 256]);
+            let channel = QueuedMessages::new(vec![frame]);
+            let error = read_webrtc_request(&channel, &server, context, &active_requests)
+                .await
+                .err()
+                .expect("over the byte budget");
+            assert_eq!(error, SOURCE_BYTE_CAPACITY_ERROR);
+            assert_eq!(swarm_tokens(&context.source.swarm_rate), full_source);
+            assert_eq!(swarm_tokens(&resources.global_swarm_rate), full_listener);
+        }
     }
 
     #[test]

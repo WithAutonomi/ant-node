@@ -248,7 +248,10 @@ may only be appended.
   arrives once the reads' budget is spent is taken on the swarm's instead,
   since only the opened frame says whether it is a swarm request: one that
   is goes on, and anything else gives the swarm its token back and is
-  refused as over the request rate, as before. Native swarm requests have a
+  refused as over the request rate, as before. So does a frame that fails to
+  arrive, open or parse, whose buffers are refused, or whose read is
+  abandoned: the swarm keeps a token only from a frame known for a swarm
+  request. Native swarm requests have a
   budget of their own with the same figures (64 a second in all, 8 from one
   host, an IPv4 address or an IPv6 /64, since a native client's identities
   cost nothing to make), taken before the request is decoded or given a
