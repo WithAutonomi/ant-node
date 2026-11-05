@@ -389,8 +389,11 @@ replication), arriving in 48 upload bursts. Of those, 1,801 admissions over
      key's paid entry. Each paid-list write updates that copy in commit order, a new
      mark just before its commit, so the copy never lacks a committed mark,
      and a write that commits the key unmarked, a plain insert that adds it
-     or a removal, drops any mark the copy holds for it. If the marks cannot be read when the node starts, it still starts, as
-     before, and hints no key as a replica until a restart can read them;
+     or a removal, drops any mark the copy holds for it. If the marks cannot
+     be read when the node starts, it still starts, as before, and hints no
+     key as a replica until a restart can read them; since any key it stores
+     may then be marked, each one with a paid entry is a paid-hint candidate
+     at any distance instead;
    - the responsible audit never samples a marked key, which also covers one
      hinted in the moment before its mark was written;
    - a prune audit, which is sent only under disk pressure (ADR-0028), still
@@ -694,8 +697,9 @@ out of 1,801:
     commit can leave it, goes with a later plain insert of the key and with
     its removal, single or batched; building
     replica hints works while the paid list cannot be read at all, and a
-    paid list whose marks cannot be read on opening still opens and hints no
-    replica;
+    paid list whose marks cannot be read on opening still opens, hints no
+    replica and offers every stored key with a paid entry as a paid hint at
+    any distance;
   - a mark that cannot be read counts as set in the responsible audit and a
     write's fan-out, and a run of such reads logs one
     warning. The tests make the read fail by holding the thread's one LMDB

@@ -480,11 +480,11 @@ impl PaidList {
     }
 
     /// The keys marked price-contested in the in-memory copy, read without
-    /// touching the database. It is empty if the marks could not be read when
-    /// the paid list opened.
-    pub fn marked_keys(&self) -> Vec<XorName> {
+    /// touching the database, or `None` if the marks could not be read when
+    /// the paid list opened, so that any key may be marked.
+    pub fn marked_keys(&self) -> Option<Vec<XorName>> {
         let snapshot = self.price_contested.read().clone();
-        snapshot.map_or_else(Vec::new, |marked| marked.iter().copied().collect())
+        snapshot.map(|marked| marked.iter().copied().collect())
     }
 
     /// Describe a failed insert. A full store is also reported, once, as an
@@ -758,6 +758,12 @@ impl PaidList {
     /// one reader slot, so until it is dropped every paid-list read on this
     /// thread fails, which lets a test drive the paths a mark that cannot be
     /// read takes.
+    /// Act as if the marks could not be read when the paid list opened.
+    #[cfg(test)]
+    pub(crate) fn forget_marks_for_tests(&self) {
+        *self.price_contested.write() = None;
+    }
+
     #[cfg(test)]
     pub(crate) fn hold_reader_for_tests(&self) -> Result<RoTxn<'_, WithTls>> {
         self.env

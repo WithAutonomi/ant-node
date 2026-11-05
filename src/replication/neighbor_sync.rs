@@ -173,7 +173,7 @@ async fn paid_hint_candidates(
     let self_xor: XorName = *p2p_node.peer_id().as_bytes();
     let near_bits = paid_near_bits(p2p_node, group_size).await;
     let scan_bits = paid_hint_scan_bits(paid_list.count()?, near_bits);
-    paid_hint_keys(paid_list, storage, &self_xor, scan_bits)
+    paid_hint_keys(paid_list, storage, &self_xor, scan_bits).await
 }
 
 /// The paid-list keys within the `scan_bits` around `center`, and the keys
@@ -184,17 +184,33 @@ async fn paid_hint_candidates(
 /// reach its close group in neither hint set. The marks and the store's index
 /// are in memory, and marks are few, so the far marked keys cost one paid-list
 /// read each.
-fn paid_hint_keys(
+///
+/// While the marks are unknown, because they could not be read when the paid
+/// list opened, any stored key may be marked and none goes out as a replica
+/// hint (see [`replica_hint_keys`]), so every stored key is taken as marked
+/// here: the per-key work the replica hints no longer do moves to these.
+async fn paid_hint_keys(
     paid_list: &PaidList,
     storage: &ChunkStore,
     center: &XorName,
     scan_bits: usize,
 ) -> Result<Vec<XorName>> {
     let mut keys = paid_list.keys_near(center, scan_bits)?;
-    keys.extend(paid_list.marked_keys().into_iter().filter(|key| {
-        !is_near(center, key, scan_bits)
-            && storage.exists(key).unwrap_or(false)
-            && paid_list.contains(key).unwrap_or(false)
+    if scan_bits >= XORNAME_BITS {
+        return Ok(keys);
+    }
+    let stored_marked = match paid_list.marked_keys() {
+        Some(marked) => marked
+            .into_iter()
+            .filter(|key| storage.exists(key).unwrap_or(false))
+            .collect(),
+        None => storage.all_keys().await.unwrap_or_else(|e| {
+            warn!("Failed to read stored keys for paid hints while the marks are unknown: {e}");
+            Vec::new()
+        }),
+    };
+    keys.extend(stored_marked.into_iter().filter(|key| {
+        !is_near(center, key, scan_bits) && paid_list.contains(key).unwrap_or(false)
     }));
     Ok(keys)
 }
@@ -724,7 +740,8 @@ mod tests {
     /// ADR-0006 with ADR-0028: a price-contested key this node stores is read
     /// for paid hints at any distance, as it would be for replica hints, while
     /// a far key it does not store or one with no mark is left out of a narrow
-    /// read, and a full read lists each key once.
+    /// read, and a full read lists each key once. While the marks are unknown,
+    /// every stored key with a paid entry is read at any distance.
     #[tokio::test]
     async fn a_stored_marked_key_is_a_paid_hint_candidate_at_any_distance() {
         const NARROW_SCAN_BITS: usize = 8;
@@ -755,23 +772,19 @@ mod tests {
             assert!(!is_near(&center, &key, NARROW_SCAN_BITS), "a far key");
         }
 
-        let read = |scan_bits| {
-            let mut keys =
-                paid_hint_keys(&paid_list, &storage, &center, scan_bits).expect("read keys");
-            keys.sort_unstable();
-            keys
-        };
         let sorted = |mut keys: Vec<XorName>| {
             keys.sort_unstable();
             keys
         };
-
+        let narrow = paid_hint_keys(&paid_list, &storage, &center, NARROW_SCAN_BITS)
+            .await
+            .expect("read keys");
+        assert_eq!(sorted(narrow), sorted(vec![near_marked, far_marked]));
+        let full = paid_hint_keys(&paid_list, &storage, &center, XORNAME_BITS)
+            .await
+            .expect("read keys");
         assert_eq!(
-            read(NARROW_SCAN_BITS),
-            sorted(vec![near_marked, far_marked])
-        );
-        assert_eq!(
-            read(XORNAME_BITS),
+            sorted(full),
             sorted(vec![
                 near_marked,
                 far_marked,
@@ -779,6 +792,27 @@ mod tests {
                 far_marked_unstored
             ]),
             "a full read covers every key once"
+        );
+
+        // While the marks are unknown any stored key may be marked, and none
+        // is hinted as a replica, so every stored key with a paid entry is
+        // read at any distance; a stored key with no paid entry is not.
+        let unpaid_stored = ChunkStore::compute_address(b"far unpaid record");
+        storage
+            .put(&unpaid_stored, b"far unpaid record")
+            .await
+            .expect("put");
+        assert!(
+            !is_near(&center, &unpaid_stored, NARROW_SCAN_BITS),
+            "a far key"
+        );
+        paid_list.forget_marks_for_tests();
+        let unknown = paid_hint_keys(&paid_list, &storage, &center, NARROW_SCAN_BITS)
+            .await
+            .expect("read keys");
+        assert_eq!(
+            sorted(unknown),
+            sorted(vec![near_marked, far_marked, far_plain])
         );
     }
 
