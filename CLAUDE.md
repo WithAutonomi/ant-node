@@ -77,9 +77,9 @@ This includes:
 | ant-quic | 9000-9999 | 9000 | QUIC transport layer |
 | **ant-node** | **10000-10999** | **10000** | Core P2P network nodes (THIS PROJECT) |
 | communitas | 11000-11999 | 11000 | Collaboration platform nodes |
-| **ant-node tests** | **20000-60000** | **random** | E2E test isolation (local only) |
+| **ant-node tests** | **OS-assigned** | **port 0** | E2E test isolation (local only) |
 
-**Note:** The E2E test suite uses ports 20000-60000 with random allocation to prevent conflicts between parallel test runs and local development instances. Production deployments MUST use 10000-10999.
+**Note:** E2E test nodes bind port 0, so the OS assigns each one a free port from its ephemeral range (by default Linux 32768-60999, macOS and Windows 49152-65535). That keeps parallel test runs apart and clear of local development instances. Production deployments MUST use 10000-10999.
 
 ### DO NOT DISTURB OTHER NETWORKS
 
