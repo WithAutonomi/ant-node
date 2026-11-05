@@ -14,7 +14,7 @@ use saorsa_core::P2PNode;
 
 use crate::ant_protocol::XorName;
 use crate::error::Result;
-use crate::replication::close_group_map::{CloseGroupMap, GroupRange};
+use crate::replication::close_group_map::{close_group_candidates, CloseGroupMap, GroupRange};
 use crate::replication::config::{ReplicationConfig, REPLICATION_PROTOCOL_ID};
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
@@ -78,22 +78,6 @@ pub async fn build_replica_hints_for_peer(
         .into_iter()
         .map(|hint| hint.key)
         .collect()
-}
-
-/// Every candidate for a key's close group in this node's view: its routing table
-/// and itself. One snapshot serves a whole build.
-async fn close_group_candidates(p2p_node: &Arc<P2PNode>) -> Vec<PeerId> {
-    let self_id = *p2p_node.peer_id();
-    let mut candidates: Vec<PeerId> = p2p_node
-        .dht_manager()
-        .routing_table_peers()
-        .await
-        .into_iter()
-        .map(|node| node.peer_id)
-        .filter(|peer| *peer != self_id)
-        .collect();
-    candidates.push(self_id);
-    candidates
 }
 
 /// Call `hint` with each key `read` returns whose close group in `groups` holds

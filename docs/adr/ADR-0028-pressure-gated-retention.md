@@ -202,6 +202,11 @@ store shares that partition.
       0.35 ms instead of 179–195 ms, with the same hints. Those keys were spread over the
       whole key space, so the neighbour's ranges held under a tenth of them. A real node's
       keys cluster around it, so a build reads a larger share, at well under 1 µs a key.
+  - **Prune passes and hint admission** use the same map in place of a lookup per key: a
+    prune pass checks every stored record, including the out-of-range ones this ADR keeps,
+    and admission checks every hinted key this node doesn't already know. The check just
+    before an erasure still does a fresh lookup, since the routing table may have changed
+    while the proofs were gathered.
   - **Store size:** the LMDB map grows from 256 MiB to 1 GiB, which holds about 17.6
     million entries, measured at about 61 bytes each with single-key commits. The file
     grows as entries do, on every platform. A full store logs one error, since new paid
@@ -214,7 +219,8 @@ store shares that partition.
 - `src/replication/retention.rs`: the pressure state, thresholds and erase order.
 - `src/replication/out_of_range_clocks.rs`: saving and restoring the clocks.
 - `ChunkStore::disk_space`: the measurement.
-- `src/replication/close_group_map.rs`: close groups per key range, for hint builds.
+- `src/replication/close_group_map.rs`: close groups per key range, for hint builds,
+  prune passes and hint admission.
 
 ### Why this holds
 
@@ -309,10 +315,12 @@ store shares that partition.
   - paid-list eviction: farthest first, up to its limit, never what it keeps, never near;
   - near ranges, and reading only the keys in one;
   - a far paid entry kept until the node knows 60 peers;
-  - close-group maps matching a sort of every candidate by distance, for 0 to 250
-    candidates and groups of 1 to 20, with IDs evenly spread, clustered beside one
+  - close-group maps matching, in order, a sort of every candidate by distance, for 0 to
+    250 candidates and groups of 1 to 20, with IDs evenly spread, clustered beside one
     candidate, or sharing their top bits, and ranges covering every key once;
   - only keys whose group holds a peer being hinted;
+  - a map of the retention width giving a prune pass the retention and strict groups, in
+    the order a lookup gives them;
   - reading key ranges from the record store and the paid list;
   - the store's file not taking the whole map up front;
   - removing a paid entry leaving its record's clock;

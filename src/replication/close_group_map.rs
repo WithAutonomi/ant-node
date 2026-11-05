@@ -17,12 +17,14 @@
 //!
 //! Each key's group is the one sorting every candidate by distance to it would
 //! give: the map applies the same order, once per range. Hint builds use it to read
-//! only the ranges where a peer they build for can be in the group.
+//! only the ranges where a peer they build for can be in the group. Prune passes
+//! and hint admission use it in place of a routing-table lookup per key.
 
 use std::collections::HashSet;
 use std::ops::Range;
 
 use saorsa_core::identity::PeerId;
+use saorsa_core::P2PNode;
 
 use crate::ant_protocol::{XorName, XORNAME_LEN};
 use crate::client::xor_distance;
@@ -38,6 +40,23 @@ const KEY_BITS: usize = XORNAME_LEN * BITS_PER_BYTE;
 
 /// A byte's highest bit, which comes first in a key's bit order.
 const HIGHEST_BIT_IN_BYTE: u8 = 0x80;
+
+/// Every candidate for a key's close group in this node's view: its routing table
+/// and itself, the set a self-inclusive lookup sorts. Take it once for a whole
+/// pass or build.
+pub async fn close_group_candidates(p2p_node: &P2PNode) -> Vec<PeerId> {
+    let self_id = *p2p_node.peer_id();
+    let mut candidates: Vec<PeerId> = p2p_node
+        .dht_manager()
+        .routing_table_peers()
+        .await
+        .into_iter()
+        .map(|node| node.peer_id)
+        .filter(|peer| *peer != self_id)
+        .collect();
+    candidates.push(self_id);
+    candidates
+}
 
 /// Keys from `low` to `high` whose close groups hold the same settled candidates,
 /// plus the closest `need` of the open ones, picked for each key.
@@ -136,13 +155,25 @@ impl CloseGroupMap {
         group
     }
 
-    /// The close group of any key.
-    #[cfg(test)]
+    /// The close group of `key`, closest first, as a lookup returns it.
     pub fn group_of(&self, key: &XorName) -> Vec<PeerId> {
+        let mut group = self
+            .range_of(key)
+            .map_or_else(Vec::new, |range| self.group_in(range, key));
+        group.sort_unstable_by_key(|peer| xor_distance(key, peer.as_bytes()));
+        group
+    }
+
+    /// Whether `peer` is in the close group of `key`.
+    pub fn includes(&self, key: &XorName, peer: &PeerId) -> bool {
+        self.range_of(key)
+            .is_some_and(|range| self.group_in(range, key).contains(peer))
+    }
+
+    /// The range holding `key`.
+    fn range_of(&self, key: &XorName) -> Option<&GroupRange> {
         let index = self.ranges.partition_point(|range| range.high < *key);
-        self.ranges
-            .get(index)
-            .map_or_else(Vec::new, |range| self.group_in(range, key))
+        self.ranges.get(index)
     }
 }
 
@@ -262,6 +293,8 @@ mod tests {
         LARGE_TABLE,
     ];
     const EXAMPLE_GROUP: usize = 2;
+    /// Candidates checked for membership of each key's group.
+    const MEMBERSHIP_CHECKS: usize = 3;
     /// Bytes a clustered ID shares with the candidate it sits beside.
     const CLUSTERED_SHARED_BYTES: usize = 3;
     const CLUSTERED_IDS: usize = 40;
@@ -307,13 +340,17 @@ mod tests {
     fn assert_matches_brute_force(candidates: &[PeerId], group_size: usize, rng: &mut StdRng) {
         let map = CloseGroupMap::new(candidates.iter().copied(), group_size);
         for key in probe_keys(candidates, rng) {
+            let expected = brute_force(candidates, &key, group_size);
             assert_eq!(
-                sorted(map.group_of(&key)),
-                sorted(brute_force(candidates, &key, group_size)),
+                map.group_of(&key),
+                expected,
                 "{} candidates, group {group_size}, key {}",
                 candidates.len(),
                 hex::encode(key)
             );
+            for candidate in candidates.iter().take(MEMBERSHIP_CHECKS) {
+                assert_eq!(map.includes(&key, candidate), expected.contains(candidate));
+            }
         }
     }
 

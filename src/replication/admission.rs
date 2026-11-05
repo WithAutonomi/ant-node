@@ -15,6 +15,7 @@ use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
 
 use crate::ant_protocol::XorName;
+use crate::replication::close_group_map::{close_group_candidates, CloseGroupMap};
 use crate::replication::config::ReplicationConfig;
 use crate::replication::paid_list::PaidList;
 use crate::storage::ChunkStore;
@@ -77,22 +78,26 @@ pub async fn is_in_paid_close_group(
 /// Storage responsibility is a *different* question, asked later against live
 /// routing state at the point of download. Keeping the two apart is what makes
 /// the sender's replica/paid labelling unable to influence what we store.
-async fn is_relevant(
+fn is_relevant(
     self_id: &PeerId,
     key: &XorName,
-    p2p_node: &Arc<P2PNode>,
-    config: &ReplicationConfig,
-    storage: &Arc<ChunkStore>,
-    paid_list: &Arc<PaidList>,
+    paid_groups: &CloseGroupMap,
+    storage: &ChunkStore,
+    paid_list: &PaidList,
     pending_keys: &HashSet<XorName>,
 ) -> bool {
     // Fast paths: we already hold the key, already track it, or already know it
     // is paid for. Each means the relevance question is settled -- no
-    // routing-table lookup needed.
+    // close-group check needed.
     storage.exists(key).unwrap_or(false)
         || pending_keys.contains(key)
         || paid_list.contains(key).unwrap_or(false)
-        || is_in_paid_close_group(self_id, key, p2p_node, config.paid_list_close_group_size).await
+        || paid_groups.includes(key, self_id)
+}
+
+/// Every key's `PaidCloseGroup`, for a whole batch of hints.
+fn paid_group_map(candidates: Vec<PeerId>, config: &ReplicationConfig) -> CloseGroupMap {
+    CloseGroupMap::new(candidates, config.paid_list_close_group_size)
 }
 
 /// Admit neighbor-sync hints per Section 7.1 rules.
@@ -122,6 +127,11 @@ pub async fn admit_hints(
         paid_only_keys: Vec::new(),
         rejected_keys: Vec::new(),
     };
+    if replica_hints.is_empty() && paid_hints.is_empty() {
+        return result;
+    }
+    // One routing-table snapshot for the whole batch, instead of a lookup per key.
+    let paid_groups = paid_group_map(close_group_candidates(p2p_node).await, config);
 
     let mut seen_replica = HashSet::new();
     for &key in replica_hints {
@@ -131,14 +141,11 @@ pub async fn admit_hints(
         if is_relevant(
             self_id,
             &key,
-            p2p_node,
-            config,
+            &paid_groups,
             storage,
             paid_list,
             pending_keys,
-        )
-        .await
-        {
+        ) {
             result.replica_keys.push(key);
         } else {
             result.rejected_keys.push(key);
@@ -159,14 +166,11 @@ pub async fn admit_hints(
         if is_relevant(
             self_id,
             &key,
-            p2p_node,
-            config,
+            &paid_groups,
             storage,
             paid_list,
             pending_keys,
-        )
-        .await
-        {
+        ) {
             result.paid_only_keys.push(key);
         } else {
             result.rejected_keys.push(key);
@@ -197,6 +201,18 @@ mod tests {
     /// Build an `XorName` from a single byte (repeated to 32 bytes).
     fn xor_name_from_byte(b: u8) -> XorName {
         [b; 32]
+    }
+
+    #[test]
+    fn a_node_ranked_just_inside_the_paid_close_group_finds_a_key_relevant() {
+        const CANDIDATES: u8 = 30;
+        let config = ReplicationConfig::default();
+        // A key of zeroes, so each candidate's rank is its first byte.
+        let candidates: Vec<PeerId> = (1..=CANDIDATES).map(peer_id_from_byte).collect();
+        let rank = |r: usize| peer_id_from_byte(u8::try_from(r).expect("rank fits"));
+        let map = paid_group_map(candidates, &config);
+        assert!(map.includes(&[0u8; 32], &rank(config.paid_list_close_group_size)));
+        assert!(!map.includes(&[0u8; 32], &rank(config.paid_list_close_group_size + 1)));
     }
 
     // -----------------------------------------------------------------------
