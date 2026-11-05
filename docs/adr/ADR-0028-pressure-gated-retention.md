@@ -183,8 +183,10 @@ store shares that partition.
     near, from a simulation of 4,000 nodes. While a node knows fewer than 60 peers, every
     entry counts as near.
   - **Sync hints:** read only the entries near this node, so their cost doesn't grow with
-    entries outside that range. Each entry read costs a routing-table lookup: measured at
-    4.7 µs with 4 peers and 14.5 µs with 24, which extrapolates to about 100 µs with 200.
+    entries outside that range. Each entry read costs a local routing-table lookup. In a
+    release build on an Apple M3 Ultra core, with 101 to 107 peers known, one took 10–11 µs
+    for a group of 7 and 15–16 µs for a group of 20, so 150,000 took about 2 s. Typical
+    node hardware is slower, roughly in proportion to its single-core speed.
     A node builds hints every round and for every inbound sync. With evenly spread IDs, a
     simulation of 500 to 10,000 nodes found no key outside the near range that this node
     or one of its 20 closest neighbours is among the closest 20 or 40 for, in about 48,000
