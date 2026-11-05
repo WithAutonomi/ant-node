@@ -484,6 +484,6 @@ mod tests {
 
         let empty = CloseGroupMap::new(Vec::new(), PAID_GROUP);
         assert_eq!(empty.ranges().len(), 1);
-        assert!(empty.group_of(&rng.gen()).is_empty());
+        assert_eq!(empty.group_of(&rng.gen()), Vec::<PeerId>::new());
     }
 }
