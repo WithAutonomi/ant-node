@@ -182,16 +182,26 @@ store shares that partition.
     evenly spread IDs and at most 20 peers per ring, about 120 nodes count a given key as
     near, from a simulation of 4,000 nodes. While a node knows fewer than 60 peers, every
     entry counts as near.
-  - **Sync hints:** read only the entries near this node, so their cost doesn't grow with
-    entries outside that range. Each entry read costs a local routing-table lookup. In a
-    release build on an Apple M3 Ultra core, with 101 to 107 peers known, one took 10–11 µs
-    for a group of 7 and 15–16 µs for a group of 20, so 150,000 took about 2 s. Typical
-    node hardware is slower, roughly in proportion to its single-core speed.
-    A node builds hints every round and for every inbound sync. With evenly spread IDs, a
-    simulation of 500 to 10,000 nodes found no key outside the near range that this node
-    or one of its 20 closest neighbours is among the closest 20 or 40 for, in about 48,000
-    sampled keys. A node knowing fewer than 60 peers reads every entry, which covers small
-    networks where a neighbour can be in the paid close group of a key far from this node.
+  - **Sync hints:** each build takes one copy of the routing table and works out each
+    key's close group once per key range, rather than once per key
+    (`src/replication/close_group_map.rs`). It then reads only the ranges where a peer it
+    builds for can be in the group, from the record store and the paid list, which are
+    both kept sorted by key. Each key gets the group a lookup for it would give, so a peer
+    gets the hint for a key however far the key is from this node. The near range plays no
+    part in hints.
+    - **Why:** before this, every stored record and every paid entry read cost a local
+      routing-table lookup, in every build. In a release build on an Apple M3 Ultra core,
+      with 101 to 107 peers known, one took 10–11 µs for a group of 7 and 15–16 µs for a
+      group of 20, so 150,000 took about 2 s. Typical node hardware is slower, roughly in
+      proportion to its single-core speed. A node builds hints every round and for every
+      inbound sync, a neighbour waits 15 s for an answer, and the records and paid entries
+      this ADR keeps add to every build.
+    - **Measured:** in a release build on the same machine, on a 300-node local network
+      where the node knew 91 peers, building hints for its nearest neighbour over 20,000
+      paid entries took 0.9 ms instead of 265–272 ms, and over 20,000 stored records
+      0.35 ms instead of 179–195 ms, with the same hints. Those keys were spread over the
+      whole key space, so the neighbour's ranges held under a tenth of them. A real node's
+      keys cluster around it, so a build reads a larger share, at well under 1 µs a key.
   - **Store size:** the LMDB map grows from 256 MiB to 1 GiB, which holds about 17.6
     million entries, measured at about 61 bytes each with single-key commits. The file
     grows as entries do, on every platform. A full store logs one error, since new paid
@@ -204,6 +214,7 @@ store shares that partition.
 - `src/replication/retention.rs`: the pressure state, thresholds and erase order.
 - `src/replication/out_of_range_clocks.rs`: saving and restoring the clocks.
 - `ChunkStore::disk_space`: the measurement.
+- `src/replication/close_group_map.rs`: close groups per key range, for hint builds.
 
 ### Why this holds
 
@@ -265,13 +276,16 @@ store shares that partition.
 ### Neutral / Operational
 
 - **The prune log line gains `disk_pressure=` and `retained=`.**
+- **The hint-build log line** reports `candidates=`, `stored_keys_read=` and
+  `paid_keys_read=` instead of `stored_keys=` and `paid_keys=`, and inbound syncs are
+  logged too.
 - **Public Rust API breaks:**
   - `PrunePassContext` gains `disk_pressure`.
   - `ReplicationConfig` gains `paid_list_evict_start_entries`.
   - `PruneResult`'s paid counters become `paid_entries_evicted`, and the prune log line's
     paid part becomes `paid total= evicted=`.
-  - `PaidList` loses its paid timers, its prune cursor and `all_keys`, and gains `keys_near`
-    and `evict_far`. Its record timestamps are `SystemTime`s.
+  - `PaidList` loses its paid timers, its prune cursor and `all_keys`, and gains
+    `evict_far`. Its record timestamps are `SystemTime`s.
   - `PointerReplication::prune_pass` takes the pressure state.
   - `NeighborSyncState::prune_cursor` is removed.
   - PR #266's removals are included.
@@ -294,15 +308,22 @@ store shares that partition.
   - a clock surviving "in range" during bootstrap;
   - paid-list eviction: farthest first, up to its limit, never what it keeps, never near;
   - near ranges, and reading only the keys in one;
-  - a far key read for hints until the node knows 60 peers, and only near keys after that;
+  - a far paid entry kept until the node knows 60 peers;
+  - close-group maps matching a sort of every candidate by distance, for 0 to 250
+    candidates and groups of 1 to 20, with IDs evenly spread, clustered beside one
+    candidate, or sharing their top bits, and ranges covering every key once;
+  - only keys whose group holds a peer being hinted;
+  - reading key ranges from the record store and the paid list;
   - the store's file not taking the whole map up front;
   - removing a paid entry leaving its record's clock;
   - a pointer needing all but one of its group to prove it.
 - **End-to-end tests:**
   - `out_of_range_records_stay_until_the_disk_needs_the_room`: with room, a record the
     whole group holds is kept and its group never asked; under pressure it goes.
-  - `a_neighbour_gets_a_paid_hint_for_a_key_far_from_this_node`: in a small network, a peer
-    far from a node still gets the hint for a key it is closest to.
+  - `a_neighbour_gets_a_paid_hint_for_a_key_far_from_this_node`: a peer far from a node
+    still gets the hint for a key it is closest to.
+  - `hint_builds_match_a_lookup_per_key`: on 25 nodes, every peer gets exactly the paid
+    and replica hints a lookup per key gives it.
   - `paid_entries_stay_below_the_threshold_and_near_this_node`: disk pressure evicts no
     paid entry, and an entry near this node stays over the threshold.
   - The existing chunk prune tests run under a simulated nearly full disk.
@@ -314,8 +335,8 @@ store shares that partition.
   - it stops at 15% free;
   - below the threshold, `paid ... evicted=0` holds on every node;
   - with a test build's low threshold, only far entries without a stored record go;
-  - on a network large enough for routing tables to pass 60 peers, hint-build times follow
-    the entries near a node rather than `paid total=`;
+  - hint builds stay in milliseconds as `paid total=` and retained records grow, from
+    `Neighbor-sync hint build ... elapsed_ms=`;
   - how fast a node under pressure erases, against how fast it receives in-range data;
   - after restarting a node under pressure, `candidates=` doesn't fall to 0 once bootstrap
     has drained;

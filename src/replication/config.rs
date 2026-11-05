@@ -105,9 +105,10 @@ pub const MAX_PAID_EVICTIONS_PER_PASS: usize = 100_000;
 /// range reaches.
 ///
 /// A key is near when its distance has no more significant bits than the distance
-/// to this peer. Reading this far out gives a steadier measure of local peer
-/// density than the closest few peers do, and reaches past every key this node or
-/// a neighbour is in the paid close group of when IDs are evenly spread (ADR-0028).
+/// to this peer, and a paid entry near this node is never evicted. Reading this
+/// far out gives a steadier measure of local peer density than the closest few
+/// peers do, and reaches past every key this node or a neighbour is in the paid
+/// close group of when IDs are evenly spread (ADR-0028).
 pub const PAID_LIST_NEAR_RANK: usize = 60;
 
 /// Number of closest peers to self eligible for neighbor sync.

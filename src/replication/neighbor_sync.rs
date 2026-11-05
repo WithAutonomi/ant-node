@@ -13,10 +13,10 @@ use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
 
 use crate::ant_protocol::XorName;
-use crate::client::xor_distance;
 use crate::error::Result;
-use crate::replication::config::{ReplicationConfig, PAID_LIST_NEAR_RANK, REPLICATION_PROTOCOL_ID};
-use crate::replication::paid_list::{near_bits_for_peer_distances, PaidList};
+use crate::replication::close_group_map::{CloseGroupMap, GroupRange};
+use crate::replication::config::{ReplicationConfig, REPLICATION_PROTOCOL_ID};
+use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
     NeighborSyncRequest, NeighborSyncResponse, ReplicationMessage, ReplicationMessageBody,
 };
@@ -60,78 +60,122 @@ pub(crate) struct PeerSyncHints {
 /// Returns keys that we believe the peer should hold (peer is among the
 /// `CLOSE_GROUP_SIZE` nearest to `K` in our `SelfInclusiveRT`).
 ///
-/// This intentionally scans all locally stored records, not only records for
-/// which this node is still responsible. Out-of-range records retained by
-/// prune hysteresis therefore continue to repair their new close group before
-/// this node is allowed to delete them.
+/// This considers every locally stored record, not only those this node is still
+/// responsible for: an out-of-range record it keeps still repairs its new close
+/// group. Only the key ranges where the peer can be in the group are read.
 pub async fn build_replica_hints_for_peer(
     peer: &PeerId,
     storage: &Arc<ChunkStore>,
     p2p_node: &Arc<P2PNode>,
     close_group_size: usize,
 ) -> Vec<XorName> {
-    build_replica_hints_for_peer_with_close_groups(peer, storage, p2p_node, close_group_size)
-        .await
+    let targets = HashSet::from([*peer]);
+    let groups = CloseGroupMap::new(close_group_candidates(p2p_node).await, close_group_size);
+    let (mut hints, _) = replica_hints(&groups, storage, &targets);
+    hints
+        .remove(peer)
+        .unwrap_or_default()
         .into_iter()
         .map(|hint| hint.key)
         .collect()
 }
 
-pub(crate) async fn build_replica_hints_for_peer_with_close_groups(
-    peer: &PeerId,
-    storage: &Arc<ChunkStore>,
-    p2p_node: &Arc<P2PNode>,
-    close_group_size: usize,
-) -> Vec<SentReplicaHint> {
-    let all_keys = match storage.all_keys().await {
-        Ok(keys) => keys,
-        Err(e) => {
-            warn!("Failed to read stored keys for hint construction: {e}");
-            return Vec::new();
-        }
-    };
+/// Every candidate for a key's close group in this node's view: its routing table
+/// and itself. One snapshot serves a whole build.
+async fn close_group_candidates(p2p_node: &Arc<P2PNode>) -> Vec<PeerId> {
+    let self_id = *p2p_node.peer_id();
+    let mut candidates: Vec<PeerId> = p2p_node
+        .dht_manager()
+        .routing_table_peers()
+        .await
+        .into_iter()
+        .map(|node| node.peer_id)
+        .filter(|peer| *peer != self_id)
+        .collect();
+    candidates.push(self_id);
+    candidates
+}
 
-    let dht = p2p_node.dht_manager();
-    let mut hints = Vec::new();
-    for key in all_keys {
-        let closest = dht
-            .find_closest_nodes_local_with_self(&key, close_group_size)
-            .await;
-        let close_peers = closest.iter().map(|n| n.peer_id).collect::<HashSet<_>>();
-        if close_peers.contains(peer) {
-            hints.push(SentReplicaHint { key, close_peers });
+/// Call `hint` with each key `read` returns whose close group in `groups` holds
+/// one of `targets`, and with that group. `read` is asked only for the ranges
+/// where one of them can be in the group. Returns how many keys were read.
+fn for_each_hinted_key(
+    groups: &CloseGroupMap,
+    targets: &HashSet<PeerId>,
+    read: impl FnOnce(&[(XorName, XorName)]) -> Result<Vec<Vec<XorName>>>,
+    mut hint: impl FnMut(XorName, Vec<PeerId>),
+) -> Result<usize> {
+    let ranges: Vec<&GroupRange> = groups
+        .ranges()
+        .iter()
+        .filter(|range| groups.may_include_any(range, targets))
+        .collect();
+    let bounds: Vec<(XorName, XorName)> = ranges.iter().map(|range| range.bounds()).collect();
+    let mut keys_read = 0;
+    for (range, keys) in ranges.into_iter().zip(read(&bounds)?) {
+        keys_read += keys.len();
+        for key in keys {
+            let group = groups.group_in(range, &key);
+            if group.iter().any(|peer| targets.contains(peer)) {
+                hint(key, group);
+            }
         }
     }
-    hints
+    Ok(keys_read)
 }
 
-/// How many low bits of a key may differ from this node's for the key to count
-/// as near it, from the distance to its [`PAID_LIST_NEAR_RANK`]th closest peer.
-///
-/// With evenly spread IDs, entries beyond this carry no vote and need no hint.
-pub(crate) async fn paid_near_bits(p2p_node: &Arc<P2PNode>) -> usize {
-    let self_xor: XorName = *p2p_node.peer_id().as_bytes();
-    let distances: Vec<XorName> = p2p_node
-        .dht_manager()
-        .find_closest_nodes_local(&self_xor, PAID_LIST_NEAR_RANK)
-        .await
-        .iter()
-        .map(|node| xor_distance(&self_xor, node.peer_id.as_bytes()))
-        .collect();
-    near_bits_for_peer_distances(&distances)
+/// Replica hints from the stored records for each of `targets`, and how many
+/// stored keys were read.
+fn replica_hints(
+    groups: &CloseGroupMap,
+    storage: &ChunkStore,
+    targets: &HashSet<PeerId>,
+) -> (HashMap<PeerId, Vec<SentReplicaHint>>, usize) {
+    let mut hints: HashMap<PeerId, Vec<SentReplicaHint>> = HashMap::new();
+    let keys_read = for_each_hinted_key(
+        groups,
+        targets,
+        |ranges| Ok(storage.keys_in_ranges(ranges)),
+        |key, group| {
+            let close_peers: HashSet<PeerId> = group.into_iter().collect();
+            for peer in close_peers.intersection(targets) {
+                hints.entry(*peer).or_default().push(SentReplicaHint {
+                    key,
+                    close_peers: close_peers.clone(),
+                });
+            }
+        },
+    )
+    .unwrap_or_default();
+    (hints, keys_read)
 }
 
-/// The paid-list keys a hint build considers: those near this node.
-async fn paid_hint_candidates(
+/// Paid hints from the paid list for each of `targets`, and how many entries
+/// were read.
+fn paid_hints(
+    groups: &CloseGroupMap,
     paid_list: &PaidList,
-    p2p_node: &Arc<P2PNode>,
-) -> Result<Vec<XorName>> {
-    let self_xor: XorName = *p2p_node.peer_id().as_bytes();
-    paid_list.keys_near(&self_xor, paid_near_bits(p2p_node).await)
+    targets: &HashSet<PeerId>,
+) -> Result<(HashMap<PeerId, Vec<XorName>>, usize)> {
+    let mut hints: HashMap<PeerId, Vec<XorName>> = HashMap::new();
+    let keys_read = for_each_hinted_key(
+        groups,
+        targets,
+        |ranges| paid_list.keys_in_ranges(ranges),
+        |key, group| {
+            for peer in group.iter().filter(|peer| targets.contains(*peer)) {
+                hints.entry(*peer).or_default().push(key);
+            }
+        },
+    )?;
+    Ok((hints, keys_read))
 }
 
-/// Build outbound hint sets for a batch of peers with one scan over local
-/// storage and one scan over the paid-list entries near this node.
+/// Build hint sets for a batch of peers from one routing-table snapshot.
+///
+/// Each store is read only in the key ranges where one of the peers can be in
+/// the close group, and each key's group is the one a lookup for that key would
+/// give, so a peer gets the hint for a key however far the key is from this node.
 pub(crate) async fn build_sync_hints_for_peers(
     peers: &[PeerId],
     storage: &Arc<ChunkStore>,
@@ -141,7 +185,7 @@ pub(crate) async fn build_sync_hints_for_peers(
     paid_list_close_group_size: usize,
 ) -> HashMap<PeerId, PeerSyncHints> {
     let started = Instant::now();
-    let target_peers = peers.iter().copied().collect::<HashSet<_>>();
+    let targets = peers.iter().copied().collect::<HashSet<_>>();
     let mut hints_by_peer = peers
         .iter()
         .copied()
@@ -152,52 +196,32 @@ pub(crate) async fn build_sync_hints_for_peers(
         return hints_by_peer;
     }
 
-    let all_keys = match storage.all_keys().await {
-        Ok(keys) => keys,
-        Err(e) => {
-            warn!("Failed to read stored keys for batch hint construction: {e}");
-            Vec::new()
-        }
-    };
-    let stored_key_count = all_keys.len();
+    let candidates = close_group_candidates(p2p_node).await;
+    let candidate_count = candidates.len();
+    let record_groups = CloseGroupMap::new(candidates.iter().copied(), close_group_size);
+    let paid_groups = CloseGroupMap::new(candidates, paid_list_close_group_size);
 
-    let dht = p2p_node.dht_manager();
-    for key in all_keys {
-        let closest = dht
-            .find_closest_nodes_local_with_self(&key, close_group_size)
-            .await;
-        let close_peers = closest.iter().map(|n| n.peer_id).collect::<HashSet<_>>();
-        for peer in close_peers.intersection(&target_peers) {
-            if let Some(peer_hints) = hints_by_peer.get_mut(peer) {
-                peer_hints.sent_replica_hints.push(SentReplicaHint {
-                    key,
-                    close_peers: close_peers.clone(),
-                });
-            }
+    let (replica, stored_keys_read) = replica_hints(&record_groups, storage, &targets);
+    for (peer, hints) in replica {
+        if let Some(peer_hints) = hints_by_peer.get_mut(&peer) {
+            peer_hints.sent_replica_hints = hints;
         }
     }
 
-    let paid_keys = match paid_hint_candidates(paid_list, p2p_node).await {
-        Ok(keys) => keys,
-        Err(e) => {
-            warn!("Failed to read PaidForList for batch hint construction: {e}");
-            Vec::new()
-        }
-    };
-    let paid_key_count = paid_keys.len();
-
-    for key in paid_keys {
-        let closest = dht
-            .find_closest_nodes_local_with_self(&key, paid_list_close_group_size)
-            .await;
-        for node in closest {
-            if target_peers.contains(&node.peer_id) {
-                if let Some(peer_hints) = hints_by_peer.get_mut(&node.peer_id) {
-                    peer_hints.paid_hints.push(key);
+    let paid_keys_read = match paid_hints(&paid_groups, paid_list, &targets) {
+        Ok((paid, keys_read)) => {
+            for (peer, hints) in paid {
+                if let Some(peer_hints) = hints_by_peer.get_mut(&peer) {
+                    peer_hints.paid_hints = hints;
                 }
             }
+            keys_read
         }
-    }
+        Err(e) => {
+            warn!("Failed to read PaidForList for batch hint construction: {e}");
+            0
+        }
+    };
 
     let replica_hint_count = hints_by_peer
         .values()
@@ -212,22 +236,14 @@ pub(crate) async fn build_sync_hints_for_peers(
     if elapsed_ms >= HINT_BUILD_SLOW_LOG_MS {
         info!(
             target: "ant_node::replication::neighbor_sync",
-            "Slow neighbor-sync hint build: peers={}, stored_keys={}, paid_keys={}, replica_hints={}, paid_hints={}, elapsed_ms={elapsed_ms}",
+            "Slow neighbor-sync hint build: peers={}, candidates={candidate_count}, stored_keys_read={stored_keys_read}, paid_keys_read={paid_keys_read}, replica_hints={replica_hint_count}, paid_hints={paid_hint_count}, elapsed_ms={elapsed_ms}",
             peers.len(),
-            stored_key_count,
-            paid_key_count,
-            replica_hint_count,
-            paid_hint_count,
         );
     } else {
         debug!(
             target: "ant_node::replication::neighbor_sync",
-            "Neighbor-sync hint build: peers={}, stored_keys={}, paid_keys={}, replica_hints={}, paid_hints={}, elapsed_ms={elapsed_ms}",
+            "Neighbor-sync hint build: peers={}, candidates={candidate_count}, stored_keys_read={stored_keys_read}, paid_keys_read={paid_keys_read}, replica_hints={replica_hint_count}, paid_hints={paid_hint_count}, elapsed_ms={elapsed_ms}",
             peers.len(),
-            stored_key_count,
-            paid_key_count,
-            replica_hint_count,
-            paid_hint_count,
         );
     }
 
@@ -244,25 +260,18 @@ pub async fn build_paid_hints_for_peer(
     p2p_node: &Arc<P2PNode>,
     paid_list_close_group_size: usize,
 ) -> Vec<XorName> {
-    let paid_keys = match paid_hint_candidates(paid_list, p2p_node).await {
-        Ok(keys) => keys,
+    let targets = HashSet::from([*peer]);
+    let groups = CloseGroupMap::new(
+        close_group_candidates(p2p_node).await,
+        paid_list_close_group_size,
+    );
+    match paid_hints(&groups, paid_list, &targets) {
+        Ok((mut hints, _)) => hints.remove(peer).unwrap_or_default(),
         Err(e) => {
             warn!("Failed to read PaidForList for hint construction: {e}");
-            return Vec::new();
-        }
-    };
-
-    let dht = p2p_node.dht_manager();
-    let mut hints = Vec::new();
-    for key in paid_keys {
-        let closest = dht
-            .find_closest_nodes_local_with_self(&key, paid_list_close_group_size)
-            .await;
-        if closest.iter().any(|n| n.peer_id == *peer) {
-            hints.push(key);
+            Vec::new()
         }
     }
-    hints
 }
 
 /// Take a fresh snapshot of close neighbors for a new round-robin cycle.
@@ -545,24 +554,23 @@ pub(crate) async fn handle_sync_request_with_proofs(
     let sender_in_rt = p2p_node.dht_manager().is_in_routing_table(sender).await;
 
     // Build outbound hints (always sent, even to non-RT peers).
-    let sent_replica_hints = build_replica_hints_for_peer_with_close_groups(
-        sender,
+    let hints = build_sync_hints_for_peers(
+        std::slice::from_ref(sender),
         storage,
+        paid_list,
         p2p_node,
         config.close_group_size,
+        config.paid_list_close_group_size,
     )
-    .await;
+    .await
+    .remove(sender)
+    .unwrap_or_default();
+    let sent_replica_hints = hints.sent_replica_hints;
     let replica_hints = sent_replica_hints
         .iter()
         .map(|hint| hint.key)
         .collect::<Vec<_>>();
-    let paid_hints = build_paid_hints_for_peer(
-        sender,
-        paid_list,
-        p2p_node,
-        config.paid_list_close_group_size,
-    )
-    .await;
+    let paid_hints = hints.paid_hints;
 
     let response = NeighborSyncResponse {
         replica_hints,
@@ -592,6 +600,53 @@ mod tests {
         let mut bytes = [0u8; 32];
         bytes[0] = b;
         PeerId::from_bytes(bytes)
+    }
+
+    // -- hint builds ----------------------------------------------------------
+
+    #[test]
+    fn only_keys_whose_group_holds_a_target_are_hinted() {
+        // Peers 0000, 0001, 0101, 1000 and 1110 in the top four bits, a group of
+        // two. Keys starting 01 take 0101 and whichever of 0000 and 0001 is closer.
+        const GROUP: usize = 2;
+        let candidates = [
+            0b0000_0000,
+            0b0001_0000,
+            0b0101_0000,
+            0b1000_0000,
+            0b1110_0000,
+        ]
+        .map(peer_id_from_byte);
+        let groups = CloseGroupMap::new(candidates, GROUP);
+        let targets = HashSet::from([candidates[1]]);
+        let keys = [0b0000_0000, 0b0100_0000, 0b0101_0000, 0b1100_0000]
+            .map(|first| *peer_id_from_byte(first).as_bytes());
+
+        let mut hinted = Vec::new();
+        let keys_read = for_each_hinted_key(
+            &groups,
+            &targets,
+            |ranges| {
+                Ok(ranges
+                    .iter()
+                    .map(|(low, high)| {
+                        keys.iter()
+                            .copied()
+                            .filter(|key| low <= key && key <= high)
+                            .collect()
+                    })
+                    .collect())
+            },
+            |key, _| hinted.push(key),
+        )
+        .expect("hints");
+
+        assert_eq!(
+            hinted,
+            vec![keys[0], keys[2]],
+            "0100 goes to 0000, not 0001"
+        );
+        assert_eq!(keys_read, 3, "keys from 1000 on aren't read");
     }
 
     // -- select_sync_batch ---------------------------------------------------

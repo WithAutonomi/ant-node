@@ -365,26 +365,33 @@ impl PaidList {
         Ok(entries as u64)
     }
 
-    /// The keys sharing all but the low `near_bits` bits with `center`.
-    ///
-    /// Reads only those keys, however long the list is. [`XORNAME_BITS`] gives
-    /// every key.
+    /// The keys in each of `ranges`, from its first key to its last, in ascending
+    /// order. Reads only those keys, however long the list is.
     ///
     /// # Errors
     ///
     /// Returns an error if the LMDB read transaction or iteration fails.
-    pub fn keys_near(&self, center: &XorName, near_bits: usize) -> Result<Vec<XorName>> {
+    pub(crate) fn keys_in_ranges(
+        &self,
+        ranges: &[(XorName, XorName)],
+    ) -> Result<Vec<Vec<XorName>>> {
         let rtxn = self
             .env
             .read_txn()
             .map_err(|e| Error::Storage(format!("Failed to create read txn: {e}")))?;
-        let (low, high) = prefix_range(center, near_bits);
-        let mut keys = Vec::new();
-        visit_range(self.db, &rtxn, (&low, &high), |key| {
-            keys.push(key);
-            true
-        })?;
-        Ok(keys)
+        ranges
+            .iter()
+            .map(|(low, high)| {
+                let mut keys = Vec::new();
+                if low <= high {
+                    visit_range(self.db, &rtxn, (low, high), |key| {
+                        keys.push(key);
+                        true
+                    })?;
+                }
+                Ok(keys)
+            })
+            .collect()
     }
 
     /// Remove up to `limit` entries outside the `near_bits` around `center`,
@@ -596,26 +603,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_far_key_is_read_until_enough_peers_are_known() {
+    async fn a_far_key_is_kept_until_enough_peers_are_known() {
         // This node is 0 and its neighbours are 1 and 2. Key 129 is far from all
         // three, yet with a group of two its closest are neighbour 1 and this node.
         const FAR_KEY: u8 = 129;
+        const EVICT_UP_TO: usize = 10;
         let (pl, _temp) = create_test_paid_list().await;
         pl.insert(&key_ending_in(FAR_KEY)).await.expect("insert");
         let this_node = key_ending_in(0);
 
-        let neighbours = [key_ending_in(1), key_ending_in(2)];
-        let few_known = near_bits_for_peer_distances(&neighbours);
-        assert_eq!(
-            pl.keys_near(&this_node, few_known).expect("keys"),
-            vec![key_ending_in(FAR_KEY)]
-        );
+        let few_known = near_bits_for_peer_distances(&[key_ending_in(1), key_ending_in(2)]);
+        let evicted = pl
+            .evict_far(this_node, few_known, EVICT_UP_TO, |_| false)
+            .await
+            .expect("evict");
+        assert_eq!(evicted, 0, "too few peers known to call any key far");
 
         let many_known = near_bits_for_peer_distances(&distances_out_to(key_ending_in(2)));
-        assert!(pl
-            .keys_near(&this_node, many_known)
-            .expect("keys")
-            .is_empty());
+        let evicted = pl
+            .evict_far(this_node, many_known, EVICT_UP_TO, |_| false)
+            .await
+            .expect("evict");
+        assert_eq!(evicted, 1);
+        assert!(!pl.contains(&key_ending_in(FAR_KEY)).expect("contains"));
     }
 
     #[test]
@@ -647,15 +657,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keys_near_reads_only_the_keys_around_the_center() {
+    async fn keys_in_ranges_reads_each_range_with_both_ends_included() {
         let (pl, _temp) = create_test_paid_list().await;
-        let center = key_with_first_byte(0x40);
-        let (near, far) = (key_with_first_byte(0x41), key_with_first_byte(0xC0));
-        pl.insert(&near).await.expect("insert");
-        pl.insert(&far).await.expect("insert");
+        let keys = [0x10, 0x20, 0x30, 0x40, 0xC0].map(key_with_first_byte);
+        for key in &keys {
+            pl.insert(key).await.expect("insert");
+        }
 
-        let near_bits = XORNAME_BITS - 4;
-        assert_eq!(pl.keys_near(&center, near_bits).expect("keys"), vec![near]);
+        let ranges = [
+            (key_with_first_byte(0x20), key_with_first_byte(0x30)),
+            (key_with_first_byte(0x41), key_with_first_byte(0xBF)),
+            (key_with_first_byte(0xC0), [0xFF; 32]),
+            (key_with_first_byte(0x30), key_with_first_byte(0x20)),
+        ];
+        assert_eq!(
+            pl.keys_in_ranges(&ranges).expect("keys"),
+            vec![vec![keys[1], keys[2]], vec![], vec![keys[4]], vec![]]
+        );
     }
 
     #[tokio::test]
@@ -810,7 +828,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keys_near_with_every_bit_free_gives_every_key() {
+    async fn keys_in_the_whole_key_space_are_every_key() {
         let (pl, _temp) = create_test_paid_list().await;
 
         let key_a: XorName = [0x01; 32];
@@ -821,7 +839,10 @@ mod tests {
         pl.insert(&key_b).await.expect("insert 2");
         pl.insert(&key_c).await.expect("insert 3");
 
-        let mut keys = pl.keys_near(&[0u8; 32], XORNAME_BITS).expect("keys");
+        let mut keys = pl
+            .keys_in_ranges(&[([0u8; 32], [0xFF; 32])])
+            .expect("keys")
+            .concat();
         keys.sort_unstable();
 
         let mut expected = vec![key_a, key_b, key_c];

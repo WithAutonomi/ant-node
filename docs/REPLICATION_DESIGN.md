@@ -160,6 +160,7 @@ Rules:
 8. In each session, sender-side hint construction uses peer-targeted sets:
     - `ReplicaHintsForPeer`: keys the sender believes the receiver should hold (receiver is among the `CLOSE_GROUP_SIZE` nearest to `K` in sender's `SelfInclusiveRT`).
     - `PaidHintsForPeer`: keys the sender believes the receiver should track in `PaidForList` (receiver is among the `PAID_LIST_CLOSE_GROUP_SIZE` nearest to `K` in sender's `SelfInclusiveRT`).
+    - A sender MAY evaluate both from one `SelfInclusiveRT` snapshot per build, once per key range rather than once per key, reading only the ranges where the receiver can be in the group (ADR-0028). The sets MUST be the ones a per-key evaluation over that snapshot gives.
 9. Transport-level chunking/fragmentation is implementation detail and out of scope for replication logic.
 10. Receiver treats hint sets as unordered collections and deduplicates repeated keys. If a key appears in both `ReplicaHintsForPeer` and `PaidHintsForPeer` in the same session, receiver MUST keep only the replica-hint entry and drop the paid-hint duplicate (single-pipeline processing).
 11. Receiver diffs replica hints against local store and pending sets, then runs per-key admission rules before quorum logic.
@@ -167,7 +168,7 @@ Rules:
 13. Only admitted unknown replica keys that pass presence quorum or paid-list authorization are queued for fetch.
 14. Receiver processes unknown paid hints via Section 7.2 majority checks in a paid-list pipeline: successful checks may update `PaidForList(self)`. If the receiver is also storage-responsible for `K`, successful verification may queue record fetch using verified `Present` sources from the same round. If the same key is also present in replica hints, rule 10 drops the paid-hint duplicate and fetch behavior is governed by the replica-hint pipeline.
 15. Sync payloads MUST NOT include PoP material; PoP remains fresh-replication-only.
-16. Nodes SHOULD use ongoing neighbor sync rounds to re-announce paid hints for locally paid keys to improve paid-list convergence. A sender reads only the entries near self for these hints (ADR-0028): those within its `PAID_LIST_NEAR_RANK`th closest peer's distance, or every entry until it knows that many peers.
+16. Nodes SHOULD use ongoing neighbor sync rounds to re-announce paid hints for locally paid keys to improve paid-list convergence. A sender includes every local paid key whose `PaidCloseGroup` holds the receiver, however far the key is from self.
 17. After each round, node sets `NeighborSyncCursor(self)` to the position after the last scanned peer in the (possibly shrunk) snapshot. Peers removed during scanning (cooldown or unreachable) do not occupy cursor positions — the cursor reflects the snapshot's state after removals. Priority syncs do not advance the cursor unless the peer was also removed from the snapshot.
 18. When `PriorityNeighborSyncOrder(self)` is empty and `NeighborSyncCursor(self) >= |NeighborSyncOrder(self)|`, the cycle is complete (`NeighborSyncCycleComplete(self)`). Node MUST execute post-cycle responsibility pruning (Section 11), then recompute `CloseNeighbors(self)` from current `LocalRT(self)`, take a fresh snapshot, and reset the cursor to `0` to begin the next cycle.
 

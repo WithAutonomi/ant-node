@@ -19,6 +19,7 @@ pub mod audit;
 pub mod audit_coordinator;
 pub(crate) mod audit_metrics;
 pub mod bootstrap;
+pub(crate) mod close_group_map;
 pub mod commitment;
 pub mod commitment_state;
 pub mod config;

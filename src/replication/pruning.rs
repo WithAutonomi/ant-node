@@ -78,17 +78,17 @@ use saorsa_core::P2PNode;
 use tokio::sync::RwLock;
 
 use crate::ant_protocol::XorName;
+use crate::client::xor_distance;
 use crate::replication::audit_coordinator::AuditChallengeCoordinator;
 use crate::replication::audit_metrics::{self, AuditFailureClass, AuditType};
 use crate::replication::commitment_state::ResponderCommitmentState;
 use crate::replication::config::{
     storage_admission_width, ReplicationConfig, AUDIT_FAILURE_TRUST_WEIGHT,
     MAX_PAID_EVICTIONS_PER_PASS, MAX_PRUNE_AUDIT_CANDIDATES_PER_PASS,
-    MAX_PRUNE_AUDIT_REQUESTS_PER_PASS, REPLICATION_PROTOCOL_ID,
+    MAX_PRUNE_AUDIT_REQUESTS_PER_PASS, PAID_LIST_NEAR_RANK, REPLICATION_PROTOCOL_ID,
 };
-use crate::replication::neighbor_sync::paid_near_bits;
 use crate::replication::out_of_range_clocks::elapsed;
-use crate::replication::paid_list::PaidList;
+use crate::replication::paid_list::{near_bits_for_peer_distances, PaidList};
 use crate::replication::protocol::{
     compute_audit_digest, AuditChallenge, AuditResponse, ReplicationMessage,
     ReplicationMessageBody, ABSENT_KEY_DIGEST,
@@ -680,6 +680,21 @@ fn select_record_prune_audits(
         deferred,
         request_count,
     }
+}
+
+/// How many low bits of a key may differ from this node's for its paid entry to
+/// count as near, from the distance to its [`PAID_LIST_NEAR_RANK`]th closest
+/// peer. Near entries are never evicted.
+async fn paid_near_bits(p2p_node: &Arc<P2PNode>) -> usize {
+    let self_xor: XorName = *p2p_node.peer_id().as_bytes();
+    let distances: Vec<XorName> = p2p_node
+        .dht_manager()
+        .find_closest_nodes_local(&self_xor, PAID_LIST_NEAR_RANK)
+        .await
+        .iter()
+        .map(|node| xor_distance(&self_xor, node.peer_id.as_bytes()))
+        .collect();
+    near_bits_for_peer_distances(&distances)
 }
 
 /// Evict `PaidForList` entries once the list has passed its threshold, and

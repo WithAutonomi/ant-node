@@ -2025,9 +2025,8 @@ async fn prune_marks_immediately_and_candidacy_waits_for_hysteresis() {
     harness.teardown().await.expect("teardown");
 }
 
-/// In a small network, a node still sends a peer the hint for a key far from the node
-/// when that peer is the key's closest. `PaidList`'s unit tests cover the near range
-/// itself: a network this small can't set one.
+/// A node sends a peer the hint for a key far from the node when that peer is the
+/// key's closest.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn a_neighbour_gets_a_paid_hint_for_a_key_far_from_this_node() {
@@ -2044,7 +2043,6 @@ async fn a_neighbour_gets_a_paid_hint_for_a_key_far_from_this_node() {
         .dht_manager()
         .find_closest_nodes_local(&self_xor, EVERY_KNOWN_PEER)
         .await;
-    assert!(peers.len() < ant_node::replication::config::PAID_LIST_NEAR_RANK);
     let farthest = peers.last().expect("a known peer").peer_id;
 
     // Beside the farthest peer, so that peer alone is its closest.
@@ -2067,6 +2065,114 @@ async fn a_neighbour_gets_a_paid_hint_for_a_key_far_from_this_node() {
     .await;
 
     assert_eq!(hints, vec![key]);
+    harness.teardown().await.expect("teardown");
+}
+
+/// The keys for which a lookup puts `peer` among the closest `group_size`, in order.
+async fn keys_by_lookup(
+    p2p: &Arc<P2PNode>,
+    keys: &[XorName],
+    peer: &PeerId,
+    group_size: usize,
+) -> Vec<XorName> {
+    let mut hinted = Vec::new();
+    for key in keys {
+        let closest = p2p
+            .dht_manager()
+            .find_closest_nodes_local_with_self(key, group_size)
+            .await;
+        if closest.iter().any(|node| node.peer_id == *peer) {
+            hinted.push(*key);
+        }
+    }
+    hinted
+}
+
+/// Every peer gets exactly the paid and replica hints a lookup per key would
+/// give it.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn hint_builds_match_a_lookup_per_key() {
+    const PAID_KEYS: usize = 400;
+    const STORED_CHUNKS: usize = 150;
+    const EVERY_KNOWN_PEER: usize = 100;
+    // The routing table can change while expected hints are worked out, so a peer
+    // is checked again until two lookups in a row agree.
+    const ATTEMPTS: usize = 3;
+    let harness = TestHarness::setup().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let node = harness.test_node(0).expect("node");
+    let p2p = Arc::clone(node.p2p_node.as_ref().expect("p2p"));
+    let storage = node.ant_protocol.as_ref().expect("protocol").storage();
+    let config = ReplicationConfig::default();
+
+    let paid_dir = tempfile::tempdir().expect("tempdir");
+    let paid_list = Arc::new(
+        ant_node::replication::paid_list::PaidList::new(paid_dir.path())
+            .await
+            .expect("paid list"),
+    );
+    let mut paid_keys: Vec<XorName> = (0..PAID_KEYS).map(|_| rand::random()).collect();
+    paid_keys.sort_unstable();
+    for key in &paid_keys {
+        paid_list.insert(key).await.expect("insert");
+    }
+    for i in 0..STORED_CHUNKS {
+        let content = format!("hint-equivalence-{i}").into_bytes();
+        storage
+            .put(&compute_address(&content), &content)
+            .await
+            .expect("put");
+    }
+    let stored_keys = storage.all_keys().await.expect("stored keys");
+
+    let self_xor: XorName = *p2p.peer_id().as_bytes();
+    let peers = p2p
+        .dht_manager()
+        .find_closest_nodes_local(&self_xor, EVERY_KNOWN_PEER)
+        .await;
+    assert!(!peers.is_empty());
+    let (mut paid_hinted, mut replica_hinted) = (0, 0);
+    for peer in peers.iter().map(|node| node.peer_id) {
+        let mut agreed = false;
+        for _ in 0..ATTEMPTS {
+            let expected_paid =
+                keys_by_lookup(&p2p, &paid_keys, &peer, config.paid_list_close_group_size).await;
+            let expected_replica =
+                keys_by_lookup(&p2p, &stored_keys, &peer, config.close_group_size).await;
+            let paid = ant_node::replication::neighbor_sync::build_paid_hints_for_peer(
+                &peer,
+                &paid_list,
+                &p2p,
+                config.paid_list_close_group_size,
+            )
+            .await;
+            let replica = ant_node::replication::neighbor_sync::build_replica_hints_for_peer(
+                &peer,
+                &storage,
+                &p2p,
+                config.close_group_size,
+            )
+            .await;
+            let still_paid =
+                keys_by_lookup(&p2p, &paid_keys, &peer, config.paid_list_close_group_size).await;
+            let still_replica =
+                keys_by_lookup(&p2p, &stored_keys, &peer, config.close_group_size).await;
+            if still_paid != expected_paid || still_replica != expected_replica {
+                continue;
+            }
+            assert_eq!(paid, expected_paid, "paid hints for {peer}");
+            assert_eq!(replica, expected_replica, "replica hints for {peer}");
+            paid_hinted += paid.len();
+            replica_hinted += replica.len();
+            agreed = true;
+            break;
+        }
+        assert!(agreed, "the routing table kept changing");
+    }
+    assert!(paid_hinted > 0 && replica_hinted > 0, "nothing was hinted");
+
     harness.teardown().await.expect("teardown");
 }
 

@@ -1644,6 +1644,28 @@ impl ChunkStore {
             .collect())
     }
 
+    /// The stored keys in each of `ranges`, from its first key to its last, in
+    /// ascending order, leaving out those [`Self::all_keys`] leaves out.
+    pub(crate) fn keys_in_ranges(&self, ranges: &[(XorName, XorName)]) -> Vec<Vec<XorName>> {
+        // Copied out first, as in `all_keys`, so no two of these locks are held at once.
+        let mut unservable: HashSet<XorName> = self.suspect.read().clone();
+        unservable.extend(self.known_wrong.read().iter().copied());
+        let index = self.index.read();
+        ranges
+            .iter()
+            .map(|(low, high)| {
+                if low > high {
+                    return Vec::new();
+                }
+                index
+                    .range(*low..=*high)
+                    .filter(|key| !unservable.contains(*key))
+                    .copied()
+                    .collect()
+            })
+            .collect()
+    }
+
     /// Stop answering for a chunk this store could not read.
     ///
     /// The file stays. It may be perfectly good and unreadable only for the moment, and
@@ -3542,6 +3564,33 @@ mod tests {
         drop(store);
         let reopened = reopen(&dir).await;
         assert_eq!(reopened.all_keys().await.expect("all_keys"), keys);
+    }
+
+    #[tokio::test]
+    async fn keys_in_ranges_reads_each_range_and_leaves_out_unservable_keys() {
+        const STORED: usize = 64;
+        let (store, _dir) = test_store().await;
+        for i in 0..STORED {
+            let (addr, content) = addressed(&format!("ranged-{i}"));
+            store.put(&addr, &content).await.expect("put");
+        }
+        let all = store.all_keys().await.expect("all_keys");
+        let (first_half, second_half) = all.split_at(STORED / 2);
+        let suspect = second_half[0];
+        store.mark_suspect(&suspect);
+
+        let ranges = [
+            (first_half[0], first_half[first_half.len() - 1]),
+            (second_half[0], [0xFF; 32]),
+            (second_half[1], first_half[0]),
+        ];
+        let read = store.keys_in_ranges(&ranges);
+        assert_eq!(read[0], first_half, "both ends are included");
+        assert_eq!(read[1], second_half[1..], "a suspect key is left out");
+        assert!(
+            read[2].is_empty(),
+            "a range ending before it starts is empty"
+        );
     }
 
     #[tokio::test]
