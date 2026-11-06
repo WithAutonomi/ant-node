@@ -762,7 +762,14 @@ out of 1,801:
   paid hints, treating unknown marks as no marks, and keeping only readable
   records' entries through eviction each fail their unit test; and
   prune-audit scoring that ignores the mark fails the e2e prune test, which
-  runs under disk pressure.
+  runs under disk pressure. Nine more were run on the coordination of
+  eviction with record admission, and each fails at least one of its six
+  interleaving tests: a removal that does not ask again; a `put_after`, a
+  `put` or a `holds_verified` that registers no admission; an admission
+  check that ignores writes in flight; an admission that does not wait for
+  a held eviction; a guard dropped before the removal; the keep rule back
+  to the index alone; and all of the coordination removed at once, which
+  fails all six.
 - `tests/e2e/price_floor_ab.rs` drives the same honest and near-empty-quoter
   uploads through a production-wired local testnet. Nodes are seeded to
   production-sized commitments, payments are real (on Anvil), and possession
