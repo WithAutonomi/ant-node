@@ -166,20 +166,22 @@ relaying an SDP also drops every candidate whose address is public (globally
 reachable, as the IANA special-purpose address registries mark it:
 `is_global_ip`) and not the sender's own host, as the node reaches it on that
 request (an IPv4 address, or an IPv6 /64). Local addresses (private use,
-shared, link-local, loopback and unique local: `is_local_ip`) and mDNS names
-stay only where the node and the client reach each other at local addresses
-(a network of their own, such as a test network or a LAN deployment): the
-node keeps them only for a sender it reaches at a local address, and a client
+link-local, loopback and unique local: `is_local_ip`) and mDNS names stay
+only where the node and the client reach each other at local addresses (a
+network of their own, such as a test network or a LAN deployment): the node
+keeps them only for a sender it reaches at a local address, and a client
 applies them only from a node it reached at one, loopback ones only over
-loopback. An address that is neither public nor local (documentation,
-benchmarking, reserved, Teredo) stays on no network. On a network
-reached at public addresses, readers meet by their public (server-reflexive)
-addresses alone, so two readers behind one NAT need it to hairpin. A stranger
-in a room therefore cannot point other readers' checks at a third party, nor
-at the readers' own home networks, and a hostile node can point them at 16
-addresses at most per SDP. Receivers read SDP leniently (webrtc-rs trims an
-attribute's value and skips a carriage return before a line, Chrome takes an
-attribute name followed by a space, Firefox names attributes in any case), so
+loopback. An address that is neither public nor local (shared carrier-grade
+NAT space, whose subscribers share no network, documentation, benchmarking,
+reserved, Teredo) stays on no network, and a sender or node reached at one
+gives no local candidates. On a network reached at public addresses, readers
+meet by their public (server-reflexive) addresses alone, so two readers
+behind one NAT need it to hairpin. A stranger in a room therefore cannot
+point other readers' checks at a third party, nor at the readers' own home
+networks, and a hostile node can point them at 16 addresses at most per SDP.
+Receivers read SDP leniently (webrtc-rs trims an attribute's value and skips
+a carriage return before a line, Chrome takes an attribute name followed by a
+space, Firefox names attributes in any case), so
 a line any of them may read as a candidate or a DTLS fingerprint stays only
 in its one standard form (`a=candidate:` or `a=fingerprint:`, then a value
 with no whitespace around it), and a line with a carriage return anywhere but

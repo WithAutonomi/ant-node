@@ -906,7 +906,7 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "6.0.0"
-source = "git+https://github.com/grumbach/ant-protocol?branch=feat%2Fpeer-swarm#4bf8dc937bd3cb0049ae45fb01491b1c99d5bc0f"
+source = "git+https://github.com/grumbach/ant-protocol?branch=feat%2Fpeer-swarm#f79e2b271ab2a0ae2231d5d4ee5c127210c6c150"
 dependencies = [
  "blake3",
  "bytes",

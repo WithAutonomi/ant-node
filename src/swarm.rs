@@ -534,12 +534,14 @@ pub fn is_swarm_request_bytes(data: &[u8]) -> bool {
 /// An SDP from a member, as this node passes it on: its candidates may name
 /// the member's own host, as this node reaches it, and no other public
 /// address, at most `MAX_SWARM_CANDIDATES` of them. Local addresses
-/// ([`is_local_ip`]: private use, shared, link-local, loopback, unique local)
-/// and mDNS names stay only for a member this node reaches at a local address
+/// ([`is_local_ip`]: private use, link-local, loopback, unique local) and
+/// mDNS names stay only for a member this node reaches at a local address
 /// itself (a network of its own, such as a test network): elsewhere they
 /// would let a stranger point readers at their own home networks. Any other
-/// address, neither public nor local (documentation, benchmarking, reserved,
-/// Teredo), stays for no member. The member an SDP goes to sends
+/// address, neither public nor local (shared carrier-grade NAT space, whose
+/// subscribers share no network, documentation, benchmarking, reserved,
+/// Teredo), stays for no member, and a member reached at one keeps nothing
+/// local. The member an SDP goes to sends
 /// connectivity checks to each candidate before anything proves who made it.
 fn relayable_sdp(sdp: &str, host: Option<IpAddr>) -> String {
     let local = host.is_some_and(is_local_ip);
@@ -2098,6 +2100,35 @@ mod tests {
                 "{host}: {kept}"
             );
         }
+        // Nor one reached through shared (carrier-grade NAT) space, at either
+        // end of it or IPv4-mapped: its subscribers share no network.
+        for host in [
+            "100.64.0.0",
+            "100.64.0.1",
+            "100.127.255.255",
+            "::ffff:100.64.0.1",
+        ] {
+            let kept = relayable_sdp(&sdp, Some(host_of(host.parse().expect("ip"))));
+            assert!(
+                !kept.contains("192.168.1.4") && !kept.contains(".local"),
+                "{host}: {kept}"
+            );
+        }
+        // Just outside it, a member is public: its own address only.
+        for host in ["100.63.255.255", "100.128.0.0"] {
+            let theirs = format!(
+                "{}a=candidate:4 1 udp 1 1f2e3d4c.local 5003 typ host\r\n",
+                pointing(host)
+            );
+            let kept = relayable_sdp(&theirs, Some(host_of(host.parse().expect("ip"))));
+            assert!(kept.contains(&format!("{host} 5000")), "{host}: {kept}");
+            assert!(
+                !kept.contains("192.168.1.4")
+                    && !kept.contains(".local")
+                    && !kept.contains("9.9.9.99"),
+                "{host}: {kept}"
+            );
+        }
         // A member over loopback, in either family, is on this node's own
         // network too.
         for host in ["127.0.0.1", "::1", "::ffff:127.0.0.1", "fe80::1", "fd12::4"] {
@@ -2107,6 +2138,40 @@ mod tests {
                 "{host}: {kept}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_member_reached_through_shared_cgnat_space_passes_on_nothing_local() {
+        let service = service();
+        from(&service, B, "100.64.0.2", announce(1, &[], 0)).await;
+        let mut offer = announce(1, &[33], 0);
+        if let ChunkMessageBody::SwarmAnnounceRequest(request) = &mut offer {
+            for sent in &mut request.offers {
+                sent.sdp = String::from(
+                    "v=0\r\n\
+                     a=candidate:1 1 udp 1 100.64.0.1 5000 typ host\r\n\
+                     a=candidate:2 1 udp 1 192.168.1.4 5001 typ host\r\n\
+                     a=candidate:3 1 udp 1 fd12::4 5002 typ host\r\n\
+                     a=candidate:4 1 udp 1 fe80::1 5003 typ host\r\n\
+                     a=candidate:5 1 udp 1 1f2e3d4c.local 5004 typ host\r\n\
+                     a=candidate:6 1 udp 1 9.9.9.99 5005 typ srflx raddr 0.0.0.0 rport 0\r\n",
+                );
+            }
+        }
+        // Two subscribers behind one carrier-grade NAT share no network:
+        // none of the sender's private, unique local, link-local or mDNS
+        // candidates, nor its shared address, nor a stranger's public one,
+        // goes on.
+        from(&service, A, "100.64.0.1", offer)
+            .await
+            .expect("joined");
+        let (_, inbox) = from(&service, B, "100.64.0.2", announce(1, &[], 0))
+            .await
+            .expect("joined");
+        let [SwarmSignal::Offer { sdp, .. }] = inbox.as_slice() else {
+            panic!("expected one offer: {inbox:?}");
+        };
+        assert_eq!(sdp, "v=0\r\n");
     }
 
     #[tokio::test]
