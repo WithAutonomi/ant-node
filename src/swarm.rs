@@ -30,7 +30,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ant_protocol::chunk::{ChunkMessageBody, ProtocolError};
 use ant_protocol::swarm::{
-    constrain_swarm_sdp, is_global_ip, MemberId, Membership, NodeId, OfferId, RoomKey,
+    constrain_swarm_sdp, is_global_ip, is_local_ip, MemberId, Membership, NodeId, OfferId, RoomKey,
     SwarmAnnounceRequest, SwarmAnnounceResponse, SwarmAnswerRequest, SwarmAnswerResponse,
     SwarmLeaveRequest, SwarmLeaveResponse, SwarmRefusal, SwarmSignal, MAX_SWARM_ICE_SERVERS,
     MAX_SWARM_ICE_SERVER_BYTES, MAX_SWARM_INBOX, MAX_SWARM_REPLY_SDP_BYTES, SWARM_SIGNAL_TTL_MS,
@@ -533,24 +533,29 @@ pub fn is_swarm_request_bytes(data: &[u8]) -> bool {
 
 /// An SDP from a member, as this node passes it on: its candidates may name
 /// the member's own host, as this node reaches it, and no other public
-/// address, at most `MAX_SWARM_CANDIDATES` of them. Local addresses and mDNS
-/// names stay only for a member this node reaches at a local address itself
-/// (a network of its own, such as a test network): elsewhere they would let a
-/// stranger point readers at their own home networks. The member an SDP goes
-/// to sends connectivity checks to each candidate before anything proves who
-/// made it.
+/// address, at most `MAX_SWARM_CANDIDATES` of them. Local addresses
+/// ([`is_local_ip`]: private use, shared, link-local, loopback, unique local)
+/// and mDNS names stay only for a member this node reaches at a local address
+/// itself (a network of its own, such as a test network): elsewhere they
+/// would let a stranger point readers at their own home networks. Any other
+/// address, neither public nor local (documentation, benchmarking, reserved,
+/// Teredo), stays for no member. The member an SDP goes to sends
+/// connectivity checks to each candidate before anything proves who made it.
 fn relayable_sdp(sdp: &str, host: Option<IpAddr>) -> String {
-    let local = host.is_some_and(|host| !is_global_ip(host));
+    let local = host.is_some_and(is_local_ip);
     constrain_swarm_sdp(sdp, |ip| match ip {
         Some(ip) if is_global_ip(ip) => Some(host_of(ip)) == host,
-        _ => local,
+        Some(ip) => local && is_local_ip(ip),
+        None => local,
     })
 }
 
 /// The host `ip` counts as: an IPv4 address, or an IPv6 /64, which one
-/// client is usually given whole.
+/// client is usually given whole. IPv6 loopback stays itself: its /64 (`::`)
+/// would not read as local.
 fn host_of(ip: IpAddr) -> IpAddr {
     match ip.to_canonical() {
+        IpAddr::V6(v6) if v6.is_loopback() => IpAddr::V6(v6),
         IpAddr::V6(v6) => {
             let mut octets = v6.octets();
             if let Some(interface) = octets.get_mut(8..) {
@@ -2080,6 +2085,84 @@ mod tests {
         );
         // A member whose address this node cannot tell keeps nothing local.
         assert!(!relayable_sdp(&sdp, None).contains("192.168.1.4"));
+        // Nor one at an address neither public nor local.
+        for host in [
+            "192.0.2.7",
+            "198.18.0.1",
+            "2001:db8::7",
+            "64:ff9b:1::a0a:302",
+        ] {
+            let kept = relayable_sdp(&sdp, Some(host_of(host.parse().expect("ip"))));
+            assert!(
+                !kept.contains("192.168.1.4") && !kept.contains(".local"),
+                "{host}: {kept}"
+            );
+        }
+        // A member over loopback, in either family, is on this node's own
+        // network too.
+        for host in ["127.0.0.1", "::1", "::ffff:127.0.0.1", "fe80::1", "fd12::4"] {
+            let kept = relayable_sdp(&sdp, Some(host_of(host.parse().expect("ip"))));
+            assert!(
+                kept.contains("192.168.1.4") && kept.contains("1f2e3d4c.local"),
+                "{host}: {kept}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_member_on_this_nodes_own_network_passes_on_only_local_and_its_own_candidates() {
+        let service = service();
+        from(&service, B, "10.78.3.3", announce(1, &[], 0)).await;
+        let mut offer = announce(1, &[32], 0);
+        if let ChunkMessageBody::SwarmAnnounceRequest(request) = &mut offer {
+            for sent in &mut request.offers {
+                sent.sdp = String::from(
+                    "v=0\r\n\
+                     a=candidate:1 1 udp 1 10.78.3.2 5000 typ host\r\n\
+                     a=candidate:2 1 udp 1 192.168.1.4 5001 typ host\r\n\
+                     a=candidate:3 1 udp 1 1f2e3d4c.local 5002 typ host\r\n\
+                     a=candidate:4 1 udp 1 fd12::4 5003 typ host\r\n\
+                     a=candidate:5 1 udp 1 64:ff9b::808:808 5004 typ host\r\n\
+                     a=candidate:6 1 udp 1 2001:4:112::1 5005 typ host\r\n\
+                     a=candidate:7 1 udp 1 192.0.0.9 5006 typ host\r\n\
+                     a=candidate:8 1 udp 1 2001:db8::1 5007 typ host\r\n\
+                     a=candidate:9 1 udp 1 198.18.0.1 5008 typ host\r\n\
+                     a=candidate:10 1 udp 1 240.0.0.1 5009 typ host\r\n\
+                     a=candidate:11 1 udp 1 64:ff9b:1::808:808 5010 typ host\r\n\
+                     a=candidate:12 1 udp 1 9.9.9.99 5011 typ srflx raddr 0.0.0.0 rport 0\r\n",
+                );
+            }
+        }
+        from(&service, A, "10.78.3.2", offer).await.expect("joined");
+        let (_, inbox) = from(&service, B, "10.78.3.3", announce(1, &[], 0))
+            .await
+            .expect("joined");
+        let [SwarmSignal::Offer { sdp, .. }] = inbox.as_slice() else {
+            panic!("expected one offer: {inbox:?}");
+        };
+        // Its local candidates, mDNS name and own address go on...
+        for kept in [
+            "10.78.3.2 5000",
+            "192.168.1.4 5001",
+            "1f2e3d4c.local 5002",
+            "fd12::4 5003",
+        ] {
+            assert!(sdp.contains(kept), "{kept}: {sdp}");
+        }
+        // ...and nothing else: no public address of another host, nothing
+        // through NAT64, nothing neither public nor local.
+        for dropped in [
+            "64:ff9b::808:808",
+            "2001:4:112::1",
+            "192.0.0.9",
+            "2001:db8::1",
+            "198.18.0.1",
+            "240.0.0.1",
+            "64:ff9b:1::808:808",
+            "9.9.9.99",
+        ] {
+            assert!(!sdp.contains(dropped), "{dropped}: {sdp}");
+        }
     }
 
     #[tokio::test]

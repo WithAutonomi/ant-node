@@ -159,14 +159,20 @@ bytes).
 sends ICE connectivity checks to every candidate in it before anything proves
 who made it. Both sides therefore pass each SDP through the protocol's
 `constrain_swarm_sdp`: UDP candidates only, naming an IP address that is not
-unspecified, multicast or broadcast, or an mDNS `.local` name, at most 16. A
-node relaying an SDP also drops every candidate whose address is public and
-not the sender's own host, as the node reaches it on that request (an IPv4
-address, or an IPv6 /64). Local addresses and mDNS names stay only where the
-node and the client reach each other at local addresses (a network of their
-own, such as a test network or a LAN deployment): the node keeps them only
-for a sender it reaches at a local address, and a client applies them only
-from a node it reached at one, loopback ones only over loopback. On a network
+unspecified, multicast, broadcast or in a NAT64 prefix (`64:ff9b::/96`,
+`64:ff9b:1::/48`, which stand for IPv4 addresses a translator on the
+receiver's network sends to), or an mDNS `.local` name, at most 16. A node
+relaying an SDP also drops every candidate whose address is public (globally
+reachable, as the IANA special-purpose address registries mark it:
+`is_global_ip`) and not the sender's own host, as the node reaches it on that
+request (an IPv4 address, or an IPv6 /64). Local addresses (private use,
+shared, link-local, loopback and unique local: `is_local_ip`) and mDNS names
+stay only where the node and the client reach each other at local addresses
+(a network of their own, such as a test network or a LAN deployment): the
+node keeps them only for a sender it reaches at a local address, and a client
+applies them only from a node it reached at one, loopback ones only over
+loopback. An address that is neither public nor local (documentation,
+benchmarking, reserved, Teredo) stays on no network. On a network
 reached at public addresses, readers meet by their public (server-reflexive)
 addresses alone, so two readers behind one NAT need it to hairpin. A stranger
 in a room therefore cannot point other readers' checks at a third party, nor
