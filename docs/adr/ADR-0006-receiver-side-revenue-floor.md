@@ -404,12 +404,13 @@ replication), arriving in 48 upload bursts. Of those, 1,801 admissions over
      still in the node's store, marked or not and readable or not, or on its
      way there, and an entry it evicts takes its mark with it. It asks again
      inside the removal, with new record admissions held back until the
-     removal commits, and a fresh offer's record counts as on its way from
-     before the offer writes the entry. So a record admitted while an
-     eviction runs keeps its entry and its mark. One admitted after the
-     removal finds no entry, as after any eviction: a fresh offer, or a
-     client PUT that carries a proof, records it afresh, and a fetch stores
-     the record without one;
+     removal commits. A fresh offer's record counts as on its way from
+     before the offer writes the entry, and a client PUT's from its check
+     that the chunk is held, through payment verification, to its store.
+     So a record admitted while an eviction runs keeps its entry and its
+     mark. One admitted after the removal finds no entry, as after any
+     eviction: a fresh offer, or a client PUT that carries a proof, records
+     it afresh, and a fetch stores the record without one;
    - a mark that cannot be read counts as set: when in doubt, judge no one.
      While reads fail the node judges no peer on any key they hit, so it
      warns at the first failure of a run and, when a read succeeds again,
@@ -710,11 +711,12 @@ out of 1,801:
   - paid-list eviction keeps the entry and the mark of a record stored
     after its scan, of one a fresh offer has recorded but not yet stored,
     of one whose put has started but is not yet writing, of one a
-    cancelled put is still writing, and of one a client PUT's check finds
-    missing from disk while the check is under way, and an admission that
-    starts while the removal runs waits for its commit without getting
-    past registering. Each test parks the eviction and the admission at
-    fixed points, so each runs one interleaving;
+    cancelled put is still writing, of one a client PUT's check finds
+    missing from disk while the check is under way, and of one a client
+    PUT is verifying payment for after finding it not held, and an
+    admission that starts while the removal runs waits for its commit
+    without getting past registering. Each test parks the eviction and the
+    admission at fixed points, so each runs one interleaving;
   - the in-memory copy of the marks is filled on opening and follows every
     write and removal, and a marked insert and a batch removal change it
     only in the order writes take; a mark held in memory alone, as a failed
@@ -762,14 +764,14 @@ out of 1,801:
   paid hints, treating unknown marks as no marks, and keeping only readable
   records' entries through eviction each fail their unit test; and
   prune-audit scoring that ignores the mark fails the e2e prune test, which
-  runs under disk pressure. Nine more were run on the coordination of
-  eviction with record admission, and each fails at least one of its six
+  runs under disk pressure. Ten more were run on the coordination of
+  eviction with record admission, and each fails at least one of its seven
   interleaving tests: a removal that does not ask again; a `put_after`, a
-  `put` or a `holds_verified` that registers no admission; an admission
-  check that ignores writes in flight; an admission that does not wait for
-  a held eviction; a guard dropped before the removal; the keep rule back
-  to the index alone; and all of the coordination removed at once, which
-  fails all six.
+  `put`, a `holds_verified` or the client PUT handler that registers no
+  admission; an admission check that ignores writes in flight; an
+  admission that does not wait for a held eviction; a guard dropped before
+  the removal; the keep rule back to the index alone; and all of the
+  coordination removed at once, which fails all seven.
 - `tests/e2e/price_floor_ab.rs` drives the same honest and near-empty-quoter
   uploads through a production-wired local testnet. Nodes are seeded to
   production-sized commitments, payments are real (on Anvil), and possession
