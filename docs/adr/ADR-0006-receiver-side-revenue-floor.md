@@ -401,8 +401,15 @@ replication), arriving in 48 upload bursts. Of those, 1,801 admissions over
    - a prune audit, which is sent only under disk pressure (ADR-0028), still
      needs its proofs before deleting a marked key, but scores no absent peer
      for it. Paid-list eviction (ADR-0028) keeps the entry of every record
-     still in the node's store, marked or not and readable or not, and an
-     entry it evicts takes its mark with it;
+     still in the node's store, marked or not and readable or not, or on its
+     way there, and an entry it evicts takes its mark with it. It asks again
+     inside the removal, with new record admissions held back until the
+     removal commits, and a fresh offer's record counts as on its way from
+     before the offer writes the entry. So a record admitted while an
+     eviction runs keeps its entry and its mark. One admitted after the
+     removal finds no entry, as after any eviction: a fresh offer, or a
+     client PUT that carries a proof, records it afresh, and a fetch stores
+     the record without one;
    - a mark that cannot be read counts as set: when in doubt, judge no one.
      While reads fail the node judges no peer on any key they hit, so it
      warns at the first failure of a run and, when a read succeeds again,
@@ -618,12 +625,6 @@ out of 1,801:
     while the mark stays. A later plain insert that adds the key, or a
     removal of it, drops the mark once that write commits, and a restart
     rebuilds the copy from the database.
-  - Paid-list eviction checks for the record when it scans, but a record
-    admitted between that scan and the delete would lose its entry, and the
-    mark with it. Eviction takes only entries far outside this node's range,
-    where with evenly spread IDs neither store path admits the record, so
-    that needs a key whose peers this node barely knows, or a routing view
-    that changes at that moment.
 - **The first paid-list record decides a key's mark, which a quoter can
   front-run.** A quoter in the 20 closest to an honest key can pay itself
   for the key, for gas only, and announce it before the client's write
@@ -706,6 +707,14 @@ out of 1,801:
     near one is left to the near-key read, paid-list eviction drops the
     mark of an entry it evicts and leaves a kept entry marked, and it keeps
     the entry of a record that cannot be read for the moment;
+  - paid-list eviction keeps the entry and the mark of a record stored
+    after its scan, of one a fresh offer has recorded but not yet stored,
+    of one whose put has started but is not yet writing, of one a
+    cancelled put is still writing, and of one a client PUT's check finds
+    missing from disk and puts back, and an admission that starts while
+    the removal runs waits for its commit without getting past
+    registering. Each test parks the eviction and the admission at fixed
+    points, so each runs one interleaving;
   - the in-memory copy of the marks is filled on opening and follows every
     write and removal, and a marked insert and a batch removal change it
     only in the order writes take; a mark held in memory alone, as a failed
