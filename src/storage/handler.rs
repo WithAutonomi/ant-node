@@ -411,6 +411,13 @@ pub struct AntProtocol {
     /// message to a node that does not keep pointers gets a clean refusal
     /// rather than a silent drop.
     pointers: Option<PointerService>,
+    /// Test-only: parks a PUT after its check found the chunk not held, before
+    /// its payment is verified.
+    #[cfg(test)]
+    test_after_check_gate: Arc<tokio::sync::RwLock<()>>,
+    /// Test-only: how many PUTs have reached that gate.
+    #[cfg(test)]
+    test_reached_after_check: Arc<AtomicU64>,
 }
 
 impl AntProtocol {
@@ -449,6 +456,10 @@ impl AntProtocol {
             fresh_write_tx: None,
             p2p_node: RwLock::new(None),
             pointers: None,
+            #[cfg(test)]
+            test_after_check_gate: Arc::new(tokio::sync::RwLock::new(())),
+            #[cfg(test)]
+            test_reached_after_check: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -835,6 +846,12 @@ impl AntProtocol {
             }
         }
 
+        // One admission from the check below to the store in step 6, so paid-list
+        // eviction cannot take this key's paid entry, and its price-contested mark,
+        // while the payment is verified (ADR-0006). That store still waits for the
+        // verified payment.
+        let _admission = self.storage.admit(&address).await;
+
         // 3. Check if already exists (idempotent success)
         //
         // Verified against the offered bytes, not answered from the name. A name can
@@ -851,6 +868,8 @@ impl AntProtocol {
             debug!("Chunk {addr_hex} already exists");
             return ChunkPutResponse::AlreadyExists { address };
         }
+        #[cfg(test)]
+        self.test_park_after_check().await;
 
         // 4. Cheap disk-space pre-check — runs BEFORE the expensive payment
         //    verification path (ML-DSA pool checks, a Kademlia closeness
@@ -933,9 +952,9 @@ impl AntProtocol {
                 self.quote_generator.record_store();
 
                 // 7. Notify replication engine for fresh fan-out.
-                //    Only emit when a real proof is present — cached-as-verified
-                //    PUTs have no proof to forward, and the chunk would have
-                //    already replicated on the original write that carried one.
+                //    Only emit when a real proof is present. A cached-as-verified
+                //    PUT normally carries none; one that does forwards it
+                //    unverified, and the fan-out prices it as it stands (ADR-0006).
                 if let (Some(ref tx), Some(proof)) = (&self.fresh_write_tx, request.payment_proof) {
                     // ADR-0004: strip any commitment sidecars before forwarding
                     // to replication — the ADR specifies persisted/replicated
@@ -1348,6 +1367,28 @@ impl AntProtocol {
     pub async fn put_local(&self, address: &[u8; 32], content: &[u8]) -> Result<bool> {
         self.storage.put(address, content).await
     }
+
+    /// Test-only handle to the gate that parks a PUT after its check found the
+    /// chunk not held.
+    #[cfg(test)]
+    fn test_after_check_gate(&self) -> Arc<tokio::sync::RwLock<()>> {
+        Arc::clone(&self.test_after_check_gate)
+    }
+
+    /// Test-only: how many PUTs have reached that gate.
+    #[cfg(test)]
+    fn test_reached_after_check(&self) -> u64 {
+        self.test_reached_after_check.load(Ordering::Acquire)
+    }
+
+    /// Test-only: the window between a check that found the chunk not held and
+    /// the store that follows a verified payment. Parks while a test holds the
+    /// gate's write half.
+    #[cfg(test)]
+    async fn test_park_after_check(&self) {
+        self.test_reached_after_check.fetch_add(1, Ordering::AcqRel);
+        drop(self.test_after_check_gate.read().await);
+    }
 }
 
 #[cfg(test)]
@@ -1357,6 +1398,9 @@ mod tests {
     use crate::payment::metrics::QuotingMetricsTracker;
     use crate::payment::{EvmVerifierConfig, PaymentVerifierConfig};
     use crate::pointer::{DATA_TYPE_POINTER, POINTER_WIRE_LEN};
+    use crate::replication::fresh::record_paid_key;
+    use crate::replication::paid_list::{PaidList, XORNAME_BITS};
+    use crate::replication::pruning::evict_paid_entries;
     use crate::storage::ChunkStoreConfig;
     use evmlib::RewardsAddress;
     use saorsa_core::identity::NodeIdentity;
@@ -1395,7 +1439,6 @@ mod tests {
             cache_capacity: 100_000,
             close_group_size: crate::ant_protocol::CLOSE_GROUP_SIZE,
             local_rewards_address: rewards_address,
-            price_floor: crate::payment::PriceFloorConfig::default(),
         };
         let payment_verifier = Arc::new(PaymentVerifier::new(payment_config));
         let metrics_tracker = QuotingMetricsTracker::new(100);
@@ -1416,6 +1459,91 @@ mod tests {
 
         let protocol = AntProtocol::new(storage, payment_verifier, Arc::new(quote_generator));
         (protocol, temp_dir)
+    }
+
+    /// ADR-0006 with ADR-0028: a client PUT of a chunk this node does not store,
+    /// whose marked paid entry an earlier `PaidNotify` wrote, finds the chunk
+    /// not held and goes on to verify payment. An eviction that removes then
+    /// must keep the entry and its mark, or the record the PUT stores would be
+    /// hinted as a replica until its own entry is written.
+    #[tokio::test]
+    async fn a_put_keeps_the_paid_entry_from_its_check_to_its_store() {
+        let (protocol, temp) = create_test_protocol().await;
+        let protocol = Arc::new(protocol);
+        let paid_list = Arc::new(
+            PaidList::new(&temp.path().join("paid"))
+                .await
+                .expect("paid list"),
+        );
+        let content = b"price-contested chunk put while an eviction runs".to_vec();
+        let address = compute_address(&content);
+        assert!(record_paid_key(&address, true, &paid_list).await);
+        protocol.payment_verifier().cache_insert(address);
+
+        // The eviction scans first and finds the entry with no record.
+        let scan_gate = paid_list.test_eviction_scan_gate();
+        let scanned = scan_gate.write().await;
+        let eviction = {
+            let (paid_list, storage) = (Arc::clone(&paid_list), Arc::clone(&protocol.storage));
+            let mut center = address;
+            if let Some(first) = center.first_mut() {
+                *first ^= 0x80;
+            }
+            tokio::spawn(async move {
+                evict_paid_entries(&paid_list, &storage, center, XORNAME_BITS - 1, 10).await
+            })
+        };
+        wait_until(|| paid_list.test_evictions_scanned() == 1).await;
+
+        // Then the PUT finds the chunk not held and stops before its payment.
+        let check_gate = protocol.test_after_check_gate();
+        let checked = check_gate.write().await;
+        let put = {
+            let protocol = Arc::clone(&protocol);
+            let request = ChunkPutRequest::new(address, Bytes::from(content));
+            tokio::spawn(async move { protocol.handle_put(request).await })
+        };
+        wait_until(|| protocol.test_reached_after_check() == 1).await;
+
+        // The eviction's removal runs and commits with the key as a candidate.
+        drop(scanned);
+        let evicted = eviction.await.expect("eviction task").expect("evict");
+        assert_eq!(
+            paid_list.test_removals_committing(),
+            1,
+            "the removal ran with the key as a candidate"
+        );
+        assert_eq!(
+            evicted, 0,
+            "the PUT's entry stays while the PUT is under way"
+        );
+
+        drop(checked);
+        let response = put.await.expect("put task");
+        assert!(
+            matches!(response, ChunkPutResponse::Success { .. }),
+            "stored: {response:?}"
+        );
+        assert!(protocol.storage.exists(&address).expect("exists"));
+        assert!(
+            paid_list.is_price_contested(&address).expect("read mark"),
+            "the stored record keeps its entry and its mark"
+        );
+        assert_eq!(
+            paid_list.split_marked(vec![address]),
+            (Vec::new(), vec![address]),
+            "so it goes out in paid hints only"
+        );
+    }
+
+    async fn wait_until(reached: impl Fn() -> bool + Send + Sync) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !reached() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("reached in time");
     }
 
     #[tokio::test]

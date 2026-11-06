@@ -78,6 +78,7 @@ use saorsa_core::P2PNode;
 use tokio::sync::RwLock;
 
 use crate::ant_protocol::XorName;
+use crate::error::Result;
 use crate::replication::audit_coordinator::AuditChallengeCoordinator;
 use crate::replication::audit_metrics::{self, AuditFailureClass, AuditType};
 use crate::replication::commitment_state::ResponderCommitmentState;
@@ -296,6 +297,7 @@ struct PruneAuditReportState {
 #[derive(Clone, Copy)]
 struct PruneAuditContext<'a> {
     storage: &'a Arc<ChunkStore>,
+    paid_list: &'a PaidList,
     p2p_node: &'a Arc<P2PNode>,
     config: &'a ReplicationConfig,
     sync_state: &'a Arc<RwLock<NeighborSyncState>>,
@@ -428,16 +430,8 @@ async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPrune
     stats.audits_attempted = audit_selection.candidates.len();
     stats.audit_requests = audit_selection.request_count;
 
-    let present_by_key = collect_record_prune_proofs(
-        &audit_selection.candidates,
-        stats.in_range,
-        ctx.storage,
-        ctx.p2p_node,
-        ctx.config,
-        ctx.sync_state,
-        ctx.audit_challenge_coordinator,
-    )
-    .await;
+    let present_by_key =
+        collect_record_prune_proofs(&audit_selection.candidates, stats.in_range, ctx).await;
     let (keys_to_delete, revalidated_cleared, audit_below_threshold) =
         revalidated_record_prune_keys(&audit_selection.candidates, &present_by_key, ctx).await;
     stats.cleared += revalidated_cleared;
@@ -687,8 +681,8 @@ fn select_record_prune_audits(
 ///
 /// Only entries far outside this node's range go, farthest first: with evenly
 /// spread IDs this node has no vote on them. An entry whose record is still stored
-/// stays, since it authorises that record's repair. So does everything while this
-/// node knows too few peers to say what is near.
+/// stays, since it authorises that record's repair (see [`keeps_paid_entry`]). So
+/// does everything while this node knows too few peers to say what is near.
 async fn evict_excess_paid_entries(ctx: &PrunePassContext<'_>) -> (usize, usize) {
     let count = match ctx.paid_list.count() {
         Ok(count) => usize::try_from(count).unwrap_or(usize::MAX),
@@ -702,16 +696,14 @@ async fn evict_excess_paid_entries(ctx: &PrunePassContext<'_>) -> (usize, usize)
         return (count, 0);
     }
     let near_bits = paid_near_bits(ctx.p2p_node, ctx.config.paid_list_close_group_size).await;
-    let storage = Arc::clone(ctx.storage);
-    let evicted = ctx
-        .paid_list
-        .evict_far(
-            *ctx.self_id.as_bytes(),
-            near_bits,
-            excess.min(MAX_PAID_EVICTIONS_PER_PASS),
-            move |key| storage.exists(key).unwrap_or(true),
-        )
-        .await;
+    let evicted = evict_paid_entries(
+        ctx.paid_list,
+        ctx.storage,
+        *ctx.self_id.as_bytes(),
+        near_bits,
+        excess.min(MAX_PAID_EVICTIONS_PER_PASS),
+    )
+    .await;
     match evicted {
         Ok(evicted) => (count.saturating_sub(evicted), evicted),
         Err(e) => {
@@ -719,6 +711,44 @@ async fn evict_excess_paid_entries(ctx: &PrunePassContext<'_>) -> (usize, usize)
             (count, 0)
         }
     }
+}
+
+/// Evict up to `limit` paid entries outside the `near_bits` around `center`,
+/// farthest first, keeping those [`keeps_paid_entry`] keeps. Returns how many
+/// went.
+///
+/// The removal asks [`keeps_paid_entry`] again inside its write transaction,
+/// with new record admissions held back until it has committed. So a record
+/// stored after the scan, or under way when the removal decides, keeps its
+/// entry and its price-contested mark (ADR-0006). A record admitted after the
+/// removal finds no entry, as after any eviction.
+pub(crate) async fn evict_paid_entries(
+    paid_list: &PaidList,
+    storage: &Arc<ChunkStore>,
+    center: XorName,
+    near_bits: usize,
+    limit: usize,
+) -> Result<usize> {
+    let keep_storage = Arc::clone(storage);
+    paid_list
+        .evict_far(
+            center,
+            near_bits,
+            limit,
+            move |key| keeps_paid_entry(&keep_storage, key),
+            storage.hold_admissions(),
+        )
+        .await
+}
+
+/// Whether eviction keeps `key`'s paid entry: while its record is in the store's
+/// index, whether or not it can be read at the moment, or on its way there
+/// (`ChunkStore::holds_or_admits`). The entry authorises the
+/// record's repair and carries its price-contested mark (ADR-0006); a record that
+/// failed a read is out of service, not gone, and losing its mark would let it be
+/// hinted as a replica once it reads again.
+fn keeps_paid_entry(storage: &ChunkStore, key: &XorName) -> bool {
+    storage.holds_or_admits(key)
 }
 
 fn remote_close_group_peers(close_group: &[PeerId], self_id: &PeerId) -> Vec<PeerId> {
@@ -768,14 +798,13 @@ async fn delete_stored_records(keys_to_delete: &[XorName], ctx: &PrunePassContex
 /// local, and the retained record continues to participate in normal
 /// neighbor-sync repair because replica hint construction walks all locally
 /// stored keys, including out-of-range keys retained by hysteresis.
+///
+/// A price-contested key still needs its proofs before it is deleted, but no
+/// absent peer is scored for it (see `fresh::record_paid_key`).
 async fn collect_record_prune_proofs(
     candidates: &[RecordPruneCandidate],
     local_stored_key_count: usize,
-    storage: &Arc<ChunkStore>,
-    p2p_node: &Arc<P2PNode>,
-    config: &ReplicationConfig,
-    sync_state: &Arc<RwLock<NeighborSyncState>>,
-    audit_challenge_coordinator: &Arc<AuditChallengeCoordinator>,
+    ctx: &PrunePassContext<'_>,
 ) -> HashMap<XorName, HashSet<PeerId>> {
     if candidates.is_empty() {
         return HashMap::new();
@@ -786,11 +815,12 @@ async fn collect_record_prune_proofs(
     let challenges = build_peer_audit_challenges(candidates, max_keys_per_challenge);
     let report_state = PruneAuditReportState::default();
     let audit_context = PruneAuditContext {
-        storage,
-        p2p_node,
-        config,
-        sync_state,
-        audit_challenge_coordinator,
+        storage: ctx.storage,
+        paid_list: ctx.paid_list,
+        p2p_node: ctx.p2p_node,
+        config: ctx.config,
+        sync_state: ctx.sync_state,
+        audit_challenge_coordinator: ctx.audit_challenge_coordinator,
         report_state: &report_state,
     };
     let mut requests = stream::iter(challenges)
@@ -1121,15 +1151,7 @@ async fn peer_proves_records(
                     "failed"
                 };
                 if !audit_failure_reported
-                    && report_prune_audit_failure_once(
-                        &peer,
-                        &key,
-                        context.p2p_node,
-                        context.config,
-                        context.report_state,
-                        failure_class,
-                    )
-                    .await
+                    && report_prune_audit_failure_once(&peer, &key, context, failure_class).await
                 {
                     audit_failure_reported = true;
                 }
@@ -1174,16 +1196,7 @@ async fn receive_prune_audit_response(
     };
 
     for key in challenge_keys {
-        if report_prune_audit_failure_once(
-            peer,
-            key,
-            context.p2p_node,
-            context.config,
-            context.report_state,
-            failure_class,
-        )
-        .await
-        {
+        if report_prune_audit_failure_once(peer, key, context, failure_class).await {
             break;
         }
     }
@@ -1467,11 +1480,25 @@ fn audit_digest_proves_key(
 async fn report_prune_audit_failure_once(
     peer: &PeerId,
     key: &XorName,
-    p2p_node: &Arc<P2PNode>,
-    config: &ReplicationConfig,
-    report_state: &PruneAuditReportState,
+    context: PruneAuditContext<'_>,
     audit_failure_class: &'static str,
 ) -> bool {
+    let PruneAuditContext {
+        paid_list,
+        p2p_node,
+        config,
+        report_state,
+        ..
+    } = context;
+    // No peer is scored for a price-contested key (see
+    // `fresh::record_paid_key`); a mark that cannot be read counts as set.
+    if paid_list.counts_as_price_contested(key) {
+        debug!(
+            "Prune audit: not scoring {peer} for {}, a price-contested key",
+            hex::encode(key)
+        );
+        return false;
+    }
     let should_report = peer_is_currently_responsible(peer, key, p2p_node, config).await
         && reserve_prune_audit_failure_report(report_state, peer).await;
     if !should_report {
@@ -1597,9 +1624,15 @@ async fn peer_is_currently_responsible(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::replication::fresh::record_paid_key;
+    use crate::replication::paid_list::XORNAME_BITS;
     use crate::storage::chunk_store::CHUNKS_DIR_NAME;
     use crate::storage::ChunkStoreConfig;
+    use futures::FutureExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tempfile::TempDir;
+    use tokio::sync::oneshot;
+    use tokio::task::JoinHandle;
 
     fn peer_id_from_byte(b: u8) -> PeerId {
         let mut bytes = [0u8; 32];
@@ -1619,6 +1652,370 @@ mod tests {
 
     fn candidate(key: XorName, target_peers: Vec<PeerId>) -> RecordPruneCandidate {
         RecordPruneCandidate { key, target_peers }
+    }
+
+    /// ADR-0006 with ADR-0028: eviction keeps the paid entry of a record that
+    /// cannot be read for the moment, so a retained price-contested record keeps
+    /// its mark through a read fault; an entry with no record does not stay.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn eviction_keeps_the_entry_of_a_record_that_cannot_be_read_for_now() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().expect("temp dir");
+        let storage = ChunkStore::new(ChunkStoreConfig {
+            root_dir: dir.path().to_path_buf(),
+            ..ChunkStoreConfig::test_default()
+        })
+        .await
+        .expect("chunk store");
+        let bytes = b"retained price-contested record".to_vec();
+        let key = ChunkStore::compute_address(&bytes);
+        storage.put(&key, &bytes).await.expect("put");
+        let path = dir
+            .path()
+            .join(CHUNKS_DIR_NAME)
+            .join(format!("{:02x}", key.last().copied().unwrap_or(0)))
+            .join(hex::encode(key));
+        let mut perms = std::fs::metadata(&path).expect("meta").permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&path, perms).expect("chmod");
+
+        assert!(storage.get(&key).await.is_err(), "the read must fail");
+        assert!(!storage.exists(&key).expect("exists"), "out of service");
+        assert!(keeps_paid_entry(&storage, &key), "but its entry stays");
+        assert!(
+            !keeps_paid_entry(&storage, &[0x5A; 32]),
+            "an entry with no record does not"
+        );
+
+        let mut perms = std::fs::metadata(&path).expect("meta").permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&path, perms).expect("chmod back");
+    }
+
+    /// A chunk store and a paid list, as one node holds them.
+    async fn eviction_fixture() -> (Arc<ChunkStore>, Arc<PaidList>, TempDir) {
+        let dir = TempDir::new().expect("temp dir");
+        let storage = ChunkStore::new(ChunkStoreConfig {
+            root_dir: dir.path().join("store"),
+            ..ChunkStoreConfig::test_default()
+        })
+        .await
+        .expect("chunk store");
+        let paid_list = PaidList::new(&dir.path().join("paid"))
+            .await
+            .expect("paid list");
+        (Arc::new(storage), Arc::new(paid_list), dir)
+    }
+
+    /// A record to admit, and its key.
+    fn test_record() -> (Vec<u8>, XorName) {
+        let content = b"price-contested record admitted during an eviction".to_vec();
+        let key = ChunkStore::compute_address(&content);
+        (content, key)
+    }
+
+    /// Evict up to ten entries far from a center whose top bit differs from
+    /// `key`'s, so `key` is a candidate.
+    fn spawn_eviction(
+        storage: &Arc<ChunkStore>,
+        paid_list: &Arc<PaidList>,
+        key: XorName,
+    ) -> JoinHandle<Result<usize>> {
+        let (storage, paid_list) = (Arc::clone(storage), Arc::clone(paid_list));
+        let mut center = key;
+        if let Some(first) = center.first_mut() {
+            *first ^= 0x80;
+        }
+        tokio::spawn(async move {
+            evict_paid_entries(&paid_list, &storage, center, XORNAME_BITS - 1, 10).await
+        })
+    }
+
+    /// Store `content` under `key` as a fresh offer does, recording the key's
+    /// marked entry first. The record waits after the entry until `store` fires,
+    /// and `recorded` fires once the entry is in.
+    fn spawn_fresh_admission(
+        storage: &Arc<ChunkStore>,
+        paid_list: &Arc<PaidList>,
+        (content, key): (Vec<u8>, XorName),
+        recorded: oneshot::Sender<()>,
+        store: oneshot::Receiver<()>,
+    ) -> JoinHandle<(bool, Result<bool>)> {
+        let (storage, paid_list) = (Arc::clone(storage), Arc::clone(paid_list));
+        tokio::spawn(async move {
+            storage
+                .put_after(&key, &content, async move {
+                    let marked = record_paid_key(&key, true, &paid_list).await;
+                    let _ = recorded.send(());
+                    let _ = store.await;
+                    marked
+                })
+                .await
+        })
+    }
+
+    async fn wait_until(reached: impl Fn() -> bool + Send + Sync) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !reached() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("reached in time");
+    }
+
+    /// Hold the write half of `gate` on a blocking thread until the returned
+    /// sender is dropped, so whatever takes its read half parks there.
+    async fn hold_gate(
+        gate: Arc<parking_lot::RwLock<()>>,
+    ) -> (oneshot::Sender<()>, JoinHandle<()>) {
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let (held_tx, held_rx) = oneshot::channel::<()>();
+        let holder = tokio::task::spawn_blocking(move || {
+            let _held = gate.write();
+            let _ = held_tx.send(());
+            let _ = release_rx.blocking_recv();
+        });
+        held_rx.await.expect("gate held");
+        (release_tx, holder)
+    }
+
+    /// The record is stored and its paid entry still carries the mark, in the
+    /// database and in memory, so it goes out in paid hints only.
+    fn assert_stored_with_its_mark(storage: &ChunkStore, paid_list: &PaidList, key: &XorName) {
+        assert!(storage.exists(key).expect("exists"), "the record is stored");
+        assert!(
+            paid_list.is_price_contested(key).expect("read mark"),
+            "its paid entry and its mark stay"
+        );
+        assert_eq!(
+            paid_list.split_marked(vec![*key]),
+            (Vec::new(), vec![*key]),
+            "and the in-memory copy still marks it"
+        );
+    }
+
+    /// ADR-0006 with ADR-0028: an eviction scan finds the key's marked entry
+    /// with no record, and a fresh offer then records (finding that entry) and
+    /// stores the record, all before the eviction removes anything. The entry
+    /// and its mark must stay, or the stored record would be hinted as a
+    /// replica.
+    #[tokio::test]
+    async fn eviction_keeps_the_entry_of_a_record_stored_after_its_scan() {
+        let (storage, paid_list, _dir) = eviction_fixture().await;
+        let (content, key) = test_record();
+        assert!(record_paid_key(&key, true, &paid_list).await);
+
+        let scan_gate = paid_list.test_eviction_scan_gate();
+        let scanned = scan_gate.write().await;
+        let eviction = spawn_eviction(&storage, &paid_list, key);
+        wait_until(|| paid_list.test_evictions_scanned() == 1).await;
+
+        let (marked, stored) = storage
+            .put_after(&key, &content, record_paid_key(&key, true, &paid_list))
+            .await;
+        assert!(marked);
+        assert!(stored.expect("put"));
+
+        drop(scanned);
+        let evicted = eviction.await.expect("eviction task").expect("evict");
+        assert_eq!(evicted, 0);
+        assert_eq!(
+            paid_list.test_removals_committing(),
+            1,
+            "the removal ran with the key as a candidate"
+        );
+        assert_stored_with_its_mark(&storage, &paid_list, &key);
+    }
+
+    /// The eviction removes while a fresh offer has recorded the key's entry
+    /// but not yet stored its record. The offer's admission keeps the entry.
+    #[tokio::test]
+    async fn eviction_keeps_the_entry_of_a_record_recorded_but_not_yet_stored() {
+        let (storage, paid_list, _dir) = eviction_fixture().await;
+        let record = test_record();
+        let key = record.1;
+        // Already recorded when the eviction scans: by a `PaidNotify`, or by
+        // this offer an instant earlier.
+        assert!(record_paid_key(&key, true, &paid_list).await);
+
+        let scan_gate = paid_list.test_eviction_scan_gate();
+        let scanned = scan_gate.write().await;
+        let eviction = spawn_eviction(&storage, &paid_list, key);
+        wait_until(|| paid_list.test_evictions_scanned() == 1).await;
+
+        let (recorded_tx, recorded_rx) = oneshot::channel();
+        let (store_tx, store_rx) = oneshot::channel();
+        let admission = spawn_fresh_admission(&storage, &paid_list, record, recorded_tx, store_rx);
+        recorded_rx.await.expect("entry recorded");
+
+        drop(scanned);
+        let evicted = eviction.await.expect("eviction task").expect("evict");
+        assert_eq!(evicted, 0);
+        assert_eq!(
+            paid_list.test_removals_committing(),
+            1,
+            "the removal ran with the key as a candidate"
+        );
+
+        store_tx.send(()).expect("store the record");
+        let (marked, stored) = admission.await.expect("admission task");
+        assert!(marked);
+        assert!(stored.expect("put"));
+        assert_stored_with_its_mark(&storage, &paid_list, &key);
+    }
+
+    /// The eviction removes while a put of the key has started but is not yet
+    /// writing. The put's admission keeps the entry.
+    #[tokio::test]
+    async fn eviction_keeps_the_entry_of_a_record_whose_put_is_not_yet_writing() {
+        let (storage, paid_list, _dir) = eviction_fixture().await;
+        let (content, key) = test_record();
+        assert!(record_paid_key(&key, true, &paid_list).await);
+
+        let scan_gate = paid_list.test_eviction_scan_gate();
+        let scanned = scan_gate.write().await;
+        let eviction = spawn_eviction(&storage, &paid_list, key);
+        wait_until(|| paid_list.test_evictions_scanned() == 1).await;
+
+        let put_gate = storage.test_pre_registration_gate();
+        let put_parked = put_gate.write().await;
+        let put = {
+            let storage = Arc::clone(&storage);
+            tokio::spawn(async move { storage.put(&key, &content).await })
+        };
+        wait_until(|| storage.test_reached_pre_registration() == 1).await;
+
+        drop(scanned);
+        let evicted = eviction.await.expect("eviction task").expect("evict");
+        assert_eq!(evicted, 0);
+        assert_eq!(
+            paid_list.test_removals_committing(),
+            1,
+            "the removal ran with the key as a candidate"
+        );
+
+        drop(put_parked);
+        assert!(put.await.expect("put task").expect("put"));
+        assert_stored_with_its_mark(&storage, &paid_list, &key);
+    }
+
+    /// The eviction removes while a put whose caller has gone away still has
+    /// its write on the blocking pool. That write lands afterwards, so the
+    /// entry stays.
+    #[tokio::test]
+    async fn eviction_keeps_the_entry_of_a_record_a_cancelled_put_is_still_writing() {
+        let (storage, paid_list, _dir) = eviction_fixture().await;
+        let (content, key) = test_record();
+        assert!(record_paid_key(&key, true, &paid_list).await);
+
+        let scan_gate = paid_list.test_eviction_scan_gate();
+        let scanned = scan_gate.write().await;
+        let eviction = spawn_eviction(&storage, &paid_list, key);
+        wait_until(|| paid_list.test_evictions_scanned() == 1).await;
+
+        let (release_write, write_parked) = hold_gate(storage.test_put_gate()).await;
+        let put = {
+            let storage = Arc::clone(&storage);
+            tokio::spawn(async move { storage.put(&key, &content).await })
+        };
+        wait_until(|| storage.test_file_tasks_in_flight() == 1).await;
+        put.abort();
+        assert!(put.await.expect_err("aborted").is_cancelled());
+
+        drop(scanned);
+        let evicted = eviction.await.expect("eviction task").expect("evict");
+        assert_eq!(evicted, 0);
+        assert_eq!(
+            paid_list.test_removals_committing(),
+            1,
+            "the removal ran with the key as a candidate"
+        );
+
+        drop(release_write);
+        write_parked.await.expect("gate holder");
+        storage.wait_idle().await;
+        assert_stored_with_its_mark(&storage, &paid_list, &key);
+    }
+
+    /// An admission that starts while an eviction is removing the key's entry
+    /// waits until the removal has committed, without getting past registering,
+    /// so it records the entry afresh rather than trusting one about to go.
+    #[tokio::test]
+    async fn an_admission_waits_for_an_eviction_to_commit() {
+        let (storage, paid_list, _dir) = eviction_fixture().await;
+        let (content, key) = test_record();
+        assert!(record_paid_key(&key, true, &paid_list).await);
+
+        let (release_commit, committing) = hold_gate(paid_list.test_removal_commit_gate()).await;
+        let eviction = spawn_eviction(&storage, &paid_list, key);
+        wait_until(|| paid_list.test_removals_committing() == 1).await;
+
+        let started = AtomicBool::new(false);
+        let admission = storage.put_after(&key, &content, async {
+            started.store(true, Ordering::Release);
+            record_paid_key(&key, true, &paid_list).await
+        });
+        tokio::pin!(admission);
+        assert!(
+            (&mut admission).now_or_never().is_none(),
+            "the admission waits for the commit"
+        );
+        assert!(
+            !started.load(Ordering::Acquire),
+            "without getting past registering"
+        );
+
+        drop(release_commit);
+        committing.await.expect("gate holder");
+        let evicted = eviction.await.expect("eviction task").expect("evict");
+        assert_eq!(evicted, 1, "the entry with no record goes");
+        let (marked, stored) = admission.await;
+        assert!(started.load(Ordering::Acquire));
+        assert!(marked, "the entry is recorded afresh, marked");
+        assert!(stored.expect("put"));
+        assert_stored_with_its_mark(&storage, &paid_list, &key);
+    }
+
+    /// A client PUT of a chunk the index names but whose file has gone finds
+    /// the file missing, drops the stale index entry, and on Unix puts the
+    /// offered copy back. An eviction that removes in between keeps the
+    /// entry: the check counts as an admission from its start.
+    #[tokio::test]
+    async fn eviction_keeps_the_entry_of_a_record_a_put_check_is_putting_back() {
+        let (storage, paid_list, _dir) = eviction_fixture().await;
+        let (content, key) = test_record();
+        assert!(storage.put(&key, &content).await.expect("put"));
+        assert!(record_paid_key(&key, true, &paid_list).await);
+        std::fs::remove_file(storage.test_chunk_path(&key)).expect("lose the file");
+
+        let repair_gate = storage.test_pre_repair_gate();
+        let repair_parked = repair_gate.write().await;
+        let check = {
+            let (storage, offered) = (Arc::clone(&storage), content.clone());
+            tokio::spawn(async move { storage.holds_verified(&key, &offered).await })
+        };
+        wait_until(|| storage.test_reached_pre_repair() == 1).await;
+        assert!(!storage.is_indexed(&key), "the stale index entry is gone");
+
+        let evicted = spawn_eviction(&storage, &paid_list, key)
+            .await
+            .expect("eviction task")
+            .expect("evict");
+        assert_eq!(evicted, 0);
+
+        drop(repair_parked);
+        // Off Unix a repair rewrites the file in place and cannot recreate a missing
+        // one, so the check answers no and the PUT stores the copy, as the handler does.
+        let put_back = check.await.expect("check task");
+        #[cfg(unix)]
+        assert!(put_back, "on Unix the check puts the offered copy back");
+        if !put_back {
+            assert!(storage.put(&key, &content).await.expect("put"));
+        }
+        assert_stored_with_its_mark(&storage, &paid_list, &key);
     }
 
     /// A prune audit judges holders against this node's own copy. A copy that

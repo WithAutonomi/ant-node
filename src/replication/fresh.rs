@@ -11,7 +11,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::logging::{debug, warn};
+use crate::logging::{debug, info, warn};
 use bytes::Bytes;
 use rand::Rng;
 use saorsa_core::identity::PeerId;
@@ -19,6 +19,7 @@ use saorsa_core::P2PNode;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 
 use crate::ant_protocol::XorName;
+use crate::payment::PaymentVerifier;
 use crate::replication::config::{
     ReplicationConfig, FRESH_REPLICATION_DELIVERY_MAX_RETRIES, REPLICATION_PROTOCOL_ID,
 };
@@ -48,6 +49,9 @@ pub struct FreshWriteEvent {
 pub(crate) struct FreshOfferEvent {
     pub(crate) key: XorName,
     pub(crate) payment_proof: Vec<u8>,
+    /// The fan-out must not judge peers on this write (see
+    /// [`announce_paid_write`]).
+    pub(crate) contested: bool,
     /// Storage read-backs attempted so far; see `MAX_FRESH_READ_ATTEMPTS`.
     pub(crate) read_attempts: u32,
 }
@@ -84,8 +88,48 @@ impl AsRef<[u8]> for EncodedOffer {
     }
 }
 
-/// Rules 6-8: record the paid key locally and announce it to
-/// `PaidCloseGroup(K)`.
+/// Rule 6: a node that validates `PoP` adds K to `PaidForList(self)`, marked
+/// when `mark`.
+///
+/// `mark` is the decision this node took when it verified the payment
+/// (`PaymentVerifier::verified_payment_contested`), so a write
+/// admitted from the payment cache is recorded by that decision, never by the
+/// proof attached to it, which nobody checked. A contested write is marked
+/// (ADR-0006) because a close-group peer may have refused it under its own
+/// floor, and refusing a below-floor payment is network policy, never
+/// misbehaviour. While this node holds the key, the mark keeps it from judging
+/// its peers on it: the key goes out in paid hints only, so no repair proof is
+/// recorded and no responsible audit samples it, and a prune audit of it
+/// scores no one. Every other check that reads the mark points here.
+///
+/// The first record of a key decides its mark: an existing entry is never
+/// changed, so a later payment can neither add nor remove it. Returns whether
+/// `mark` or the key's record is marked once this call is done, whichever
+/// record won: ours, or one a concurrent `PaidNotify` or fresh offer wrote
+/// first. A mark that cannot be read counts as set (see
+/// `PaidList::counts_as_price_contested`).
+pub(crate) async fn record_paid_key(key: &XorName, mark: bool, paid_list: &PaidList) -> bool {
+    let recorded = if mark {
+        paid_list.insert_price_contested(key).await
+    } else {
+        paid_list.insert(key).await
+    };
+    if let Err(e) = recorded {
+        warn!("Failed to add key {} to PaidForList: {e}", hex::encode(key));
+    }
+    mark || paid_list.counts_as_price_contested(key)
+}
+
+/// Rules 6-8: record the paid key locally (see [`record_paid_key`]) and
+/// announce it to `PaidCloseGroup(K)`. Returns whether the write's fan-out
+/// must leave its peers unjudged (ADR-0006).
+///
+/// The record is marked by the decision this node took when it verified the
+/// payment. The fan-out is left unjudged when that decision or the key's
+/// record is marked once recorded, whichever record won, so a marked write is
+/// never judged, and also when the proof being forwarded is contested: a
+/// cached PUT forwards it unverified, and its peers verify it and may refuse
+/// it.
 ///
 /// This is the evidence peers need to repair the key later, so it runs the
 /// moment a write is accepted and is never gated by the pending-offer permit
@@ -93,20 +137,28 @@ impl AsRef<[u8]> for EncodedOffer {
 pub(crate) async fn announce_paid_write(
     key: &XorName,
     proof_of_payment: &[u8],
+    payment_verifier: &PaymentVerifier,
     paid_list: &PaidList,
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
-) {
-    // Rule 6: Node that validates PoP adds K to PaidForList(self).
-    if let Err(e) = paid_list.insert(key).await {
-        warn!("Failed to add key {} to PaidForList: {e}", hex::encode(key));
-    }
+) -> bool {
+    let marked = record_paid_key(
+        key,
+        payment_verifier.verified_payment_contested(key),
+        paid_list,
+    )
+    .await;
     // Rules 7-8: PaidNotify to every member of PaidCloseGroup(K).
     send_paid_notify(key, proof_of_payment, p2p_node, config).await;
+    marked
+        || payment_verifier
+            .price_contested(key, proof_of_payment)
+            .await
 }
 
 /// Rules 2-3: send fresh offers to the close group and schedule the delayed
-/// possession check (ADR-0003) for the responsible peers.
+/// possession check (ADR-0003) for the responsible peers, unless `contested`
+/// (see [`announce_paid_write`]).
 ///
 /// `pending_offer` is the caller's permit from the pending-offer semaphore;
 /// it is held with the encoded offer until the last handle to it is dropped.
@@ -117,6 +169,7 @@ pub(crate) async fn send_fresh_offers(
     key: &XorName,
     data: Vec<u8>,
     proof_of_payment: Vec<u8>,
+    contested: bool,
     pending_offer: OwnedSemaphorePermit,
 ) {
     let self_id = *ctx.p2p_node.peer_id();
@@ -210,12 +263,21 @@ pub(crate) async fn send_fresh_offers(
 
     // Schedule the delayed possession check (ADR-0003) for the responsible
     // close-group peers. A closed receiver (engine shutting down) is ignored.
+    // Not for a contested write: a peer may have refused it (ADR-0006).
     if !target_peers.is_empty() {
         ctx.dispatched.fetch_add(1, Ordering::Relaxed);
-        let _ = ctx.possession_check_tx.send(PossessionCheckEvent {
-            key: *key,
-            peers: target_peers,
-        });
+        if contested {
+            info!(
+                "Fresh replication of {}: no possession check, the payment is contested \
+                 under the price floor",
+                hex::encode(key)
+            );
+        } else {
+            let _ = ctx.possession_check_tx.send(PossessionCheckEvent {
+                key: *key,
+                peers: target_peers,
+            });
+        }
     }
 }
 
@@ -274,6 +336,52 @@ async fn send_paid_notify(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// ADR-0006: a contested payment marks a newly recorded key, an
+    /// uncontested one records it plainly, and the first record of a key
+    /// decides: a later record, either way, changes nothing. Each call
+    /// reports the winning record's mark, or its own when that is set, so a
+    /// write whose plain decision lost to a marked record is still left
+    /// unjudged.
+    #[tokio::test]
+    async fn the_first_record_of_a_key_decides_its_mark() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paid_list = PaidList::new(dir.path()).await.expect("paid list");
+        let contested = [0x91u8; 32];
+        let plain = [0x92u8; 32];
+
+        let reported = vec![
+            record_paid_key(&contested, true, &paid_list).await,
+            record_paid_key(&plain, false, &paid_list).await,
+            record_paid_key(&contested, false, &paid_list).await,
+            record_paid_key(&plain, true, &paid_list).await,
+        ];
+
+        let marks: Vec<(bool, bool)> = [contested, plain]
+            .iter()
+            .map(|key| {
+                (
+                    paid_list.contains(key).expect("contains"),
+                    paid_list.is_price_contested(key).expect("read mark"),
+                )
+            })
+            .collect();
+        assert_eq!(marks, vec![(true, true), (true, false)]);
+        assert_eq!(reported, vec![true, false, true, true]);
+    }
+
+    /// ADR-0006: a plain write is left unjudged while the paid list cannot be
+    /// read, since the record that won may be marked.
+    #[tokio::test]
+    async fn a_write_whose_mark_cannot_be_read_is_left_unjudged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paid_list = PaidList::new(dir.path()).await.expect("paid list");
+        let plain = [0x93u8; 32];
+        assert!(!record_paid_key(&plain, false, &paid_list).await);
+
+        let _reader = paid_list.hold_reader_for_tests().expect("hold reader");
+        assert!(record_paid_key(&plain, false, &paid_list).await);
+    }
 
     /// The permit is released with the last handle to the encoded offer, not
     /// the first: a slice the transport still holds keeps the offer counted.

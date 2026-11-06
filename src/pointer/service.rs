@@ -561,7 +561,7 @@ fn cross_kind_refusal(address: XorName, chunk_present: Result<bool>) -> Option<P
 )]
 mod tests {
     use super::*;
-    use crate::payment::{EvmVerifierConfig, PriceFloorConfig};
+    use crate::payment::EvmVerifierConfig;
     use ant_protocol::pointer::{Pointer, PointerTarget, PointerTargetKind, FINAL_COUNTER};
     use saorsa_pqc::api::sig::{ml_dsa_65, MlDsaPublicKey, MlDsaSecretKey};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -882,7 +882,6 @@ mod tests {
             cache_capacity: 16,
             close_group_size: ant_protocol::chunk::CLOSE_GROUP_SIZE,
             local_rewards_address: evmlib::common::Address::new([1u8; 20]),
-            price_floor: PriceFloorConfig::default(),
         }));
         let service = PointerService::new(store).with_payments(verifier);
 

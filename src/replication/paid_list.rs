@@ -14,24 +14,39 @@
 //! ```
 //!
 //! One unnamed database stores set membership: key = 32-byte `XorName`,
-//! value = empty byte slice. Keys sort by their bytes, so the keys sharing a
-//! prefix with a given key are one contiguous range.
+//! value = empty byte slice, or one marker byte for a key whose
+//! payment the price floor contested here (ADR-0006). Releases before that
+//! marker only ever test presence, so they read a marked key as paid. The
+//! marked keys are also held in memory, so hint construction never scans the
+//! database for them. Keys sort by their bytes, so the keys sharing a prefix
+//! with a given key are one contiguous range.
 
 use crate::ant_protocol::XorName;
 use crate::error::{Error, Result};
-use crate::logging::{debug, error, trace, warn};
+use crate::logging::{debug, error, info, trace, warn};
 use crate::replication::config::{PAID_LIST_MAP_SIZE, PAID_LIST_NEAR_MARGIN_BITS};
 use crate::replication::out_of_range_clocks::OutOfRangeClocks;
 use heed::types::Bytes;
+#[cfg(test)]
+use heed::WithTls;
 use heed::{Database, Env, EnvOpenOptions, MdbError, RoTxn};
+use parking_lot::{Mutex, RwLock};
+use std::collections::HashSet;
+use std::future::Future;
 use std::ops::Bound;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::slice;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::task::spawn_blocking;
 use tokio_util::task::TaskTracker;
 
 use crate::ant_protocol::XORNAME_LEN;
+
+/// Value stored for a key whose payment the price floor contested here (see
+/// `fresh::record_paid_key`).
+const PRICE_CONTESTED_VALUE: &[u8] = &[1];
 
 /// Bits in one byte of a key.
 const BITS_PER_BYTE: usize = 8;
@@ -83,6 +98,14 @@ fn prefix_range(key: &XorName, free_bits: usize) -> (XorName, XorName) {
     (low, high)
 }
 
+/// Whether `key` shares all but the low `near_bits` bits with `center`, so
+/// [`PaidList::keys_near`] reads it.
+#[must_use]
+pub fn is_near(center: &XorName, key: &XorName, near_bits: usize) -> bool {
+    let (low, high) = prefix_range(center, near_bits);
+    low <= *key && *key <= high
+}
+
 /// The key ranges outside the `near_bits` around `center`, farthest first: each
 /// holds the keys whose highest bit differing from `center` is one given bit.
 fn far_ranges(center: &XorName, near_bits: usize) -> impl Iterator<Item = (XorName, XorName)> {
@@ -131,6 +154,49 @@ fn visit_range(
     Ok(true)
 }
 
+/// What the open task returns: the environment, the database, the saved record
+/// clocks and the keys marked price-contested in the database, if they could
+/// be read.
+type OpenedPaidList = (
+    Env,
+    Database<Bytes, Bytes>,
+    OutOfRangeClocks,
+    Result<HashSet<XorName>>,
+);
+
+/// Every key whose entry in `db` carries the price-contested mark.
+fn read_price_contested_keys(db: &Database<Bytes, Bytes>, txn: &RoTxn) -> Result<HashSet<XorName>> {
+    let mut keys = HashSet::new();
+    for result in db
+        .iter(txn)
+        .map_err(|e| Error::Storage(format!("Failed to iterate paid-list: {e}")))?
+    {
+        let (key_bytes, value) =
+            result.map_err(|e| Error::Storage(format!("Failed to read paid-list entry: {e}")))?;
+        if value.is_empty() {
+            continue;
+        }
+        if let Ok(key) = XorName::try_from(key_bytes) {
+            keys.insert(key);
+        }
+    }
+    Ok(keys)
+}
+
+/// Drop `keys` from the in-memory marks, after a commit that left none of
+/// them marked in the database. The set is copied only if one of them is in
+/// it.
+fn unmark_in_memory(marks: &RwLock<Option<Arc<HashSet<XorName>>>>, keys: &[XorName]) {
+    if let Some(marked) = marks.write().as_mut() {
+        if keys.iter().any(|key| marked.contains(key)) {
+            let marked = Arc::make_mut(marked);
+            for key in keys {
+                marked.remove(key);
+            }
+        }
+    }
+}
+
 /// Persistent paid-for-list backed by LMDB.
 ///
 /// Tracks which keys this node believes are paid-authorized.
@@ -138,8 +204,27 @@ fn visit_range(
 pub struct PaidList {
     /// LMDB environment.
     env: Env,
-    /// The unnamed default database (key = `XorName` bytes, value = empty).
+    /// The unnamed default database (key = `XorName` bytes, value = empty, or
+    /// the price-contested marker).
     db: Database<Bytes, Bytes>,
+    /// In-memory copy of the keys whose entry carries the price-contested
+    /// mark, or `None` if they could not be read on open. Changed only by the
+    /// blocking task that writes the database, under `write_order`, so a
+    /// cancelled caller cannot leave it stale. Readers clone the `Arc` and
+    /// filter outside the lock; a write while such a snapshot is alive
+    /// copies the set first (`Arc::make_mut`).
+    price_contested: Arc<RwLock<Option<Arc<HashSet<XorName>>>>>,
+    /// Held by every database write from before its write transaction until
+    /// it has updated `price_contested`, so the copy changes in commit order.
+    /// A new mark goes in just before its commit and a removed one just after,
+    /// so the copy never lacks a committed mark. A mark whose commit fails
+    /// stays, since that commit may still have reached the disk: when in
+    /// doubt, judge no one. Any later write that commits the key unmarked, a
+    /// plain insert that adds it or a removal, drops that mark.
+    write_order: Arc<Mutex<()>>,
+    /// Mark reads that have failed since the last one that succeeded, so a
+    /// run of failures is logged once (see `counts_as_price_contested`).
+    failed_mark_reads: AtomicU64,
     /// When each stored record first went out of storage-responsibility range.
     record_out_of_range: OutOfRangeClocks,
     /// Whether a full store has been reported, so it is reported only once.
@@ -151,6 +236,19 @@ pub struct PaidList {
     /// is dropped, so [`Self::wait_idle`] waits on the blocking tasks
     /// themselves before the environment may be reopened.
     blocking_tracker: TaskTracker,
+    /// Test-only: parks an eviction between its scan and its removal.
+    #[cfg(test)]
+    test_eviction_scan_gate: Arc<tokio::sync::RwLock<()>>,
+    /// Test-only: how many evictions have finished their scan.
+    #[cfg(test)]
+    test_evictions_scanned: Arc<AtomicU64>,
+    /// Test-only: parks a removal on the blocking pool after it has deleted its
+    /// keys and before it commits.
+    #[cfg(test)]
+    test_removal_commit_gate: Arc<RwLock<()>>,
+    /// Test-only: how many removals have reached that gate.
+    #[cfg(test)]
+    test_removals_committing: Arc<AtomicU64>,
 }
 
 impl PaidList {
@@ -172,8 +270,8 @@ impl PaidList {
         // Constructor-only blocking task: it runs before `self` (and its
         // `blocking_tracker`) exists, so it is deliberately untracked.  The
         // constructor awaits it right here, so it cannot outlive this call.
-        let (env, db, record_out_of_range) = spawn_blocking(
-            move || -> Result<(Env, Database<Bytes, Bytes>, OutOfRangeClocks)> {
+        let (env, db, record_out_of_range, price_contested) =
+            spawn_blocking(move || -> Result<OpenedPaidList> {
                 // SAFETY: `EnvOpenOptions::open()` is unsafe because LMDB uses
                 // memory-mapped I/O and relies on OS file-locking to prevent
                 // corruption from concurrent access by multiple processes. We
@@ -199,19 +297,52 @@ impl PaidList {
                     })?;
                 wtxn.commit()
                     .map_err(|e| Error::Storage(format!("Failed to commit db creation: {e}")))?;
+                // A failed read leaves its transaction unable to commit, so the
+                // scan gets one of its own, dropped uncommitted. A write
+                // transaction takes no reader slot on this thread.
+                let price_contested = env
+                    .write_txn()
+                    .map_err(|e| Error::Storage(format!("Failed to create write txn: {e}")))
+                    .and_then(|scan| read_price_contested_keys(&db, &scan));
 
-                Ok((env, db, OutOfRangeClocks::load(record_clocks_path)))
-            },
-        )
-        .await
-        .map_err(|e| Error::Storage(format!("Paid-list init task failed: {e}")))??;
+                Ok((
+                    env,
+                    db,
+                    OutOfRangeClocks::load(record_clocks_path),
+                    price_contested,
+                ))
+            })
+            .await
+            .map_err(|e| Error::Storage(format!("Paid-list init task failed: {e}")))??;
+        // A paid list whose marks cannot be read still opens; the node then
+        // sends no replica hints until it restarts (see `retain_unmarked`).
+        let price_contested = price_contested
+            .inspect_err(|e| {
+                warn!(
+                    "Cannot read the paid list's price-contested marks; sending no replica \
+                     hints until restart: {e}"
+                );
+            })
+            .ok()
+            .map(Arc::new);
 
         let paid_list = Self {
             env,
             db,
+            price_contested: Arc::new(RwLock::new(price_contested)),
+            write_order: Arc::new(Mutex::new(())),
+            failed_mark_reads: AtomicU64::new(0),
             record_out_of_range,
             full_reported: AtomicBool::new(false),
             blocking_tracker: TaskTracker::new(),
+            #[cfg(test)]
+            test_eviction_scan_gate: Arc::new(tokio::sync::RwLock::new(())),
+            #[cfg(test)]
+            test_evictions_scanned: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            test_removal_commit_gate: Arc::new(RwLock::new(())),
+            #[cfg(test)]
+            test_removals_committing: Arc::new(AtomicU64::new(0)),
         };
 
         let count = paid_list.count()?;
@@ -228,6 +359,25 @@ impl PaidList {
     ///
     /// Returns an error if the LMDB write transaction fails.
     pub async fn insert(&self, key: &XorName) -> Result<bool> {
+        self.insert_with_value(key, &[]).await
+    }
+
+    /// Insert `key` as paid at a price the floor contested here (see
+    /// `fresh::record_paid_key`). Like [`Self::insert`], an existing entry is
+    /// left exactly as it is, so a key already recorded can never gain the
+    /// mark later. The mark survives restarts and later inserts, and goes
+    /// with the entry on [`Self::remove`].
+    ///
+    /// Returns `true` if the key was newly added, `false` if it already existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LMDB write transaction fails.
+    pub async fn insert_price_contested(&self, key: &XorName) -> Result<bool> {
+        self.insert_with_value(key, PRICE_CONTESTED_VALUE).await
+    }
+
+    async fn insert_with_value(&self, key: &XorName, value: &'static [u8]) -> Result<bool> {
         // Fast-path: avoid write transaction if key already present.
         if self.contains(key)? {
             trace!("Paid-list key {} already present", hex::encode(key));
@@ -237,10 +387,13 @@ impl PaidList {
         let key_owned = *key;
         let env = self.env.clone();
         let db = self.db;
+        let price_contested = Arc::clone(&self.price_contested);
+        let write_order = Arc::clone(&self.write_order);
 
         let was_new = self
             .blocking_tracker
             .spawn_blocking(move || -> heed::Result<bool> {
+                let ordered = write_order.lock();
                 let mut wtxn = env.write_txn()?;
 
                 // Authoritative existence check inside the serialized write txn.
@@ -248,8 +401,17 @@ impl PaidList {
                     return Ok(false);
                 }
 
-                db.put(&mut wtxn, &key_owned, &[])?;
+                db.put(&mut wtxn, &key_owned, value)?;
+                if !value.is_empty() {
+                    if let Some(keys) = price_contested.write().as_mut() {
+                        Arc::make_mut(keys).insert(key_owned);
+                    }
+                }
                 wtxn.commit()?;
+                if value.is_empty() {
+                    unmark_in_memory(&price_contested, slice::from_ref(&key_owned));
+                }
+                drop(ordered);
 
                 Ok(true)
             })
@@ -258,10 +420,97 @@ impl PaidList {
             .map_err(|e| self.insert_error(&e))?;
 
         if was_new {
-            debug!("Added key {} to paid-list", hex::encode(key));
+            debug!(
+                "Added key {} to paid-list{}",
+                hex::encode(key),
+                if value.is_empty() {
+                    ""
+                } else {
+                    " as price-contested"
+                }
+            );
         }
 
         Ok(was_new)
+    }
+
+    /// Whether `key` is paid at a price the floor contested here (see
+    /// [`Self::insert_price_contested`]).
+    ///
+    /// Reads the database, which is authoritative: the in-memory copy behind
+    /// [`Self::retain_unmarked`] can hold a mark whose commit is under way or
+    /// failed, or be missing. A caller that has just seen a racing write's
+    /// entry sees its mark here as well (see `fresh::record_paid_key`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LMDB read transaction fails.
+    pub fn is_price_contested(&self, key: &XorName) -> Result<bool> {
+        let rtxn = self
+            .env
+            .read_txn()
+            .map_err(|e| Error::Storage(format!("Failed to create read txn: {e}")))?;
+        let marked = self
+            .db
+            .get(&rtxn, key.as_ref())
+            .map_err(|e| Error::Storage(format!("Failed to read paid-list entry: {e}")))?
+            .is_some_and(|value| !value.is_empty());
+        Ok(marked)
+    }
+
+    /// Whether `key` must be treated as price-contested: its entry carries the
+    /// mark, or the mark cannot be read (when in doubt, judge no one). While
+    /// reads fail no peer is judged on any key they hit, so the first failure
+    /// of a run is a warning, and the read that ends the run reports how many
+    /// failed.
+    pub fn counts_as_price_contested(&self, key: &XorName) -> bool {
+        match self.is_price_contested(key) {
+            Ok(marked) => {
+                let failed = self.failed_mark_reads.swap(0, Ordering::Relaxed);
+                if failed > 0 {
+                    info!("Price-contested marks are readable again, after {failed} failed reads");
+                }
+                marked
+            }
+            Err(e) => {
+                if self.failed_mark_reads.fetch_add(1, Ordering::Relaxed) == 0 {
+                    warn!(
+                        "Cannot read the price-contested mark of key {}; counting unreadable \
+                         marks as set until a read succeeds: {e}",
+                        hex::encode(key)
+                    );
+                } else {
+                    debug!(
+                        "Price-contested mark of key {} still unreadable: {e}",
+                        hex::encode(key)
+                    );
+                }
+                true
+            }
+        }
+    }
+
+    /// Drop from `keys` every key marked price-contested, using the in-memory
+    /// copy rather than the database. If the marks could not be read on open,
+    /// no key is known to be unmarked, so every key is dropped.
+    pub fn retain_unmarked(&self, keys: &mut Vec<XorName>) {
+        let snapshot = self.price_contested.read().clone();
+        match snapshot {
+            Some(marked) => keys.retain(|key| !marked.contains(key)),
+            None => keys.clear(),
+        }
+    }
+
+    /// Split `keys` into those known to be unmarked and those marked
+    /// price-contested, using the in-memory copy rather than the database. If
+    /// the marks could not be read on open, no key is known to be unmarked, so
+    /// every key counts as marked.
+    pub fn split_marked(&self, keys: Vec<XorName>) -> (Vec<XorName>, Vec<XorName>) {
+        let snapshot = self.price_contested.read().clone();
+        match snapshot {
+            Some(marked) => keys.into_iter().partition(|key| !marked.contains(key)),
+            None => (Vec::new(), keys),
+        }
     }
 
     /// Describe a failed insert. A full store is also reported, once, as an
@@ -291,10 +540,13 @@ impl PaidList {
         let key_owned = *key;
         let env = self.env.clone();
         let db = self.db;
+        let price_contested = Arc::clone(&self.price_contested);
+        let write_order = Arc::clone(&self.write_order);
 
         let existed = self
             .blocking_tracker
             .spawn_blocking(move || -> Result<bool> {
+                let ordered = write_order.lock();
                 let mut wtxn = env
                     .write_txn()
                     .map_err(|e| Error::Storage(format!("Failed to create write txn: {e}")))?;
@@ -304,6 +556,8 @@ impl PaidList {
                 wtxn.commit().map_err(|e| {
                     Error::Storage(format!("Failed to commit paid-list delete: {e}"))
                 })?;
+                unmark_in_memory(&price_contested, slice::from_ref(&key_owned));
+                drop(ordered);
                 Ok(deleted)
             })
             .await
@@ -381,19 +635,29 @@ impl PaidList {
     /// Remove up to `limit` entries outside the `near_bits` around `center`,
     /// farthest first, leaving those `keep` accepts. Returns how many went.
     ///
+    /// `keep` is asked twice: by the scan that picks the candidates, and again
+    /// for each candidate inside the write transaction that removes them, once
+    /// `settle` has given its guard. The guard is held until that transaction
+    /// has committed, so a caller whose answer can change meanwhile passes one
+    /// that holds those changes back, and the second answer still holds when
+    /// the removal lands (see `ChunkStore::hold_admissions`).
+    ///
     /// # Errors
     ///
     /// Returns an error if an LMDB transaction fails.
-    pub async fn evict_far(
+    pub async fn evict_far<G: Send + 'static>(
         &self,
         center: XorName,
         near_bits: usize,
         limit: usize,
-        keep: impl Fn(&XorName) -> bool + Send + 'static,
+        keep: impl Fn(&XorName) -> bool + Send + Sync + 'static,
+        settle: impl Future<Output = G>,
     ) -> Result<usize> {
         if limit == 0 {
             return Ok(0);
         }
+        let keep = Arc::new(keep);
+        let scan_keep = Arc::clone(&keep);
         let env = self.env.clone();
         let db = self.db;
         let evictable = self
@@ -405,7 +669,7 @@ impl PaidList {
                 let mut evictable = Vec::new();
                 for (low, high) in far_ranges(&center, near_bits) {
                     let more = visit_range(db, &rtxn, (&low, &high), |key| {
-                        if !keep(&key) {
+                        if !scan_keep(&key) {
                             evictable.push(key);
                         }
                         evictable.len() < limit
@@ -418,7 +682,17 @@ impl PaidList {
             })
             .await
             .map_err(|e| Error::Storage(format!("Paid-list eviction scan failed: {e}")))??;
-        self.remove_batch(&evictable).await
+        #[cfg(test)]
+        {
+            self.test_evictions_scanned.fetch_add(1, Ordering::AcqRel);
+            drop(self.test_eviction_scan_gate.read().await);
+        }
+        if evictable.is_empty() {
+            return Ok(0);
+        }
+        let held = settle.await;
+        self.remove_unkept(evictable, move |key| keep(key), held)
+            .await
     }
 
     /// Record the `RecordOutOfRangeFirstSeen` timestamp for a key.
@@ -463,42 +737,72 @@ impl PaidList {
     ///
     /// Returns an error if the LMDB write transaction fails.
     pub async fn remove_batch(&self, keys: &[XorName]) -> Result<usize> {
+        let count = self.remove_unkept(keys.to_vec(), |_| false, ()).await?;
+        debug!("Batch-removed {count} keys from paid-list");
+        Ok(count)
+    }
+
+    /// Remove each of `keys` that `keep` rejects, in one write transaction,
+    /// asking `keep` inside it, and hold `held` until the removal has
+    /// committed and the in-memory marks follow it. Returns how many entries
+    /// went.
+    async fn remove_unkept<G: Send + 'static>(
+        &self,
+        keys: Vec<XorName>,
+        keep: impl Fn(&XorName) -> bool + Send + 'static,
+        held: G,
+    ) -> Result<usize> {
         if keys.is_empty() {
             return Ok(0);
         }
 
-        let keys_owned: Vec<XorName> = keys.to_vec();
         let env = self.env.clone();
         let db = self.db;
+        let price_contested = Arc::clone(&self.price_contested);
+        let write_order = Arc::clone(&self.write_order);
+        #[cfg(test)]
+        let (commit_gate, committing) = (
+            Arc::clone(&self.test_removal_commit_gate),
+            Arc::clone(&self.test_removals_committing),
+        );
 
-        let removed_keys = self
-            .blocking_tracker
-            .spawn_blocking(move || -> Result<Vec<XorName>> {
+        self.blocking_tracker
+            .spawn_blocking(move || -> Result<usize> {
+                // Dropped last, once the commit and the in-memory marks are done
+                // or the transaction is abandoned.
+                let _held = held;
+                let ordered = write_order.lock();
                 let mut wtxn = env
                     .write_txn()
                     .map_err(|e| Error::Storage(format!("Failed to create write txn: {e}")))?;
 
-                let mut removed = Vec::new();
-                for key in &keys_owned {
+                let doomed: Vec<XorName> = keys.into_iter().filter(|key| !keep(key)).collect();
+                let mut removed = 0;
+                for key in &doomed {
                     let deleted = db.delete(&mut wtxn, key.as_ref()).map_err(|e| {
                         Error::Storage(format!("Failed to delete from paid-list: {e}"))
                     })?;
                     if deleted {
-                        removed.push(*key);
+                        removed += 1;
                     }
                 }
 
+                #[cfg(test)]
+                {
+                    committing.fetch_add(1, Ordering::AcqRel);
+                    drop(commit_gate.read());
+                }
                 wtxn.commit()
                     .map_err(|e| Error::Storage(format!("Failed to commit batch remove: {e}")))?;
+                // Every key removed, not only those the database held: a mark
+                // whose commit failed can be in memory alone.
+                unmark_in_memory(&price_contested, &doomed);
+                drop(ordered);
 
                 Ok(removed)
             })
             .await
-            .map_err(|e| Error::Storage(format!("Paid-list batch remove task failed: {e}")))??;
-
-        let count = removed_keys.len();
-        debug!("Batch-removed {count} keys from paid-list");
-        Ok(count)
+            .map_err(|e| Error::Storage(format!("Paid-list batch remove task failed: {e}")))?
     }
 
     /// Wait until every tracked paid-list LMDB blocking task has finished.
@@ -518,17 +822,79 @@ impl PaidList {
         self.blocking_tracker.wait().await;
         self.blocking_tracker.reopen();
     }
+
+    /// Hold a read transaction on the calling thread. LMDB gives each thread
+    /// one reader slot, so until it is dropped every paid-list read on this
+    /// thread fails, which lets a test drive the paths a mark that cannot be
+    /// read takes.
+    /// Act as if the marks could not be read when the paid list opened.
+    #[cfg(test)]
+    pub(crate) fn forget_marks_for_tests(&self) {
+        *self.price_contested.write() = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_reader_for_tests(&self) -> Result<RoTxn<'_, WithTls>> {
+        self.env
+            .read_txn()
+            .map_err(|e| Error::Storage(format!("Failed to create read txn: {e}")))
+    }
+
+    /// Test-only handle to the gate an eviction waits on after its scan: hold
+    /// the write half to park the next eviction there.
+    #[cfg(test)]
+    pub(crate) fn test_eviction_scan_gate(&self) -> Arc<tokio::sync::RwLock<()>> {
+        Arc::clone(&self.test_eviction_scan_gate)
+    }
+
+    /// Test-only: how many evictions have finished their scan.
+    #[cfg(test)]
+    pub(crate) fn test_evictions_scanned(&self) -> u64 {
+        self.test_evictions_scanned.load(Ordering::Acquire)
+    }
+
+    /// Test-only handle to the gate a removal waits on before its commit, on
+    /// the blocking pool: hold the write half to park the next removal there.
+    #[cfg(test)]
+    pub(crate) fn test_removal_commit_gate(&self) -> Arc<RwLock<()>> {
+        Arc::clone(&self.test_removal_commit_gate)
+    }
+
+    /// Test-only: how many removals have reached the gate before their commit.
+    #[cfg(test)]
+    pub(crate) fn test_removals_committing(&self) -> u64 {
+        self.test_removals_committing.load(Ordering::Acquire)
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    #[cfg(target_pointer_width = "64")]
+    use std::fs::OpenOptions;
+    #[cfg(target_pointer_width = "64")]
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use tokio::sync::oneshot;
+    use tokio::task::JoinHandle;
+    #[cfg(feature = "logging")]
+    use tracing::subscriber::with_default;
+    #[cfg(feature = "logging")]
+    use tracing_subscriber::fmt::writer::{MakeWriter, MutexGuardWriter};
 
     /// Short probe used to prove `wait_idle` is still blocked on a parked op.
     const WAIT_IDLE_BLOCKED_PROBE: std::time::Duration = std::time::Duration::from_millis(200);
     /// Generous ceiling for `wait_idle` to complete once the op is released.
     const WAIT_IDLE_COMPLETE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// The in-memory copy of the marks, which must have been read on open.
+    fn marked_in_memory(pl: &PaidList) -> HashSet<XorName> {
+        pl.price_contested
+            .read()
+            .as_deref()
+            .cloned()
+            .expect("marks read on open")
+    }
 
     async fn create_test_paid_list() -> (PaidList, tempfile::TempDir) {
         let temp_dir = tempfile::TempDir::new().expect("create temp dir");
@@ -619,7 +985,7 @@ mod tests {
         }
 
         let evicted = pl
-            .evict_far(center, near_bits, 1, |_| false)
+            .evict_far(center, near_bits, 1, |_| false, async {})
             .await
             .expect("evict");
         assert_eq!(evicted, 1);
@@ -630,7 +996,7 @@ mod tests {
         assert!(pl.contains(&mid).expect("contains"));
 
         let evicted = pl
-            .evict_far(center, near_bits, 10, |_| false)
+            .evict_far(center, near_bits, 10, |_| false, async {})
             .await
             .expect("evict");
         assert_eq!(evicted, 1, "only the far entry was left to evict");
@@ -646,7 +1012,7 @@ mod tests {
 
         let near_bits = XORNAME_BITS - 1;
         let evicted = pl
-            .evict_far([0u8; 32], near_bits, 10, move |key| *key == kept)
+            .evict_far([0u8; 32], near_bits, 10, move |key| *key == kept, async {})
             .await
             .expect("evict");
 
@@ -662,7 +1028,7 @@ mod tests {
         pl.insert(&key).await.expect("insert");
 
         let evicted = pl
-            .evict_far([0u8; 32], XORNAME_BITS, 10, |_| false)
+            .evict_far([0u8; 32], XORNAME_BITS, 10, |_| false, async {})
             .await
             .expect("evict");
 
@@ -753,6 +1119,347 @@ mod tests {
             assert_eq!(pl.count().expect("count"), 1);
             assert!(pl.contains(&key).expect("contains after reopen"));
         }
+    }
+
+    /// ADR-0006: the price-contested mark is written only with a new entry, so
+    /// an already recorded key can never gain it. It survives a restart and a
+    /// later plain insert, and goes with the entry on removal.
+    #[tokio::test]
+    async fn price_contested_mark_persists_until_the_key_is_removed() {
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        let marked: XorName = [0x51; 32];
+        let recorded_first: XorName = [0x52; 32];
+
+        {
+            let pl = PaidList::new(temp_dir.path())
+                .await
+                .expect("create paid list");
+            assert!(pl.insert(&recorded_first).await.expect("insert"));
+            assert!(pl.insert_price_contested(&marked).await.expect("mark"));
+            assert!(!pl
+                .insert_price_contested(&recorded_first)
+                .await
+                .expect("mark an existing key"));
+            assert!(!pl.insert(&marked).await.expect("re-insert"));
+        }
+
+        let pl = PaidList::new(temp_dir.path())
+            .await
+            .expect("reopen paid list");
+        assert_eq!(pl.count().expect("count"), 2);
+        assert!(pl.contains(&marked).expect("contains"));
+        assert!(pl.is_price_contested(&marked).expect("read mark"));
+        assert!(!pl.is_price_contested(&recorded_first).expect("read mark"));
+        assert_eq!(marked_in_memory(&pl), HashSet::from([marked]));
+
+        pl.remove(&marked).await.expect("remove");
+        pl.insert(&marked).await.expect("insert again");
+        assert!(!pl.is_price_contested(&marked).expect("read mark"));
+        assert!(marked_in_memory(&pl).is_empty());
+    }
+
+    /// ADR-0006: the in-memory marks follow every insert, removal and batch
+    /// removal.
+    #[tokio::test]
+    async fn the_in_memory_marks_follow_every_write() {
+        let (pl, _temp) = create_test_paid_list().await;
+        let first: XorName = [0x61; 32];
+        let second: XorName = [0x62; 32];
+        let plain: XorName = [0x63; 32];
+        pl.insert_price_contested(&first).await.expect("mark");
+        pl.insert_price_contested(&second).await.expect("mark");
+        pl.insert(&plain).await.expect("insert");
+        assert_eq!(marked_in_memory(&pl), HashSet::from([first, second]));
+        let mut keys = vec![first, plain, second];
+        pl.retain_unmarked(&mut keys);
+        assert_eq!(keys, vec![plain]);
+        pl.remove(&first).await.expect("remove");
+        assert_eq!(marked_in_memory(&pl), HashSet::from([second]));
+        pl.remove_batch(&[second, plain])
+            .await
+            .expect("remove batch");
+        assert!(marked_in_memory(&pl).is_empty());
+    }
+
+    /// ADR-0006 with ADR-0028: eviction drops the in-memory mark of an entry
+    /// it evicts, so no mark outlives its entry in memory alone, and a marked
+    /// entry it keeps stays marked.
+    #[tokio::test]
+    async fn eviction_takes_an_evicted_entry_s_mark_and_leaves_a_kept_one() {
+        let (pl, _temp) = create_test_paid_list().await;
+        let (kept, evicted_key) = (key_with_first_byte(0x80), key_with_first_byte(0x81));
+        pl.insert_price_contested(&kept).await.expect("mark");
+        pl.insert_price_contested(&evicted_key).await.expect("mark");
+
+        let evicted = pl
+            .evict_far(
+                [0u8; 32],
+                XORNAME_BITS - 1,
+                10,
+                move |key| *key == kept,
+                async {},
+            )
+            .await
+            .expect("evict");
+
+        assert_eq!(evicted, 1);
+        assert!(!pl.contains(&evicted_key).expect("contains"));
+        assert!(pl.is_price_contested(&kept).expect("read mark"));
+        assert_eq!(marked_in_memory(&pl), HashSet::from([kept]));
+        let mut keys = vec![kept, evicted_key];
+        pl.retain_unmarked(&mut keys);
+        assert_eq!(keys, vec![evicted_key]);
+    }
+
+    /// ADR-0006: while a database write holds the write order, a marked
+    /// insert or a batch removal neither commits nor changes the in-memory
+    /// copy, so writes and the copy move in one order.
+    #[tokio::test]
+    async fn the_in_memory_marks_change_in_commit_order() {
+        let (pl, _temp) = create_test_paid_list().await;
+        let key: XorName = [0x6B; 32];
+        let (release_tx, holder) = hold_write_order(&pl).await;
+
+        let insert = pl.insert_price_contested(&key);
+        tokio::pin!(insert);
+        let blocked = tokio::time::timeout(WAIT_IDLE_BLOCKED_PROBE, &mut insert).await;
+        assert!(blocked.is_err(), "the insert must wait for the write order");
+        assert!(!pl.contains(&key).expect("contains"));
+        assert!(marked_in_memory(&pl).is_empty());
+
+        drop(release_tx);
+        holder.await.expect("holder task");
+        assert!(insert.await.expect("insert"));
+        assert_eq!(marked_in_memory(&pl), HashSet::from([key]));
+
+        let (release_tx, holder) = hold_write_order(&pl).await;
+
+        let batch = [key];
+        let removal = pl.remove_batch(&batch);
+        tokio::pin!(removal);
+        let blocked = tokio::time::timeout(WAIT_IDLE_BLOCKED_PROBE, &mut removal).await;
+        assert!(
+            blocked.is_err(),
+            "the removal must wait for the write order"
+        );
+        assert!(pl.contains(&key).expect("contains"));
+        assert_eq!(marked_in_memory(&pl), HashSet::from([key]));
+
+        drop(release_tx);
+        holder.await.expect("holder task");
+        assert_eq!(removal.await.expect("remove batch"), 1);
+        assert!(marked_in_memory(&pl).is_empty());
+    }
+
+    /// Mark `key` in memory only, with no entry in the database: what a marked
+    /// insert whose commit failed before reaching the disk leaves.
+    fn mark_in_memory_only(pl: &PaidList, key: XorName) {
+        let mut marks = pl.price_contested.write();
+        let marks = marks.as_mut().expect("marks read on open");
+        Arc::make_mut(marks).insert(key);
+    }
+
+    /// ADR-0006: a mark left in memory alone by a failed commit goes with a
+    /// later plain insert that adds the key, so the copy agrees with the
+    /// database again and the key is hinted as a replica. A plain insert of a
+    /// key whose entry carries the mark leaves both as they are.
+    #[tokio::test]
+    async fn a_plain_insert_drops_a_mark_held_in_memory_only() {
+        let (pl, _temp) = create_test_paid_list().await;
+        let stale: XorName = [0x71; 32];
+        let marked: XorName = [0x72; 32];
+        pl.insert_price_contested(&marked).await.expect("mark");
+        mark_in_memory_only(&pl, stale);
+        let mut keys = vec![stale];
+        pl.retain_unmarked(&mut keys);
+        assert_eq!(keys, Vec::<XorName>::new());
+
+        assert!(pl.insert(&stale).await.expect("insert"));
+        assert!(!pl.insert(&marked).await.expect("insert"));
+        assert!(!pl.is_price_contested(&stale).expect("read mark"));
+        assert!(pl.is_price_contested(&marked).expect("read mark"));
+        assert_eq!(marked_in_memory(&pl), HashSet::from([marked]));
+        let mut keys = vec![stale, marked];
+        pl.retain_unmarked(&mut keys);
+        assert_eq!(keys, vec![stale]);
+    }
+
+    /// ADR-0006: a mark left in memory alone by a failed commit goes with a
+    /// later removal of the key, single or batched, although the database
+    /// holds no entry to delete. A mark the removal does not name stays.
+    #[tokio::test]
+    async fn a_removal_drops_a_mark_held_in_memory_only() {
+        let (pl, _temp) = create_test_paid_list().await;
+        let batched: XorName = [0x73; 32];
+        let single: XorName = [0x74; 32];
+        let marked: XorName = [0x75; 32];
+        pl.insert_price_contested(&marked).await.expect("mark");
+        mark_in_memory_only(&pl, batched);
+        mark_in_memory_only(&pl, single);
+
+        assert_eq!(pl.remove_batch(&[batched]).await.expect("remove batch"), 0);
+        assert_eq!(marked_in_memory(&pl), HashSet::from([single, marked]));
+        assert!(!pl.remove(&single).await.expect("remove"));
+        assert_eq!(marked_in_memory(&pl), HashSet::from([marked]));
+        assert!(pl.is_price_contested(&marked).expect("read mark"));
+    }
+
+    /// Byte offsets in an LMDB meta page on a 64-bit target: the magic number
+    /// follows the 16-byte page header, the free list's record keeps the page
+    /// size at 40, and the main database's root page number sits at 128.
+    #[cfg(target_pointer_width = "64")]
+    const LMDB_MAGIC_AT: u64 = 16;
+    #[cfg(target_pointer_width = "64")]
+    const LMDB_PAGE_SIZE_AT: u64 = 40;
+    #[cfg(target_pointer_width = "64")]
+    const LMDB_MAIN_ROOT_AT: u64 = 128;
+
+    /// ADR-0006: a paid list whose marks cannot be read still opens, with no
+    /// marks in memory, so the node hints no key as a replica. Both meta pages
+    /// point the database's root past the end of the file, so the scan for
+    /// the marks fails as it would on a lost page.
+    #[cfg(target_pointer_width = "64")]
+    #[tokio::test]
+    async fn a_paid_list_whose_marks_cannot_be_read_still_opens() {
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        let marked: XorName = [0x70; 32];
+        {
+            let pl = PaidList::new(temp_dir.path())
+                .await
+                .expect("create paid list");
+            pl.insert_price_contested(&marked).await.expect("mark");
+        }
+
+        let mut data = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(temp_dir.path().join("paid_list.mdb").join("data.mdb"))
+            .expect("open data file");
+        let mut read_u32 = |at: u64| {
+            let mut word = [0u8; 4];
+            data.seek(SeekFrom::Start(at)).expect("seek");
+            data.read_exact(&mut word).expect("read");
+            u32::from_ne_bytes(word)
+        };
+        let page_size = u64::from(read_u32(LMDB_PAGE_SIZE_AT));
+        for meta in [0, page_size] {
+            assert_eq!(
+                read_u32(meta + LMDB_MAGIC_AT),
+                0xBEEF_C0DE,
+                "LMDB meta page"
+            );
+        }
+        for meta in [0, page_size] {
+            data.seek(SeekFrom::Start(meta + LMDB_MAIN_ROOT_AT))
+                .expect("seek");
+            data.write_all(&(1u64 << 40).to_ne_bytes()).expect("write");
+        }
+        data.sync_all().expect("sync");
+        drop(data);
+
+        let pl = PaidList::new(temp_dir.path())
+            .await
+            .expect("a paid list whose marks cannot be read must open");
+        assert!(pl.price_contested.read().is_none());
+        assert!(pl.is_price_contested(&marked).is_err());
+        let mut keys = vec![marked];
+        pl.retain_unmarked(&mut keys);
+        assert_eq!(keys, Vec::<XorName>::new());
+    }
+
+    /// ADR-0006: a paid list whose marks could not be read on open shows no
+    /// key as unmarked, so the node hints no key as a replica, while writes and
+    /// point reads of the marks still work.
+    #[tokio::test]
+    async fn marks_unread_on_open_hint_no_replicas() {
+        let (pl, _temp) = create_test_paid_list().await;
+        let marked: XorName = [0x6C; 32];
+        let plain: XorName = [0x6D; 32];
+        *pl.price_contested.write() = None;
+
+        let mut keys = vec![plain];
+        pl.retain_unmarked(&mut keys);
+        assert_eq!(keys, Vec::<XorName>::new());
+        pl.insert_price_contested(&marked).await.expect("mark");
+        pl.insert(&plain).await.expect("insert");
+        pl.remove_batch(&[plain]).await.expect("remove batch");
+        assert!(pl.price_contested.read().is_none());
+        assert!(pl.counts_as_price_contested(&marked));
+        assert!(!pl.counts_as_price_contested(&plain));
+    }
+
+    /// ADR-0006: a key counts as price-contested when it is marked, or when
+    /// its mark cannot be read; an unmarked or unpaid key that reads fine
+    /// does not.
+    #[tokio::test]
+    async fn an_unreadable_mark_counts_as_price_contested() {
+        let (pl, _temp) = create_test_paid_list().await;
+        let marked: XorName = [0x64; 32];
+        let plain: XorName = [0x65; 32];
+        let unpaid: XorName = [0x66; 32];
+        pl.insert_price_contested(&marked).await.expect("mark");
+        pl.insert(&plain).await.expect("insert");
+
+        assert!(pl.counts_as_price_contested(&marked));
+        assert!(!pl.counts_as_price_contested(&plain));
+        assert!(!pl.counts_as_price_contested(&unpaid));
+
+        let _reader = pl.hold_reader_for_tests().expect("hold reader");
+        assert!(pl.counts_as_price_contested(&plain));
+        assert!(pl.counts_as_price_contested(&unpaid));
+    }
+
+    /// In-memory sink a test subscriber writes its lines to.
+    #[cfg(feature = "logging")]
+    #[derive(Clone, Default)]
+    struct LogSink(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    #[cfg(feature = "logging")]
+    impl<'a> MakeWriter<'a> for LogSink {
+        type Writer = MutexGuardWriter<'a, Vec<u8>>;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.0.make_writer()
+        }
+    }
+
+    /// ADR-0006: a run of mark reads that fail logs one warning, not one per
+    /// key, and the read that ends the run reports how many failed.
+    #[cfg(feature = "logging")]
+    #[tokio::test]
+    async fn a_run_of_unreadable_marks_warns_once() {
+        let (pl, _temp) = create_test_paid_list().await;
+        let first: XorName = [0x6E; 32];
+        let second: XorName = [0x6F; 32];
+        pl.insert(&first).await.expect("insert");
+        let sink = LogSink::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .finish();
+
+        with_default(subscriber, || {
+            {
+                let _reader = pl.hold_reader_for_tests().expect("hold reader");
+                for key in [first, second, first] {
+                    assert!(pl.counts_as_price_contested(&key));
+                }
+            }
+            assert!(!pl.counts_as_price_contested(&first));
+            assert!(!pl.counts_as_price_contested(&second));
+        });
+
+        let logs = String::from_utf8(sink.0.lock().expect("sink").clone()).expect("utf-8");
+        assert_eq!(
+            logs.matches("Cannot read the price-contested mark").count(),
+            1,
+            "{logs}"
+        );
+        assert_eq!(
+            logs.matches("readable again, after 3 failed reads").count(),
+            1,
+            "{logs}"
+        );
     }
 
     #[tokio::test]
@@ -942,6 +1649,24 @@ mod tests {
             let _ = release_rx.blocking_recv();
         });
         opened_rx.await.expect("holder txn opened");
+        (release_tx, holder)
+    }
+
+    /// Hold the paid list's write order on a blocking thread, so the next
+    /// write waits before its write transaction.
+    ///
+    /// Returns once the order is held. Dropping the returned sender releases
+    /// it.
+    async fn hold_write_order(pl: &PaidList) -> (oneshot::Sender<()>, JoinHandle<()>) {
+        let write_order = Arc::clone(&pl.write_order);
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let (held_tx, held_rx) = oneshot::channel::<()>();
+        let holder = spawn_blocking(move || {
+            let _ordered = write_order.lock();
+            let _ = held_tx.send(());
+            let _ = release_rx.blocking_recv();
+        });
+        assert!(held_rx.await.is_ok(), "write order held");
         (release_tx, holder)
     }
 

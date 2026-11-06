@@ -43,6 +43,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
+use std::future::Future;
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -533,6 +534,35 @@ impl Drop for WriteInFlight {
     }
 }
 
+/// An admission of a record under way, counted until dropped (see
+/// [`ChunkStore::admit`]).
+#[derive(Debug)]
+#[must_use = "the admission ends as soon as this is dropped"]
+pub struct RecordAdmission {
+    admitting: Arc<parking_lot::Mutex<HashMap<XorName, usize>>>,
+    address: XorName,
+}
+
+impl Drop for RecordAdmission {
+    fn drop(&mut self) {
+        let mut admitting = self.admitting.lock();
+        match admitting.get_mut(&self.address) {
+            Some(count) if *count > 1 => *count -= 1,
+            _ => {
+                admitting.remove(&self.address);
+            }
+        }
+    }
+}
+
+/// Record admissions held back on a [`ChunkStore`] (see
+/// [`ChunkStore::hold_admissions`]). They resume when this is dropped.
+#[derive(Debug)]
+#[must_use = "admissions resume as soon as this is dropped"]
+pub struct AdmissionsHeld {
+    _gate: tokio::sync::OwnedRwLockWriteGuard<()>,
+}
+
 /// What is behind a chunk's name on disk.
 ///
 /// Four answers, not two, because "could not read it" must never be treated as "wrong":
@@ -678,6 +708,15 @@ pub struct ChunkStore {
     writing: Arc<parking_lot::Mutex<HashMap<XorName, usize>>>,
     /// Woken when [`Self::writing`] loses its last entry for a key.
     write_finished: Arc<tokio::sync::Notify>,
+    /// Records being admitted: for each address, how many admissions of it are under
+    /// way (see [`Self::holds_or_admits`]).
+    ///
+    /// Counted, like [`Self::writing`]: the admission [`Self::put_after`] holds spans
+    /// the put it makes, which holds one of its own.
+    admitting: Arc<parking_lot::Mutex<HashMap<XorName, usize>>>,
+    /// Taken shared while an admission registers, and exclusively by
+    /// [`Self::hold_admissions`], so no admission starts while that is held.
+    admission_gate: Arc<tokio::sync::RwLock<()>>,
     /// Size-aware free-space predicate.
     capacity: Arc<CapacityGuard>,
     /// Monotonic counter that makes temp filenames unique within this store.
@@ -734,6 +773,14 @@ pub struct ChunkStore {
     /// is a flake waiting for a loaded machine.
     #[cfg(test)]
     test_reached_pre_registration: Arc<std::sync::atomic::AtomicU64>,
+
+    /// Test-only: parks [`Self::holds_verified`] after its read and before it repairs.
+    #[cfg(test)]
+    test_pre_repair_gate: Arc<tokio::sync::RwLock<()>>,
+
+    /// Test-only: how many checks have reached that gate.
+    #[cfg(test)]
+    test_reached_pre_repair: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ChunkStore {
@@ -832,6 +879,8 @@ impl ChunkStore {
             known_wrong: Arc::new(parking_lot::RwLock::new(HashSet::new())),
             writing: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             write_finished: Arc::new(tokio::sync::Notify::new()),
+            admitting: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            admission_gate: Arc::new(tokio::sync::RwLock::new(())),
             capacity,
             temp_seq: AtomicU64::new(0),
             nonce: rand::random(),
@@ -847,6 +896,10 @@ impl ChunkStore {
             test_pre_registration_gate: Arc::new(tokio::sync::RwLock::new(())),
             #[cfg(test)]
             test_reached_pre_registration: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            test_pre_repair_gate: Arc::new(tokio::sync::RwLock::new(())),
+            #[cfg(test)]
+            test_reached_pre_repair: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -868,6 +921,9 @@ impl ChunkStore {
     /// Returns [`Error::Storage`] if the content does not hash to `address`, the disk
     /// is too full, or the write fails.
     pub async fn put(&self, address: &XorName, content: &[u8]) -> Result<bool> {
+        // Before the key's lane, so a put kept waiting by `hold_admissions` holds no lane
+        // a delete needs.
+        let _admission = self.admit(address).await;
         // The key's whole transition, not just the part that touches the disk. Registering
         // the write is what a delete waits for, and everything before that registration
         // happens outside it: validation, the duplicate read, the capacity reservation. A
@@ -1042,6 +1098,25 @@ impl ChunkStore {
         }
     }
 
+    /// Run `first`, then store `content` under `address` as [`Self::put`] does, all as
+    /// one admission, and return both results.
+    ///
+    /// For a caller that writes something the record depends on, such as its paid-list
+    /// entry, before the record itself: [`Self::holds_or_admits`] counts the key from
+    /// before `first` starts, so whatever acts on keys with no record cannot act on this
+    /// one in between.
+    pub async fn put_after<T>(
+        &self,
+        address: &XorName,
+        content: &[u8],
+        first: impl Future<Output = T>,
+    ) -> (T, Result<bool>) {
+        let _admission = self.admit(address).await;
+        let first = first.await;
+        let stored = self.put(address, content).await;
+        (first, stored)
+    }
+
     /// Decide what a name that was already taken actually means.
     ///
     /// Split out of [`Self::put`] because it is a different question. `put` puts bytes on
@@ -1107,6 +1182,55 @@ impl ChunkStore {
         }
     }
 
+    /// Register an admission of `address`, once no [`Self::hold_admissions`] is held,
+    /// and keep it until the returned guard is dropped.
+    ///
+    /// [`Self::put`], [`Self::put_after`], [`Self::repair`] and [`Self::holds_verified`]
+    /// each hold one of their own. A caller that admits a record in several steps holds
+    /// one across all of them, so [`Self::holds_or_admits`] counts the key throughout:
+    /// the client PUT handler holds one from its check that the chunk is held, through
+    /// payment verification, to its store.
+    pub async fn admit(&self, address: &XorName) -> RecordAdmission {
+        let _open = self.admission_gate.read().await;
+        *self.admitting.lock().entry(*address).or_insert(0) += 1;
+        RecordAdmission {
+            admitting: Arc::clone(&self.admitting),
+            address: *address,
+        }
+    }
+
+    /// Hold back every new admission of a record ([`Self::admit`], and so [`Self::put`],
+    /// [`Self::put_after`], [`Self::repair`] and [`Self::holds_verified`]) until the
+    /// returned guard is dropped.
+    ///
+    /// While it is held, a key [`Self::holds_or_admits`] answers `false` for gets no
+    /// record. Waits only for admissions registering at this moment, not for those under
+    /// way, which `holds_or_admits` answers for.
+    ///
+    /// For a caller that acts on keys having no record: paid-list eviction removes such
+    /// keys' entries, and a record admitted between its decision and the removal would
+    /// lose its entry, and its price-contested mark with it (ADR-0006).
+    pub async fn hold_admissions(&self) -> AdmissionsHeld {
+        AdmissionsHeld {
+            _gate: Arc::clone(&self.admission_gate).write_owned().await,
+        }
+    }
+
+    /// Whether `address` has a record in the index or on its way there: an admission or
+    /// a write of it is under way. Unlike [`Self::exists`], a record that cannot be read
+    /// for now counts.
+    ///
+    /// Read in this order because each step hands over to the next before it ends: an
+    /// admission ends only after indexing its key itself or registering the write that
+    /// will, and a write unregisters only after indexing its key. So a key that has just
+    /// left one is already in the next.
+    #[must_use]
+    pub fn holds_or_admits(&self, address: &XorName) -> bool {
+        self.admitting.lock().contains_key(address)
+            || self.writing.lock().contains_key(address)
+            || self.is_indexed(address)
+    }
+
     /// Take the critical section for one key.
     ///
     /// Held across await points, unlike the write lanes, so a whole logical transition for
@@ -1152,6 +1276,10 @@ impl ChunkStore {
         // longer has. Closing that would mean holding a per-key lock across a network
         // response, which trades a narrow window for a much worse one. Replication finds
         // the key missing and re-offers it.
+        //
+        // An admission, since its read can drop a stale index entry and its repair then
+        // puts the key back (see `hold_admissions`). Taken before the lane, as `put` does.
+        let _admission = self.admit(address).await;
         let _lane = self.key_lock(address).await;
 
         if !self.is_indexed(address) {
@@ -1161,7 +1289,16 @@ impl ChunkStore {
         // does not match, and off Unix replacing a chunk truncates it in place, so acting
         // on an unanswered question would empty a healthy sole copy. The read below
         // distinguishes them.
-        match self.get_raw(address).await {
+        let read = self.get_raw(address).await;
+        // Test-only: the window between a read that dropped a stale index entry and the
+        // repair that puts the key back.
+        #[cfg(test)]
+        {
+            self.test_reached_pre_repair
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            drop(self.test_pre_repair_gate.read().await);
+        }
+        match read {
             // Byte-for-byte what the caller has, and the caller checked those bytes against
             // the address before getting here. Nothing is wrong with this file.
             Ok(Some(stored)) if stored == content => {
@@ -1275,6 +1412,7 @@ impl ChunkStore {
     /// Returns [`Error::Storage`] if `content` does not hash to `address`, or the write
     /// fails.
     pub async fn repair(&self, address: &XorName, content: &[u8]) -> Result<()> {
+        let _admission = self.admit(address).await;
         let _lane = self.key_lock(address).await;
         self.repair_holding_the_lane(address, content).await
     }
@@ -1890,14 +2028,28 @@ impl ChunkStore {
 
     /// Test-only handle to the gate that parks a put before it registers itself.
     #[cfg(test)]
-    fn test_pre_registration_gate(&self) -> Arc<tokio::sync::RwLock<()>> {
+    pub(crate) fn test_pre_registration_gate(&self) -> Arc<tokio::sync::RwLock<()>> {
         Arc::clone(&self.test_pre_registration_gate)
     }
 
     /// Test-only: how many puts have reached the pre-registration gate.
     #[cfg(test)]
-    fn test_reached_pre_registration(&self) -> u64 {
+    pub(crate) fn test_reached_pre_registration(&self) -> u64 {
         self.test_reached_pre_registration
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Test-only handle to the gate that parks [`Self::holds_verified`] before it
+    /// repairs.
+    #[cfg(test)]
+    pub(crate) fn test_pre_repair_gate(&self) -> Arc<tokio::sync::RwLock<()>> {
+        Arc::clone(&self.test_pre_repair_gate)
+    }
+
+    /// Test-only: how many checks have reached the pre-repair gate.
+    #[cfg(test)]
+    pub(crate) fn test_reached_pre_repair(&self) -> u64 {
+        self.test_reached_pre_repair
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
