@@ -61,7 +61,7 @@ pub(crate) mod traffic;
 
 pub use crate::ant_protocol::XorName;
 pub(crate) use chunk_store::{rename_with_retry, Reservation};
-pub use chunk_store::{ChunkStore, ChunkStoreConfig, DiskSpace};
+pub use chunk_store::{AdmissionsHeld, ChunkStore, ChunkStoreConfig, DiskSpace};
 // Crate-private, as it was before the two stores became one: `CapacityVerdict` was
 // `pub(crate)` on the old store and has no caller outside this crate.
 pub(crate) use chunk_store::CapacityVerdict;

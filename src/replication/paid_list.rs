@@ -32,6 +32,7 @@ use heed::WithTls;
 use heed::{Database, Env, EnvOpenOptions, MdbError, RoTxn};
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashSet;
+use std::future::Future;
 use std::ops::Bound;
 use std::path::Path;
 use std::slice;
@@ -235,6 +236,19 @@ pub struct PaidList {
     /// is dropped, so [`Self::wait_idle`] waits on the blocking tasks
     /// themselves before the environment may be reopened.
     blocking_tracker: TaskTracker,
+    /// Test-only: parks an eviction between its scan and its removal.
+    #[cfg(test)]
+    test_eviction_scan_gate: Arc<tokio::sync::RwLock<()>>,
+    /// Test-only: how many evictions have finished their scan.
+    #[cfg(test)]
+    test_evictions_scanned: Arc<AtomicU64>,
+    /// Test-only: parks a removal on the blocking pool after it has deleted its
+    /// keys and before it commits.
+    #[cfg(test)]
+    test_removal_commit_gate: Arc<RwLock<()>>,
+    /// Test-only: how many removals have reached that gate.
+    #[cfg(test)]
+    test_removals_committing: Arc<AtomicU64>,
 }
 
 impl PaidList {
@@ -321,6 +335,14 @@ impl PaidList {
             record_out_of_range,
             full_reported: AtomicBool::new(false),
             blocking_tracker: TaskTracker::new(),
+            #[cfg(test)]
+            test_eviction_scan_gate: Arc::new(tokio::sync::RwLock::new(())),
+            #[cfg(test)]
+            test_evictions_scanned: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            test_removal_commit_gate: Arc::new(RwLock::new(())),
+            #[cfg(test)]
+            test_removals_committing: Arc::new(AtomicU64::new(0)),
         };
 
         let count = paid_list.count()?;
@@ -613,19 +635,29 @@ impl PaidList {
     /// Remove up to `limit` entries outside the `near_bits` around `center`,
     /// farthest first, leaving those `keep` accepts. Returns how many went.
     ///
+    /// `keep` is asked twice: by the scan that picks the candidates, and again
+    /// for each candidate inside the write transaction that removes them, once
+    /// `settle` has given its guard. The guard is held until that transaction
+    /// has committed, so a caller whose answer can change meanwhile passes one
+    /// that holds those changes back, and the second answer still holds when
+    /// the removal lands (see `ChunkStore::hold_admissions`).
+    ///
     /// # Errors
     ///
     /// Returns an error if an LMDB transaction fails.
-    pub async fn evict_far(
+    pub async fn evict_far<G: Send + 'static>(
         &self,
         center: XorName,
         near_bits: usize,
         limit: usize,
-        keep: impl Fn(&XorName) -> bool + Send + 'static,
+        keep: impl Fn(&XorName) -> bool + Send + Sync + 'static,
+        settle: impl Future<Output = G>,
     ) -> Result<usize> {
         if limit == 0 {
             return Ok(0);
         }
+        let keep = Arc::new(keep);
+        let scan_keep = Arc::clone(&keep);
         let env = self.env.clone();
         let db = self.db;
         let evictable = self
@@ -637,7 +669,7 @@ impl PaidList {
                 let mut evictable = Vec::new();
                 for (low, high) in far_ranges(&center, near_bits) {
                     let more = visit_range(db, &rtxn, (&low, &high), |key| {
-                        if !keep(&key) {
+                        if !scan_keep(&key) {
                             evictable.push(key);
                         }
                         evictable.len() < limit
@@ -650,7 +682,17 @@ impl PaidList {
             })
             .await
             .map_err(|e| Error::Storage(format!("Paid-list eviction scan failed: {e}")))??;
-        self.remove_batch(&evictable).await
+        #[cfg(test)]
+        {
+            self.test_evictions_scanned.fetch_add(1, Ordering::AcqRel);
+            drop(self.test_eviction_scan_gate.read().await);
+        }
+        if evictable.is_empty() {
+            return Ok(0);
+        }
+        let held = settle.await;
+        self.remove_unkept(evictable, move |key| keep(key), held)
+            .await
     }
 
     /// Record the `RecordOutOfRangeFirstSeen` timestamp for a key.
@@ -695,49 +737,72 @@ impl PaidList {
     ///
     /// Returns an error if the LMDB write transaction fails.
     pub async fn remove_batch(&self, keys: &[XorName]) -> Result<usize> {
+        let count = self.remove_unkept(keys.to_vec(), |_| false, ()).await?;
+        debug!("Batch-removed {count} keys from paid-list");
+        Ok(count)
+    }
+
+    /// Remove each of `keys` that `keep` rejects, in one write transaction,
+    /// asking `keep` inside it, and hold `held` until the removal has
+    /// committed and the in-memory marks follow it. Returns how many entries
+    /// went.
+    async fn remove_unkept<G: Send + 'static>(
+        &self,
+        keys: Vec<XorName>,
+        keep: impl Fn(&XorName) -> bool + Send + 'static,
+        held: G,
+    ) -> Result<usize> {
         if keys.is_empty() {
             return Ok(0);
         }
 
-        let keys_owned: Vec<XorName> = keys.to_vec();
         let env = self.env.clone();
         let db = self.db;
         let price_contested = Arc::clone(&self.price_contested);
         let write_order = Arc::clone(&self.write_order);
+        #[cfg(test)]
+        let (commit_gate, committing) = (
+            Arc::clone(&self.test_removal_commit_gate),
+            Arc::clone(&self.test_removals_committing),
+        );
 
-        let removed_keys = self
-            .blocking_tracker
-            .spawn_blocking(move || -> Result<Vec<XorName>> {
+        self.blocking_tracker
+            .spawn_blocking(move || -> Result<usize> {
+                // Dropped last, once the commit and the in-memory marks are done
+                // or the transaction is abandoned.
+                let _held = held;
                 let ordered = write_order.lock();
                 let mut wtxn = env
                     .write_txn()
                     .map_err(|e| Error::Storage(format!("Failed to create write txn: {e}")))?;
 
-                let mut removed = Vec::new();
-                for key in &keys_owned {
+                let doomed: Vec<XorName> = keys.into_iter().filter(|key| !keep(key)).collect();
+                let mut removed = 0;
+                for key in &doomed {
                     let deleted = db.delete(&mut wtxn, key.as_ref()).map_err(|e| {
                         Error::Storage(format!("Failed to delete from paid-list: {e}"))
                     })?;
                     if deleted {
-                        removed.push(*key);
+                        removed += 1;
                     }
                 }
 
+                #[cfg(test)]
+                {
+                    committing.fetch_add(1, Ordering::AcqRel);
+                    drop(commit_gate.read());
+                }
                 wtxn.commit()
                     .map_err(|e| Error::Storage(format!("Failed to commit batch remove: {e}")))?;
-                // Every key of the batch, not only those the database held: a
-                // mark whose commit failed can be in memory alone.
-                unmark_in_memory(&price_contested, &keys_owned);
+                // Every key removed, not only those the database held: a mark
+                // whose commit failed can be in memory alone.
+                unmark_in_memory(&price_contested, &doomed);
                 drop(ordered);
 
                 Ok(removed)
             })
             .await
-            .map_err(|e| Error::Storage(format!("Paid-list batch remove task failed: {e}")))??;
-
-        let count = removed_keys.len();
-        debug!("Batch-removed {count} keys from paid-list");
-        Ok(count)
+            .map_err(|e| Error::Storage(format!("Paid-list batch remove task failed: {e}")))?
     }
 
     /// Wait until every tracked paid-list LMDB blocking task has finished.
@@ -773,6 +838,32 @@ impl PaidList {
         self.env
             .read_txn()
             .map_err(|e| Error::Storage(format!("Failed to create read txn: {e}")))
+    }
+
+    /// Test-only handle to the gate an eviction waits on after its scan: hold
+    /// the write half to park the next eviction there.
+    #[cfg(test)]
+    pub(crate) fn test_eviction_scan_gate(&self) -> Arc<tokio::sync::RwLock<()>> {
+        Arc::clone(&self.test_eviction_scan_gate)
+    }
+
+    /// Test-only: how many evictions have finished their scan.
+    #[cfg(test)]
+    pub(crate) fn test_evictions_scanned(&self) -> u64 {
+        self.test_evictions_scanned.load(Ordering::Acquire)
+    }
+
+    /// Test-only handle to the gate a removal waits on before its commit, on
+    /// the blocking pool: hold the write half to park the next removal there.
+    #[cfg(test)]
+    pub(crate) fn test_removal_commit_gate(&self) -> Arc<RwLock<()>> {
+        Arc::clone(&self.test_removal_commit_gate)
+    }
+
+    /// Test-only: how many removals have reached the gate before their commit.
+    #[cfg(test)]
+    pub(crate) fn test_removals_committing(&self) -> u64 {
+        self.test_removals_committing.load(Ordering::Acquire)
     }
 }
 
@@ -894,7 +985,7 @@ mod tests {
         }
 
         let evicted = pl
-            .evict_far(center, near_bits, 1, |_| false)
+            .evict_far(center, near_bits, 1, |_| false, async {})
             .await
             .expect("evict");
         assert_eq!(evicted, 1);
@@ -905,7 +996,7 @@ mod tests {
         assert!(pl.contains(&mid).expect("contains"));
 
         let evicted = pl
-            .evict_far(center, near_bits, 10, |_| false)
+            .evict_far(center, near_bits, 10, |_| false, async {})
             .await
             .expect("evict");
         assert_eq!(evicted, 1, "only the far entry was left to evict");
@@ -921,7 +1012,7 @@ mod tests {
 
         let near_bits = XORNAME_BITS - 1;
         let evicted = pl
-            .evict_far([0u8; 32], near_bits, 10, move |key| *key == kept)
+            .evict_far([0u8; 32], near_bits, 10, move |key| *key == kept, async {})
             .await
             .expect("evict");
 
@@ -937,7 +1028,7 @@ mod tests {
         pl.insert(&key).await.expect("insert");
 
         let evicted = pl
-            .evict_far([0u8; 32], XORNAME_BITS, 10, |_| false)
+            .evict_far([0u8; 32], XORNAME_BITS, 10, |_| false, async {})
             .await
             .expect("evict");
 
@@ -1101,7 +1192,13 @@ mod tests {
         pl.insert_price_contested(&evicted_key).await.expect("mark");
 
         let evicted = pl
-            .evict_far([0u8; 32], XORNAME_BITS - 1, 10, move |key| *key == kept)
+            .evict_far(
+                [0u8; 32],
+                XORNAME_BITS - 1,
+                10,
+                move |key| *key == kept,
+                async {},
+            )
             .await
             .expect("evict");
 

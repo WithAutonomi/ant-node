@@ -6622,16 +6622,21 @@ async fn handle_fresh_offer(
 
     // Rule 6: add to PaidForList, marked if the price floor contested the
     // payment when this node verified it, before the record is stored and
-    // can be hinted.
-    fresh::record_paid_key(
-        key,
-        ctx.payment_verifier.verified_payment_contested(key),
-        &ctx.paid_list,
-    )
-    .await;
-
-    // Store the record.
-    match ctx.storage.put(key, data).await {
+    // can be hinted. Then store the record. One admission covers both, so
+    // paid-list eviction cannot take the entry in between (ADR-0006).
+    let (_, stored) = ctx
+        .storage
+        .put_after(
+            key,
+            data,
+            fresh::record_paid_key(
+                key,
+                ctx.payment_verifier.verified_payment_contested(key),
+                &ctx.paid_list,
+            ),
+        )
+        .await;
+    match stored {
         Ok(_) => {
             send_replication_response(
                 source,
