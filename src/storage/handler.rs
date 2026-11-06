@@ -848,7 +848,8 @@ impl AntProtocol {
 
         // One admission from the check below to the store in step 6, so paid-list
         // eviction cannot take this key's paid entry, and its price-contested mark,
-        // while the payment is verified (ADR-0006). Nothing is stored before then.
+        // while the payment is verified (ADR-0006). That store still waits for the
+        // verified payment.
         let _admission = self.storage.admit(&address).await;
 
         // 3. Check if already exists (idempotent success)
