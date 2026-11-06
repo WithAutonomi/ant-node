@@ -534,14 +534,16 @@ impl Drop for WriteInFlight {
     }
 }
 
-/// An admission of a record under way, counted in [`ChunkStore::admitting`] until
-/// dropped.
-struct Admission {
+/// An admission of a record under way, counted until dropped (see
+/// [`ChunkStore::admit`]).
+#[derive(Debug)]
+#[must_use = "the admission ends as soon as this is dropped"]
+pub struct RecordAdmission {
     admitting: Arc<parking_lot::Mutex<HashMap<XorName, usize>>>,
     address: XorName,
 }
 
-impl Drop for Admission {
+impl Drop for RecordAdmission {
     fn drop(&mut self) {
         let mut admitting = self.admitting.lock();
         match admitting.get_mut(&self.address) {
@@ -1180,18 +1182,26 @@ impl ChunkStore {
         }
     }
 
-    /// Register an admission of `address`, once no [`Self::hold_admissions`] is held.
-    async fn admit(&self, address: &XorName) -> Admission {
+    /// Register an admission of `address`, once no [`Self::hold_admissions`] is held,
+    /// and keep it until the returned guard is dropped.
+    ///
+    /// [`Self::put`], [`Self::put_after`], [`Self::repair`] and [`Self::holds_verified`]
+    /// each hold one of their own. A caller that admits a record in several steps holds
+    /// one across all of them, so [`Self::holds_or_admits`] counts the key throughout:
+    /// the client PUT handler holds one from its check that the chunk is held, through
+    /// payment verification, to its store.
+    pub async fn admit(&self, address: &XorName) -> RecordAdmission {
         let _open = self.admission_gate.read().await;
         *self.admitting.lock().entry(*address).or_insert(0) += 1;
-        Admission {
+        RecordAdmission {
             admitting: Arc::clone(&self.admitting),
             address: *address,
         }
     }
 
-    /// Hold back every new admission of a record ([`Self::put`], [`Self::put_after`],
-    /// [`Self::repair`], [`Self::holds_verified`]) until the returned guard is dropped.
+    /// Hold back every new admission of a record ([`Self::admit`], and so [`Self::put`],
+    /// [`Self::put_after`], [`Self::repair`] and [`Self::holds_verified`]) until the
+    /// returned guard is dropped.
     ///
     /// While it is held, a key [`Self::holds_or_admits`] answers `false` for gets no
     /// record. Waits only for admissions registering at this moment, not for those under

@@ -722,7 +722,7 @@ async fn evict_excess_paid_entries(ctx: &PrunePassContext<'_>) -> (usize, usize)
 /// stored after the scan, or under way when the removal decides, keeps its
 /// entry and its price-contested mark (ADR-0006). A record admitted after the
 /// removal finds no entry, as after any eviction.
-async fn evict_paid_entries(
+pub(crate) async fn evict_paid_entries(
     paid_list: &PaidList,
     storage: &Arc<ChunkStore>,
     center: XorName,
