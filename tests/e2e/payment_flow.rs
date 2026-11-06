@@ -1,26 +1,16 @@
-//! E2E tests for payment-enabled chunk storage across multiple nodes.
+//! Setup for payment E2E tests: a 10-node network with payment enforcement on,
+//! sharing one Anvil EVM testnet with a funded client wallet.
 //!
-//! These tests validate the full payment workflow for chunk storage:
+//! The only test here checks that this environment comes up: the network
+//! starts, the funded wallet can be created and the harness has a node 0. It
+//! does not collect quotes, pay, store or retrieve anything.
 //!
-//! **Payment Workflow**:
-//! 1. Client requests quotes from `CLOSE_GROUP_SIZE` network nodes via DHT
-//! 2. Client sorts quotes by price and selects median
-//! 3. Client pays median node 3x on Arbitrum (`SingleNode` payment strategy)
-//! 4. Client sends 0 atto to the other nodes for verification
-//! 5. Client sends chunk with `ProofOfPayment` to storage nodes
-//! 6. Nodes verify payment on-chain before storing (when EVM verification enabled)
-//! 7. Chunk is retrievable from the network
-//!
-//! **Test Coverage**:
-//! - Network setup with 10-node test network and Anvil EVM testnet
-//! - Wallet creation and funding
-//! - Quote collection from DHT peers
-//! - Median price calculation and `SingleNode` payment
-//! - On-chain payment verification
-//! - Payment cache preventing duplicate payments
-//! - Network resilience with node failures
-//!
-//! **Network Setup**: Uses a 10-node test network (need 8+ for `CLOSE_GROUP_SIZE`).
+//! The full flow (close-group quotes, median `SingleNode` payment, on-chain
+//! verification by the storing nodes, retrieval from a different node) has no
+//! cargo E2E test yet; V2-1841 tracks it. What is covered today:
+//! `security_attacks.rs` and `merkle_payment.rs` for the rejection paths, and
+//! the ignored five-node devnet test in `tests/webrtc_direct_devnet.rs` for a
+//! single paid upload.
 
 use super::harness::TestHarness;
 use evmlib::testnet::Testnet;
