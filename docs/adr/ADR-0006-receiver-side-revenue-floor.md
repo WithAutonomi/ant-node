@@ -711,10 +711,10 @@ out of 1,801:
     after its scan, of one a fresh offer has recorded but not yet stored,
     of one whose put has started but is not yet writing, of one a
     cancelled put is still writing, and of one a client PUT's check finds
-    missing from disk and puts back, and an admission that starts while
-    the removal runs waits for its commit without getting past
-    registering. Each test parks the eviction and the admission at fixed
-    points, so each runs one interleaving;
+    missing from disk while the check is under way, and an admission that
+    starts while the removal runs waits for its commit without getting
+    past registering. Each test parks the eviction and the admission at
+    fixed points, so each runs one interleaving;
   - the in-memory copy of the marks is filled on opening and follows every
     write and removal, and a marked insert and a batch removal change it
     only in the order writes take; a mark held in memory alone, as a failed

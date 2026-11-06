@@ -1980,9 +1980,9 @@ mod tests {
     }
 
     /// A client PUT of a chunk the index names but whose file has gone finds
-    /// the file missing, drops the stale index entry, and puts the offered
-    /// copy back. An eviction that removes in between keeps the entry: the
-    /// check counts as an admission from its start.
+    /// the file missing, drops the stale index entry, and on Unix puts the
+    /// offered copy back. An eviction that removes in between keeps the
+    /// entry: the check counts as an admission from its start.
     #[tokio::test]
     async fn eviction_keeps_the_entry_of_a_record_a_put_check_is_putting_back() {
         let (storage, paid_list, _dir) = eviction_fixture().await;
@@ -1994,8 +1994,8 @@ mod tests {
         let repair_gate = storage.test_pre_repair_gate();
         let repair_parked = repair_gate.write().await;
         let check = {
-            let storage = Arc::clone(&storage);
-            tokio::spawn(async move { storage.holds_verified(&key, &content).await })
+            let (storage, offered) = (Arc::clone(&storage), content.clone());
+            tokio::spawn(async move { storage.holds_verified(&key, &offered).await })
         };
         wait_until(|| storage.test_reached_pre_repair() == 1).await;
         assert!(!storage.is_indexed(&key), "the stale index entry is gone");
@@ -2007,7 +2007,14 @@ mod tests {
         assert_eq!(evicted, 0);
 
         drop(repair_parked);
-        assert!(check.await.expect("check task"), "the offered copy is back");
+        // Off Unix a repair rewrites the file in place and cannot recreate a missing
+        // one, so the check answers no and the PUT stores the copy, as the handler does.
+        let put_back = check.await.expect("check task");
+        #[cfg(unix)]
+        assert!(put_back, "on Unix the check puts the offered copy back");
+        if !put_back {
+            assert!(storage.put(&key, &content).await.expect("put"));
+        }
         assert_stored_with_its_mark(&storage, &paid_list, &key);
     }
 
