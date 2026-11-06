@@ -1154,25 +1154,22 @@ fn jittered_interval(base: std::time::Duration) -> std::time::Duration {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use rand::Rng;
     use tempfile::TempDir;
 
     use crate::storage::legacy_artifacts::LEGACY_ENV_DIR;
-
-    /// The e2e port range, so a test bind never lands on a production or dev instance.
-    const TEST_PORT_RANGE: std::ops::Range<u16> = 20000..60000;
-
-    /// How many times a bind is retried before the failure is treated as real.
-    const BIND_ATTEMPTS: u32 = 5;
 
     /// A well-formed address that receives nothing; no chain is contacted in these tests.
     const TEST_REWARDS_ADDRESS: &str = "0x0000000000000000000000000000000000000001";
 
     /// A node config that builds without touching a chain or a real network.
-    fn local_node_config(root: &std::path::Path, port: u16) -> NodeConfig {
+    ///
+    /// Port 0: the OS assigns a free port, so a build never fails on a port that
+    /// is in use (V2-1894). These tests used to pick a random one in 20000-60000,
+    /// which overlaps the OS ephemeral range.
+    fn local_node_config(root: &std::path::Path) -> NodeConfig {
         NodeConfig {
             root_dir: root.to_path_buf(),
-            port,
+            port: 0,
             ipv4_only: true,
             network_mode: NetworkMode::Development,
             payment: crate::config::PaymentConfig {
@@ -1194,7 +1191,7 @@ mod tests {
         let occupied = tokio::net::UdpSocket::bind("127.0.0.1:0")
             .await
             .expect("bind");
-        let mut config = local_node_config(&root, 0);
+        let mut config = local_node_config(&root);
         config.webrtc_direct.enabled = true;
         config.webrtc_direct.bind = occupied.local_addr().expect("address");
         let mut node = NodeBuilder::new(config).build().await.expect("build");
@@ -1214,27 +1211,10 @@ mod tests {
         let root = dir.path().join("node");
         std::fs::create_dir_all(&root).expect("mkdir");
 
-        let mut built = None;
-        let mut last_err = String::new();
-        for _ in 0..BIND_ATTEMPTS {
-            let port = rand::thread_rng().gen_range(TEST_PORT_RANGE);
-            match NodeBuilder::new(local_node_config(&root, port))
-                .build()
-                .await
-            {
-                Ok(node) => {
-                    built = Some(node);
-                    break;
-                }
-                Err(e) => {
-                    last_err = e.to_string();
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                }
-            }
-        }
-        let Some(node) = built else {
-            panic!("could not build a node after {BIND_ATTEMPTS} attempts: {last_err}");
-        };
+        let node = NodeBuilder::new(local_node_config(&root))
+            .build()
+            .await
+            .expect("a node builds on a clean root");
 
         node.shutdown.cancel();
     }
@@ -1263,8 +1243,7 @@ mod tests {
             std::fs::write(env.join("data.mdb"), b"chunks that were never copied out")
                 .expect("seed");
 
-            let port = rand::thread_rng().gen_range(TEST_PORT_RANGE);
-            let mut config = local_node_config(&root, port);
+            let mut config = local_node_config(&root);
             config.storage.enabled = storage_enabled;
 
             let node = NodeBuilder::new(config).build().await.unwrap_or_else(|e| {
@@ -1302,8 +1281,7 @@ mod tests {
         .expect("seed");
         std::fs::write(env.join("RETIRED"), b"retired").expect("mark");
 
-        let port = rand::thread_rng().gen_range(TEST_PORT_RANGE);
-        let mut config = local_node_config(&root, port);
+        let mut config = local_node_config(&root);
         config.storage.enabled = false;
         let node = NodeBuilder::new(config).build().await.expect("must start");
         settle();
@@ -1329,8 +1307,7 @@ mod tests {
         .expect("seed");
         std::fs::write(env.join("RETIRED"), b"retired").expect("mark");
 
-        let port = rand::thread_rng().gen_range(TEST_PORT_RANGE);
-        let node = NodeBuilder::new(local_node_config(&root, port))
+        let node = NodeBuilder::new(local_node_config(&root))
             .build()
             .await
             .expect("a node with a finished leftover must start");
@@ -1360,10 +1337,7 @@ mod tests {
         // A file where the chunk directory has to be, so the store cannot create it.
         std::fs::write(root.join("chunks"), b"not a directory").expect("block the store");
 
-        let port = rand::thread_rng().gen_range(TEST_PORT_RANGE);
-        let built = NodeBuilder::new(local_node_config(&root, port))
-            .build()
-            .await;
+        let built = NodeBuilder::new(local_node_config(&root)).build().await;
         assert!(
             built.is_err(),
             "the file store was supposed to fail to open"

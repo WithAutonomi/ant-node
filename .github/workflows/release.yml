@@ -316,6 +316,12 @@ jobs:
     needs: [build, sign-windows]
     runs-on: ubuntu-latest
     steps:
+      # For sign/release-signing-key.pub, which the signatures are verified
+      # against below and which is published with the release.
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: sign
+
       - name: Download build artifacts (excluding signed)
         uses: actions/download-artifact@v4
         with:
@@ -365,6 +371,34 @@ jobs:
       - name: Clean up signing key
         if: always()
         run: rm -f /tmp/signing-key.secret
+
+      # Every signature must verify against the key the release notes tell
+      # people to use. A unit test (test_published_key_file_matches_embedded_key)
+      # holds that file equal to the key nodes enforce for upgrades, so this also
+      # proves running nodes will accept these archives. Until V2-1802 nothing
+      # checked the signatures this job made, and the published key had been
+      # stale since 2026-03-24.
+      - name: Verify every signature against the published key
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=(artifacts/ant-node-cli-*.tar.gz artifacts/ant-node-cli-*.zip)
+          if [ "${#archives[@]}" -eq 0 ]; then
+            echo "::error::no release archives to verify"
+            exit 1
+          fi
+          for file in "${archives[@]}"; do
+            if ! /tmp/ant-keygen verify \
+              --key sign/release-signing-key.pub \
+              --input "$file" \
+              --signature "${file}.sig"; then
+              echo "::error::$file.sig does not verify against sign/release-signing-key.pub"
+              exit 1
+            fi
+            echo "verified $file"
+          done
+          cp sign/release-signing-key.pub artifacts/
 
       - name: Generate checksums
         run: |
@@ -456,7 +490,9 @@ jobs:
             ### Verification
 
             All downloads are signed with ML-DSA-65 (FIPS 204) post-quantum signatures.
-            Download `ant-keygen` from [WithAutonomi/ant-keygen](https://github.com/WithAutonomi/ant-keygen/releases)
+            The public key is `release-signing-key.pub`, attached to this release; it is
+            the key running nodes verify upgrades against. Download `ant-keygen` from
+            [WithAutonomi/ant-keygen](https://github.com/WithAutonomi/ant-keygen/releases)
             and verify:
 
             ```bash
@@ -476,6 +512,7 @@ jobs:
             release/ant-node-cli-*.tar.gz
             release/ant-node-cli-*.zip
             release/ant-node-cli-*.sig
+            release/release-signing-key.pub
             release/SHA256SUMS.txt
           draft: false
           prerelease: ${{ needs.validate.outputs.is_prerelease }}

@@ -19,12 +19,14 @@ env:
 # build, and `CI Gate` is the single "is this PR green" check:
 #   quick-checks   fmt, clippy, docs, the no-default-features lib check
 #   msrv           the declared minimum toolchain
-#   notices        THIRD-PARTY-NOTICES.txt generation
+#   notices        THIRD-PARTY-NOTICES.txt generation, when the PR changes its
+#                  inputs
 #   test (3 OS)    every lib, bin and integration test target; Linux also runs
 #                  the doc tests, the ignored five-node devnet test and the lib
 #                  tests without default features
 #   filesystems    the storage tests on ext4, XFS and btrfs
 #   build-release  the shipped Linux binary, built exactly as release.yml does
+#   security       RustSec vulnerabilities the PR adds to Cargo.lock
 jobs:
   quick-checks:
     name: Quick checks
@@ -60,19 +62,72 @@ jobs:
       - run: cargo check --all-targets --all-features --locked
 
   # The release workflow ships THIRD-PARTY-NOTICES.txt in every archive.
-  # Generating it on each pull request catches a dependency that ships no
-  # licence text, or a new crate that compiles bundled C code, before release.
+  # Generating it on a pull request catches a dependency that ships no licence
+  # text, or a new crate that compiles bundled C code, before release.
+  #
+  # Generation downloads licence texts from crate repositories and from
+  # musl.libc.org, so a PR that doesn't change the dependency set, the toolchain
+  # pin or the generator would only be testing those sites (V2-1815). Such a PR passes this
+  # job without generating anything. The job still runs and succeeds rather than
+  # being skipped, because CI Gate counts a skipped job as a failure. A rustc
+  # release can move the musl version, and no PR changes that; the release
+  # workflow regenerates the notices for every build, so it catches that.
   notices:
     name: Third-party notices
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The PR's merge commit and its first parent, the base branch tip, so
+          # the step below can list what the PR changes.
+          fetch-depth: 2
+      - name: Does this PR change what the notices are generated from?
+        id: inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Fail safe: anything other than a merge commit with its base parent
+          # present (a re-run on an odd ref, say) generates the notices.
+          if ! git rev-parse --verify -q 'HEAD^2' > /dev/null \
+            || ! git rev-parse --verify -q 'HEAD^1' > /dev/null; then
+            echo "not a pull request merge commit; generating"
+            echo "generate=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Everything the generated notices depend on that a PR can change:
+          # every Cargo manifest and the lockfile (cargo tree, cargo metadata);
+          # cargo's own config (source replacement, path overrides); the
+          # toolchain pin (rustup prefers it to the stable toolchain installed
+          # below, `rustc -vV` picks the musl release, and the toolchain ships
+          # the standard library's copyright text); the generator; and this
+          # workflow, which holds the generator's arguments.
+          watched=(
+            Cargo.lock
+            ':(glob)**/Cargo.toml'
+            .cargo
+            rust-toolchain
+            rust-toolchain.toml
+            scripts/third_party_notices
+            .github/workflows/ci.yml
+          )
+          changed=$(git diff --name-only 'HEAD^1' HEAD -- "${watched[@]}")
+          if [ -n "$changed" ]; then
+            echo "inputs changed:"
+            echo "$changed"
+            echo "generate=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::No change to a Cargo manifest, Cargo.lock, .cargo, the toolchain pin, scripts/third_party_notices or this workflow; notices not regenerated"
+            echo "generate=false" >> "$GITHUB_OUTPUT"
+          fi
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.inputs.outputs.generate == 'true'
       - uses: actions/setup-python@v5
+        if: steps.inputs.outputs.generate == 'true'
         with:
           python-version: "3.12"
       - name: Generate THIRD-PARTY-NOTICES.txt
+        if: steps.inputs.outputs.generate == 'true'
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: >-
@@ -276,27 +331,91 @@ jobs:
           fi
           echo "no failpoint in the release build"
 
-  # Kept outside CI Gate until V2-1800 settles how advisories are handled: an
-  # advisory comes from the RustSec database, not from the PR, so today this
-  # reds every PR (RUSTSEC-2026-0387, V2-1743).
+  # Fails on a RustSec vulnerability that the PR brings into Cargo.lock (V2-1800).
+  #
+  # A plain `cargo audit` fails on every advisory in the lockfile. A new advisory
+  # comes from the RustSec database, not from a PR, so the day one is published
+  # against a dependency main already has, every open PR goes red. That made
+  # this job red on 43 of 50 PRs (RUSTSEC-2026-0387, V2-1743), and the red
+  # stopped meaning anything. So the job audits the base branch's lockfile and
+  # the PR's against the same database, and fails only on what the PR adds.
+  # Advisories already on main are printed as warnings. A PR that doesn't
+  # change Cargo.lock passes without auditing, since it can't add anything.
+  #
+  # Finding advisories newly published against main is the daily org-wide sweep
+  # (V2-1767), not this job.
   security:
     name: Security Audit
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The PR's merge commit and its first parent, the base branch tip.
+          fetch-depth: 2
+      - name: Does this PR change the lockfile or the audit?
+        id: inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Fail safe: anything other than a merge commit with its base parent
+          # present audits the whole lockfile, with nothing counted as existing.
+          if ! git rev-parse --verify -q 'HEAD^2' > /dev/null \
+            || ! git rev-parse --verify -q 'HEAD^1' > /dev/null; then
+            echo "not a pull request merge commit; auditing everything"
+            echo "audit=true" >> "$GITHUB_OUTPUT"
+            echo "base=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed=$(git diff --name-only 'HEAD^1' HEAD -- \
+            Cargo.lock .cargo/audit.toml .github/scripts/audit_regressions.sh .github/workflows/ci.yml)
+          if [ -n "$changed" ]; then
+            echo "inputs changed:"
+            echo "$changed"
+            echo "audit=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::No change to Cargo.lock, .cargo/audit.toml or the audit itself; nothing new to audit"
+            echo "audit=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "base=true" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.inputs.outputs.audit == 'true'
       - name: Install cargo-audit
-        run: cargo install cargo-audit
-      - name: Run security audit
-        run: cargo audit
+        if: steps.inputs.outputs.audit == 'true'
+        run: cargo install cargo-audit --locked --version 0.22.2
+      - name: Audit for advisories this PR introduces
+        if: steps.inputs.outputs.audit == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.inputs.outputs.base }}" = true ]; then
+            git show 'HEAD^1:Cargo.lock' > "$RUNNER_TEMP/base.lock"
+            # The base branch's ignores, not the PR's: an ignore the PR adds
+            # would hide the advisory it is meant to catch from both audits.
+            # A change to them takes effect once it is on the base branch.
+            if git cat-file -e 'HEAD^1:.cargo/audit.toml' 2> /dev/null; then
+              git show 'HEAD^1:.cargo/audit.toml' > "$RUNNER_TEMP/base-audit.toml"
+            else
+              : > "$RUNNER_TEMP/base-audit.toml"
+            fi
+            if ! git diff --quiet 'HEAD^1' HEAD -- .cargo/audit.toml; then
+              echo "::warning::This PR changes .cargo/audit.toml. The audit applies the base branch's ignores; the PR's apply once it merges."
+              git diff 'HEAD^1' HEAD -- .cargo/audit.toml
+            fi
+            bash .github/scripts/audit_regressions.sh --config "$RUNNER_TEMP/base-audit.toml" \
+              Cargo.lock "$RUNNER_TEMP/base.lock"
+          elif [ -f .cargo/audit.toml ]; then
+            bash .github/scripts/audit_regressions.sh --config .cargo/audit.toml Cargo.lock
+          else
+            bash .github/scripts/audit_regressions.sh Cargo.lock
+          fi
 
   # The single check that says whether a PR is green. It fails unless every job
   # it needs succeeded; a skipped or cancelled job counts as a failure.
   gate:
     name: CI Gate
     if: always()
-    needs: [quick-checks, msrv, notices, test, filesystems, build-release]
+    needs: [quick-checks, msrv, notices, test, filesystems, build-release, security]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
