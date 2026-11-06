@@ -42,5 +42,6 @@ See [`TOOLING.md`](./TOOLING.md) for `adrs`, `adr-kit`, and AI harness setup.
 - [ADR-0020: Kademlia-style chunk GET: return the chunk or closer peers](./ADR-0020-kademlia-chunk-get-or-closer.md)
 - [ADR-0022: Remove the LMDB Chunk Store](./ADR-0022-remove-the-lmdb-chunk-store.md)
 - [ADR-0023: Spread hot-record reads across the close group, and refuse full browser sessions explicitly](./ADR-0023-spread-hot-reads-and-refuse-full-browser-sessions.md)
+- [ADR-0026: Clients reading the same file share its records; nodes introduce them and stay the last seed](./ADR-0026-clients-share-records-nodes-introduce-them.md)
 - [ADR-0027: Map the browser listener's port through UPnP](./ADR-0027-map-the-browser-listener-port-through-upnp.md)
 - [ADR-0028: Pressure-gated retention of out-of-range records](./ADR-0028-pressure-gated-retention.md)
